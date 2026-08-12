@@ -1,0 +1,17 @@
+{
+  "name": "nostrd",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml"
+      ]
+    }
+  },
+  "remoteUser": "vscode",
+  "postCreateCommand": "rustc --version && cargo --version",
+  "runArgs": ["--init"]
+}
