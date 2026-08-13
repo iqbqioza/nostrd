@@ -236,6 +236,16 @@ impl GroupStore {
             }
             9000 => {
                 if let Some(group) = self.groups.get_mut(gid) {
+                    // NIP-29: roles are carried as the elements after the
+                    // pubkey in each `p` tag (["p", <pubkey>, <role>...]);
+                    // a separate `role` tag is also accepted for leniency.
+                    for tag in event.tags.iter().filter(|t| t.len() >= 2 && t[0] == P) {
+                        let pk = &tag[1];
+                        let roles = group.members.entry(pk.clone()).or_default();
+                        for role in &tag[2..] {
+                            roles.insert(role.clone());
+                        }
+                    }
                     for pk in tag_values(event, P) {
                         let roles = group.members.entry(pk.to_string()).or_default();
                         roles.extend(tag_values(event, ROLE).map(str::to_string));
@@ -680,6 +690,31 @@ mod tests {
         assert!(store.validate_write(&bad).is_err());
         let good = event(9001, ADMIN, Some("g1"), vec![vec![P.into(), OTHER.into()]]);
         assert!(store.validate_write(&good).is_ok());
+    }
+
+    #[test]
+    fn put_user_roles_from_p_tag_extras() {
+        // NIP-29: a kind:9000 carries the roles as the elements after the
+        // pubkey inside the `p` tag.
+        let mut store = seeded();
+        let put = event(
+            9000,
+            ADMIN,
+            Some("g1"),
+            vec![vec![
+                P.into(),
+                USER.into(),
+                "ceo".into(),
+                "secretary".into(),
+            ]],
+        );
+        store.apply(&put, "", 1, false);
+        let group = store.group("g1").unwrap();
+        assert_eq!(
+            group.members.get(USER).unwrap(),
+            &["ceo".into(), "secretary".into()].into_iter().collect()
+        );
+        assert!(group.is_admin(USER));
     }
 
     #[test]
