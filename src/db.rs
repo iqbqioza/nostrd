@@ -132,6 +132,7 @@ enum Msg {
 pub struct DbClient {
     tx: mpsc::UnboundedSender<Msg>,
     errors: Arc<std::sync::atomic::AtomicU64>,
+    expiry: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl DbClient {
@@ -140,7 +141,8 @@ impl DbClient {
         expiry_enabled: bool,
         errors: Arc<std::sync::atomic::AtomicU64>,
     ) -> Result<DbClient> {
-        let store = Store::open(cfg, expiry_enabled)?;
+        let expiry = Arc::new(std::sync::atomic::AtomicBool::new(expiry_enabled));
+        let store = Store::open(cfg, Arc::clone(&expiry))?;
         let (tx, mut rx) = mpsc::unbounded_channel();
         let thread_errors = Arc::clone(&errors);
         std::thread::spawn(move || {
@@ -405,7 +407,13 @@ impl DbClient {
                 }
             }
         });
-        Ok(DbClient { tx, errors })
+        Ok(DbClient { tx, errors, expiry })
+    }
+
+    /// Toggles NIP-40 expiration handling at runtime (config reload).
+    pub fn set_expiry_enabled(&self, enabled: bool) {
+        self.expiry
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
     async fn request<R: Default>(&self, make: impl FnOnce(oneshot::Sender<R>) -> Msg) -> R {
@@ -550,11 +558,15 @@ struct Store {
     vanish: Database<Bytes, Bytes>,
     banned: Database<Bytes, Bytes>,
     /// NIP-40 expiration handling is only active when the NIP is enabled.
-    expiry_enabled: bool,
+    /// Shared with the relay so that a config reload can toggle it at runtime.
+    expiry_enabled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Store {
-    fn open(cfg: &DatabaseConfig, expiry_enabled: bool) -> Result<Store> {
+    fn open(
+        cfg: &DatabaseConfig,
+        expiry_enabled: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Result<Store> {
         std::fs::create_dir_all(&cfg.path)?;
         // SAFETY: the returned `Env` is owned by `Store` and outlives every
         // transaction created from it within this process.
@@ -704,7 +716,9 @@ impl Store {
         if self.deleted.get(wtxn, &id)?.is_some() {
             return Ok(PutOutcome::PreviouslyDeleted);
         }
-        if self.expiry_enabled
+        if self
+            .expiry_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
             && let Some(exp) = nip40::expiry(event)
             && exp < now
         {
@@ -780,7 +794,9 @@ impl Store {
                 )?;
             }
         }
-        if self.expiry_enabled
+        if self
+            .expiry_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
             && let Some(exp) = nip40::expiry(event)
         {
             self.expiry.put(wtxn, &created_key(exp, id), b"")?;
@@ -826,7 +842,9 @@ impl Store {
                 )?;
             }
         }
-        if self.expiry_enabled
+        if self
+            .expiry_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
             && let Some(exp) = nip40::expiry(&event)
         {
             self.expiry.delete(wtxn, &created_key(exp, id))?;
@@ -1216,7 +1234,8 @@ impl Store {
                 self.deleted,
                 self.banned,
                 self.expiry,
-                self.expiry_enabled,
+                self.expiry_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed),
                 rtxn,
                 id,
                 filter,
@@ -1785,6 +1804,39 @@ mod tests {
                 .await;
             assert_eq!(res.len(), 1);
             assert_eq!(res[0].id, other_wrap.id, "the other wrap survives");
+        });
+    }
+
+    #[test]
+    fn expiry_enabled_toggles_at_runtime() {
+        // A config reload must be able to enable/disable NIP-40 handling.
+        let db = DbClient::open(&config(), true, Arc::new(Default::default())).unwrap();
+        let now = unix_now();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let ev = event(
+                1,
+                "expiring",
+                now,
+                vec![vec!["expiration".into(), (now - 5).to_string()]],
+            );
+            assert_eq!(db.put(ev.clone(), now).await, PutOutcome::Expired);
+
+            // Disabled: the expired event is accepted and served.
+            db.set_expiry_enabled(false);
+            assert_eq!(db.put(ev.clone(), now).await, PutOutcome::Stored);
+            let (res, _) = db.query(vec![Filter::default()], 500, now).await;
+            assert_eq!(res.len(), 1);
+
+            // Re-enabled: a fresh expired event is rejected again.
+            db.set_expiry_enabled(true);
+            let ev2 = event(
+                1,
+                "expiring2",
+                now,
+                vec![vec!["expiration".into(), (now - 5).to_string()]],
+            );
+            assert_eq!(db.put(ev2, now).await, PutOutcome::Expired);
         });
     }
 

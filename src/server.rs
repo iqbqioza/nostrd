@@ -204,6 +204,7 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
     tasks.push(tokio::spawn(reload_handler(
         config_path,
         relay.config.clone(),
+        relay.db.clone(),
         shutdown_rx.clone(),
     )));
 
@@ -525,6 +526,7 @@ async fn signal_handler(shutdown: watch::Sender<bool>) {
 async fn reload_handler(
     config_path: PathBuf,
     config: Arc<tokio::sync::RwLock<Config>>,
+    db: DbClient,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut hangup = match signal(SignalKind::hangup()) {
@@ -540,6 +542,7 @@ async fn reload_handler(
                 match Config::load(&config_path) {
                     Ok(mut new_config) => {
                         new_config.absolutize_paths(&config_path);
+                        db.set_expiry_enabled(new_config.nip_enabled(40));
                         *config.write().await = new_config;
                         info!("configuration reloaded from {}", config_path.display());
                     }
