@@ -384,6 +384,7 @@ async fn rpc_authenticated(relay: &Relay, headers: &HeaderMap) -> bool {
             Some(&cfg.server.admin_pubkey),
             relay.secp(),
             true,
+            "POST",
             |url| {
                 nip62::tag_matches(
                     url,
@@ -435,7 +436,11 @@ pub fn router(relay: Arc<Relay>, shutdown_tx: watch::Sender<bool>) -> Router {
         }))
 }
 
-async fn check_auth(headers: &HeaderMap, state: &AdminState) -> std::result::Result<(), Response> {
+async fn check_auth(
+    headers: &HeaderMap,
+    state: &AdminState,
+    method: &str,
+) -> std::result::Result<(), Response> {
     let relay = &state.relay;
     let cfg = relay.config.read().await;
 
@@ -462,6 +467,7 @@ async fn check_auth(headers: &HeaderMap, state: &AdminState) -> std::result::Res
             Some(&cfg.server.admin_pubkey),
             relay.secp(),
             true,
+            method,
             |_| true,
         )
         .await
@@ -486,7 +492,7 @@ fn bad_request(msg: &str) -> Response {
 }
 
 async fn admin_info(State(state): State<Arc<AdminState>>, headers: HeaderMap) -> Response {
-    if let Err(resp) = check_auth(&headers, &state).await {
+    if let Err(resp) = check_auth(&headers, &state, "GET").await {
         return resp;
     }
     let cfg = state.relay.config.read().await;
@@ -499,7 +505,7 @@ async fn admin_info(State(state): State<Arc<AdminState>>, headers: HeaderMap) ->
 }
 
 async fn admin_stats(State(state): State<Arc<AdminState>>, headers: HeaderMap) -> Response {
-    if let Err(resp) = check_auth(&headers, &state).await {
+    if let Err(resp) = check_auth(&headers, &state, "GET").await {
         return resp;
     }
     Json(state.relay.stats.as_json()).into_response()
@@ -510,7 +516,7 @@ async fn block_pubkey(
     headers: HeaderMap,
     Json(body): Json<PubkeyBody>,
 ) -> Response {
-    if let Err(resp) = check_auth(&headers, &state).await {
+    if let Err(resp) = check_auth(&headers, &state, "POST").await {
         return resp;
     }
     if hex::decode(&body.pubkey)
@@ -531,7 +537,7 @@ async fn allow_pubkey(
     headers: HeaderMap,
     Json(body): Json<PubkeyBody>,
 ) -> Response {
-    if let Err(resp) = check_auth(&headers, &state).await {
+    if let Err(resp) = check_auth(&headers, &state, "POST").await {
         return resp;
     }
     let mut access = state.relay.access.write().await;
@@ -544,7 +550,7 @@ async fn block_kind(
     headers: HeaderMap,
     Json(body): Json<KindBody>,
 ) -> Response {
-    if let Err(resp) = check_auth(&headers, &state).await {
+    if let Err(resp) = check_auth(&headers, &state, "POST").await {
         return resp;
     }
     let mut access = state.relay.access.write().await;
@@ -559,7 +565,7 @@ async fn allow_kind(
     headers: HeaderMap,
     Json(body): Json<KindBody>,
 ) -> Response {
-    if let Err(resp) = check_auth(&headers, &state).await {
+    if let Err(resp) = check_auth(&headers, &state, "POST").await {
         return resp;
     }
     let mut access = state.relay.access.write().await;
@@ -572,7 +578,7 @@ async fn event_status(
     headers: HeaderMap,
     AxPath(id): AxPath<String>,
 ) -> Response {
-    if let Err(resp) = check_auth(&headers, &state).await {
+    if let Err(resp) = check_auth(&headers, &state, "GET").await {
         return resp;
     }
     let filter: Value = json!({ "ids": [id] });
@@ -588,7 +594,7 @@ async fn event_status(
 }
 
 async fn shutdown(State(state): State<Arc<AdminState>>, headers: HeaderMap) -> Response {
-    if let Err(resp) = check_auth(&headers, &state).await {
+    if let Err(resp) = check_auth(&headers, &state, "POST").await {
         return resp;
     }
     let _ = state.shutdown.send(true);

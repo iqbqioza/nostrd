@@ -349,8 +349,8 @@ async fn livekit_token(
         );
     };
     // NIP-29: the auth event's `u` tag must point at this group's livekit
-    // token endpoint.
-    let authed = crate::nips::nip98::verify(&encoded, None, relay.secp(), false, |url| {
+    // token endpoint, and its `method` tag must match the GET request.
+    let authed = crate::nips::nip98::verify(&encoded, None, relay.secp(), false, "GET", |url| {
         url_path(url) == Some(expected_path.as_str())
     })
     .await;

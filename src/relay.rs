@@ -144,13 +144,13 @@ impl Relay {
     pub async fn accept_event(
         &self,
         event: Event,
-        authed: Option<String>,
+        authed: &[String],
     ) -> (PutOutcome, Option<Arc<Event>>) {
         let now = unix_now();
         let cfg = self.config.read().await;
         let access = self.access.read().await;
 
-        if let Err(reason) = self.validate(&cfg, &access, &event, now, authed.as_deref()) {
+        if let Err(reason) = self.validate(&cfg, &access, &event, now, authed) {
             self.stats.bump(&self.stats.events_rejected, 1);
             return (PutOutcome::Invalid(reason), None);
         }
@@ -252,7 +252,7 @@ impl Relay {
         drop(access);
 
         match outcome {
-            PutOutcome::Stored | PutOutcome::Replaced => {
+            PutOutcome::Stored | PutOutcome::Replaced | PutOutcome::Ephemeral => {
                 self.stats.bump(&self.stats.events_accepted, 1);
                 if self.config.read().await.nip_enabled(9) && event.kind == nip09::DELETION_KIND {
                     let removed = self
@@ -267,7 +267,8 @@ impl Relay {
                     self.stats.bump(&self.stats.events_deleted, removed as u64);
                 }
                 if roles_enabled && event.kind == nip43::LEAVE {
-                    // NIP-43: leave requests update the member list.
+                    // NIP-43: leave requests (ephemeral kinds) update the
+                    // member list without being stored.
                     self.apply_leave_request(&event).await;
                 }
                 let is_group_event = groups_enabled
@@ -457,7 +458,7 @@ impl Relay {
         access: &AccessControl,
         event: &Event,
         now: u64,
-        authed: Option<&str>,
+        authed: &[String],
     ) -> std::result::Result<(), String> {
         let limits = &cfg.limits;
 
@@ -528,12 +529,19 @@ impl Relay {
             return Err("invalid: authentication events cannot be published".into());
         }
 
-        if cfg.nip_enabled(42) && cfg.server.require_auth && authed.is_none() {
+        if cfg.nip_enabled(42) && cfg.server.require_auth && authed.is_empty() {
             return Err("auth-required: this relay requires authentication".into());
         }
 
-        if cfg.nip_enabled(70) && nip70::is_protected(event) && authed.is_none() {
-            return Err("auth-required: protected events require authentication".into());
+        // NIP-70: protected events may only be published by their author,
+        // so the event's own pubkey must be among the authenticated keys.
+        if cfg.nip_enabled(70)
+            && nip70::is_protected(event)
+            && !authed.iter().any(|pk| pk == &event.pubkey)
+        {
+            return Err(
+                "auth-required: protected events may only be published by their author".into(),
+            );
         }
 
         Ok(())

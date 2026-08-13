@@ -146,14 +146,15 @@ impl Conn {
             }
         };
         let id = event.id.clone();
-        let outcome = self
-            .relay
-            .accept_event(event, self.authed_pubkeys.last().cloned())
-            .await
-            .0;
+        let outcome = self.relay.accept_event(event, &self.authed_pubkeys).await.0;
         match outcome {
             crate::db::PutOutcome::Stored | crate::db::PutOutcome::Replaced => {
                 self.ok(&id, true, "");
+            }
+            crate::db::PutOutcome::Ephemeral => {
+                // NIP-01: ephemeral kinds are delivered live but never
+                // stored; the NIP-01 `mute:` prefix acknowledges this.
+                self.ok(&id, true, "mute: ephemeral event not stored");
             }
             crate::db::PutOutcome::Duplicate => {
                 self.ok(&id, true, "duplicate: event already stored");
@@ -527,6 +528,12 @@ impl Conn {
         // total so that many concurrent NEG-OPENs cannot pin excessive
         // memory on a single connection.
         let total_cap = max_items.saturating_mul(2);
+        // A NEG-OPEN for an already open subscription id replaces the
+        // existing one (NIP-77): release the old items from the accounting
+        // first so the total does not drift upward.
+        if let Some(old) = self.neg.remove(&sub_id) {
+            self.neg_total = self.neg_total.saturating_sub(old.len());
+        }
         if self.neg_total.saturating_add(items.len()) > total_cap {
             self.send_json(json!([
                 "NEG-ERR",

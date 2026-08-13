@@ -34,6 +34,11 @@ pub enum PutOutcome {
     Replaced,
     Expired,
     PreviouslyDeleted,
+    /// NIP-01: kinds 20000-29999 are ephemeral and must not be stored
+    /// (NIP-59 requires kind 21059 in particular to never be stored).
+    /// The event is delivered live to subscribers and acknowledged with
+    /// an `OK` carrying the `mute:` prefix.
+    Ephemeral,
     Invalid(String),
 }
 
@@ -680,6 +685,12 @@ impl Store {
             && exp < now
         {
             return Ok(PutOutcome::Expired);
+        }
+
+        // NIP-01: kinds 20000-29999 are ephemeral: they are delivered to
+        // currently connected subscribers but never stored or indexed.
+        if (20000..30000).contains(&event.kind) {
+            return Ok(PutOutcome::Ephemeral);
         }
 
         let outcome = if is_replaceable(event) {
@@ -1646,6 +1657,29 @@ mod tests {
             assert!(db.unban_event(id).await);
             let (res, _) = db.query(vec![Filter::default()], 500, now).await;
             assert!(res.is_empty(), "the event itself was removed");
+        });
+    }
+
+    #[test]
+    fn ephemeral_events_are_not_stored() {
+        // NIP-01: kinds 20000-29999 must not be stored (NIP-59 requires
+        // kind 21059 in particular to never be stored).
+        let db = DbClient::open(&config(), true, Arc::new(Default::default())).unwrap();
+        let now = unix_now();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let ev = event(
+                21059,
+                "gift wrap",
+                now,
+                vec![vec!["p".into(), "a".repeat(64)]],
+            );
+            assert_eq!(db.put(ev.clone(), now).await, PutOutcome::Ephemeral);
+            // Nothing was stored: queries return nothing and re-publication
+            // is not a duplicate.
+            let (res, _) = db.query(vec![Filter::default()], 500, now).await;
+            assert!(res.is_empty());
+            assert_eq!(db.put(ev, now).await, PutOutcome::Ephemeral);
         });
     }
 
