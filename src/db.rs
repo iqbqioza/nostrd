@@ -56,7 +56,7 @@ fn db_error(errors: &Arc<std::sync::atomic::AtomicU64>, e: &crate::error::Error)
         e,
         crate::error::Error::Heed(heed::Error::Mdb(heed::MdbError::MapFull))
     ) {
-        log::error!("database map is full: increase database.map_size in nostrd.toml");
+        log::error!("database map is full: increase database.map_max_size in nostrd.toml");
     } else {
         log::error!("database error: {e}");
     }
@@ -73,6 +73,14 @@ enum Msg {
         limit: usize,
         now: u64,
         reply: oneshot::Sender<(Vec<Event>, bool)>,
+    },
+    /// NIP-77: query returning only `(created_at, id)` records so that large
+    /// negentropy ranges do not materialize every full event in memory.
+    NegQuery {
+        filter: Filter,
+        limit: usize,
+        now: u64,
+        reply: oneshot::Sender<(NegItems, bool)>,
     },
     Count {
         filters: Vec<Filter>,
@@ -125,6 +133,10 @@ enum Msg {
     DatabaseSize {
         reply: oneshot::Sender<u64>,
     },
+    #[cfg(test)]
+    MapSize {
+        reply: oneshot::Sender<u64>,
+    },
     Shutdown,
 }
 
@@ -152,23 +164,20 @@ impl DbClient {
             // sent after the commit, so an OK implies durability.
             const BATCH: usize = 64;
             let mut pending: Option<heed::RwTxn> = None;
-            let mut replies: Vec<(oneshot::Sender<PutOutcome>, PutOutcome)> = Vec::new();
+            let mut batch_puts: Vec<(Event, u64)> = Vec::new();
+            let mut senders: Vec<oneshot::Sender<PutOutcome>> = Vec::new();
             'outer: loop {
                 let Some(msg) = rx.blocking_recv() else {
                     // The channel is closed (every DbClient was dropped
                     // without a shutdown): flush any pending batch so that
                     // awaiting requests are not left hanging.
-                    if let Some(wtxn) = pending.take()
-                        && let Err(e) = wtxn.commit()
-                    {
-                        db_error(&thread_errors, &e.into());
-                        for (reply, _) in replies.drain(..) {
-                            let _ = reply.send(PutOutcome::Invalid("database error".into()));
-                        }
-                    }
-                    for (reply, out) in replies.drain(..) {
-                        let _ = reply.send(out);
-                    }
+                    flush_batch(
+                        &store,
+                        &thread_errors,
+                        &mut pending,
+                        &mut batch_puts,
+                        &mut senders,
+                    );
                     break;
                 };
                 let mut msgs = vec![msg];
@@ -192,59 +201,30 @@ impl DbClient {
                                     }
                                 }
                             }
-                            let out = match store.put_event_in(
-                                pending.as_mut().expect("txn just opened"),
-                                &event,
-                                now,
-                            ) {
-                                Ok(out) => out,
-                                Err(e) => {
-                                    db_error(&thread_errors, &e);
-                                    // The transaction is poisoned: abort it and
-                                    // revoke every reply already queued for it,
-                                    // because those events were rolled back with
-                                    // it and their OK would be a lie.
-                                    pending.take();
-                                    for (reply, _) in replies.drain(..) {
-                                        let _ = reply
-                                            .send(PutOutcome::Invalid("database error".into()));
-                                    }
-                                    PutOutcome::Invalid("database error".into())
-                                }
-                            };
-                            replies.push((reply, out));
+                            batch_puts.push((event, now));
+                            senders.push(reply);
                         }
                         Msg::Shutdown => {
-                            if let Some(wtxn) = pending.take()
-                                && let Err(e) = wtxn.commit()
-                            {
-                                db_error(&thread_errors, &e.into());
-                                for (reply, _) in replies.drain(..) {
-                                    let _ =
-                                        reply.send(PutOutcome::Invalid("database error".into()));
-                                }
-                            }
-                            for (reply, out) in replies.drain(..) {
-                                let _ = reply.send(out);
-                            }
+                            flush_batch(
+                                &store,
+                                &thread_errors,
+                                &mut pending,
+                                &mut batch_puts,
+                                &mut senders,
+                            );
                             let _ = store.env.force_sync();
                             break 'outer;
                         }
                         other => {
                             // Work that is not a plain put commits the batch
                             // first so that ordering is preserved.
-                            if let Some(wtxn) = pending.take()
-                                && let Err(e) = wtxn.commit()
-                            {
-                                db_error(&thread_errors, &e.into());
-                                for (reply, _) in replies.drain(..) {
-                                    let _ =
-                                        reply.send(PutOutcome::Invalid("database error".into()));
-                                }
-                            }
-                            for (reply, out) in replies.drain(..) {
-                                let _ = reply.send(out);
-                            }
+                            flush_batch(
+                                &store,
+                                &thread_errors,
+                                &mut pending,
+                                &mut batch_puts,
+                                &mut senders,
+                            );
                             match other {
                                 Msg::Query {
                                     filters,
@@ -253,6 +233,21 @@ impl DbClient {
                                     reply,
                                 } => {
                                     let out = match store.scan(&filters, now, limit, false) {
+                                        Ok(out) => out,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            (Vec::new(), false)
+                                        }
+                                    };
+                                    let _ = reply.send(out);
+                                }
+                                Msg::NegQuery {
+                                    filter,
+                                    limit,
+                                    now,
+                                    reply,
+                                } => {
+                                    let out = match store.scan_neg(&filter, now, limit) {
                                         Ok(out) => out,
                                         Err(e) => {
                                             db_error(&thread_errors, &e);
@@ -386,6 +381,10 @@ impl DbClient {
                                 Msg::DatabaseSize { reply } => {
                                     let _ = reply.send(store.size_on_disk());
                                 }
+                                #[cfg(test)]
+                                Msg::MapSize { reply } => {
+                                    let _ = reply.send(store.env.info().map_size as u64);
+                                }
                                 Msg::Put { .. } | Msg::Shutdown => unreachable!(),
                             }
                         }
@@ -394,17 +393,13 @@ impl DbClient {
                 // Flush the batch before blocking again: clients await their
                 // replies, so a pending batch must not wait for the next
                 // message or every requestor deadlocks.
-                if let Some(wtxn) = pending.take()
-                    && let Err(e) = wtxn.commit()
-                {
-                    db_error(&thread_errors, &e.into());
-                    for (reply, _) in replies.drain(..) {
-                        let _ = reply.send(PutOutcome::Invalid("database error".into()));
-                    }
-                }
-                for (reply, out) in replies.drain(..) {
-                    let _ = reply.send(out);
-                }
+                flush_batch(
+                    &store,
+                    &thread_errors,
+                    &mut pending,
+                    &mut batch_puts,
+                    &mut senders,
+                );
             }
         });
         Ok(DbClient { tx, errors, expiry })
@@ -431,6 +426,18 @@ impl DbClient {
     pub async fn query(&self, filters: Vec<Filter>, limit: usize, now: u64) -> (Vec<Event>, bool) {
         self.request(|reply| Msg::Query {
             filters,
+            limit,
+            now,
+            reply,
+        })
+        .await
+    }
+
+    /// NIP-77: returns only `(created_at, id)` records of the matching
+    /// events, keeping the memory footprint at a few bytes per record.
+    pub async fn neg_items(&self, filter: Filter, limit: usize, now: u64) -> (NegItems, bool) {
+        self.request(|reply| Msg::NegQuery {
+            filter,
             limit,
             now,
             reply,
@@ -539,8 +546,106 @@ impl DbClient {
         self.request(|reply| Msg::DatabaseSize { reply }).await
     }
 
+    /// Current memory map size in bytes (used by tests to verify growth).
+    #[cfg(test)]
+    pub async fn map_size_now(&self) -> u64 {
+        self.request(|reply| Msg::MapSize { reply }).await
+    }
+
     pub fn shutdown(&self) {
         let _ = self.tx.send(Msg::Shutdown);
+    }
+}
+
+/// Commits the pending put batch. The batch is applied inside one write
+/// transaction; when the commit fails because the memory map is full, the
+/// map is grown (up to `map_max_size`) and the whole batch is re-applied in
+/// a fresh transaction. Replies are only sent after a successful commit, so
+/// an OK implies durability.
+#[allow(clippy::too_many_arguments)]
+fn flush_batch(
+    store: &Store,
+    thread_errors: &Arc<std::sync::atomic::AtomicU64>,
+    pending: &mut Option<heed::RwTxn>,
+    batch_puts: &mut Vec<(Event, u64)>,
+    senders: &mut Vec<oneshot::Sender<PutOutcome>>,
+) {
+    if batch_puts.is_empty() {
+        if let Some(wtxn) = pending.take()
+            && let Err(e) = wtxn.commit()
+        {
+            db_error(thread_errors, &e.into());
+        }
+        return;
+    }
+    loop {
+        let mut txn = match pending.take() {
+            Some(t) => t,
+            None => match store.env.write_txn() {
+                Ok(t) => t,
+                Err(e) => {
+                    db_error(thread_errors, &e.into());
+                    for s in senders.drain(..) {
+                        let _ = s.send(PutOutcome::Invalid("database error".into()));
+                    }
+                    batch_puts.clear();
+                    return;
+                }
+            },
+        };
+        let mut outcomes = Vec::with_capacity(batch_puts.len());
+        let mut poisoned = false;
+        for (event, now) in batch_puts.iter() {
+            match store.put_event_in(&mut txn, event, *now) {
+                Ok(out) => outcomes.push(out),
+                Err(e) => {
+                    db_error(thread_errors, &e);
+                    poisoned = true;
+                    break;
+                }
+            }
+        }
+        if poisoned {
+            // The transaction is unusable: abort it and revoke every reply
+            // queued for it, because the applied puts were rolled back with
+            // it and their OK would be a lie.
+            drop(txn);
+            for s in senders.drain(..) {
+                let _ = s.send(PutOutcome::Invalid("database error".into()));
+            }
+            batch_puts.clear();
+            return;
+        }
+        match txn.commit() {
+            Ok(()) => {
+                for (s, out) in senders.drain(..).zip(outcomes) {
+                    let _ = s.send(out);
+                }
+                batch_puts.clear();
+                store.grow_map_if_needed();
+                return;
+            }
+            Err(heed::Error::Mdb(heed::MdbError::MapFull)) => {
+                if !store.grow_map() {
+                    // The map cannot grow further: the batch cannot be
+                    // committed, so every reply is revoked.
+                    for s in senders.drain(..) {
+                        let _ = s.send(PutOutcome::Invalid("database error".into()));
+                    }
+                    batch_puts.clear();
+                    return;
+                }
+                // Retry the whole batch in the larger map.
+            }
+            Err(e) => {
+                db_error(thread_errors, &e.into());
+                for s in senders.drain(..) {
+                    let _ = s.send(PutOutcome::Invalid("database error".into()));
+                }
+                batch_puts.clear();
+                return;
+            }
+        }
     }
 }
 
@@ -560,6 +665,59 @@ struct Store {
     /// NIP-40 expiration handling is only active when the NIP is enabled.
     /// Shared with the relay so that a config reload can toggle it at runtime.
     expiry_enabled: Arc<std::sync::atomic::AtomicBool>,
+    /// Ceiling for the automatic map growth (bytes).
+    map_max_size: u64,
+    /// System page size in bytes (LMDB uses it for its pages).
+    page_size: usize,
+}
+
+/// `(created_at, id)` records returned by the NIP-77 negentropy query.
+type NegItems = Vec<(u64, [u8; 32])>;
+
+/// Output collector for a scan: either full events (REQ/COUNT) or
+/// `(created_at, id)` records (NIP-77 negentropy, memory-efficient).
+trait ScanCollector {
+    fn len(&self) -> usize;
+    /// Pushes a matched event; must return `false` when the per-filter
+    /// limit is reached so the scan stops.
+    fn push(&mut self, event: Event, id: [u8; 32], limit: usize) -> bool;
+    /// Sorts the collected records by the NIP-01 ordering (newest first).
+    fn sort_key(&mut self);
+}
+
+struct EventCollector(Vec<Event>);
+
+impl ScanCollector for EventCollector {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+    fn push(&mut self, event: Event, _id: [u8; 32], limit: usize) -> bool {
+        self.0.push(event);
+        self.0.len() < limit
+    }
+    fn sort_key(&mut self) {
+        self.0.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+    }
+}
+
+struct ItemCollector(NegItems);
+
+impl ScanCollector for ItemCollector {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+    fn push(&mut self, event: Event, id: [u8; 32], limit: usize) -> bool {
+        self.0.push((event.created_at, id));
+        self.0.len() < limit
+    }
+    fn sort_key(&mut self) {
+        self.0
+            .sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    }
 }
 
 impl Store {
@@ -570,11 +728,22 @@ impl Store {
         std::fs::create_dir_all(&cfg.path)?;
         // SAFETY: the returned `Env` is owned by `Store` and outlives every
         // transaction created from it within this process.
+        // The map is virtual address space: on 64-bit systems the growth
+        // ceiling can be huge; on 32-bit systems LMDB is limited to ~2 GiB.
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
+        let page_size = page_size.max(4096);
+        let mut map_size = (cfg.map_size as u64).max(16 * 1024 * 1024);
+        let mut map_max_size = (cfg.map_max_size as u64).max(map_size);
+        if usize::BITS < 64 {
+            let cap = 2u64 * 1024 * 1024 * 1024;
+            map_size = map_size.min(cap);
+            map_max_size = map_max_size.min(cap);
+        }
         let env = unsafe {
             EnvOpenOptions::new()
                 .max_dbs(cfg.max_dbs.max(16))
                 .max_readers(cfg.max_readers.max(8))
-                .map_size(cfg.map_size.max(16 * 1024 * 1024))
+                .map_size(map_size as usize)
                 .open(&cfg.path)?
         };
 
@@ -610,7 +779,59 @@ impl Store {
             vanish,
             banned,
             expiry_enabled,
+            map_max_size,
+            page_size,
         })
+    }
+
+    /// Grows the memory map (doubling it, at least covering the current
+    /// usage) up to `map_max_size`. Returns `false` when the map cannot
+    /// grow further, meaning the database is full for good.
+    ///
+    /// Must be called with no transactions active: the DB thread is the only
+    /// user of the environment and calls this between messages, after a
+    /// failed commit has consumed its transaction.
+    fn grow_map(&self) -> bool {
+        let info = self.env.info();
+        let current = info.map_size as u64;
+        let used = info.last_page_number as u64 * self.page_size as u64;
+        let target = current
+            .saturating_mul(2)
+            .max(used.saturating_mul(2))
+            .min(self.map_max_size);
+        if target <= current {
+            log::error!(
+                "database map is full and cannot grow beyond {} bytes (map_max_size)",
+                self.map_max_size
+            );
+            return false;
+        }
+        let target = target.div_ceil(self.page_size as u64) * self.page_size as u64;
+        // SAFETY: the environment is only used by this thread and no
+        // transaction is active at this point.
+        match unsafe { self.env.resize(target as usize) } {
+            Ok(()) => {
+                log::info!("database map resized to {target} bytes");
+                true
+            }
+            Err(e) => {
+                // A failed resize must be reported so the caller does not
+                // retry into an infinite loop.
+                log::error!("database map resize to {target} bytes failed: {e}");
+                false
+            }
+        }
+    }
+
+    /// Grows the map proactively when it is more than 90% used, so that
+    /// subsequent commits do not pay the grow-and-retry cost.
+    fn grow_map_if_needed(&self) {
+        let info = self.env.info();
+        let used = info.last_page_number as u64 * self.page_size as u64;
+        let current = info.map_size as u64;
+        if used > current.saturating_mul(9) / 10 {
+            self.grow_map();
+        }
     }
 
     fn size_on_disk(&self) -> u64 {
@@ -955,7 +1176,7 @@ impl Store {
                 if d != address.d.as_bytes() {
                     continue;
                 }
-                if value.len() < CREATED_LEN {
+                if value.len() < CREATED_LEN + ID_LEN {
                     continue;
                 }
                 let created = u64::from_be_bytes(value[..CREATED_LEN].try_into().unwrap());
@@ -1164,8 +1385,7 @@ impl Store {
         Ok(removed)
     }
 
-    // ----- querying -----
-
+    /// Collects events that match the filters, most recent first.
     fn scan(
         &self,
         filters: &[Filter],
@@ -1173,12 +1393,44 @@ impl Store {
         max_limit: usize,
         count_mode: bool,
     ) -> Result<(Vec<Event>, bool)> {
+        let mut out = EventCollector(Vec::new());
+        let more = self.scan_collect(filters, now, max_limit, count_mode, &mut out)?;
+        Ok((out.0, more))
+    }
+
+    /// Collects only `(created_at, id)` records of the matching events
+    /// (NIP-77 negentropy). Keeps the memory footprint at a few bytes per
+    /// record instead of materializing every full event.
+    fn scan_neg(&self, filter: &Filter, now: u64, max_items: usize) -> Result<(NegItems, bool)> {
+        let mut out = ItemCollector(Vec::new());
+        let more = self.scan_collect(
+            std::slice::from_ref(filter),
+            now,
+            max_items,
+            false,
+            &mut out,
+        )?;
+        Ok((out.0, more))
+    }
+
+    /// Shared scan core: applies the filters through the index-selected
+    /// candidate walks and collects into `out`. Returns `true` when the
+    /// scan stopped at the limit instead of exhausting the matches
+    /// (NIP-67 EOSE completeness hint).
+    #[allow(clippy::too_many_arguments)]
+    fn scan_collect<C: ScanCollector>(
+        &self,
+        filters: &[Filter],
+        now: u64,
+        max_limit: usize,
+        count_mode: bool,
+        out: &mut C,
+    ) -> Result<bool> {
         if max_limit == 0 {
-            return Ok((Vec::new(), false));
+            return Ok(false);
         }
         let rtxn = self.env.read_txn()?;
         let mut seen: HashSet<Vec<u8>> = HashSet::new();
-        let mut out: Vec<Event> = Vec::new();
         // `more` is true when a scan stopped because of a limit instead of
         // exhausting the matching records (NIP-67 EOSE completeness hint).
         let mut more = false;
@@ -1199,7 +1451,7 @@ impl Store {
                 Vec::new()
             };
             let stop = self.scan_filter(
-                &rtxn, filter, &terms, now, limit, max_limit, &mut seen, &mut out, &mut more,
+                &rtxn, filter, &terms, now, limit, max_limit, &mut seen, out, &mut more,
             )?;
             if stop {
                 break;
@@ -1208,18 +1460,14 @@ impl Store {
         if !count_mode {
             // NIP-01: newest events first; on equal created_at the event
             // with the lowest id comes first.
-            out.sort_by(|a, b| {
-                b.created_at
-                    .cmp(&a.created_at)
-                    .then_with(|| a.id.cmp(&b.id))
-            });
+            ScanCollector::sort_key(out);
         }
-        Ok((out, more))
+        Ok(more)
     }
 
     /// Returns `true` when the global limit was reached.
     #[allow(clippy::too_many_arguments)]
-    fn scan_filter(
+    fn scan_filter<C: ScanCollector>(
         &self,
         rtxn: &RoTxn,
         filter: &Filter,
@@ -1228,7 +1476,7 @@ impl Store {
         limit: usize,
         max_limit: usize,
         seen: &mut HashSet<Vec<u8>>,
-        out: &mut Vec<Event>,
+        out: &mut C,
         more: &mut bool,
     ) -> Result<bool> {
         let mut consider = |id: &[u8]| -> Result<bool> {
@@ -1371,7 +1619,7 @@ impl Store {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn consider_event(
+fn consider_event<C: ScanCollector>(
     events: Database<Bytes, Bytes>,
     deleted: Database<Bytes, Bytes>,
     banned: Database<Bytes, Bytes>,
@@ -1383,7 +1631,7 @@ fn consider_event(
     terms: &[String],
     now: u64,
     seen: &mut HashSet<Vec<u8>>,
-    out: &mut Vec<Event>,
+    out: &mut C,
     limit: usize,
     max_limit: usize,
 ) -> Result<bool> {
@@ -1414,8 +1662,8 @@ fn consider_event(
         return Ok(true);
     }
     seen.insert(id.to_vec());
-    out.push(event);
-    Ok(out.len() < limit)
+    let id = id.try_into().unwrap_or([0u8; 32]);
+    Ok(out.push(event, id, limit))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1816,6 +2064,44 @@ mod tests {
                 .await;
             assert_eq!(res.len(), 1);
             assert_eq!(res[0].id, other_wrap.id, "the other wrap survives");
+        });
+    }
+
+    #[test]
+    fn map_grows_beyond_initial_size() {
+        // The database must keep accepting writes once it outgrows the
+        // initial map size: the map is grown automatically up to
+        // map_max_size, without degrading reads or writes.
+        let cfg = DatabaseConfig {
+            map_size: 256 * 1024,
+            map_max_size: 32 * 1024 * 1024,
+            ..config()
+        };
+        let db = DbClient::open(&cfg, true, Arc::new(Default::default())).unwrap();
+        let now = unix_now();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let n = 3000;
+            for i in 0..n {
+                let ev = event(
+                    1,
+                    &format!("bulk-{i}"),
+                    now - i as u64,
+                    vec![vec!["t".into(), format!("tag-{i}")]],
+                );
+                let out = db.put(ev.clone(), now).await;
+                assert!(
+                    matches!(out, PutOutcome::Stored | PutOutcome::Duplicate),
+                    "event {i} failed: {out:?}"
+                );
+            }
+            // Every event is readable back.
+            let f: Filter =
+                serde_json::from_value(serde_json::json!({"kinds": [1], "limit": n})).unwrap();
+            let (res, _) = db.query(vec![f], n, now).await;
+            assert_eq!(res.len(), n, "all events must be queryable");
+            // And the map grew beyond the initial size.
+            assert!(db.map_size_now().await > 256 * 1024, "map must have grown");
         });
     }
 

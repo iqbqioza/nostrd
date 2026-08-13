@@ -529,8 +529,10 @@ impl Conn {
             return;
         }
         let now = unix_now();
-        let (events, more) = self.relay.db.query(vec![filter], max_items, now).await;
-        if more || events.len() > max_items {
+        // The negentropy query only needs (created_at, id) records, so it
+        // never materializes every matching full event in memory.
+        let (items, more) = self.relay.db.neg_items(filter, max_items, now).await;
+        if more || items.len() > max_items {
             // NIP-77: the maximum number of processable records may be
             // returned as the fourth element.
             self.send_json(json!([
@@ -541,14 +543,7 @@ impl Conn {
             ]));
             return;
         }
-        let mut items: Vec<nip77::Item> = Vec::with_capacity(events.len());
-        for event in events {
-            let Some(id) = event.id_bytes() else {
-                continue;
-            };
-            items.push((event.created_at, id));
-        }
-        items = nip77::sort_items(items);
+        let items = nip77::sort_items(items);
 
         // The items stay on this connection for the whole sync; bound the
         // total so that many concurrent NEG-OPENs cannot pin excessive

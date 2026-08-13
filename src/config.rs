@@ -107,7 +107,14 @@ pub struct DatabaseConfig {
     pub path: PathBuf,
     pub max_dbs: u32,
     pub max_readers: u32,
+    /// Initial memory map size in bytes. The map grows automatically (up to
+    /// `map_max_size`) when the database outgrows it, so reads and writes
+    /// keep working no matter how large the database becomes.
     pub map_size: usize,
+    /// Upper bound for the automatic map growth. The reservation is virtual
+    /// address space (sparse file): physical memory is only consumed by the
+    /// pages actually touched.
+    pub map_max_size: usize,
     pub purge_interval_secs: u64,
     /// Enable the NIP-50 full-text word index.
     pub search_index: bool,
@@ -194,6 +201,9 @@ impl Default for DatabaseConfig {
             max_dbs: 32,
             max_readers: 128,
             map_size: 1024 * 1024 * 1024,
+            // 1 TiB of virtual address space; the actual disk usage grows
+            // only with the stored data (sparse file).
+            map_max_size: 1024 * 1024 * 1024 * 1024,
             purge_interval_secs: 300,
             search_index: true,
         }

@@ -184,10 +184,15 @@ max_dbs = 32
 # Maximum number of concurrent reader threads.
 max_readers = 128
 
-# Initial memory map size in bytes. The map grows when full; if the OS limit
-# is reached, events are rejected with a logged "database map is full"
-# message — increase this value (and/or vm.max_map_count) for large relays.
+# Initial memory map size in bytes. When the database outgrows it, the map
+# is grown automatically (doubling, up to map_max_size) so reads and writes
+# keep working no matter how large the database becomes.
 map_size = 1073741824
+
+# Upper bound for the automatic map growth. This is a virtual address space
+# reservation backed by a sparse file: physical memory and disk usage grow
+# only with the data actually stored. On 32-bit systems it is capped at 2 GiB.
+map_max_size = 1099511627776
 
 # Interval in seconds between NIP-40 expired-event purge runs.
 purge_interval_secs = 300
