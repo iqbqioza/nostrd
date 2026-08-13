@@ -143,6 +143,20 @@ impl DbClient {
             let mut replies: Vec<(oneshot::Sender<PutOutcome>, PutOutcome)> = Vec::new();
             'outer: loop {
                 let Some(msg) = rx.blocking_recv() else {
+                    // The channel is closed (every DbClient was dropped
+                    // without a shutdown): flush any pending batch so that
+                    // awaiting requests are not left hanging.
+                    if let Some(wtxn) = pending.take()
+                        && let Err(e) = wtxn.commit()
+                    {
+                        db_error(&thread_errors, &e.into());
+                        for (reply, _) in replies.drain(..) {
+                            let _ = reply.send(PutOutcome::Invalid("database error".into()));
+                        }
+                    }
+                    for (reply, out) in replies.drain(..) {
+                        let _ = reply.send(out);
+                    }
                     break;
                 };
                 let mut msgs = vec![msg];
@@ -155,19 +169,34 @@ impl DbClient {
                 for msg in msgs {
                     match msg {
                         Msg::Put { event, now, reply } => {
+                            if pending.is_none() {
+                                match store.env.write_txn() {
+                                    Ok(txn) => pending = Some(txn),
+                                    Err(e) => {
+                                        db_error(&thread_errors, &e.into());
+                                        let _ = reply
+                                            .send(PutOutcome::Invalid("database error".into()));
+                                        continue;
+                                    }
+                                }
+                            }
                             let out = match store.put_event_in(
-                                pending.get_or_insert_with(|| {
-                                    store.env.write_txn().expect("write txn")
-                                }),
+                                pending.as_mut().expect("txn just opened"),
                                 &event,
                                 now,
                             ) {
                                 Ok(out) => out,
                                 Err(e) => {
                                     db_error(&thread_errors, &e);
-                                    // The transaction is poisoned: abort it so
-                                    // the next put starts fresh.
+                                    // The transaction is poisoned: abort it and
+                                    // revoke every reply already queued for it,
+                                    // because those events were rolled back with
+                                    // it and their OK would be a lie.
                                     pending.take();
+                                    for (reply, _) in replies.drain(..) {
+                                        let _ = reply
+                                            .send(PutOutcome::Invalid("database error".into()));
+                                    }
                                     PutOutcome::Invalid("database error".into())
                                 }
                             };
@@ -178,6 +207,10 @@ impl DbClient {
                                 && let Err(e) = wtxn.commit()
                             {
                                 db_error(&thread_errors, &e.into());
+                                for (reply, _) in replies.drain(..) {
+                                    let _ =
+                                        reply.send(PutOutcome::Invalid("database error".into()));
+                                }
                             }
                             for (reply, out) in replies.drain(..) {
                                 let _ = reply.send(out);
@@ -188,10 +221,13 @@ impl DbClient {
                         other => {
                             // Work that is not a plain put commits the batch
                             // first so that ordering is preserved.
-                            if let Some(wtxn) = pending.take() {
-                                match wtxn.commit() {
-                                    Ok(()) => {}
-                                    Err(e) => db_error(&thread_errors, &e.into()),
+                            if let Some(wtxn) = pending.take()
+                                && let Err(e) = wtxn.commit()
+                            {
+                                db_error(&thread_errors, &e.into());
+                                for (reply, _) in replies.drain(..) {
+                                    let _ =
+                                        reply.send(PutOutcome::Invalid("database error".into()));
                                 }
                             }
                             for (reply, out) in replies.drain(..) {
@@ -340,6 +376,9 @@ impl DbClient {
                     && let Err(e) = wtxn.commit()
                 {
                     db_error(&thread_errors, &e.into());
+                    for (reply, _) in replies.drain(..) {
+                        let _ = reply.send(PutOutcome::Invalid("database error".into()));
+                    }
                 }
                 for (reply, out) in replies.drain(..) {
                     let _ = reply.send(out);
