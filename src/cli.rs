@@ -172,6 +172,7 @@ fn open_db(cfg: &Config) -> Result<crate::db::DbClient> {
         &cfg.database,
         cfg.nip_enabled(40),
         std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        cfg.limits.db_request_timeout_secs,
     )
 }
 

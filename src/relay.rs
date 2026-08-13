@@ -141,10 +141,9 @@ impl Relay {
         self.key.is_some()
     }
 
-    /// Validates and stores a single event (kept for tests; the live path
-    /// uses the batched [`Self::accept_events_batch`]).
-    #[cfg(test)]
-    #[allow(dead_code)]
+    /// Validates and stores a single event. The live path batches events
+    /// through [`Self::accept_events_batch`], which falls back to this
+    /// method for batches containing group-state events.
     pub async fn accept_event(
         &self,
         event: Event,
@@ -313,6 +312,24 @@ impl Relay {
         events: Vec<Event>,
         authed: &[String],
     ) -> Vec<(String, PutOutcome)> {
+        // Group moderation events mutate the in-memory group state; their
+        // effects must be visible to later events of the same batch (e.g. a
+        // put-user followed by the new member's post), so batches containing
+        // them are processed sequentially.
+        if events.iter().any(|e| {
+            nip29::group_id(e).is_some()
+                || (nip29::MOD_MIN..=nip29::MOD_MAX).contains(&e.kind)
+                || e.kind == nip29::JOIN
+                || e.kind == nip29::LEAVE
+        }) {
+            let mut out = Vec::with_capacity(events.len());
+            for event in events {
+                let id = event.id.clone();
+                let (outcome, _) = self.accept_event(event, authed).await;
+                out.push((id, outcome));
+            }
+            return out;
+        }
         let now = unix_now();
         let cfg = self.config.read().await;
         let access = self.access.read().await;
@@ -417,13 +434,19 @@ impl Relay {
         drop(cfg);
         drop(access);
 
-        let outcomes = if puts.is_empty() {
+        let mut outcomes = if puts.is_empty() {
             Vec::new()
         } else {
             self.db
                 .put_batch(puts.iter().map(|e| (e.clone(), now)).collect())
                 .await
         };
+        if outcomes.len() != puts.len() {
+            // A timed-out (or failed) request returns no outcomes: every
+            // pending event is reported as failed instead of being replied
+            // with an empty id.
+            outcomes = vec![PutOutcome::Invalid("error: database timeout".into()); puts.len()];
+        }
 
         for ((event, outcome), slot) in puts.into_iter().zip(outcomes).zip(put_slots) {
             let id = event.id.clone();

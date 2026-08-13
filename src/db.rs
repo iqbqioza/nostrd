@@ -150,6 +150,11 @@ pub struct DbClient {
     tx: mpsc::UnboundedSender<Msg>,
     errors: Arc<std::sync::atomic::AtomicU64>,
     expiry: Arc<std::sync::atomic::AtomicBool>,
+    /// Seconds a request may wait for the database thread before timing out
+    /// (0 = wait forever). Keeps the relay responsive even when the storage
+    /// is stuck: timed-out requests fail with a clear error instead of
+    /// hanging the connection.
+    timeout_secs: u64,
 }
 
 impl DbClient {
@@ -157,6 +162,7 @@ impl DbClient {
         cfg: &DatabaseConfig,
         expiry_enabled: bool,
         errors: Arc<std::sync::atomic::AtomicU64>,
+        request_timeout_secs: u64,
     ) -> Result<DbClient> {
         let expiry = Arc::new(std::sync::atomic::AtomicBool::new(expiry_enabled));
         let store = Store::open(cfg, Arc::clone(&expiry))?;
@@ -439,7 +445,12 @@ impl DbClient {
                 }
             }
         });
-        Ok(DbClient { tx, errors, expiry })
+        Ok(DbClient {
+            tx,
+            errors,
+            expiry,
+            timeout_secs: request_timeout_secs,
+        })
     }
 
     /// Toggles NIP-40 expiration handling at runtime (config reload).
@@ -453,7 +464,13 @@ impl DbClient {
         if self.tx.send(make(tx)).is_err() {
             return R::default();
         }
-        rx.await.unwrap_or_default()
+        if self.timeout_secs == 0 {
+            return rx.await.unwrap_or_default();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(self.timeout_secs), rx)
+            .await
+            .map(|r| r.unwrap_or_default())
+            .unwrap_or_default()
     }
 
     pub async fn put(&self, event: Event, now: u64) -> PutOutcome {
@@ -1876,7 +1893,7 @@ mod tests {
 
     #[test]
     fn insert_and_query() {
-        let db = DbClient::open(&config(), true, Arc::new(Default::default())).unwrap();
+        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0).unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -1907,7 +1924,7 @@ mod tests {
 
     #[test]
     fn replaceable_and_deletion() {
-        let db = DbClient::open(&config(), true, Arc::new(Default::default())).unwrap();
+        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0).unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -1932,7 +1949,7 @@ mod tests {
 
     #[test]
     fn expired_events_are_filtered() {
-        let db = DbClient::open(&config(), true, Arc::new(Default::default())).unwrap();
+        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0).unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -1947,7 +1964,7 @@ mod tests {
 
     #[test]
     fn deletion_by_address_and_author() {
-        let db = DbClient::open(&config(), true, Arc::new(Default::default())).unwrap();
+        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0).unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2006,7 +2023,7 @@ mod tests {
 
     #[test]
     fn deletion_requests_are_never_deleted() {
-        let db = DbClient::open(&config(), true, Arc::new(Default::default())).unwrap();
+        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0).unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2044,7 +2061,7 @@ mod tests {
 
     #[test]
     fn metadata_and_follows_are_replaceable() {
-        let db = DbClient::open(&config(), true, Arc::new(Default::default())).unwrap();
+        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0).unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2062,7 +2079,7 @@ mod tests {
 
     #[test]
     fn equal_timestamp_replaceable_keeps_lowest_id() {
-        let db = DbClient::open(&config(), true, Arc::new(Default::default())).unwrap();
+        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0).unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2087,7 +2104,7 @@ mod tests {
 
     #[test]
     fn banned_events_are_removed_and_rejected() {
-        let db = DbClient::open(&config(), true, Arc::new(Default::default())).unwrap();
+        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0).unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2115,7 +2132,7 @@ mod tests {
     fn ephemeral_events_are_not_stored() {
         // NIP-01: kinds 20000-29999 must not be stored (NIP-59 requires
         // kind 21059 in particular to never be stored).
-        let db = DbClient::open(&config(), true, Arc::new(Default::default())).unwrap();
+        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0).unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2136,7 +2153,7 @@ mod tests {
 
     #[test]
     fn gift_wraps_to_are_deleted() {
-        let db = DbClient::open(&config(), true, Arc::new(Default::default())).unwrap();
+        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0).unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2183,7 +2200,7 @@ mod tests {
             map_max_size: 32 * 1024 * 1024,
             ..config()
         };
-        let db = DbClient::open(&cfg, true, Arc::new(Default::default())).unwrap();
+        let db = DbClient::open(&cfg, true, Arc::new(Default::default()), 0).unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2214,7 +2231,7 @@ mod tests {
     #[test]
     fn expiry_enabled_toggles_at_runtime() {
         // A config reload must be able to enable/disable NIP-40 handling.
-        let db = DbClient::open(&config(), true, Arc::new(Default::default())).unwrap();
+        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0).unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2248,7 +2265,7 @@ mod tests {
     fn multiletter_tag_filters_match() {
         // NIP-01 only requires single-letter tags to be indexed; filters on
         // longer tag names must still match via the full scan.
-        let db = DbClient::open(&config(), true, Arc::new(Default::default())).unwrap();
+        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0).unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2281,7 +2298,7 @@ mod tests {
             search_index: false,
             ..config()
         };
-        let db = DbClient::open(&cfg, true, Arc::new(Default::default())).unwrap();
+        let db = DbClient::open(&cfg, true, Arc::new(Default::default()), 0).unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {

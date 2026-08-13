@@ -150,6 +150,11 @@ buffer_size = 1024
 # exceeding this are rejected with a NEG-ERR carrying the cap.
 neg_max_items = 100000
 
+# Seconds a database request may wait before timing out (0 = wait forever).
+# A timeout keeps the relay responsive even when the storage is stuck: the
+# request fails with a clear error instead of hanging the connection.
+db_request_timeout_secs = 30
+
 # Maximum bytes of outgoing messages queued per connection before new ones
 # are dropped (protects memory against slow readers).
 max_out_queue_bytes = 262144
