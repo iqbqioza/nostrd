@@ -51,7 +51,7 @@ impl Cli {
             Command::Init => return init_config(&self.config),
             Command::Check => {
                 let cfg = self.load_config()?;
-                println!("configuration OK: {}", cfg.relay.name);
+                print_line(&format!("configuration OK: {}", cfg.relay.name));
                 return Ok(());
             }
             Command::Stop => return self.stop(),
@@ -136,7 +136,7 @@ impl Cli {
         let pid = match running_pid(&self.load_config()?.daemon.pid_file) {
             Some(pid) => pid,
             None => {
-                println!("nostrd is not running");
+                print_line("nostrd is not running");
                 return Ok(());
             }
         };
@@ -162,7 +162,7 @@ impl Cli {
         }
         let raw = std::fs::read_to_string(&cfg.daemon.stats_file)?;
         let value: serde_json::Value = serde_json::from_str(&raw)?;
-        println!("{}", serde_json::to_string_pretty(&value)?);
+        print_line(&serde_json::to_string_pretty(&value)?);
         Ok(())
     }
 }
@@ -177,9 +177,16 @@ fn open_db(cfg: &Config) -> Result<crate::db::DbClient> {
     )
 }
 
+/// Prints a line to stdout, ignoring broken-pipe errors (e.g. `nostrd stats
+/// | head`): a closed pipe must not panic the process like `println!` does.
+fn print_line(text: &str) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stdout(), "{text}");
+}
+
 fn init_config(path: &Path) -> Result<()> {
     match Config::write_default(path) {
-        Ok(()) => println!("wrote {}", path.display()),
+        Ok(()) => print_line(&format!("wrote {}", path.display())),
         Err(Error::Config(msg)) => {
             error!("{msg}");
             std::process::exit(1);
