@@ -70,7 +70,9 @@ pub fn verify(event: &Event, secp: &Secp256k1<secp256k1::All>) -> bool {
     if sig.len() != 64 {
         return false;
     }
-    let payload = format!("nostr:delegation:{delegator}:{conditions}");
+    // NIP-26: the token is a signature over the *delegatee's* pubkey, i.e.
+    // the pubkey of the event being published (the event's own author).
+    let payload = format!("nostr:delegation:{}:{conditions}", event.pubkey);
     let mut hasher = Sha256::new();
     hasher.update(payload.as_bytes());
     let message: [u8; 32] = hasher.finalize().into();
@@ -115,5 +117,64 @@ mod tests {
         };
         let secp = Secp256k1::new();
         assert!(verify(&ev, &secp));
+    }
+
+    #[test]
+    fn spec_example_delegation_verifies() {
+        // The NIP-26 spec example: delegator 8e0d3d3e... grants the
+        // delegatee 477318cf... permission with
+        // "kind=1&created_at>1674834236&created_at<1677426236".
+        let secp = Secp256k1::new();
+        let delegator =
+            "8e0d3d3eb2881ec137a11debe736a9086715a8c8beeeda615780064d68bc25dd".to_string();
+        let delegatee =
+            "477318cfb5427b9cfc66a9fa376150c1ddbc62115ae27cef72417eb959691396".to_string();
+        let conditions = "kind=1&created_at>1674834236&created_at<1677426236";
+        // The token is signed over the DELEGATEE's pubkey, per the spec.
+        let payload = format!("nostr:delegation:{delegatee}:{conditions}");
+        let mut hasher = Sha256::new();
+        hasher.update(payload.as_bytes());
+        let message: [u8; 32] = hasher.finalize().into();
+        let delegator_key = secp256k1::Keypair::from_seckey_slice(
+            &secp,
+            &hex::decode("ee35e8bb71131c02c1d7e73231daa48e9953d329a4b701f7133c8f46dd21139c")
+                .unwrap(),
+        )
+        .unwrap();
+        let token = secp
+            .sign_schnorr_no_aux_rand(&message, &delegator_key)
+            .to_string();
+
+        let ev = Event {
+            id: String::new(),
+            pubkey: delegatee,
+            created_at: 1_677_000_000,
+            kind: 1,
+            tags: vec![vec![
+                DELEGATION_TAG.into(),
+                delegator,
+                conditions.into(),
+                token,
+            ]],
+            content: "Hello, world!".into(),
+            sig: String::new(),
+        };
+        assert!(verify(&ev, &secp));
+
+        // A token signed over the delegator's own pubkey (the previous,
+        // incorrect behavior) must fail.
+        let bad_payload = format!("nostr:delegation:{}{conditions}", "8e0d3d3e".repeat(0));
+        let _ = bad_payload;
+        let bad_token = {
+            let payload = format!("nostr:delegation:{}:{conditions}", ev.tags[0][1]);
+            let mut hasher = Sha256::new();
+            hasher.update(payload.as_bytes());
+            let message: [u8; 32] = hasher.finalize().into();
+            secp.sign_schnorr_no_aux_rand(&message, &delegator_key)
+                .to_string()
+        };
+        let mut bad_ev = ev.clone();
+        bad_ev.tags[0][3] = bad_token;
+        assert!(!verify(&bad_ev, &secp));
     }
 }

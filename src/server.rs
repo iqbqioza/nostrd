@@ -89,15 +89,18 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
     let live_batch_size = config.limits.live_batch_size;
     let config = Arc::new(tokio::sync::RwLock::new(config));
     let stats = Stats::new();
-    let mut relay = Arc::new(Relay::new(
-        config,
-        db,
-        stats,
-        &private_key,
-        live_buffer,
-        live_batch_interval_ms,
-        live_batch_size,
-    ));
+    let mut relay = Arc::new(
+        Relay::new(
+            config,
+            db,
+            stats,
+            &private_key,
+            live_buffer,
+            live_batch_interval_ms,
+            live_batch_size,
+        )
+        .await,
+    );
     Arc::get_mut(&mut relay)
         .expect("relay not cloned yet")
         .start_live_bus();

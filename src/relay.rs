@@ -35,7 +35,7 @@ pub struct Relay {
 
 impl Relay {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub async fn new(
         config: Arc<RwLock<Config>>,
         db: DbClient,
         stats: Arc<Stats>,
@@ -61,8 +61,10 @@ impl Relay {
             }
         };
         Relay {
-            config,
-            access: Arc::new(RwLock::new(AccessControl::default())),
+            // Seed the access control from the config so operator bans and
+            // allowlists survive restarts.
+            config: Arc::clone(&config),
+            access: Arc::new(RwLock::new(config.read().await.access.clone())),
             db,
             stats,
             live,

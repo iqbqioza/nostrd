@@ -15,6 +15,9 @@ pub struct Config {
     pub limits: LimitsConfig,
     pub database: DatabaseConfig,
     pub daemon: DaemonConfig,
+    /// Initial access control lists (NIP-86 bans/allowlists), seeded at
+    /// startup so they survive restarts.
+    pub access: AccessControl,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

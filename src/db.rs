@@ -892,12 +892,15 @@ impl Store {
                 continue;
             };
             // NIP-09: only events authored by the request's pubkey are
-            // deleted, and deletion requests cannot be deleted.
+            // deleted, and deletion requests cannot be deleted. NIP-26:
+            // the delegator may also delete events published by a
+            // delegatee on their behalf.
             if event.kind == nip09::DELETION_KIND {
                 continue;
             }
             if let Some(pubkey) = request_pubkey
                 && event.pubkey != pubkey
+                && !delegated_by(&event, pubkey)
             {
                 continue;
             }
@@ -1455,6 +1458,15 @@ fn indexable_tag(tag: &[String]) -> bool {
         && tag[0].len() == 1
         && tag[0].as_bytes()[0].is_ascii_alphanumeric()
         && tag[1].len() <= TAG_VALUE_MAX
+}
+
+/// Returns `true` when the event was published under a NIP-26 delegation
+/// granted by `delegator`.
+fn delegated_by(event: &Event, delegator: &str) -> bool {
+    event
+        .tags
+        .iter()
+        .any(|t| t.len() == 4 && t[0] == "delegation" && t[1] == delegator)
 }
 
 fn string_values(value: &serde_json::Value) -> Vec<String> {
