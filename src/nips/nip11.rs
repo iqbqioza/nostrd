@@ -65,15 +65,6 @@ pub fn relay_info(config: &Config, stats: &Stats, self_pubkey: Option<&str>) -> 
     info
 }
 
-pub async fn info_handler(State(relay): State<Arc<Relay>>) -> Json<Value> {
-    let cfg = relay.config.read().await;
-    Json(relay_info(
-        &cfg,
-        &relay.stats,
-        relay.relay_pubkey().as_deref(),
-    ))
-}
-
 pub async fn stats_handler(State(relay): State<Arc<Relay>>) -> Json<Value> {
     Json(relay.stats.as_json())
 }

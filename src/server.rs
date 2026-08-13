@@ -23,7 +23,7 @@ use tokio::time::{MissedTickBehavior, interval};
 use crate::config::Config;
 use crate::db::DbClient;
 use crate::error::{Error, Result};
-use crate::nips::nip11::{info_handler, relay_info, stats_handler};
+use crate::nips::nip11::{relay_info, stats_handler};
 use crate::nips::nip86;
 use crate::relay::Relay;
 use crate::stats::{Stats, unix_now};
@@ -125,7 +125,7 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let mut app = Router::new()
-        .route("/", get(info_handler).post(nip86::rpc_handler))
+        .route("/", get(ws_handler).post(nip86::rpc_handler))
         .route("/ws", get(ws_handler).post(nip86::rpc_handler))
         .route("/ws/", get(ws_handler))
         .route("/health", get(health_handler))
@@ -249,9 +249,57 @@ async fn await_shutdown(mut rx: watch::Receiver<bool>) {
     }
 }
 
-/// Serves the WebSocket endpoint; plain HTTP requests (no WebSocket upgrade)
-/// receive the NIP-11 relay information document, per NIP-11 ("on the same
-/// URI as the relay's websocket").
+/// Returns `true` when the request is a valid WebSocket handshake: the
+/// standard upgrade headers must be present (`Upgrade: websocket`,
+/// `Connection: upgrade`, `Sec-WebSocket-Version: 13` and a non-empty
+/// `Sec-WebSocket-Key`), and a proxy-provided `X-Forwarded-Proto` must be
+/// `ws` or `wss`. Anything else is a plain HTTP request.
+fn is_websocket_request(headers: &HeaderMap) -> bool {
+    let upgrade = headers
+        .get(axum::http::header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.eq_ignore_ascii_case("websocket"))
+        .unwrap_or(false);
+    let connection = headers
+        .get(axum::http::header::CONNECTION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| {
+            v.to_ascii_lowercase()
+                .split(',')
+                .any(|t| t.trim() == "upgrade")
+        })
+        .unwrap_or(false);
+    let version = headers
+        .get(axum::http::header::SEC_WEBSOCKET_VERSION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v == "13")
+        .unwrap_or(false);
+    let key = headers
+        .get(axum::http::header::SEC_WEBSOCKET_KEY)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| !v.is_empty())
+        .unwrap_or(false);
+    if !(upgrade && connection && version && key) {
+        return false;
+    }
+    // Behind a proxy the request scheme is announced with
+    // X-Forwarded-Proto; a WebSocket connection must be ws or wss.
+    match headers
+        .get("x-forwarded-proto")
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(proto) => {
+            let proto = proto.to_ascii_lowercase();
+            proto == "ws" || proto == "wss"
+        }
+        None => true,
+    }
+}
+
+/// Serves the WebSocket endpoint and the NIP-11 document on the same URI:
+/// valid WebSocket handshakes are upgraded, plain HTTP requests (GET with
+/// no upgrade headers) receive the relay information document, per NIP-11
+/// ("on the same URI as the relay's websocket").
 async fn ws_handler(State(relay): State<Arc<Relay>>, request: Request) -> Response {
     // NIP-86: blockip — refuse WebSocket connections from blocked peers.
     if let Some(ip) = request
@@ -268,10 +316,8 @@ async fn ws_handler(State(relay): State<Arc<Relay>>, request: Request) -> Respon
     {
         return StatusCode::FORBIDDEN.into_response();
     }
-    if !request
-        .headers()
-        .contains_key(axum::http::header::SEC_WEBSOCKET_KEY)
-    {
+    if !is_websocket_request(request.headers()) {
+        // Not a WebSocket handshake: serve the NIP-11 info document.
         let cfg = relay.config.read().await;
         return Json(relay_info(
             &cfg,
