@@ -1,0 +1,234 @@
+# =============================================================================
+# nostrd configuration template
+#
+# Copy this file to `nostrd.toml` (or pass `--config <path>` to the CLI) and
+# adjust the values. Every setting is optional: missing entries fall back to
+# the defaults shown here, so a minimal file with a handful of overrides is
+# enough to run the relay.
+#
+# Commands:
+#   nostrd start    start as a daemon (add --foreground to run in the shell)
+#   nostrd restart  stop and start again (reloads nostrd.toml)
+#   nostrd stop     stop the running daemon
+#   nostrd stats    show live statistics of the running daemon
+#   nostrd check    validate this file and exit
+#   nostrd init     write a default configuration and exit
+#
+# Sending SIGHUP to the daemon reloads this file at runtime (limits and
+# server settings apply immediately; the NIP-40 toggle is applied live too).
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Relay identity and metadata (advertised in the NIP-11 info document)
+# -----------------------------------------------------------------------------
+[relay]
+# Human-readable relay name.
+name = "nostrd"
+
+# Short description of the relay.
+description = "A minimal and stable Nostr relay"
+
+# Administrative contact pubkey (32-byte hex) advertised in the info document.
+pubkey = ""
+
+# Alternative contact (URL or mailto URI).
+contact = ""
+
+# Relay icon URL.
+icon = ""
+
+# Software URL advertised in the info document.
+software = "https://github.com/iqbqioza/nostrd"
+
+# Software version string.
+version = "0.1.0"
+
+# Posting policy text advertised in the info document.
+post_policy = ""
+
+# Hex-encoded secret key of the relay itself. When set, the relay can sign
+# and publish NIP-29 group metadata events and NIP-43 role/membership events,
+# and its pubkey is advertised as the NIP-11 `self` field.
+private_key = ""
+
+# Public URL of this relay (e.g. "wss://relay.example.com"). Used for NIP-62
+# request-to-vanish matching and NIP-42 auth relay-tag checks; falls back to
+# server.host:server.port when empty.
+public_url = ""
+
+# Optional LiveKit server URL for NIP-29 live audio/video rooms.
+livekit_url = ""
+livekit_api_key = ""
+livekit_api_secret = ""
+
+# Explicit NIP allowlist: when non-empty, only the listed NIPs are advertised
+# and their behavior is enabled. Empty means "all except disabled_nips".
+enabled_nips = []
+
+# NIPs to disable (behavior off and not advertised). File-storage NIPs
+# (34 git, 94 file metadata, 96 HTTP storage) are never implemented.
+disabled_nips = []
+
+# -----------------------------------------------------------------------------
+# Network server
+# -----------------------------------------------------------------------------
+[server]
+# Bind address of the relay's WebSocket/HTTP endpoint.
+host = "127.0.0.1"
+port = 8080
+
+# Separate localhost management port for the legacy NIP-86 REST endpoints;
+# 0 disables the management server entirely. The NIP-86 JSON-RPC API is
+# always served on the relay's own HTTP endpoint.
+management_port = 0
+management_host = "127.0.0.1"
+
+# Bearer token that authorizes NIP-86 management calls
+# (Authorization: Bearer <token>). Empty disables this method.
+management_token = ""
+
+# Admin pubkey that authorizes NIP-86 management calls via a NIP-98 event
+# (Authorization: Nostr <base64 event>). Empty disables this method.
+admin_pubkey = ""
+
+# Require every connection to perform the NIP-42 AUTH flow before REQ and
+# EVENT messages are honored.
+require_auth = false
+
+# Send the NIP-42 AUTH challenge to every new connection.
+send_auth_challenge = true
+
+# -----------------------------------------------------------------------------
+# Limits (anti-abuse and resource bounds)
+# -----------------------------------------------------------------------------
+[limits]
+# Maximum number of concurrent WebSocket connections.
+max_connections = 10000
+
+# Maximum size in bytes of a single incoming WebSocket message.
+max_ws_message_size = 1048576
+
+# Maximum number of filters in a single REQ/COUNT message.
+max_filters = 20
+
+# Maximum number of active subscriptions per connection.
+max_subscriptions = 20
+
+# Per-filter cap for the number of events returned by a REQ.
+max_limit = 500
+
+# Cap for the number of events counted by a NIP-45 COUNT (results beyond the
+# cap are reported with `"approximate": true`).
+count_limit = 2000
+
+# Maximum length of a subscription id.
+max_sub_id_len = 256
+
+# Maximum bytes of an event's `content` field.
+max_content_bytes = 65536
+
+# Maximum number of tags on an event.
+max_tags = 2000
+
+# Maximum bytes of a single tag value.
+max_tag_value_bytes = 1024
+
+# Events whose created_at is more than this many seconds in the future are
+# silently dropped with an OK `mute:` prefix instead of rejected.
+max_created_at_future = 3600
+
+# NIP-13 proof-of-work difficulty required for new events (0 disables).
+require_pow = 0
+
+# Maximum number of content words indexed for NIP-50 search per event.
+max_indexed_words = 128
+
+# Reserved (unused).
+buffer_size = 1024
+
+# NIP-77: maximum number of records a single NEG-OPEN may process; queries
+# exceeding this are rejected with a NEG-ERR carrying the cap.
+neg_max_items = 100000
+
+# Maximum bytes of outgoing messages queued per connection before new ones
+# are dropped (protects memory against slow readers).
+max_out_queue_bytes = 262144
+
+# Maximum total bytes of subscription filters held per connection.
+max_sub_bytes = 524288
+
+# NIP-29: reject group events whose created_at is older than this many
+# seconds (late-publication prevention); 0 disables the check.
+group_late_publish_secs = 604800
+
+# Live fan-out batching: events are broadcast to subscribers in batches of
+# at most `live_batch_size` events every `live_batch_interval_ms`
+# milliseconds, so idle connections wake up once per batch.
+live_batch_interval_ms = 10
+live_batch_size = 64
+
+# Bounded queue of events waiting to be broadcast live; messages are dropped
+# (never stored) when it overflows, remaining available via subscriptions.
+live_buffer = 65536
+
+# -----------------------------------------------------------------------------
+# Database (LMDB via heed)
+# -----------------------------------------------------------------------------
+[database]
+# Directory holding the LMDB environment.
+path = "./data"
+
+# Maximum number of named databases.
+max_dbs = 32
+
+# Maximum number of concurrent reader threads.
+max_readers = 128
+
+# Initial memory map size in bytes. The map grows when full; if the OS limit
+# is reached, events are rejected with a logged "database map is full"
+# message — increase this value (and/or vm.max_map_count) for large relays.
+map_size = 1073741824
+
+# Interval in seconds between NIP-40 expired-event purge runs.
+purge_interval_secs = 300
+
+# Build the NIP-50 full-text word index (searches still work without it via
+# a full scan, but are slower).
+search_index = true
+
+# -----------------------------------------------------------------------------
+# Daemon
+# -----------------------------------------------------------------------------
+[daemon]
+# PID file used by `nostrd start/stop/restart`.
+pid_file = "./nostrd.pid"
+
+# Log file (stdout/stderr of the daemon).
+log_file = "./nostrd.log"
+
+# File written periodically with the relay statistics (read by `nostrd stats`).
+stats_file = "./nostrd.stats.json"
+
+# Interval in seconds between statistics file writes.
+stats_interval_secs = 5
+
+# -----------------------------------------------------------------------------
+# Access control (seeded at startup; NIP-86 management calls mutate these
+# lists at runtime, and the changes survive restarts only when written back
+# into this file)
+# -----------------------------------------------------------------------------
+[access]
+# Pubkeys whose events are rejected ("blocked: pubkey not allowed").
+blocked_pubkeys = []
+
+# When non-empty, only these pubkeys may publish (empty = allow all).
+allowed_pubkeys = []
+
+# Event kinds rejected at publish time.
+blocked_kinds = []
+
+# When non-empty, only these event kinds may be published.
+allowed_kinds = []
+
+# IP addresses refused at the WebSocket endpoint.
+blocked_ips = []
