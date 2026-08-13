@@ -265,6 +265,13 @@ impl Relay {
                         )
                         .await;
                     self.stats.bump(&self.stats.events_deleted, removed as u64);
+                    // NIP-59: gift wraps are signed by random keys, so their
+                    // recipient cannot delete them via NIP-09; the relay
+                    // deletes wraps addressed to the deleter instead.
+                    if let Some(pubkey) = event.pubkey_bytes() {
+                        let purged = self.db.delete_gift_wraps_to(pubkey).await;
+                        self.stats.bump(&self.stats.events_deleted, purged as u64);
+                    }
                 }
                 if roles_enabled && event.kind == nip43::LEAVE {
                     // NIP-43: leave requests (ephemeral kinds) update the
@@ -527,6 +534,17 @@ impl Relay {
         // broadcast.
         if cfg.nip_enabled(42) && event.kind == crate::nips::nip42::AUTH_KIND {
             return Err("invalid: authentication events cannot be published".into());
+        }
+
+        // NIP-70: reposts must not embed a protected event; relays SHOULD
+        // summarily reject such reposts (kind 6 embeds the note JSON in the
+        // content, kind 16 embeds replaceable events the same way).
+        if cfg.nip_enabled(70)
+            && (event.kind == 6 || event.kind == 16)
+            && let Ok(embedded) = serde_json::from_str::<Event>(&event.content)
+            && nip70::is_protected(&embedded)
+        {
+            return Err("restricted: repost of a protected event".into());
         }
 
         if cfg.nip_enabled(42) && cfg.server.require_auth && authed.is_empty() {

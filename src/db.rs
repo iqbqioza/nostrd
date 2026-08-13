@@ -91,6 +91,11 @@ enum Msg {
         pubkey: Vec<u8>,
         reply: oneshot::Sender<usize>,
     },
+    /// NIP-59: delete gift wraps addressed to a pubkey (on NIP-09 deletion).
+    GiftWrapPurge {
+        pubkey: Vec<u8>,
+        reply: oneshot::Sender<usize>,
+    },
     PrefixExists {
         prefix: Vec<u8>,
         reply: oneshot::Sender<bool>,
@@ -300,6 +305,16 @@ impl DbClient {
                                     };
                                     let _ = reply.send(n);
                                 }
+                                Msg::GiftWrapPurge { pubkey, reply } => {
+                                    let n = match store.delete_gift_wraps_to(&pubkey) {
+                                        Ok(n) => n,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            0
+                                        }
+                                    };
+                                    let _ = reply.send(n);
+                                }
                                 Msg::PrefixExists { prefix, reply } => {
                                     let exists = match store.event_id_prefix_exists(&prefix) {
                                         Ok(exists) => exists,
@@ -444,6 +459,15 @@ impl DbClient {
 
     pub async fn apply_vanish(&self, pubkey: [u8; 32]) -> usize {
         self.request(|reply| Msg::Vanish {
+            pubkey: pubkey.to_vec(),
+            reply,
+        })
+        .await
+    }
+
+    /// NIP-59: deletes `kind:1059` gift wraps p-tagging `pubkey`.
+    pub async fn delete_gift_wraps_to(&self, pubkey: [u8; 32]) -> usize {
+        self.request(|reply| Msg::GiftWrapPurge {
             pubkey: pubkey.to_vec(),
             reply,
         })
@@ -1014,6 +1038,40 @@ impl Store {
             }
         }
 
+        wtxn.commit()?;
+        Ok(removed)
+    }
+
+    /// NIP-59: relays SHOULD delete `kind:1059` gift wraps addressed to a
+    /// pubkey when that pubkey signs a NIP-09 deletion request. Wraps are
+    /// signed by random keys, so they cannot be deleted by their recipient
+    /// through the normal deletion flow.
+    fn delete_gift_wraps_to(&self, pubkey: &[u8]) -> Result<usize> {
+        let mut wtxn = self.env.write_txn()?;
+        let start = tag_key(b'p', pubkey, 0, &[0u8; ID_LEN]);
+        let end = tag_key(b'p', pubkey, u64::MAX, &[0xffu8; ID_LEN]);
+        let range = (
+            std::ops::Bound::Included(start.as_slice()),
+            std::ops::Bound::Excluded(end.as_slice()),
+        );
+        let ids: Vec<Vec<u8>> = self
+            .by_tag
+            .range(&wtxn, &range)?
+            .filter_map(|item| item.ok().map(|(k, _)| k[k.len() - ID_LEN..].to_vec()))
+            .collect();
+        let mut removed = 0usize;
+        for id in ids {
+            let Some(raw) = self.events.get(&wtxn, &id)? else {
+                continue;
+            };
+            let Ok(event) = serde_json::from_slice::<Event>(raw) else {
+                continue;
+            };
+            if event.kind == crate::nips::nip62::GIFT_WRAP_KIND {
+                self.remove_event(&mut wtxn, &id)?;
+                removed += 1;
+            }
+        }
         wtxn.commit()?;
         Ok(removed)
     }
