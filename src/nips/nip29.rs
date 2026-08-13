@@ -59,6 +59,15 @@ pub fn group_id(event: &Event) -> Option<&str> {
     tag_value(event, H)
 }
 
+/// Whether the event is a group event at all: user and moderation events
+/// carry an `h` tag, relay-generated metadata events are kinds 39000-39005
+/// identified by their `d` tag. Cheap enough to run per live event; mirrors
+/// the `gid` selection in [`GroupStore::visible_to`].
+pub fn is_group_event(event: &Event) -> bool {
+    group_id(event).is_some()
+        || ((GROUP_META..=GROUP_PINS).contains(&event.kind) && group_id_d(event).is_some())
+}
+
 /// Group id of a relay-generated metadata event (from the `d` tag).
 pub fn group_id_d(event: &Event) -> Option<&str> {
     tag_value(event, D)

@@ -40,6 +40,10 @@ pub struct Conn {
     /// Every pubkey authenticated on this connection (NIP-42: all of them
     /// are treated as authenticated).
     authed_pubkeys: Vec<String>,
+    /// Whether this connection delivers NIP-40 expired events live. Cached
+    /// from the config on connect and refreshed whenever a message arrives,
+    /// so the per-batch live path avoids the shared config lock.
+    expiry_enabled: bool,
     dropped: u64,
     /// Per-connection message/byte counters, flushed into the shared stats
     /// once on disconnect so that a million connections do not hammer the
@@ -403,17 +407,24 @@ impl Conn {
 
     /// Streams live events that match active subscriptions.
     ///
-    /// `groups` and `expiry_enabled` are read once per batch by the caller so
-    /// that a batch of events does not re-acquire the locks per event.
-    fn deliver_live(&mut self, event: &Event, groups: &nip29::GroupStore, expiry_enabled: bool) {
+    /// `groups` is only present when the batch contains group events (the
+    /// caller skips the lock otherwise); `expiry_enabled` is a per-connection
+    /// cache refreshed whenever a message arrives, so the hot live path does
+    /// not acquire the shared config lock once per batch per connection.
+    fn deliver_live(&mut self, event: &Event, groups: Option<&nip29::GroupStore>) {
         // Fast path: most connections have no subscriptions.
         if self.subs.is_empty() {
             return;
         }
-        if !self.visible_to(groups, event) {
+        if !self.is_authed() && nip70::is_protected(event) {
             return;
         }
-        if expiry_enabled
+        if let Some(groups) = groups
+            && !self.visible_to(groups, event)
+        {
+            return;
+        }
+        if self.expiry_enabled
             && let Some(exp) = nip40::expiry(event)
             && exp < unix_now()
         {
@@ -603,9 +614,13 @@ pub async fn handle_connection(mut socket: WebSocket, relay: Arc<Relay>) {
     }
 
     let (mut sender, mut receiver) = socket.split();
-    let (max_msg_size, out_queue_bytes) = {
+    let (max_msg_size, out_queue_bytes, expiry_enabled) = {
         let limits = &relay.config.read().await.limits;
-        (limits.max_ws_message_size, limits.max_out_queue_bytes)
+        (
+            limits.max_ws_message_size,
+            limits.max_out_queue_bytes,
+            relay.config.read().await.nip_enabled(40),
+        )
     };
 
     let challenge = nip42::generate_challenge();
@@ -621,6 +636,7 @@ pub async fn handle_connection(mut socket: WebSocket, relay: Arc<Relay>) {
         neg_total: 0,
         challenge,
         authed_pubkeys: Vec::new(),
+        expiry_enabled,
         dropped: 0,
         in_msgs: 0,
         in_bytes: 0,
@@ -664,6 +680,9 @@ pub async fn handle_connection(mut socket: WebSocket, relay: Arc<Relay>) {
                         conn.in_msgs += 1;
                         conn.in_bytes += text.len() as u64;
                         conn.handle_text(&text).await;
+                        // Refresh the cached NIP-40 flag so config reloads
+                        // take effect for live delivery.
+                        conn.expiry_enabled = conn.relay.config.read().await.nip_enabled(40);
                     }
                     Some(Ok(Message::Binary(data))) => {
                         if data.len() > max_msg_size {
@@ -674,6 +693,7 @@ pub async fn handle_connection(mut socket: WebSocket, relay: Arc<Relay>) {
                         conn.in_msgs += 1;
                         conn.in_bytes += data.len() as u64;
                         conn.handle_text(&text).await;
+                        conn.expiry_enabled = conn.relay.config.read().await.nip_enabled(40);
                     }
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Ok(_)) => {}
@@ -692,14 +712,23 @@ pub async fn handle_connection(mut socket: WebSocket, relay: Arc<Relay>) {
             live_batch = live_fut => {
                 match live_batch {
                     Ok(batch) => {
-                        // Read the shared state once per batch instead of
-                        // once per event.
-                        let groups = Arc::clone(&conn.relay.groups);
-                        let groups = groups.read().await;
-                        let expiry_enabled =
-                            conn.relay.config.read().await.nip_enabled(40);
+                        // The group store lock is only taken when the batch
+                        // actually contains group events (rare); ordinary
+                        // traffic skips the shared lock entirely.
+                        let has_group_events =
+                            batch.iter().any(nip29::is_group_event);
+                        // The store Arc stays alive for the whole batch so
+                        // the read guard can borrow it; the lock is only
+                        // taken for batches containing group events.
+                        let store = Arc::clone(&conn.relay.groups);
+                        let guard = if has_group_events {
+                            Some(store.read().await)
+                        } else {
+                            None
+                        };
+                        let groups = guard.as_deref();
                         for event in batch.iter() {
-                            conn.deliver_live(event, &groups, expiry_enabled);
+                            conn.deliver_live(event, groups);
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}

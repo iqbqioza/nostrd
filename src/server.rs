@@ -216,8 +216,8 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
             let _ = stream.set_nodelay(true);
             // SAFETY: `setsockopt` only touches the socket's own buffers.
             unsafe {
-                set_sock_opt(stream, libc::SO_RCVBUF, 16 * 1024);
-                set_sock_opt(stream, libc::SO_SNDBUF, 16 * 1024);
+                set_sock_opt(stream, libc::SO_RCVBUF, 32 * 1024);
+                set_sock_opt(stream, libc::SO_SNDBUF, 32 * 1024);
             }
         }),
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
