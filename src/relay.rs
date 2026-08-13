@@ -148,6 +148,7 @@ impl Relay {
         &self,
         event: Event,
         authed: &[String],
+        known_prefixes: Option<&std::collections::HashSet<Vec<u8>>>,
     ) -> (PutOutcome, Option<Arc<Event>>) {
         let now = unix_now();
         let cfg = self.config.read().await;
@@ -264,13 +265,19 @@ impl Relay {
                                 None,
                             );
                         };
-                        if !prefix.is_empty() && !self.db.event_id_prefix_exists(&prefix).await {
-                            return (
-                                PutOutcome::Invalid(
-                                    "invalid: unknown previous tag reference".into(),
-                                ),
-                                None,
-                            );
+                        if !prefix.is_empty() {
+                            let exists = match known_prefixes {
+                                Some(known) => known.contains(&prefix),
+                                None => self.db.event_id_prefix_exists(&prefix).await,
+                            };
+                            if !exists {
+                                return (
+                                    PutOutcome::Invalid(
+                                        "invalid: unknown previous tag reference".into(),
+                                    ),
+                                    None,
+                                );
+                            }
                         }
                     }
                 }
@@ -351,10 +358,34 @@ impl Relay {
                 || e.kind == nip29::JOIN
                 || e.kind == nip29::LEAVE
         }) {
+            // Check every `previous` tag reference of the whole batch in one
+            // database round trip: a single event must not be able to
+            // amplify into thousands of database requests.
+            let mut prefixes: Vec<Vec<u8>> = Vec::new();
+            for event in &events {
+                for prefix in nip29::previous_tags(event) {
+                    let Ok(prefix) = hex::decode(&prefix) else {
+                        continue;
+                    };
+                    if !prefix.is_empty() && !prefixes.iter().any(|p| p == &prefix) {
+                        prefixes.push(prefix);
+                    }
+                }
+            }
+            let known: std::collections::HashSet<Vec<u8>> = if prefixes.is_empty() {
+                std::collections::HashSet::new()
+            } else {
+                let existing = self.db.prefixes_exist(prefixes.clone()).await;
+                prefixes
+                    .into_iter()
+                    .zip(existing)
+                    .filter_map(|(p, exists)| exists.then_some(p))
+                    .collect()
+            };
             let mut out = Vec::with_capacity(events.len());
             for event in events {
                 let id = event.id.clone();
-                let (outcome, _) = self.accept_event(event, authed).await;
+                let (outcome, _) = self.accept_event(event, authed, Some(&known)).await;
                 out.push((id, outcome));
             }
             return out;

@@ -846,6 +846,7 @@ pub async fn handle_connection(mut socket: WebSocket, relay: Arc<Relay>) {
                 // Batch window: keep reading for a moment so consecutive
                 // EVENT messages from a busy publisher share one database
                 // commit, then flush the queue when the socket is idle.
+                let mut too_large = false;
                 loop {
                     match tokio::time::timeout(
                         std::time::Duration::from_millis(1),
@@ -856,6 +857,7 @@ pub async fn handle_connection(mut socket: WebSocket, relay: Arc<Relay>) {
                         Ok(Some(Ok(Message::Text(text)))) => {
                             if text.len() > max_msg_size {
                                 conn.notice("error: message too large");
+                                too_large = true;
                                 break;
                             }
                             conn.in_msgs += 1;
@@ -865,6 +867,7 @@ pub async fn handle_connection(mut socket: WebSocket, relay: Arc<Relay>) {
                         Ok(Some(Ok(Message::Binary(data)))) => {
                             if data.len() > max_msg_size {
                                 conn.notice("error: message too large");
+                                too_large = true;
                                 break;
                             }
                             let text = String::from_utf8_lossy(&data).into_owned();
@@ -874,6 +877,9 @@ pub async fn handle_connection(mut socket: WebSocket, relay: Arc<Relay>) {
                         }
                         _ => break,
                     }
+                }
+                if too_large {
+                    break;
                 }
                 conn.flush_pending_events().await;
                 // Subscribe to live events once the first REQ arrives and

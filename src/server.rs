@@ -345,6 +345,12 @@ async fn ws_handler(State(relay): State<Arc<Relay>>, request: Request) -> Respon
             upgrade
                 .read_buffer_size(2 * 1024)
                 .write_buffer_size(2 * 1024)
+                // Reject oversized frames at the protocol layer: without
+                // this the WebSocket stack buffers frames of up to its own
+                // 64 MiB default into memory before the application check
+                // runs, letting a client pin large allocations per frame.
+                .max_message_size(max_msg)
+                .max_frame_size(max_msg)
                 .max_write_buffer_size(max_write)
                 .on_upgrade(move |socket| handle_connection(socket, relay))
                 .into_response()

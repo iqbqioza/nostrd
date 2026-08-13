@@ -1,7 +1,9 @@
 //! NIP-50: Search Capability.
 //!
 //! Filters may carry a `search` string. The relay maintains a word index of
-//! event content and matches against all of the search terms.
+//! event content: an event matches when at least one query term appears in
+//! its content, and the results are ordered by how many terms match
+//! (relevance), with the `limit` applied after that ordering.
 
 /// Tokenizes text into lowercase alphanumeric words of length >= 2.
 pub fn tokenize(text: &str) -> Vec<String> {

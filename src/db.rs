@@ -120,6 +120,13 @@ enum Msg {
         prefix: Vec<u8>,
         reply: oneshot::Sender<bool>,
     },
+    /// Checks many event-id prefixes in one round trip (NIP-29 `previous`
+    /// tag validation), so a single event cannot amplify into thousands of
+    /// database requests.
+    PrefixesExist {
+        prefixes: Vec<Vec<u8>>,
+        reply: oneshot::Sender<Vec<bool>>,
+    },
     ReplaceableCreatedAt {
         kind: u64,
         pubkey: String,
@@ -356,6 +363,21 @@ impl DbClient {
                                         };
                                         let _ = reply.send(exists);
                                     }
+                                    Msg::PrefixesExist { prefixes, reply } => {
+                                        let mut out = Vec::with_capacity(prefixes.len());
+                                        for prefix in &prefixes {
+                                            let exists = match store.event_id_prefix_exists(prefix)
+                                            {
+                                                Ok(exists) => exists,
+                                                Err(e) => {
+                                                    db_error(&thread_errors, &e);
+                                                    false
+                                                }
+                                            };
+                                            out.push(exists);
+                                        }
+                                        let _ = reply.send(out);
+                                    }
                                     Msg::ReplaceableCreatedAt {
                                         kind,
                                         pubkey,
@@ -475,6 +497,12 @@ impl DbClient {
                         pending = None;
                         for s in senders.drain(..) {
                             let _ = s.send(PutOutcome::Invalid("database error".into()));
+                        }
+                        for (events, reply) in pending_batches.drain(..) {
+                            let _ = reply.send(vec![
+                                PutOutcome::Invalid("database error".into());
+                                events.len()
+                            ]);
                         }
                         batch_puts.clear();
                     }
@@ -597,6 +625,12 @@ impl DbClient {
             reply,
         })
         .await
+    }
+
+    /// Checks many event-id prefixes in a single database round trip.
+    pub async fn prefixes_exist(&self, prefixes: Vec<Vec<u8>>) -> Vec<bool> {
+        self.request(|reply| Msg::PrefixesExist { prefixes, reply })
+            .await
     }
 
     /// Drains and returns the number of database errors since the last call.
@@ -1266,7 +1300,15 @@ impl Store {
         }
 
         let outcome = if is_replaceable(event) {
-            let dtag = nip33::dtag(event);
+            // NIP-01: normal replaceable kinds (0, 3, 10000-19999) are
+            // replaced per (pubkey, kind) — their `d` tag must not create
+            // separate slots. Only addressable kinds (30000-39999, NIP-33)
+            // key on the `d` tag value.
+            let dtag = if nip33::is_param_replaceable_kind(event.kind) {
+                nip33::dtag(event)
+            } else {
+                String::new()
+            };
             let rkey = replaceable_key(event.kind, &pubkey, &dtag);
             let old = self.replaceable.get(wtxn, &rkey)?;
             let had_old = old.is_some();
@@ -2893,6 +2935,31 @@ mod tests {
             let (events, more) = db.count(vec![f], 5, now).await;
             assert_eq!(events.len(), 5, "the cap cuts exactly");
             assert!(more, "the capped scan is flagged as approximate");
+        });
+    }
+
+    #[test]
+    fn replaceable_kinds_ignore_the_d_tag() {
+        // NIP-01: kind 0/3/10000-19999 are replaced per (pubkey, kind) —
+        // a `d` tag must not create a separate slot that keeps old versions
+        // alive.
+        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
+        let now = unix_now();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let d = vec![vec!["d".to_string(), "weird".to_string()]];
+            let v1 = event(0, "{\"name\":\"old\"}", now, d.clone());
+            let v2 = event(0, "{\"name\":\"new\"}", now + 5, vec![]);
+            assert_eq!(db.put(v1.clone(), now).await, PutOutcome::Stored);
+            assert_eq!(
+                db.put(v2.clone(), now).await,
+                PutOutcome::Replaced,
+                "the d-tagged kind 0 must be replaced by the plain one"
+            );
+            let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [0]})).unwrap();
+            let (res, _) = db.query(vec![f], 500, now).await;
+            assert_eq!(res.len(), 1, "only the latest kind 0 is stored");
+            assert_eq!(res[0].id, v2.id);
         });
     }
 

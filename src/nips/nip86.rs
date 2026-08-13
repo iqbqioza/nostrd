@@ -361,6 +361,19 @@ fn is_pubkey(value: &str) -> bool {
     hex::decode(value).map(|b| b.len() == 32).unwrap_or(false)
 }
 
+/// Constant-time comparison for the management token: the token must not be
+/// recoverable through response-timing differences of the comparison.
+fn ct_eq(a: &str, b: &str) -> bool {
+    let a = a.as_bytes();
+    let b = b.as_bytes();
+    let mut diff = (a.len() ^ b.len()) as u8;
+    let n = a.len().max(b.len());
+    for i in 0..n {
+        diff |= a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0);
+    }
+    diff == 0
+}
+
 /// NIP-86 authentication: either the bearer `management_token` or a NIP-98
 /// event by `admin_pubkey` whose `payload` tag is present and whose `u` tag
 /// matches this relay's URL, including the request path (NIP-98: "the `u`
@@ -372,7 +385,7 @@ async fn rpc_authenticated(relay: &Relay, headers: &HeaderMap, request_path: &st
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
-        && token == cfg.server.management_token
+        && ct_eq(token, &cfg.server.management_token)
     {
         return true;
     }
@@ -452,7 +465,7 @@ async fn check_auth(
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
             .ok_or_else(|| unauthorized("missing bearer token"))?;
-        if token == cfg.server.management_token {
+        if ct_eq(token, &cfg.server.management_token) {
             return Ok(());
         }
         return Err(unauthorized("invalid bearer token"));
