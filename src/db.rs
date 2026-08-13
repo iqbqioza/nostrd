@@ -1013,9 +1013,12 @@ impl Store {
             }
         }
 
-        // NIP-59 gift wraps addressed to the vanished pubkey.
-        let start = tag_key(b'p', pubkey, 0, &[0u8; ID_LEN]);
-        let end = tag_key(b'p', pubkey, u64::MAX, &[0xffu8; ID_LEN]);
+        // NIP-59 gift wraps addressed to the vanished pubkey. The by_tag
+        // index stores the tag value verbatim (the 64-char hex string), not
+        // the decoded bytes.
+        let pubkey_hex = hex::encode(pubkey).into_bytes();
+        let start = tag_key(b'p', &pubkey_hex, 0, &[0u8; ID_LEN]);
+        let end = tag_key(b'p', &pubkey_hex, u64::MAX, &[0xffu8; ID_LEN]);
         let range = (
             std::ops::Bound::Included(start.as_slice()),
             std::ops::Bound::Excluded(end.as_slice()),
@@ -1048,8 +1051,11 @@ impl Store {
     /// through the normal deletion flow.
     fn delete_gift_wraps_to(&self, pubkey: &[u8]) -> Result<usize> {
         let mut wtxn = self.env.write_txn()?;
-        let start = tag_key(b'p', pubkey, 0, &[0u8; ID_LEN]);
-        let end = tag_key(b'p', pubkey, u64::MAX, &[0xffu8; ID_LEN]);
+        // The by_tag index stores the tag value verbatim (the 64-char hex
+        // string), not the decoded bytes.
+        let pubkey_hex = hex::encode(pubkey).into_bytes();
+        let start = tag_key(b'p', &pubkey_hex, 0, &[0u8; ID_LEN]);
+        let end = tag_key(b'p', &pubkey_hex, u64::MAX, &[0xffu8; ID_LEN]);
         let range = (
             std::ops::Bound::Included(start.as_slice()),
             std::ops::Bound::Excluded(end.as_slice()),
@@ -1738,6 +1744,45 @@ mod tests {
             let (res, _) = db.query(vec![Filter::default()], 500, now).await;
             assert!(res.is_empty());
             assert_eq!(db.put(ev, now).await, PutOutcome::Ephemeral);
+        });
+    }
+
+    #[test]
+    fn gift_wraps_to_are_deleted() {
+        let db = DbClient::open(&config(), true, Arc::new(Default::default())).unwrap();
+        let now = unix_now();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let recipient = "b83130de0d1386592fe7b9f407f5f1ae8f1db91d772e484b3d81df0fa2e88f24";
+            let other = "c83130de0d1386592fe7b9f407f5f1ae8f1db91d772e484b3d81df0fa2e88f24";
+            let wrap = event(
+                1059,
+                "encrypted",
+                now,
+                vec![vec!["p".into(), recipient.into()]],
+            );
+            let other_wrap = event(
+                1059,
+                "encrypted2",
+                now,
+                vec![vec!["p".into(), other.into()]],
+            );
+            assert_eq!(db.put(wrap.clone(), now).await, PutOutcome::Stored);
+            assert_eq!(db.put(other_wrap.clone(), now).await, PutOutcome::Stored);
+            let recipient_bytes = hex::decode(recipient).unwrap();
+            let removed = db
+                .delete_gift_wraps_to(recipient_bytes.try_into().unwrap())
+                .await;
+            assert_eq!(removed, 1, "only the wrap addressed to the recipient");
+            let (res, _) = db
+                .query(
+                    vec![serde_json::from_value(serde_json::json!({"kinds": [1059]})).unwrap()],
+                    500,
+                    now,
+                )
+                .await;
+            assert_eq!(res.len(), 1);
+            assert_eq!(res[0].id, other_wrap.id, "the other wrap survives");
         });
     }
 

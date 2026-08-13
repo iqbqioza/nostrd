@@ -44,6 +44,9 @@ pub struct Conn {
     /// from the config on connect and refreshed whenever a message arrives,
     /// so the per-batch live path avoids the shared config lock.
     expiry_enabled: bool,
+    /// Whether NIP-59 gift wraps are only served to their recipients
+    /// (enforced with NIP-42 auth; false when NIP-42 is disabled).
+    giftwrap_restricted: bool,
     dropped: u64,
     /// Per-connection message/byte counters, flushed into the shared stats
     /// once on disconnect so that a million connections do not hammer the
@@ -399,10 +402,27 @@ impl Conn {
         self.send_json(nip45::count_response(sub_id, &filters, &events, more));
     }
 
+    /// NIP-59 / NIP-17: gift wraps are signed by random keys, so they may
+    /// only be served to their recipients, i.e. authenticated users whose
+    /// pubkey appears in a `p` tag of the wrap (enforced with NIP-42 auth;
+    /// skipped when NIP-42 is disabled).
+    fn gift_wrap_visible(&self, event: &Event) -> bool {
+        !self.giftwrap_restricted
+            || event.kind != crate::nips::nip62::GIFT_WRAP_KIND
+            || event
+                .tags
+                .iter()
+                .any(|t| t.len() >= 2 && t[0] == "p" && self.authed_pubkeys.contains(&t[1]))
+    }
+
     /// Whether a stored or live event may be served on this connection
-    /// (NIP-70 protected and NIP-29 group access checks).
+    /// (NIP-70 protected, NIP-59 gift-wrap recipient and NIP-29 group
+    /// access checks).
     fn visible_to(&self, groups: &nip29::GroupStore, event: &Event) -> bool {
         if !self.is_authed() && nip70::is_protected(event) {
+            return false;
+        }
+        if !self.gift_wrap_visible(event) {
             return false;
         }
         if self.authed_pubkeys.is_empty() {
@@ -426,6 +446,12 @@ impl Conn {
             return;
         }
         if !self.is_authed() && nip70::is_protected(event) {
+            return;
+        }
+        // NIP-59: gift wraps are only delivered to their recipients, even
+        // when the batch contains no group events (visible_to is only
+        // reached when the groups lock was taken).
+        if !self.gift_wrap_visible(event) {
             return;
         }
         if let Some(groups) = groups
@@ -629,12 +655,13 @@ pub async fn handle_connection(mut socket: WebSocket, relay: Arc<Relay>) {
     }
 
     let (mut sender, mut receiver) = socket.split();
-    let (max_msg_size, out_queue_bytes, expiry_enabled) = {
-        let limits = &relay.config.read().await.limits;
+    let (max_msg_size, out_queue_bytes, expiry_enabled, giftwrap_restricted) = {
+        let cfg = relay.config.read().await;
         (
-            limits.max_ws_message_size,
-            limits.max_out_queue_bytes,
-            relay.config.read().await.nip_enabled(40),
+            cfg.limits.max_ws_message_size,
+            cfg.limits.max_out_queue_bytes,
+            cfg.nip_enabled(40),
+            cfg.nip_enabled(42),
         )
     };
 
@@ -652,6 +679,7 @@ pub async fn handle_connection(mut socket: WebSocket, relay: Arc<Relay>) {
         challenge,
         authed_pubkeys: Vec::new(),
         expiry_enabled,
+        giftwrap_restricted,
         dropped: 0,
         in_msgs: 0,
         in_bytes: 0,
@@ -695,9 +723,11 @@ pub async fn handle_connection(mut socket: WebSocket, relay: Arc<Relay>) {
                         conn.in_msgs += 1;
                         conn.in_bytes += text.len() as u64;
                         conn.handle_text(&text).await;
-                        // Refresh the cached NIP-40 flag so config reloads
-                        // take effect for live delivery.
-                        conn.expiry_enabled = conn.relay.config.read().await.nip_enabled(40);
+                        // Refresh the cached NIP-40/NIP-42 flags so config
+                        // reloads take effect for live delivery.
+                        let cfg = conn.relay.config.read().await;
+                        conn.expiry_enabled = cfg.nip_enabled(40);
+                        conn.giftwrap_restricted = cfg.nip_enabled(42);
                     }
                     Some(Ok(Message::Binary(data))) => {
                         if data.len() > max_msg_size {
@@ -708,7 +738,9 @@ pub async fn handle_connection(mut socket: WebSocket, relay: Arc<Relay>) {
                         conn.in_msgs += 1;
                         conn.in_bytes += data.len() as u64;
                         conn.handle_text(&text).await;
-                        conn.expiry_enabled = conn.relay.config.read().await.nip_enabled(40);
+                        let cfg = conn.relay.config.read().await;
+                        conn.expiry_enabled = cfg.nip_enabled(40);
+                        conn.giftwrap_restricted = cfg.nip_enabled(42);
                     }
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Ok(_)) => {}
