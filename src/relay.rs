@@ -141,8 +141,10 @@ impl Relay {
         self.key.is_some()
     }
 
-    /// Validates and stores an event. Returns the storage outcome and, when the
-    /// event was accepted, the event to broadcast.
+    /// Validates and stores a single event (kept for tests; the live path
+    /// uses the batched [`Self::accept_events_batch`]).
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub async fn accept_event(
         &self,
         event: Event,
@@ -300,6 +302,189 @@ impl Relay {
                 (other, None)
             }
         }
+    }
+
+    /// Accepts a batch of events from one connection, returning the outcome
+    /// of each. The database layer commits the whole batch in a single write
+    /// transaction, so the commit cost is paid once per batch instead of
+    /// once per event. Ordering and per-event replies are preserved.
+    pub async fn accept_events_batch(
+        &self,
+        events: Vec<Event>,
+        authed: &[String],
+    ) -> Vec<(String, PutOutcome)> {
+        let now = unix_now();
+        let cfg = self.config.read().await;
+        let access = self.access.read().await;
+        let mut results: Vec<(String, PutOutcome)> = Vec::with_capacity(events.len());
+        let mut puts: Vec<Event> = Vec::new();
+        let mut put_slots: Vec<usize> = Vec::new();
+        let mut vanishes: Vec<(String, Event)> = Vec::new();
+
+        for event in events {
+            let id = event.id.clone();
+            if let Err(reason) = self.validate(&cfg, &access, &event, now, authed) {
+                self.stats.bump(&self.stats.events_rejected, 1);
+                results.push((id, PutOutcome::Invalid(reason)));
+                continue;
+            }
+            if cfg.nip_enabled(62)
+                && nip62::is_vanish(&event)
+                && nip62::targets_us(
+                    &event,
+                    &cfg.server.host,
+                    cfg.server.port,
+                    &cfg.relay.public_url,
+                )
+            {
+                vanishes.push((id, event));
+                continue;
+            }
+            if cfg.nip_enabled(43) && event.kind == 28934 {
+                self.stats.bump(&self.stats.events_rejected, 1);
+                results.push((
+                    id,
+                    PutOutcome::Invalid(
+                        "restricted: this relay does not issue invite codes".into(),
+                    ),
+                ));
+                continue;
+            }
+            if cfg.nip_enabled(29) {
+                if (nip29::GROUP_META..=nip29::GROUP_PINS).contains(&event.kind)
+                    && Some(event.pubkey.as_str()) != self.relay_pubkey().as_deref()
+                {
+                    self.stats.bump(&self.stats.events_rejected, 1);
+                    results.push((
+                        id,
+                        PutOutcome::Invalid(
+                            "blocked: group metadata must be published by the relay".into(),
+                        ),
+                    ));
+                    continue;
+                }
+                if nip29::group_id(&event).is_some() {
+                    if cfg.limits.group_late_publish_secs > 0
+                        && event
+                            .created_at
+                            .saturating_add(cfg.limits.group_late_publish_secs)
+                            < now
+                    {
+                        self.stats.bump(&self.stats.events_rejected, 1);
+                        results.push((
+                            id,
+                            PutOutcome::Invalid("invalid: event is too old for this group".into()),
+                        ));
+                        continue;
+                    }
+                    let reason = {
+                        let groups = self.groups.read().await;
+                        groups.validate_write(&event).err()
+                    };
+                    if let Some(reason) = reason {
+                        self.stats.bump(&self.stats.events_rejected, 1);
+                        results.push((id, PutOutcome::Invalid(reason)));
+                        continue;
+                    }
+                    let mut previous_ok = true;
+                    for prefix in nip29::previous_tags(&event) {
+                        let Ok(prefix) = hex::decode(&prefix) else {
+                            previous_ok = false;
+                            break;
+                        };
+                        if !prefix.is_empty() && !self.db.event_id_prefix_exists(&prefix).await {
+                            previous_ok = false;
+                            break;
+                        }
+                    }
+                    if !previous_ok {
+                        self.stats.bump(&self.stats.events_rejected, 1);
+                        results.push((
+                            id,
+                            PutOutcome::Invalid("invalid: unknown previous tag reference".into()),
+                        ));
+                        continue;
+                    }
+                }
+            }
+            put_slots.push(results.len());
+            results.push((String::new(), PutOutcome::Invalid(String::new())));
+            puts.push(event);
+        }
+
+        let groups_enabled = cfg.nip_enabled(29);
+        let roles_enabled = cfg.nip_enabled(43);
+        drop(cfg);
+        drop(access);
+
+        let outcomes = if puts.is_empty() {
+            Vec::new()
+        } else {
+            self.db
+                .put_batch(puts.iter().map(|e| (e.clone(), now)).collect())
+                .await
+        };
+
+        for ((event, outcome), slot) in puts.into_iter().zip(outcomes).zip(put_slots) {
+            let id = event.id.clone();
+            match outcome {
+                PutOutcome::Stored | PutOutcome::Replaced | PutOutcome::Ephemeral => {
+                    self.stats.bump(&self.stats.events_accepted, 1);
+                    if self.config.read().await.nip_enabled(9) && event.kind == nip09::DELETION_KIND
+                    {
+                        let removed = self
+                            .db
+                            .apply_deletion(
+                                nip09::deletion_targets(&event),
+                                nip09::deletion_addresses(&event),
+                                Some(event.pubkey.clone()),
+                                event.created_at,
+                            )
+                            .await;
+                        self.stats.bump(&self.stats.events_deleted, removed as u64);
+                        if let Some(pubkey) = event.pubkey_bytes() {
+                            let purged = self.db.delete_gift_wraps_to(pubkey).await;
+                            self.stats.bump(&self.stats.events_deleted, purged as u64);
+                        }
+                    }
+                    if roles_enabled && event.kind == nip43::LEAVE {
+                        self.apply_leave_request(&event).await;
+                    }
+                    let is_group_event = groups_enabled
+                        && ((nip29::MOD_MIN..=nip29::MOD_MAX).contains(&event.kind)
+                            || event.kind == nip29::JOIN
+                            || event.kind == nip29::LEAVE);
+                    if is_group_event {
+                        self.apply_group_event(&event, now).await;
+                    }
+                    self.broadcast(event);
+                }
+                PutOutcome::Duplicate => {
+                    self.stats.bump(&self.stats.events_duplicate, 1);
+                }
+                _ => {
+                    self.stats.bump(&self.stats.events_rejected, 1);
+                }
+            }
+            results[slot] = (id, outcome);
+        }
+
+        for (id, event) in vanishes {
+            if let Some(pubkey) = event.pubkey_bytes() {
+                let pubkey_hex = hex::encode(pubkey);
+                let removed = self.db.apply_vanish(pubkey).await;
+                self.stats.bump(&self.stats.events_deleted, removed as u64);
+                if self.config.read().await.nip_enabled(29) {
+                    let mut groups = self.groups.write().await;
+                    for group in groups.groups.values_mut() {
+                        group.members.remove(&pubkey_hex);
+                    }
+                }
+            }
+            results.push((id, PutOutcome::Stored));
+        }
+
+        results
     }
 
     /// Applies a stored NIP-29 event to the group state and publishes the

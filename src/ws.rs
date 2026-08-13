@@ -14,6 +14,9 @@ use crate::stats::unix_now;
 /// Secondary bound on the number of queued messages (a long tail of small
 /// messages must not outgrow the VecDeque either).
 const OUT_QUEUE_LIMIT: usize = 4096;
+/// Events queued on a connection before they are accepted as one database
+/// batch (the batch shares a single write commit).
+const EVENT_BATCH: usize = 64;
 
 pub struct Conn {
     relay: Arc<Relay>,
@@ -40,6 +43,9 @@ pub struct Conn {
     /// Every pubkey authenticated on this connection (NIP-42: all of them
     /// are treated as authenticated).
     authed_pubkeys: Vec<String>,
+    /// Events received but not yet accepted; flushed in batches so the
+    /// database commit cost is amortized over many events.
+    pending_events: Vec<Event>,
     /// Whether this connection delivers NIP-40 expired events live. Cached
     /// from the config on connect and refreshed whenever a message arrives,
     /// so the per-batch live path avoids the shared config lock.
@@ -122,20 +128,49 @@ impl Conn {
         };
 
         match kind {
-            "EVENT" => self.handle_event(&msg[1..]).await,
-            "REQ" => self.handle_req(&msg[1..]).await,
-            "CLOSE" => self.handle_close(&msg[1..]),
-            "AUTH" => self.handle_auth(&msg[1..]).await,
-            "COUNT" => self.handle_count(&msg[1..]).await,
-            "NEG-OPEN" => self.handle_neg_open(&msg[1..]).await,
-            "NEG-MSG" => self.handle_neg_msg(&msg[1..]).await,
-            "NEG-CLOSE" => self.handle_neg_close(&msg[1..]),
+            // EVENT messages are queued and accepted in batches so the
+            // database commit cost is paid once per batch instead of once
+            // per event; the batch is flushed when it is full, when the
+            // socket is momentarily idle, or before any other message.
+            "EVENT" => self.queue_event(&msg[1..]).await,
+            "REQ" => {
+                self.flush_pending_events().await;
+                self.handle_req(&msg[1..]).await;
+            }
+            "CLOSE" => {
+                self.flush_pending_events().await;
+                self.handle_close(&msg[1..]);
+            }
+            "AUTH" => {
+                self.flush_pending_events().await;
+                self.handle_auth(&msg[1..]).await;
+            }
+            "COUNT" => {
+                self.flush_pending_events().await;
+                self.handle_count(&msg[1..]).await;
+            }
+            "NEG-OPEN" => {
+                self.flush_pending_events().await;
+                self.handle_neg_open(&msg[1..]).await;
+            }
+            "NEG-MSG" => {
+                self.flush_pending_events().await;
+                self.handle_neg_msg(&msg[1..]).await;
+            }
+            "NEG-CLOSE" => {
+                self.flush_pending_events().await;
+                self.handle_neg_close(&msg[1..]);
+            }
             "PING" => {}
-            other => self.notice(&format!("error: unsupported message type {other}")),
+            other => {
+                self.flush_pending_events().await;
+                self.notice(&format!("error: unsupported message type {other}"));
+            }
         }
     }
 
-    async fn handle_event(&mut self, rest: &[Value]) {
+    /// Queues an EVENT message for batched acceptance.
+    async fn queue_event(&mut self, rest: &[Value]) {
         self.relay.stats.bump(&self.relay.stats.events_received, 1);
         if rest.is_empty() {
             self.notice("error: EVENT requires an event object");
@@ -148,28 +183,44 @@ impl Conn {
                 return;
             }
         };
-        let id = event.id.clone();
-        let outcome = self.relay.accept_event(event, &self.authed_pubkeys).await.0;
-        match outcome {
-            crate::db::PutOutcome::Stored | crate::db::PutOutcome::Replaced => {
-                self.ok(&id, true, "");
-            }
-            crate::db::PutOutcome::Ephemeral => {
-                // NIP-01: ephemeral kinds are delivered live but never
-                // stored; the NIP-01 `mute:` prefix acknowledges this.
-                self.ok(&id, true, "mute: ephemeral event not stored");
-            }
-            crate::db::PutOutcome::Duplicate => {
-                self.ok(&id, true, "duplicate: event already stored");
-            }
-            crate::db::PutOutcome::Invalid(reason) => {
-                self.ok(&id, false, &reason);
-            }
-            crate::db::PutOutcome::Expired => {
-                self.ok(&id, false, "invalid: event has expired");
-            }
-            crate::db::PutOutcome::PreviouslyDeleted => {
-                self.ok(&id, false, "blocked: event has been deleted");
+        self.pending_events.push(event);
+        if self.pending_events.len() >= EVENT_BATCH {
+            self.flush_pending_events().await;
+        }
+    }
+
+    /// Accepts the queued events in one database batch and sends the OKs.
+    async fn flush_pending_events(&mut self) {
+        if self.pending_events.is_empty() {
+            return;
+        }
+        let events = std::mem::take(&mut self.pending_events);
+        let outcomes = self
+            .relay
+            .accept_events_batch(events, &self.authed_pubkeys)
+            .await;
+        for (id, outcome) in outcomes {
+            match outcome {
+                crate::db::PutOutcome::Stored | crate::db::PutOutcome::Replaced => {
+                    self.ok(&id, true, "");
+                }
+                crate::db::PutOutcome::Ephemeral => {
+                    // NIP-01: ephemeral kinds are delivered live but never
+                    // stored; the NIP-01 `mute:` prefix acknowledges this.
+                    self.ok(&id, true, "mute: ephemeral event not stored");
+                }
+                crate::db::PutOutcome::Duplicate => {
+                    self.ok(&id, true, "duplicate: event already stored");
+                }
+                crate::db::PutOutcome::Invalid(reason) => {
+                    self.ok(&id, false, &reason);
+                }
+                crate::db::PutOutcome::Expired => {
+                    self.ok(&id, false, "invalid: event has expired");
+                }
+                crate::db::PutOutcome::PreviouslyDeleted => {
+                    self.ok(&id, false, "blocked: event has been deleted");
+                }
             }
         }
     }
@@ -673,6 +724,7 @@ pub async fn handle_connection(mut socket: WebSocket, relay: Arc<Relay>) {
         neg_total: 0,
         challenge,
         authed_pubkeys: Vec::new(),
+        pending_events: Vec::new(),
         expiry_enabled,
         giftwrap_restricted,
         dropped: 0,
@@ -741,6 +793,39 @@ pub async fn handle_connection(mut socket: WebSocket, relay: Arc<Relay>) {
                     Some(Ok(_)) => {}
                     Some(Err(_)) => break,
                 }
+                // Batch window: keep reading for a moment so consecutive
+                // EVENT messages from a busy publisher share one database
+                // commit, then flush the queue when the socket is idle.
+                loop {
+                    match tokio::time::timeout(
+                        std::time::Duration::from_millis(1),
+                        receiver.next(),
+                    )
+                    .await
+                    {
+                        Ok(Some(Ok(Message::Text(text)))) => {
+                            if text.len() > max_msg_size {
+                                conn.notice("error: message too large");
+                                break;
+                            }
+                            conn.in_msgs += 1;
+                            conn.in_bytes += text.len() as u64;
+                            conn.handle_text(&text).await;
+                        }
+                        Ok(Some(Ok(Message::Binary(data)))) => {
+                            if data.len() > max_msg_size {
+                                conn.notice("error: message too large");
+                                break;
+                            }
+                            let text = String::from_utf8_lossy(&data).into_owned();
+                            conn.in_msgs += 1;
+                            conn.in_bytes += data.len() as u64;
+                            conn.handle_text(&text).await;
+                        }
+                        _ => break,
+                    }
+                }
+                conn.flush_pending_events().await;
                 // Subscribe to live events once the first REQ arrives and
                 // drop the receiver again when every subscription is closed,
                 // so connections without active subscriptions are never
@@ -779,6 +864,11 @@ pub async fn handle_connection(mut socket: WebSocket, relay: Arc<Relay>) {
             }
         }
     }
+
+    // Events received but not yet batched are accepted before closing, so
+    // a client that disconnects without waiting for its OKs does not lose
+    // them. The live broadcast of these events still reaches subscribers.
+    conn.flush_pending_events().await;
 
     // Final flush: deliver any queued messages (e.g. NOTICEs) before
     // closing the connection.

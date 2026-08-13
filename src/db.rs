@@ -74,6 +74,11 @@ enum Msg {
         now: u64,
         reply: oneshot::Sender<(Vec<Event>, bool)>,
     },
+    /// Accepts many events in a single write transaction (one commit).
+    PutBatch {
+        events: Vec<(Event, u64)>,
+        reply: oneshot::Sender<Vec<PutOutcome>>,
+    },
     /// NIP-77: query returning only `(created_at, id)` records so that large
     /// negentropy ranges do not materialize every full event in memory.
     NegQuery {
@@ -166,240 +171,272 @@ impl DbClient {
             let mut pending: Option<heed::RwTxn> = None;
             let mut batch_puts: Vec<(Event, u64)> = Vec::new();
             let mut senders: Vec<oneshot::Sender<PutOutcome>> = Vec::new();
+            // Put batches received within the current message drain, merged
+            // into a single commit at flush time.
+            let mut pending_batches: Vec<PutBatchMsg> = Vec::new();
             'outer: loop {
                 let Some(msg) = rx.blocking_recv() else {
                     // The channel is closed (every DbClient was dropped
                     // without a shutdown): flush any pending batch so that
                     // awaiting requests are not left hanging.
-                    flush_batch(
+                    flush_everything(
                         &store,
                         &thread_errors,
                         &mut pending,
                         &mut batch_puts,
                         &mut senders,
+                        &mut pending_batches,
                     );
                     break;
                 };
-                let mut msgs = vec![msg];
-                for _ in 0..BATCH - 1 {
-                    match rx.try_recv() {
-                        Ok(m) => msgs.push(m),
-                        Err(_) => break,
+                // The database thread is the single point of failure for
+                // every request: a panic here would hang all clients, so
+                // the whole batch handling is isolated. After a panic (which
+                // the code audit makes unreachable) the state is reset and
+                // the thread keeps serving.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut msgs = vec![msg];
+                    for _ in 0..BATCH - 1 {
+                        match rx.try_recv() {
+                            Ok(m) => msgs.push(m),
+                            Err(_) => break,
+                        }
                     }
-                }
-                for msg in msgs {
-                    match msg {
-                        Msg::Put { event, now, reply } => {
-                            if pending.is_none() {
-                                match store.env.write_txn() {
-                                    Ok(txn) => pending = Some(txn),
-                                    Err(e) => {
-                                        db_error(&thread_errors, &e.into());
-                                        let _ = reply
-                                            .send(PutOutcome::Invalid("database error".into()));
-                                        continue;
+                    for msg in msgs {
+                        match msg {
+                            Msg::Put { event, now, reply } => {
+                                if pending.is_none() {
+                                    match store.env.write_txn() {
+                                        Ok(txn) => pending = Some(txn),
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e.into());
+                                            let _ = reply
+                                                .send(PutOutcome::Invalid("database error".into()));
+                                            continue;
+                                        }
+                                    }
+                                }
+                                batch_puts.push((event, now));
+                                senders.push(reply);
+                            }
+                            Msg::PutBatch { events, reply } => {
+                                pending_batches.push((events, reply));
+                            }
+                            Msg::Shutdown => {
+                                flush_everything(
+                                    &store,
+                                    &thread_errors,
+                                    &mut pending,
+                                    &mut batch_puts,
+                                    &mut senders,
+                                    &mut pending_batches,
+                                );
+                                let _ = store.env.force_sync();
+                                return true;
+                            }
+                            other => {
+                                // Work that is not a plain put commits the
+                                // batch first so that ordering is preserved.
+                                flush_everything(
+                                    &store,
+                                    &thread_errors,
+                                    &mut pending,
+                                    &mut batch_puts,
+                                    &mut senders,
+                                    &mut pending_batches,
+                                );
+                                match other {
+                                    Msg::Query {
+                                        filters,
+                                        limit,
+                                        now,
+                                        reply,
+                                    } => {
+                                        let out = match store.scan(&filters, now, limit, false) {
+                                            Ok(out) => out,
+                                            Err(e) => {
+                                                db_error(&thread_errors, &e);
+                                                (Vec::new(), false)
+                                            }
+                                        };
+                                        let _ = reply.send(out);
+                                    }
+                                    Msg::NegQuery {
+                                        filter,
+                                        limit,
+                                        now,
+                                        reply,
+                                    } => {
+                                        let out = match store.scan_neg(&filter, now, limit) {
+                                            Ok(out) => out,
+                                            Err(e) => {
+                                                db_error(&thread_errors, &e);
+                                                (Vec::new(), false)
+                                            }
+                                        };
+                                        let _ = reply.send(out);
+                                    }
+                                    Msg::Count {
+                                        filters,
+                                        limit,
+                                        now,
+                                        reply,
+                                    } => {
+                                        let out = match store.scan(&filters, now, limit, true) {
+                                            Ok(out) => out,
+                                            Err(e) => {
+                                                db_error(&thread_errors, &e);
+                                                (Vec::new(), false)
+                                            }
+                                        };
+                                        let _ = reply.send(out);
+                                    }
+                                    Msg::Delete {
+                                        targets,
+                                        addresses,
+                                        request_pubkey,
+                                        request_created,
+                                        reply,
+                                    } => {
+                                        let n = match store.apply_deletion(
+                                            &targets,
+                                            &addresses,
+                                            request_pubkey.as_deref(),
+                                            request_created,
+                                        ) {
+                                            Ok(n) => n,
+                                            Err(e) => {
+                                                db_error(&thread_errors, &e);
+                                                0
+                                            }
+                                        };
+                                        let _ = reply.send(n);
+                                    }
+                                    Msg::Vanish { pubkey, reply } => {
+                                        let n = match store.apply_vanish(&pubkey) {
+                                            Ok(n) => n,
+                                            Err(e) => {
+                                                db_error(&thread_errors, &e);
+                                                0
+                                            }
+                                        };
+                                        let _ = reply.send(n);
+                                    }
+                                    Msg::GiftWrapPurge { pubkey, reply } => {
+                                        let n = match store.delete_gift_wraps_to(&pubkey) {
+                                            Ok(n) => n,
+                                            Err(e) => {
+                                                db_error(&thread_errors, &e);
+                                                0
+                                            }
+                                        };
+                                        let _ = reply.send(n);
+                                    }
+                                    Msg::PrefixExists { prefix, reply } => {
+                                        let exists = match store.event_id_prefix_exists(&prefix) {
+                                            Ok(exists) => exists,
+                                            Err(e) => {
+                                                db_error(&thread_errors, &e);
+                                                false
+                                            }
+                                        };
+                                        let _ = reply.send(exists);
+                                    }
+                                    Msg::ReplaceableCreatedAt {
+                                        kind,
+                                        pubkey,
+                                        d,
+                                        reply,
+                                    } => {
+                                        let created =
+                                            match store.replaceable_created_at(kind, &pubkey, &d) {
+                                                Ok(created) => created,
+                                                Err(e) => {
+                                                    db_error(&thread_errors, &e);
+                                                    None
+                                                }
+                                            };
+                                        let _ = reply.send(created);
+                                    }
+                                    Msg::Ban { id, reason, reply } => {
+                                        let banned = match store.apply_ban(&id, &reason) {
+                                            Ok(banned) => banned,
+                                            Err(e) => {
+                                                db_error(&thread_errors, &e);
+                                                false
+                                            }
+                                        };
+                                        let _ = reply.send(banned);
+                                    }
+                                    Msg::Unban { id, reply } => {
+                                        let unbanned = match store.apply_unban(&id) {
+                                            Ok(unbanned) => unbanned,
+                                            Err(e) => {
+                                                db_error(&thread_errors, &e);
+                                                false
+                                            }
+                                        };
+                                        let _ = reply.send(unbanned);
+                                    }
+                                    Msg::ListBanned { reply } => {
+                                        let banned = match store.list_banned() {
+                                            Ok(banned) => banned,
+                                            Err(e) => {
+                                                db_error(&thread_errors, &e);
+                                                Vec::new()
+                                            }
+                                        };
+                                        let _ = reply.send(banned);
+                                    }
+                                    Msg::PurgeExpired { now, reply } => {
+                                        let n = match store.purge_expired(now) {
+                                            Ok(n) => n,
+                                            Err(e) => {
+                                                db_error(&thread_errors, &e);
+                                                0
+                                            }
+                                        };
+                                        let _ = reply.send(n);
+                                    }
+                                    Msg::DatabaseSize { reply } => {
+                                        let _ = reply.send(store.size_on_disk());
+                                    }
+                                    #[cfg(test)]
+                                    Msg::MapSize { reply } => {
+                                        let _ = reply.send(store.env.info().map_size as u64);
+                                    }
+                                    Msg::PutBatch { .. } | Msg::Put { .. } | Msg::Shutdown => {
+                                        unreachable!()
                                     }
                                 }
                             }
-                            batch_puts.push((event, now));
-                            senders.push(reply);
-                        }
-                        Msg::Shutdown => {
-                            flush_batch(
-                                &store,
-                                &thread_errors,
-                                &mut pending,
-                                &mut batch_puts,
-                                &mut senders,
-                            );
-                            let _ = store.env.force_sync();
-                            break 'outer;
-                        }
-                        other => {
-                            // Work that is not a plain put commits the batch
-                            // first so that ordering is preserved.
-                            flush_batch(
-                                &store,
-                                &thread_errors,
-                                &mut pending,
-                                &mut batch_puts,
-                                &mut senders,
-                            );
-                            match other {
-                                Msg::Query {
-                                    filters,
-                                    limit,
-                                    now,
-                                    reply,
-                                } => {
-                                    let out = match store.scan(&filters, now, limit, false) {
-                                        Ok(out) => out,
-                                        Err(e) => {
-                                            db_error(&thread_errors, &e);
-                                            (Vec::new(), false)
-                                        }
-                                    };
-                                    let _ = reply.send(out);
-                                }
-                                Msg::NegQuery {
-                                    filter,
-                                    limit,
-                                    now,
-                                    reply,
-                                } => {
-                                    let out = match store.scan_neg(&filter, now, limit) {
-                                        Ok(out) => out,
-                                        Err(e) => {
-                                            db_error(&thread_errors, &e);
-                                            (Vec::new(), false)
-                                        }
-                                    };
-                                    let _ = reply.send(out);
-                                }
-                                Msg::Count {
-                                    filters,
-                                    limit,
-                                    now,
-                                    reply,
-                                } => {
-                                    let out = match store.scan(&filters, now, limit, true) {
-                                        Ok(out) => out,
-                                        Err(e) => {
-                                            db_error(&thread_errors, &e);
-                                            (Vec::new(), false)
-                                        }
-                                    };
-                                    let _ = reply.send(out);
-                                }
-                                Msg::Delete {
-                                    targets,
-                                    addresses,
-                                    request_pubkey,
-                                    request_created,
-                                    reply,
-                                } => {
-                                    let n = match store.apply_deletion(
-                                        &targets,
-                                        &addresses,
-                                        request_pubkey.as_deref(),
-                                        request_created,
-                                    ) {
-                                        Ok(n) => n,
-                                        Err(e) => {
-                                            db_error(&thread_errors, &e);
-                                            0
-                                        }
-                                    };
-                                    let _ = reply.send(n);
-                                }
-                                Msg::Vanish { pubkey, reply } => {
-                                    let n = match store.apply_vanish(&pubkey) {
-                                        Ok(n) => n,
-                                        Err(e) => {
-                                            db_error(&thread_errors, &e);
-                                            0
-                                        }
-                                    };
-                                    let _ = reply.send(n);
-                                }
-                                Msg::GiftWrapPurge { pubkey, reply } => {
-                                    let n = match store.delete_gift_wraps_to(&pubkey) {
-                                        Ok(n) => n,
-                                        Err(e) => {
-                                            db_error(&thread_errors, &e);
-                                            0
-                                        }
-                                    };
-                                    let _ = reply.send(n);
-                                }
-                                Msg::PrefixExists { prefix, reply } => {
-                                    let exists = match store.event_id_prefix_exists(&prefix) {
-                                        Ok(exists) => exists,
-                                        Err(e) => {
-                                            db_error(&thread_errors, &e);
-                                            false
-                                        }
-                                    };
-                                    let _ = reply.send(exists);
-                                }
-                                Msg::ReplaceableCreatedAt {
-                                    kind,
-                                    pubkey,
-                                    d,
-                                    reply,
-                                } => {
-                                    let created =
-                                        match store.replaceable_created_at(kind, &pubkey, &d) {
-                                            Ok(created) => created,
-                                            Err(e) => {
-                                                db_error(&thread_errors, &e);
-                                                None
-                                            }
-                                        };
-                                    let _ = reply.send(created);
-                                }
-                                Msg::Ban { id, reason, reply } => {
-                                    let banned = match store.apply_ban(&id, &reason) {
-                                        Ok(banned) => banned,
-                                        Err(e) => {
-                                            db_error(&thread_errors, &e);
-                                            false
-                                        }
-                                    };
-                                    let _ = reply.send(banned);
-                                }
-                                Msg::Unban { id, reply } => {
-                                    let unbanned = match store.apply_unban(&id) {
-                                        Ok(unbanned) => unbanned,
-                                        Err(e) => {
-                                            db_error(&thread_errors, &e);
-                                            false
-                                        }
-                                    };
-                                    let _ = reply.send(unbanned);
-                                }
-                                Msg::ListBanned { reply } => {
-                                    let banned = match store.list_banned() {
-                                        Ok(banned) => banned,
-                                        Err(e) => {
-                                            db_error(&thread_errors, &e);
-                                            Vec::new()
-                                        }
-                                    };
-                                    let _ = reply.send(banned);
-                                }
-                                Msg::PurgeExpired { now, reply } => {
-                                    let n = match store.purge_expired(now) {
-                                        Ok(n) => n,
-                                        Err(e) => {
-                                            db_error(&thread_errors, &e);
-                                            0
-                                        }
-                                    };
-                                    let _ = reply.send(n);
-                                }
-                                Msg::DatabaseSize { reply } => {
-                                    let _ = reply.send(store.size_on_disk());
-                                }
-                                #[cfg(test)]
-                                Msg::MapSize { reply } => {
-                                    let _ = reply.send(store.env.info().map_size as u64);
-                                }
-                                Msg::Put { .. } | Msg::Shutdown => unreachable!(),
-                            }
                         }
                     }
+                    // Flush the batch before blocking again: clients await
+                    // their replies, so a pending batch must not wait for
+                    // the next message or every requestor deadlocks.
+                    flush_everything(
+                        &store,
+                        &thread_errors,
+                        &mut pending,
+                        &mut batch_puts,
+                        &mut senders,
+                        &mut pending_batches,
+                    );
+                    false
+                }));
+                match result {
+                    Ok(false) => {}
+                    Ok(true) => break 'outer,
+                    Err(_) => {
+                        log::error!("database thread recovered from a panic");
+                        pending = None;
+                        for s in senders.drain(..) {
+                            let _ = s.send(PutOutcome::Invalid("database error".into()));
+                        }
+                        batch_puts.clear();
+                    }
                 }
-                // Flush the batch before blocking again: clients await their
-                // replies, so a pending batch must not wait for the next
-                // message or every requestor deadlocks.
-                flush_batch(
-                    &store,
-                    &thread_errors,
-                    &mut pending,
-                    &mut batch_puts,
-                    &mut senders,
-                );
             }
         });
         Ok(DbClient { tx, errors, expiry })
@@ -431,6 +468,11 @@ impl DbClient {
             reply,
         })
         .await
+    }
+
+    /// Stores a batch of events in a single write transaction.
+    pub async fn put_batch(&self, events: Vec<(Event, u64)>) -> Vec<PutOutcome> {
+        self.request(|reply| Msg::PutBatch { events, reply }).await
     }
 
     /// NIP-77: returns only `(created_at, id)` records of the matching
@@ -557,45 +599,54 @@ impl DbClient {
     }
 }
 
-/// Commits the pending put batch. The batch is applied inside one write
-/// transaction; when the commit fails because the memory map is full, the
-/// map is grown (up to `map_max_size`) and the whole batch is re-applied in
-/// a fresh transaction. Replies are only sent after a successful commit, so
-/// an OK implies durability.
-#[allow(clippy::too_many_arguments)]
-fn flush_batch(
+/// Applies `puts` in one write transaction and commits. When the commit
+/// fails because the memory map is full, the map is grown (up to
+/// `map_max_size`) and the whole batch is re-applied in a fresh
+/// transaction. Returns one outcome per put; all outcomes are
+/// `Invalid("...")` when the batch cannot be committed.
+fn apply_put_batch(
     store: &Store,
     thread_errors: &Arc<std::sync::atomic::AtomicU64>,
-    pending: &mut Option<heed::RwTxn>,
-    batch_puts: &mut Vec<(Event, u64)>,
-    senders: &mut Vec<oneshot::Sender<PutOutcome>>,
-) {
-    if batch_puts.is_empty() {
-        if let Some(wtxn) = pending.take()
-            && let Err(e) = wtxn.commit()
+    mut pending: Option<heed::RwTxn>,
+    puts: &[(Event, u64)],
+) -> Vec<PutOutcome> {
+    if puts.is_empty() {
+        if let Some(txn) = pending
+            && let Err(e) = txn.commit()
         {
             db_error(thread_errors, &e.into());
         }
-        return;
+        return Vec::new();
+    }
+    // Disk-full guard: writing to the memory map of a file on a full disk
+    // raises SIGBUS and kills the process, so refuse to commit while the
+    // free space is below the margin. Reads keep working.
+    if let Some(free) = store.free_space()
+        && free < DISK_FREE_MARGIN
+    {
+        log::error!(
+            "disk is full: refusing to commit {} events ({} bytes free)",
+            puts.len(),
+            free
+        );
+        return vec![PutOutcome::Invalid("error: disk is full".into()); puts.len()];
     }
     loop {
+        // LMDB allows a single writer: reuse the pending transaction if one
+        // is open, otherwise open a fresh one.
         let mut txn = match pending.take() {
             Some(t) => t,
             None => match store.env.write_txn() {
                 Ok(t) => t,
                 Err(e) => {
                     db_error(thread_errors, &e.into());
-                    for s in senders.drain(..) {
-                        let _ = s.send(PutOutcome::Invalid("database error".into()));
-                    }
-                    batch_puts.clear();
-                    return;
+                    return vec![PutOutcome::Invalid("database error".into()); puts.len()];
                 }
             },
         };
-        let mut outcomes = Vec::with_capacity(batch_puts.len());
+        let mut outcomes = Vec::with_capacity(puts.len());
         let mut poisoned = false;
-        for (event, now) in batch_puts.iter() {
+        for (event, now) in puts {
             match store.put_event_in(&mut txn, event, *now) {
                 Ok(out) => outcomes.push(out),
                 Err(e) => {
@@ -609,43 +660,71 @@ fn flush_batch(
             // The transaction is unusable: abort it and revoke every reply
             // queued for it, because the applied puts were rolled back with
             // it and their OK would be a lie.
-            drop(txn);
-            for s in senders.drain(..) {
-                let _ = s.send(PutOutcome::Invalid("database error".into()));
-            }
-            batch_puts.clear();
-            return;
+            return vec![PutOutcome::Invalid("database error".into()); puts.len()];
         }
         match txn.commit() {
             Ok(()) => {
-                for (s, out) in senders.drain(..).zip(outcomes) {
-                    let _ = s.send(out);
-                }
-                batch_puts.clear();
                 store.grow_map_if_needed();
-                return;
+                return outcomes;
             }
             Err(heed::Error::Mdb(heed::MdbError::MapFull)) => {
                 if !store.grow_map() {
                     // The map cannot grow further: the batch cannot be
                     // committed, so every reply is revoked.
-                    for s in senders.drain(..) {
-                        let _ = s.send(PutOutcome::Invalid("database error".into()));
-                    }
-                    batch_puts.clear();
-                    return;
+                    return vec![PutOutcome::Invalid("database error".into()); puts.len()];
                 }
                 // Retry the whole batch in the larger map.
             }
             Err(e) => {
                 db_error(thread_errors, &e.into());
-                for s in senders.drain(..) {
-                    let _ = s.send(PutOutcome::Invalid("database error".into()));
-                }
-                batch_puts.clear();
-                return;
+                return vec![PutOutcome::Invalid("database error".into()); puts.len()];
             }
         }
+    }
+}
+
+/// A batch of events to store in one transaction, with its reply.
+type PutBatchMsg = (Vec<(Event, u64)>, oneshot::Sender<Vec<PutOutcome>>);
+
+/// Commits the pending single-put batch together with every queued
+/// `PutBatch`, merging them all into one write transaction (one commit for
+/// events arriving from many connections). Replies are only sent after a
+/// successful commit, so an OK implies durability.
+#[allow(clippy::too_many_arguments)]
+fn flush_everything(
+    store: &Store,
+    thread_errors: &Arc<std::sync::atomic::AtomicU64>,
+    pending: &mut Option<heed::RwTxn>,
+    batch_puts: &mut Vec<(Event, u64)>,
+    senders: &mut Vec<oneshot::Sender<PutOutcome>>,
+    pending_batches: &mut Vec<PutBatchMsg>,
+) {
+    if batch_puts.is_empty() && pending_batches.is_empty() {
+        if let Some(wtxn) = pending.take()
+            && let Err(e) = wtxn.commit()
+        {
+            db_error(thread_errors, &e.into());
+        }
+        return;
+    }
+    // Merge the singles and every queued batch into one list; the split
+    // points let the outcomes be distributed back in order.
+    let mut all: Vec<(Event, u64)> = std::mem::take(batch_puts);
+    let mut splits: Vec<usize> = vec![all.len()];
+    for (events, _) in pending_batches.iter_mut() {
+        all.append(events);
+        splits.push(all.len());
+    }
+    let outcomes = apply_put_batch(store, thread_errors, pending.take(), &all);
+    for (s, out) in senders
+        .drain(..)
+        .zip(outcomes.iter().take(splits[0]).cloned())
+    {
+        let _ = s.send(out);
+    }
+    for (i, (_, reply)) in pending_batches.drain(..).enumerate() {
+        let range = splits[i]..splits[i + 1];
+        let _ = reply.send(outcomes[range].to_vec());
     }
 }
 
@@ -834,10 +913,37 @@ impl Store {
         }
     }
 
+    /// Free bytes on the filesystem hosting the data directory, when
+    /// statvfs succeeds.
+    fn free_space(&self) -> Option<u64> {
+        let path = self.env.path();
+        let dir = if path.is_file() {
+            path.parent().unwrap_or(path)
+        } else {
+            path
+        };
+        let c_path = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).ok()?;
+        let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: `stat` points at a valid buffer and the path is a valid
+        // NUL-terminated string.
+        if unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) } == 0 {
+            let stat = unsafe { stat.assume_init() };
+            Some(stat.f_bavail * stat.f_frsize)
+        } else {
+            None
+        }
+    }
+
     fn size_on_disk(&self) -> u64 {
         self.env.real_disk_size().unwrap_or(0)
     }
 }
+
+/// Minimum free space required before a batch of writes is committed.
+/// Writing to the memory map of a file on a completely full disk raises
+/// SIGBUS (killing the process), so the relay refuses to commit while the
+/// free space is below this margin and keeps serving reads.
+const DISK_FREE_MARGIN: u64 = 32 * 1024 * 1024;
 
 // ----- key builders -----
 
