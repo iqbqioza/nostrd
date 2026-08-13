@@ -1285,23 +1285,25 @@ impl Store {
             return Ok(out.len() >= max_limit);
         }
 
-        if !filter.tags.is_empty() {
-            if let Some((name, values)) = filter.tags.iter().next() {
-                let tag_name = name.strip_prefix('#').unwrap_or(name);
-                if tag_name.len() == 1 {
-                    let name_byte = tag_name.as_bytes()[0];
-                    for value in string_values(values) {
-                        if value.len() > TAG_VALUE_MAX {
-                            continue;
-                        }
-                        let (start, end) = tag_range(name_byte, value.as_bytes(), since, until);
-                        if !self.for_each(rtxn, self.by_tag, &start, &end, &mut consider, more)? {
-                            return Ok(false);
-                        }
+        if let Some((name, values)) = filter.tags.iter().next() {
+            let tag_name = name.strip_prefix('#').unwrap_or(name);
+            if tag_name.len() == 1 {
+                let name_byte = tag_name.as_bytes()[0];
+                for value in string_values(values) {
+                    if value.len() > TAG_VALUE_MAX {
+                        continue;
+                    }
+                    let (start, end) = tag_range(name_byte, value.as_bytes(), since, until);
+                    if !self.for_each(rtxn, self.by_tag, &start, &end, &mut consider, more)? {
+                        return Ok(false);
                     }
                 }
+                return Ok(out.len() >= max_limit);
             }
-            return Ok(out.len() >= max_limit);
+            // Multi-letter tag names are not indexed (NIP-01 only requires
+            // single-letter tags to be indexed): fall through to the
+            // time-range scan, where the final in-memory match enforces the
+            // tag filter.
         }
 
         if let Some(kinds) = &filter.kinds {
@@ -1783,6 +1785,35 @@ mod tests {
                 .await;
             assert_eq!(res.len(), 1);
             assert_eq!(res[0].id, other_wrap.id, "the other wrap survives");
+        });
+    }
+
+    #[test]
+    fn multiletter_tag_filters_match() {
+        // NIP-01 only requires single-letter tags to be indexed; filters on
+        // longer tag names must still match via the full scan.
+        let db = DbClient::open(&config(), true, Arc::new(Default::default())).unwrap();
+        let now = unix_now();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let hit = event(1, "alt", now, vec![vec!["alt".into(), "reply".into()]]);
+            let miss = event(1, "no alt", now, vec![]);
+            assert_eq!(db.put(hit.clone(), now).await, PutOutcome::Stored);
+            assert_eq!(db.put(miss, now).await, PutOutcome::Stored);
+
+            let f: Filter = serde_json::from_value(serde_json::json!({"#alt": ["reply"]})).unwrap();
+            let (res, _) = db.query(vec![f], 500, now).await;
+            assert_eq!(res.len(), 1);
+            assert_eq!(res[0].id, hit.id);
+
+            // Combined with another dimension.
+            let f: Filter = serde_json::from_value(serde_json::json!({
+                "#alt": ["reply"], "kinds": [1]
+            }))
+            .unwrap();
+            let (res, _) = db.query(vec![f], 500, now).await;
+            assert_eq!(res.len(), 1);
+            assert_eq!(res[0].id, hit.id);
         });
     }
 
