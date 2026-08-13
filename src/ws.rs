@@ -348,7 +348,15 @@ impl Conn {
         };
         if accepted {
             // NIP-42: all authenticated pubkeys are treated as authenticated.
-            self.authed_pubkeys.push(event.pubkey.clone());
+            // Bound the list: repeated AUTHs with the same key are
+            // deduplicated and the number of distinct keys is capped so a
+            // connection cannot grow this vector (or the per-event
+            // visibility scan over it) without limit.
+            if !self.authed_pubkeys.iter().any(|pk| pk == &event.pubkey)
+                && self.authed_pubkeys.len() < 64
+            {
+                self.authed_pubkeys.push(event.pubkey.clone());
+            }
         }
         self.send_json(nip42::ok(&id, accepted));
     }
