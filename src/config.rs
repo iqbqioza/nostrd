@@ -86,6 +86,10 @@ pub struct LimitsConfig {
     /// forever). A timeout keeps the relay responsive even when the storage
     /// is stuck: the request fails with a clear error instead of hanging.
     pub db_request_timeout_secs: u64,
+    /// Spam defense: a pubkey's first accepted event is recorded, and events
+    /// from pubkeys first seen less than this many seconds ago are rejected
+    /// with `restricted: your account is too new` (0 disables the check).
+    pub new_pubkey_min_age_secs: u64,
     /// Maximum bytes of outgoing messages queued for a single connection
     /// before new ones are dropped (protects memory against slow readers).
     pub max_out_queue_bytes: usize,
@@ -189,6 +193,7 @@ impl Default for LimitsConfig {
             buffer_size: 1_024,
             neg_max_items: 100_000,
             db_request_timeout_secs: 30,
+            new_pubkey_min_age_secs: 0,
             max_out_queue_bytes: 256 * 1024,
             max_sub_bytes: 512 * 1024,
             live_batch_interval_ms: 10,

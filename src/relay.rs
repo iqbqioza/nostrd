@@ -186,6 +186,23 @@ impl Relay {
             return (PutOutcome::Stored, None);
         }
 
+        // First-seen trust check: a pubkey's first accepted event records
+        // its arrival; events from pubkeys first seen within the configured
+        // window are rejected (spam from freshly created accounts).
+        if cfg.limits.new_pubkey_min_age_secs > 0
+            && let Some(pubkey) = event.pubkey_bytes()
+        {
+            let (created, first_seen) =
+                self.db.touch_first_seen_batch(vec![(pubkey, now)]).await[0];
+            if !created && now.saturating_sub(first_seen) < cfg.limits.new_pubkey_min_age_secs {
+                self.stats.bump(&self.stats.events_rejected, 1);
+                return (
+                    PutOutcome::Invalid("restricted: your account is too new".into()),
+                    None,
+                );
+            }
+        }
+
         // NIP-43: join requests carry an invite code, which this relay never
         // issues; every claim therefore fails (NIP-43 mandates an OK reply).
         if cfg.nip_enabled(43) && event.kind == 28934 {
@@ -431,8 +448,38 @@ impl Relay {
 
         let groups_enabled = cfg.nip_enabled(29);
         let roles_enabled = cfg.nip_enabled(43);
+        let min_age = cfg.limits.new_pubkey_min_age_secs;
         drop(cfg);
         drop(access);
+
+        // First-seen trust check: pubkeys first seen within the configured
+        // window may not publish (their first event established the
+        // account). Performed in one database round trip for the batch.
+        if min_age > 0 && !puts.is_empty() {
+            let entries: Vec<([u8; 32], u64)> = puts
+                .iter()
+                .map(|e| (e.pubkey_bytes().unwrap_or([0u8; 32]), now))
+                .collect();
+            let first_seens = self.db.touch_first_seen_batch(entries).await;
+            let mut kept = Vec::with_capacity(puts.len());
+            let mut kept_slots = Vec::with_capacity(put_slots.len());
+            for ((event, slot), (created, first_seen)) in
+                puts.into_iter().zip(put_slots).zip(first_seens)
+            {
+                if !created && now.saturating_sub(first_seen) < min_age {
+                    self.stats.bump(&self.stats.events_rejected, 1);
+                    results[slot] = (
+                        event.id,
+                        PutOutcome::Invalid("restricted: your account is too new".into()),
+                    );
+                } else {
+                    kept.push(event);
+                    kept_slots.push(slot);
+                }
+            }
+            puts = kept;
+            put_slots = kept_slots;
+        }
 
         let mut outcomes = if puts.is_empty() {
             Vec::new()

@@ -155,6 +155,11 @@ neg_max_items = 100000
 # request fails with a clear error instead of hanging the connection.
 db_request_timeout_secs = 30
 
+# Spam defense: a pubkey's first accepted event is recorded, and events from
+# pubkeys first seen less than this many seconds ago are rejected with
+# `restricted: your account is too new`. 0 disables the check.
+new_pubkey_min_age_secs = 0
+
 # Maximum bytes of outgoing messages queued per connection before new ones
 # are dropped (protects memory against slow readers).
 max_out_queue_bytes = 262144

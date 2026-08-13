@@ -22,6 +22,7 @@ const EXPIRY: &str = "expiry";
 const REPLACEABLE: &str = "replaceable";
 const VANISH: &str = "vanish";
 const BANNED: &str = "banned";
+const FIRST_SEEN: &str = "first_seen";
 
 const CREATED_LEN: usize = 8;
 const ID_LEN: usize = 32;
@@ -78,6 +79,12 @@ enum Msg {
     PutBatch {
         events: Vec<(Event, u64)>,
         reply: oneshot::Sender<Vec<PutOutcome>>,
+    },
+    /// First-seen trust bookkeeping: records the arrival time of each
+    /// pubkey when unknown and returns `(created, first_seen)` per entry.
+    TouchFirstSeen {
+        entries: Vec<([u8; 32], u64)>,
+        reply: oneshot::Sender<Vec<(bool, u64)>>,
     },
     /// NIP-77: query returning only `(created_at, id)` records so that large
     /// negentropy ranges do not materialize every full event in memory.
@@ -411,6 +418,34 @@ impl DbClient {
                                     Msg::MapSize { reply } => {
                                         let _ = reply.send(store.env.info().map_size as u64);
                                     }
+                                    Msg::TouchFirstSeen { entries, reply } => {
+                                        let mut wtxn = match store.env.write_txn() {
+                                            Ok(t) => t,
+                                            Err(e) => {
+                                                db_error(&thread_errors, &e.into());
+                                                let _ = reply
+                                                    .send(vec![(false, u64::MAX); entries.len()]);
+                                                continue;
+                                            }
+                                        };
+                                        let mut out = Vec::with_capacity(entries.len());
+                                        for (pubkey, now) in entries {
+                                            match store.touch_first_seen(&mut wtxn, &pubkey, now) {
+                                                Ok((created, ts)) => out.push((created, ts)),
+                                                Err(e) => {
+                                                    db_error(&thread_errors, &e);
+                                                    // Fail closed: treat the
+                                                    // pubkey as too young.
+                                                    out.push((false, u64::MAX));
+                                                }
+                                            }
+                                        }
+                                        match wtxn.commit() {
+                                            Ok(()) => {}
+                                            Err(e) => db_error(&thread_errors, &e.into()),
+                                        }
+                                        let _ = reply.send(out);
+                                    }
                                     Msg::PutBatch { .. } | Msg::Put { .. } | Msg::Shutdown => {
                                         unreachable!()
                                     }
@@ -485,6 +520,13 @@ impl DbClient {
             reply,
         })
         .await
+    }
+
+    /// Records the first-seen time of each pubkey when unknown; returns
+    /// `(created, first_seen)` per entry, aligned with the input.
+    pub async fn touch_first_seen_batch(&self, entries: Vec<([u8; 32], u64)>) -> Vec<(bool, u64)> {
+        self.request(|reply| Msg::TouchFirstSeen { entries, reply })
+            .await
     }
 
     /// Stores a batch of events in a single write transaction.
@@ -758,6 +800,8 @@ struct Store {
     replaceable: Database<Bytes, Bytes>,
     vanish: Database<Bytes, Bytes>,
     banned: Database<Bytes, Bytes>,
+    /// pubkey (32 bytes) -> unix timestamp of the first accepted event.
+    first_seen: Database<Bytes, Bytes>,
     /// NIP-40 expiration handling is only active when the NIP is enabled.
     /// Shared with the relay so that a config reload can toggle it at runtime.
     expiry_enabled: Arc<std::sync::atomic::AtomicBool>,
@@ -859,6 +903,7 @@ impl Store {
         let replaceable = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(REPLACEABLE))?;
         let vanish = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(VANISH))?;
         let banned = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(BANNED))?;
+        let first_seen = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(FIRST_SEEN))?;
         wtxn.commit()?;
 
         Ok(Store {
@@ -874,6 +919,7 @@ impl Store {
             replaceable,
             vanish,
             banned,
+            first_seen,
             expiry_enabled,
             map_max_size,
             page_size,
@@ -1408,6 +1454,27 @@ impl Store {
 
         wtxn.commit()?;
         Ok(removed)
+    }
+
+    /// Records `now` as the first-seen time of `pubkey` when the pubkey is
+    /// unknown, and returns `(created, first_seen)`: `created` is true when
+    /// the entry was just written (the pubkey's first accepted event).
+    fn touch_first_seen(
+        &self,
+        wtxn: &mut heed::RwTxn,
+        pubkey: &[u8],
+        now: u64,
+    ) -> Result<(bool, u64)> {
+        match self.first_seen.get(wtxn, pubkey)? {
+            Some(raw) if raw.len() >= 8 => {
+                let ts = u64::from_be_bytes(raw[..8].try_into().unwrap());
+                Ok((false, ts))
+            }
+            _ => {
+                self.first_seen.put(wtxn, pubkey, &now.to_be_bytes())?;
+                Ok((true, now))
+            }
+        }
     }
 
     /// NIP-59: relays SHOULD delete `kind:1059` gift wraps addressed to a
@@ -2225,6 +2292,36 @@ mod tests {
             assert_eq!(res.len(), n, "all events must be queryable");
             // And the map grew beyond the initial size.
             assert!(db.map_size_now().await > 256 * 1024, "map must have grown");
+        });
+    }
+
+    #[test]
+    fn first_seen_trust_period() {
+        // A pubkey's first event records its arrival; later events within
+        // the trust window are rejected by the relay. Here we verify the
+        // bookkeeping itself.
+        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0).unwrap();
+        let now = unix_now();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let pubkey = [7u8; 32];
+            // First touch: created, the arrival time is recorded.
+            let (created, first) = db.touch_first_seen_batch(vec![(pubkey, now)]).await[0];
+            assert!(created);
+            assert_eq!(first, now);
+            // Second touch: not created, the same time is returned.
+            let (created, first) = db.touch_first_seen_batch(vec![(pubkey, now + 5)]).await[0];
+            assert!(!created);
+            assert_eq!(first, now);
+            // The recorded first-seen time never changes, so the trust
+            // period does not restart once the window has elapsed: the
+            // entry is kept permanently (one 40-byte row per unique pubkey).
+            let (created, first) = db.touch_first_seen_batch(vec![(pubkey, now + 9999)]).await[0];
+            assert!(!created);
+            assert_eq!(first, now, "first-seen stays at the original arrival");
+            // A different pubkey is created independently.
+            let (created, _) = db.touch_first_seen_batch(vec![([8u8; 32], now)]).await[0];
+            assert!(created);
         });
     }
 
