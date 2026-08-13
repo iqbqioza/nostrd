@@ -517,7 +517,11 @@ impl Conn {
         {
             return;
         }
+        // NIP-40: expired stored events are not delivered live; ephemeral
+        // kinds are exempt ("an expiration timestamp does not affect
+        // storage of ephemeral events").
         if self.expiry_enabled
+            && !(20000..30000).contains(&event.kind)
             && let Some(exp) = nip40::expiry(event)
             && exp < unix_now()
         {
@@ -579,6 +583,12 @@ impl Conn {
             self.notice("error: NEG-OPEN message must be hex");
             return;
         };
+        // NIP-42: an auth-requiring relay applies the same policy to
+        // negentropy subscriptions as to REQ subscriptions.
+        if self.relay.config.read().await.server.require_auth && !self.is_authed() {
+            self.neg_err(&sub_id, "auth-required: please authenticate before syncing");
+            return;
+        }
 
         let max_items = self.relay.config.read().await.limits.neg_max_items;
         let max_subs = self.relay.config.read().await.limits.max_subscriptions;
@@ -601,6 +611,32 @@ impl Conn {
             ]));
             return;
         }
+        // NIP-70/NIP-29: withhold protected events from unauthenticated
+        // peers and private/hidden group content from non-members, exactly
+        // like the REQ path.
+        let items: Vec<nip77::Item> = {
+            let groups = self.relay.groups.read().await;
+            items
+                .into_iter()
+                .filter(|(_, _, protected, gid, meta)| {
+                    if *protected && !self.is_authed() {
+                        return false;
+                    }
+                    if let Some(gid) = gid {
+                        if self.authed_pubkeys.is_empty() {
+                            groups.visible_gid(gid, *meta, None)
+                        } else {
+                            self.authed_pubkeys
+                                .iter()
+                                .any(|pk| groups.visible_gid(gid, *meta, Some(pk)))
+                        }
+                    } else {
+                        true
+                    }
+                })
+                .map(|(created, id, _, _, _)| (created, id))
+                .collect()
+        };
         let items = nip77::sort_items(items);
 
         // The items stay on this connection for the whole sync; bound the
@@ -658,7 +694,14 @@ impl Conn {
         };
         match nip77::respond(items, &message) {
             Ok(response) => self.neg_msg(&sub_id, &response),
-            Err(reason) => self.neg_err(&sub_id, &format!("error: {reason}")),
+            Err(reason) => {
+                // NIP-77: "After a NEG-ERR is issued, the subscription is
+                // considered to be closed."
+                if let Some(items) = self.neg.remove(&sub_id) {
+                    self.neg_total = self.neg_total.saturating_sub(items.len());
+                }
+                self.neg_err(&sub_id, &format!("error: {reason}"));
+            }
         }
     }
 

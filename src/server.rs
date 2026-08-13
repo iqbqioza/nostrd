@@ -435,7 +435,7 @@ async fn group_allows(relay: &Relay, group: &str, pubkey: &str) -> bool {
 
 /// The path component of an absolute URL, e.g. `/x/y` for
 /// `https://host/x/y?q=1`.
-fn url_path(url: &str) -> Option<&str> {
+pub(crate) fn url_path(url: &str) -> Option<&str> {
     let rest = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))

@@ -67,6 +67,7 @@ fn rpc_err(message: &str) -> Response {
 /// NIP-86 JSON-RPC handler, mounted on `POST /` and `POST /ws`.
 pub async fn rpc_handler(
     State(relay): State<Arc<Relay>>,
+    uri: axum::http::Uri,
     headers: HeaderMap,
     body: String,
 ) -> Response {
@@ -84,7 +85,7 @@ pub async fn rpc_handler(
         )
             .into_response();
     }
-    if !rpc_authenticated(&relay, &headers).await {
+    if !rpc_authenticated(&relay, &headers, uri.path()).await {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "unauthorized" })),
@@ -362,8 +363,9 @@ fn is_pubkey(value: &str) -> bool {
 
 /// NIP-86 authentication: either the bearer `management_token` or a NIP-98
 /// event by `admin_pubkey` whose `payload` tag is present and whose `u` tag
-/// matches this relay's URL.
-async fn rpc_authenticated(relay: &Relay, headers: &HeaderMap) -> bool {
+/// matches this relay's URL, including the request path (NIP-98: "the `u`
+/// tag MUST be exactly the same as the absolute request URL").
+async fn rpc_authenticated(relay: &Relay, headers: &HeaderMap, request_path: &str) -> bool {
     let cfg = relay.config.read().await;
     if !cfg.server.management_token.is_empty()
         && let Some(token) = headers
@@ -391,7 +393,7 @@ async fn rpc_authenticated(relay: &Relay, headers: &HeaderMap) -> bool {
                     &cfg.server.host,
                     cfg.server.port,
                     &cfg.relay.public_url,
-                )
+                ) && crate::server::url_path(url).unwrap_or("/") == request_path
             },
         )
         .await

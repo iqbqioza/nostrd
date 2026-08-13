@@ -814,9 +814,11 @@ struct Store {
     page_size: usize,
 }
 
-/// `(created_at, id)` records returned by the NIP-77 negentropy query,
-/// keeping the memory footprint at a few bytes per record.
-type NegItems = Vec<(u64, [u8; 32])>;
+/// `(created_at, id, protected, group_id, is_meta)` records returned by the
+/// NIP-77 negentropy query. The visibility flags let the connection layer
+/// withhold NIP-70 protected events from unauthenticated peers and NIP-29
+/// private/hidden group content from non-members, mirroring the REQ path.
+type NegItems = Vec<(u64, [u8; 32], bool, Option<String>, bool)>;
 
 /// NIP-50 search collection budget: the scan gathers up to this many
 /// candidates (instead of the response limit) so that the relevance
@@ -856,16 +858,20 @@ struct EventCollector {
     events: Vec<Event>,
     /// Hard stop for the whole scan.
     cap: usize,
+    /// Whether the created_at boundary continuation applies (REQ/NEG
+    /// delivery, NIP-67) or the limit must cut exactly (COUNT, NIP-45).
+    boundary_ok: bool,
     /// created_at of the event that filled a per-filter limit; events at
     /// the same timestamp keep being collected (see [`ScanCollector::push`]).
     boundary: Option<u64>,
 }
 
 impl EventCollector {
-    fn new(cap: usize) -> Self {
+    fn new(cap: usize, boundary_ok: bool) -> Self {
         EventCollector {
             events: Vec::new(),
             cap,
+            boundary_ok,
             boundary: None,
         }
     }
@@ -895,6 +901,9 @@ impl ScanCollector for EventCollector {
     }
     fn push(&mut self, event: Event, _id: [u8; 32], limit: usize) -> bool {
         if self.events.len() >= limit {
+            if !self.boundary_ok {
+                return false;
+            }
             match self.boundary {
                 Some(b) if b == event.created_at => {}
                 _ => return false,
@@ -963,7 +972,17 @@ impl ScanCollector for ItemCollector {
         } else if self.items.len() + 1 == limit {
             self.boundary = Some(event.created_at);
         }
-        self.items.push((event.created_at, id));
+        let protected = crate::nips::nip70::is_protected(&event);
+        let (gid, meta) = match crate::nips::nip29::group_id_any(&event) {
+            Some(gid) => {
+                let meta = (crate::nips::nip29::GROUP_META..=crate::nips::nip29::GROUP_PINS)
+                    .contains(&event.kind);
+                (Some(gid.to_string()), meta)
+            }
+            None => (None, false),
+        };
+        self.items
+            .push((event.created_at, id, protected, gid, meta));
         true
     }
     fn sort_key(&mut self) {
@@ -1229,6 +1248,14 @@ impl Store {
         if self.deleted.get(wtxn, &id)?.is_some() {
             return Ok(PutOutcome::PreviouslyDeleted);
         }
+        // NIP-01: kinds 20000-29999 are ephemeral: they are delivered to
+        // currently connected subscribers but never stored or indexed.
+        if (20000..30000).contains(&event.kind) {
+            return Ok(PutOutcome::Ephemeral);
+        }
+        // NIP-40: events whose expiration already passed are dropped. The
+        // check comes after the ephemeral range because "an expiration
+        // timestamp does not affect storage of ephemeral events".
         if self
             .expiry_enabled
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -1236,12 +1263,6 @@ impl Store {
             && exp < now
         {
             return Ok(PutOutcome::Expired);
-        }
-
-        // NIP-01: kinds 20000-29999 are ephemeral: they are delivered to
-        // currently connected subscribers but never stored or indexed.
-        if (20000..30000).contains(&event.kind) {
-            return Ok(PutOutcome::Ephemeral);
         }
 
         let outcome = if is_replaceable(event) {
@@ -1734,7 +1755,7 @@ impl Store {
         } else {
             max_limit
         };
-        let mut out = EventCollector::new(collect_cap);
+        let mut out = EventCollector::new(collect_cap, !count_mode);
         let more = self.scan_collect(filters, now, max_limit, count_mode, true, &mut out)?;
         Ok((out.events, more))
     }
@@ -1893,10 +1914,12 @@ impl Store {
 
         if filter.has_search() {
             // With the word index available, scan the index of every term
-            // and union the candidates (a note matching only the second
-            // term must still be found). Without the index, fall through to
-            // the time-range scans, where the terms are checked per event.
+            // and union the candidates in one merged walk (a note matching
+            // only the second term must still be found, and the limit
+            // applies to the union). Without the index, fall through to the
+            // time-range scans, where the terms are checked per event.
             if let Some(by_word) = self.by_word {
+                let mut ranges: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(terms.len());
                 for word in terms {
                     let start = {
                         let mut v = word.as_bytes().to_vec();
@@ -1908,9 +1931,10 @@ impl Store {
                         v.push(0x01);
                         v
                     };
-                    if !self.for_each(rtxn, by_word, &start, &end, &mut consider, more)? {
-                        return Ok(false);
-                    }
+                    ranges.push((start, end));
+                }
+                if !self.walk_merged(rtxn, by_word, &ranges, &mut consider, more)? {
+                    return Ok(false);
                 }
                 return Ok(out.full());
             }
@@ -1920,6 +1944,7 @@ impl Store {
         let until = filter.until.unwrap_or(u64::MAX);
 
         if let Some(authors) = &filter.authors {
+            let mut ranges: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(authors.len());
             for author in authors {
                 let Ok(pk) = hex::decode(author) else {
                     continue;
@@ -1927,11 +1952,15 @@ impl Store {
                 if pk.len() != ID_LEN {
                     continue;
                 }
-                let start = pubkey_key(&pk, since, &[0u8; ID_LEN]);
-                let end = pubkey_key(&pk, until, &[0xffu8; ID_LEN]);
-                if !self.for_each(rtxn, self.by_pubkey, &start, &end, &mut consider, more)? {
-                    return Ok(false);
-                }
+                ranges.push((
+                    pubkey_key(&pk, since, &[0u8; ID_LEN]),
+                    pubkey_key(&pk, until, &[0xffu8; ID_LEN]),
+                ));
+            }
+            if !ranges.is_empty()
+                && !self.walk_merged(rtxn, self.by_pubkey, &ranges, &mut consider, more)?
+            {
+                return Ok(false);
             }
             return Ok(out.full());
         }
@@ -1940,14 +1969,17 @@ impl Store {
             let tag_name = name.strip_prefix('#').unwrap_or(name);
             if tag_name.len() == 1 {
                 let name_byte = tag_name.as_bytes()[0];
+                let mut ranges: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
                 for value in string_values(values) {
                     if value.len() > TAG_VALUE_MAX {
                         continue;
                     }
-                    let (start, end) = tag_range(name_byte, value.as_bytes(), since, until);
-                    if !self.for_each(rtxn, self.by_tag, &start, &end, &mut consider, more)? {
-                        return Ok(false);
-                    }
+                    ranges.push(tag_range(name_byte, value.as_bytes(), since, until));
+                }
+                if !ranges.is_empty()
+                    && !self.walk_merged(rtxn, self.by_tag, &ranges, &mut consider, more)?
+                {
+                    return Ok(false);
                 }
                 return Ok(out.full());
             }
@@ -1958,12 +1990,17 @@ impl Store {
         }
 
         if let Some(kinds) = &filter.kinds {
+            let mut ranges: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(kinds.len());
             for kind in kinds {
-                let start = kind_key(*kind, since, &[0u8; ID_LEN]);
-                let end = kind_key(*kind, until, &[0xffu8; ID_LEN]);
-                if !self.for_each(rtxn, self.by_kind, &start, &end, &mut consider, more)? {
-                    return Ok(false);
-                }
+                ranges.push((
+                    kind_key(*kind, since, &[0u8; ID_LEN]),
+                    kind_key(*kind, until, &[0xffu8; ID_LEN]),
+                ));
+            }
+            if !ranges.is_empty()
+                && !self.walk_merged(rtxn, self.by_kind, &ranges, &mut consider, more)?
+            {
+                return Ok(false);
             }
             return Ok(out.full());
         }
@@ -1996,6 +2033,73 @@ impl Store {
             }
         }
         Ok(true)
+    }
+
+    /// Walks several index ranges in parallel, handing ids to `consider` in
+    /// global `(created_at, id)` descending order. A per-filter limit thus
+    /// applies to the union of every range (NIP-01: "the last n events
+    /// ordered by the created_at"): `{"authors": [A, B], "limit": 100}`
+    /// returns the 100 newest events by either author instead of filling
+    /// the limit from the first author only.
+    fn walk_merged(
+        &self,
+        rtxn: &RoTxn,
+        db: Database<Bytes, Bytes>,
+        ranges: &[(Vec<u8>, Vec<u8>)],
+        consider: &mut impl FnMut(&[u8]) -> Result<bool>,
+        more: &mut bool,
+    ) -> Result<bool> {
+        type RevIter<'a> = Box<dyn Iterator<Item = heed::Result<(&'a [u8], &'a [u8])>> + 'a>;
+        struct Head<'a> {
+            iter: RevIter<'a>,
+            next_key: Option<Vec<u8>>,
+        }
+        let mut heads: Vec<Head<'_>> = Vec::with_capacity(ranges.len());
+        for (start, end) in ranges {
+            let range = (
+                std::ops::Bound::Included(start.as_slice()),
+                std::ops::Bound::Excluded(end.as_slice()),
+            );
+            heads.push(Head {
+                iter: Box::new(db.rev_range(rtxn, &range)?),
+                next_key: None,
+            });
+        }
+        loop {
+            // The index keys are `(prefix..., created_at, id)`, so the
+            // newest head is the one with the largest (created_at, id)
+            // pair, not the largest full key.
+            let mut best: Option<(usize, [u8; 8], [u8; 32])> = None;
+            for (i, head) in heads.iter_mut().enumerate() {
+                if head.next_key.is_none() {
+                    match head.iter.next() {
+                        Some(Ok((key, _))) => head.next_key = Some(key.to_vec()),
+                        Some(Err(e)) => return Err(e.into()),
+                        None => {}
+                    }
+                }
+                if let Some(key) = &head.next_key {
+                    let created: [u8; 8] = key[key.len() - 40..key.len() - 32].try_into().unwrap();
+                    let id: [u8; 32] = key[key.len() - 32..].try_into().unwrap();
+                    if best
+                        .as_ref()
+                        .is_none_or(|(_, bc, bi)| (created, id) > (*bc, *bi))
+                    {
+                        best = Some((i, created, id));
+                    }
+                }
+            }
+            let Some((i, _, _)) = best else {
+                return Ok(true);
+            };
+            let key = heads[i].next_key.as_ref().expect("head was picked");
+            let id = &key[key.len() - ID_LEN..];
+            if !consider(id)? {
+                *more = true;
+                return Ok(false);
+            }
+            heads[i].next_key = None;
+        }
     }
 }
 
@@ -2667,6 +2771,128 @@ mod tests {
             assert_eq!(res.len(), 5, "all tied events are in one page");
             assert!(!more, "the tie completed the scan");
             assert!(res.windows(2).all(|w| w[0].created_at >= w[1].created_at));
+        });
+    }
+
+    #[test]
+    fn multi_author_limit_applies_to_the_union() {
+        // NIP-01: `{"authors": [A, B], "limit": n}` returns the n newest
+        // events by either author; the limit must not be consumed by the
+        // first author's range alone, and older events of the other author
+        // must not displace newer ones.
+        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
+        let now = unix_now();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let pub_a = "a".repeat(64);
+            let pub_b = "b".repeat(64);
+            let mut ea1 = event(1, "a1", now, vec![]);
+            ea1.pubkey = pub_a.clone();
+            ea1.id = nip01::compute_id(&ea1);
+            let mut ea2 = event(1, "a2", now - 1, vec![]);
+            ea2.pubkey = pub_a.clone();
+            ea2.id = nip01::compute_id(&ea2);
+            // B's only event is OLDER than both of A's; with limit 2 it
+            // must not be returned even though B sorts after A in the
+            // pubkey index.
+            let mut eb1 = event(1, "b1", now - 3, vec![]);
+            eb1.pubkey = pub_b.clone();
+            eb1.id = nip01::compute_id(&eb1);
+            for e in [&ea1, &ea2, &eb1] {
+                assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
+            }
+            let f: Filter = serde_json::from_value(serde_json::json!({
+                "authors": [pub_a, pub_b], "limit": 2
+            }))
+            .unwrap();
+            let (res, more) = db.query(vec![f], 500, now).await;
+            assert_eq!(res.len(), 2, "the two newest events are returned");
+            assert_eq!(res[0].id, ea1.id);
+            assert_eq!(res[1].id, ea2.id, "older B event must not displace A2");
+            assert!(more, "B's older event was cut");
+        });
+    }
+
+    #[test]
+    fn expiration_does_not_affect_ephemeral_events() {
+        // NIP-40: "An expiration timestamp does not affect storage of
+        // ephemeral events": an ephemeral event with a past expiration is
+        // still handled as ephemeral (delivered live, never stored).
+        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
+        let now = unix_now();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let ev = event(
+                21059,
+                "ephemeral wrap",
+                now,
+                vec![vec!["expiration".into(), (now - 50).to_string()]],
+            );
+            assert_eq!(db.put(ev.clone(), now).await, PutOutcome::Ephemeral);
+            let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [21059]})).unwrap();
+            let (res, _) = db.query(vec![f], 500, now).await;
+            assert!(res.is_empty(), "ephemeral events are never stored");
+        });
+    }
+
+    #[test]
+    fn neg_items_carry_visibility_flags() {
+        // NIP-70/NIP-29: the negentropy items carry the protected flag and
+        // the group id so the connection layer can mirror the REQ path's
+        // visibility rules.
+        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
+        let now = unix_now();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let protected = event(1, "protected", now, vec![vec!["-".into()]]);
+            let grouped = event(1, "grouped", now - 1, vec![vec!["h".into(), "g1".into()]]);
+            let plain = event(1, "plain", now - 2, vec![]);
+            for e in [&protected, &grouped, &plain] {
+                assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
+            }
+            let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap();
+            let (items, _) = db.neg_items(f, 100, now).await;
+            let by_id = |id: &str| items.iter().find(|i| hex::encode(i.1) == id).unwrap();
+            assert!(by_id(&protected.id).2, "protected flag set");
+            assert!(!by_id(&plain.id).2, "plain events are not protected");
+            assert_eq!(
+                by_id(&grouped.id).3.as_deref(),
+                Some("g1"),
+                "group id captured"
+            );
+            assert!(
+                !by_id(&grouped.id).4,
+                "regular group events are not metadata"
+            );
+        });
+    }
+
+    #[test]
+    fn count_stops_exactly_at_the_cap() {
+        // NIP-45: the relay's count limit cuts exactly — the created_at
+        // boundary continuation of the REQ path (NIP-67) must not inflate
+        // the count beyond the cap or hide the `approximate` flag.
+        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
+        let now = unix_now();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            // All events share one created_at so the boundary continuation
+            // would previously collect every one of them.
+            for i in 0..7 {
+                let e = event(
+                    7,
+                    &format!("r-{i}"),
+                    now,
+                    vec![vec!["e".into(), "t".repeat(64)]],
+                );
+                assert_eq!(db.put(e, now).await, PutOutcome::Stored);
+            }
+            let f: Filter =
+                serde_json::from_value(serde_json::json!({"kinds": [7], "#e": ["t".repeat(64)]}))
+                    .unwrap();
+            let (events, more) = db.count(vec![f], 5, now).await;
+            assert_eq!(events.len(), 5, "the cap cuts exactly");
+            assert!(more, "the capped scan is flagged as approximate");
         });
     }
 

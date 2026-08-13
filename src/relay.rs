@@ -759,7 +759,10 @@ impl Relay {
             return Err("invalid: empty tag".into());
         }
 
-        if event.content.len() > limits.max_content_bytes {
+        // NIP-11's `max_content_length` is a count of unicode characters,
+        // so the enforcement counts characters (the byte size is bounded by
+        // the websocket message limit instead).
+        if event.content.chars().count() > limits.max_content_bytes {
             return Err("invalid: content too large".into());
         }
         if event.tags.len() > limits.max_tags {

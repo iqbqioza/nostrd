@@ -79,6 +79,15 @@ pub fn group_id_d(event: &Event) -> Option<&str> {
     tag_value(event, D)
 }
 
+/// Group id of a stored event for visibility checks: the `h` tag for user
+/// and moderation events, the `d` tag for relay-generated metadata events.
+pub fn group_id_any(event: &Event) -> Option<&str> {
+    match event.kind {
+        GROUP_META..=GROUP_PINS => group_id_d(event),
+        _ => group_id(event),
+    }
+}
+
 /// The `previous` tag values of an event (NIP-29 timeline references).
 pub fn previous_tags(event: &Event) -> Vec<String> {
     tag_values(event, "previous").map(str::to_string).collect()
@@ -424,13 +433,17 @@ impl GroupStore {
 
     /// Whether a stored event may be served to `authed` (NIP-29 read access).
     pub fn visible_to(&self, event: &Event, authed: Option<&str>) -> bool {
-        let gid = match event.kind {
-            GROUP_META..=GROUP_PINS => group_id_d(event),
-            _ => group_id(event),
-        };
-        let Some(gid) = gid else {
+        let Some(gid) = group_id_any(event) else {
             return true;
         };
+        let is_meta = (GROUP_META..=GROUP_PINS).contains(&event.kind);
+        self.visible_gid(gid, is_meta, authed)
+    }
+
+    /// Whether the content of a group may be served to `authed`. `is_meta`
+    /// distinguishes relay-generated metadata events (kinds 39000-39005),
+    /// which `hidden` groups additionally withhold from non-members.
+    pub fn visible_gid(&self, gid: &str, is_meta: bool, authed: Option<&str>) -> bool {
         // Content of a deleted group is never served: the group is gone,
         // and its (possibly private) history must not become readable by
         // everyone.
@@ -444,7 +457,7 @@ impl GroupStore {
         if group.settings.private && !member {
             return false;
         }
-        if group.settings.hidden && (GROUP_META..=GROUP_PINS).contains(&event.kind) && !member {
+        if group.settings.hidden && is_meta && !member {
             return false;
         }
         true
