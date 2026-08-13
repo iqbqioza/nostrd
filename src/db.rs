@@ -170,9 +170,10 @@ impl DbClient {
         expiry_enabled: bool,
         errors: Arc<std::sync::atomic::AtomicU64>,
         request_timeout_secs: u64,
+        max_indexed_words: usize,
     ) -> Result<DbClient> {
         let expiry = Arc::new(std::sync::atomic::AtomicBool::new(expiry_enabled));
-        let store = Store::open(cfg, Arc::clone(&expiry))?;
+        let store = Store::open(cfg, Arc::clone(&expiry), max_indexed_words)?;
         let (tx, mut rx) = mpsc::unbounded_channel();
         let thread_errors = Arc::clone(&errors);
         std::thread::spawn(move || {
@@ -805,58 +806,178 @@ struct Store {
     /// NIP-40 expiration handling is only active when the NIP is enabled.
     /// Shared with the relay so that a config reload can toggle it at runtime.
     expiry_enabled: Arc<std::sync::atomic::AtomicBool>,
+    /// NIP-50 word index: maximum number of words indexed per event.
+    max_indexed_words: usize,
     /// Ceiling for the automatic map growth (bytes).
     map_max_size: u64,
     /// System page size in bytes (LMDB uses it for its pages).
     page_size: usize,
 }
 
-/// `(created_at, id)` records returned by the NIP-77 negentropy query.
+/// `(created_at, id)` records returned by the NIP-77 negentropy query,
+/// keeping the memory footprint at a few bytes per record.
 type NegItems = Vec<(u64, [u8; 32])>;
+
+/// NIP-50 search collection budget: the scan gathers up to this many
+/// candidates (instead of the response limit) so that the relevance
+/// ordering can pick the best matches before the limit is applied.
+const SEARCH_BUDGET_MULTIPLIER: usize = 8;
+const SEARCH_BUDGET_MAX: usize = 100_000;
 
 /// Output collector for a scan: either full events (REQ/COUNT) or
 /// `(created_at, id)` records (NIP-77 negentropy, memory-efficient).
 trait ScanCollector {
     fn len(&self) -> usize;
-    /// Pushes a matched event; must return `false` when the per-filter
-    /// limit is reached so the scan stops.
+    /// Whether the scan must stop: the hard collection cap is reached and
+    /// no created_at boundary is being completed.
+    fn full(&self) -> bool;
+    /// The hard collection cap of this collector.
+    fn cap(&self) -> usize;
+    /// Starts the per-filter limit accounting over (the boundary timestamp
+    /// belongs to one filter's limit, not the next one's).
+    fn reset_boundary(&mut self);
+    /// Pushes a matched event; returns `false` when the per-filter limit is
+    /// reached and the event is strictly older than the boundary timestamp,
+    /// so the scan stops. Events at the boundary timestamp are still
+    /// collected: a page never splits a created_at tie across responses
+    /// (NIP-01 ordering, NIP-67 boundary cursor).
     fn push(&mut self, event: Event, id: [u8; 32], limit: usize) -> bool;
-    /// Sorts the collected records by the NIP-01 ordering (newest first).
+    /// Sorts the collected records by the NIP-01 ordering (newest first,
+    /// lowest id first on equal timestamps).
     fn sort_key(&mut self);
+    /// Sorts by NIP-50 search relevance (most matching terms first), then
+    /// by the NIP-01 ordering.
+    fn sort_relevance(&mut self, terms: &[String]);
+    /// Keeps only the first `take` records.
+    fn truncate_to(&mut self, take: usize);
 }
 
-struct EventCollector(Vec<Event>);
+struct EventCollector {
+    events: Vec<Event>,
+    /// Hard stop for the whole scan.
+    cap: usize,
+    /// created_at of the event that filled a per-filter limit; events at
+    /// the same timestamp keep being collected (see [`ScanCollector::push`]).
+    boundary: Option<u64>,
+}
+
+impl EventCollector {
+    fn new(cap: usize) -> Self {
+        EventCollector {
+            events: Vec::new(),
+            cap,
+            boundary: None,
+        }
+    }
+}
+
+/// How many of `terms` appear in the event's content (NIP-50 relevance).
+fn relevance(event: &Event, terms: &[String]) -> usize {
+    let content = event.content.to_lowercase();
+    terms
+        .iter()
+        .filter(|t| content.contains(t.as_str()))
+        .count()
+}
 
 impl ScanCollector for EventCollector {
     fn len(&self) -> usize {
-        self.0.len()
+        self.events.len()
+    }
+    fn full(&self) -> bool {
+        self.events.len() >= self.cap && self.boundary.is_none()
+    }
+    fn cap(&self) -> usize {
+        self.cap
+    }
+    fn reset_boundary(&mut self) {
+        self.boundary = None;
     }
     fn push(&mut self, event: Event, _id: [u8; 32], limit: usize) -> bool {
-        self.0.push(event);
-        self.0.len() < limit
+        if self.events.len() >= limit {
+            match self.boundary {
+                Some(b) if b == event.created_at => {}
+                _ => return false,
+            }
+        } else if self.events.len() + 1 == limit {
+            self.boundary = Some(event.created_at);
+        }
+        self.events.push(event);
+        true
     }
     fn sort_key(&mut self) {
-        self.0.sort_by(|a, b| {
+        self.events.sort_by(|a, b| {
             b.created_at
                 .cmp(&a.created_at)
                 .then_with(|| a.id.cmp(&b.id))
         });
     }
+    fn sort_relevance(&mut self, terms: &[String]) {
+        self.events.sort_by(|a, b| {
+            relevance(b, terms)
+                .cmp(&relevance(a, terms))
+                .then_with(|| b.created_at.cmp(&a.created_at))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+    }
+    fn truncate_to(&mut self, take: usize) {
+        self.events.truncate(take);
+    }
 }
 
-struct ItemCollector(NegItems);
+struct ItemCollector {
+    items: NegItems,
+    cap: usize,
+    boundary: Option<u64>,
+}
+
+impl ItemCollector {
+    fn new(cap: usize) -> Self {
+        ItemCollector {
+            items: Vec::new(),
+            cap,
+            boundary: None,
+        }
+    }
+}
 
 impl ScanCollector for ItemCollector {
     fn len(&self) -> usize {
-        self.0.len()
+        self.items.len()
+    }
+    fn full(&self) -> bool {
+        self.items.len() >= self.cap && self.boundary.is_none()
+    }
+    fn cap(&self) -> usize {
+        self.cap
+    }
+    fn reset_boundary(&mut self) {
+        self.boundary = None;
     }
     fn push(&mut self, event: Event, id: [u8; 32], limit: usize) -> bool {
-        self.0.push((event.created_at, id));
-        self.0.len() < limit
+        if self.items.len() >= limit {
+            match self.boundary {
+                Some(b) if b == event.created_at => {}
+                _ => return false,
+            }
+        } else if self.items.len() + 1 == limit {
+            self.boundary = Some(event.created_at);
+        }
+        self.items.push((event.created_at, id));
+        true
     }
     fn sort_key(&mut self) {
-        self.0
+        self.items
             .sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    }
+    fn sort_relevance(&mut self, terms: &[String]) {
+        // Negentropy items are re-sorted by the protocol anyway; keep the
+        // relevance path a no-op for the same ordering as sort_key.
+        let _ = terms;
+        self.sort_key();
+    }
+    fn truncate_to(&mut self, take: usize) {
+        self.items.truncate(take);
     }
 }
 
@@ -864,6 +985,7 @@ impl Store {
     fn open(
         cfg: &DatabaseConfig,
         expiry_enabled: Arc<std::sync::atomic::AtomicBool>,
+        max_indexed_words: usize,
     ) -> Result<Store> {
         std::fs::create_dir_all(&cfg.path)?;
         // SAFETY: the returned `Env` is owned by `Store` and outlives every
@@ -921,6 +1043,7 @@ impl Store {
             banned,
             first_seen,
             expiry_enabled,
+            max_indexed_words: max_indexed_words.max(1),
             map_max_size,
             page_size,
         })
@@ -1173,6 +1296,16 @@ impl Store {
         self.by_created.put(wtxn, &created_key(created, id), b"")?;
         self.by_pubkey
             .put(wtxn, &pubkey_key(pubkey, created, id), b"")?;
+        // NIP-26: the delegator's pubkey is indexed alongside the author's,
+        // so a REQ with `authors: [<delegator>]` also finds events published
+        // by a delegatee on the delegator's behalf.
+        if let Some(delegator) = crate::nips::nip26::delegation(event)
+            && let Ok(delegator_bytes) = hex::decode(delegator[0])
+            && delegator_bytes.len() == ID_LEN
+        {
+            self.by_pubkey
+                .put(wtxn, &pubkey_key(&delegator_bytes, created, id), b"")?;
+        }
         self.by_kind
             .put(wtxn, &kind_key(event.kind, created, id), b"")?;
         for tag in &event.tags {
@@ -1194,7 +1327,7 @@ impl Store {
         if let Some(by_word) = self.by_word {
             for word in nip50::tokenize(&event.content)
                 .iter()
-                .take(nip50::MAX_INDEXED_WORDS)
+                .take(self.max_indexed_words)
             {
                 by_word.put(wtxn, &word_key(word, created, id), b"")?;
             }
@@ -1217,6 +1350,14 @@ impl Store {
             .delete(wtxn, &created_key(event.created_at, id))?;
         self.by_pubkey
             .delete(wtxn, &pubkey_key(&pubkey, event.created_at, id))?;
+        // NIP-26: drop the delegator's index entry as well.
+        if let Some(delegator) = crate::nips::nip26::delegation(&event)
+            && let Ok(delegator_bytes) = hex::decode(delegator[0])
+            && delegator_bytes.len() == ID_LEN
+        {
+            self.by_pubkey
+                .delete(wtxn, &pubkey_key(&delegator_bytes, event.created_at, id))?;
+        }
         self.by_kind
             .delete(wtxn, &kind_key(event.kind, event.created_at, id))?;
         for tag in &event.tags {
@@ -1242,7 +1383,7 @@ impl Store {
         if let Some(by_word) = self.by_word {
             for word in nip50::tokenize(&event.content)
                 .iter()
-                .take(nip50::MAX_INDEXED_WORDS)
+                .take(self.max_indexed_words)
             {
                 by_word.delete(wtxn, &word_key(word, event.created_at, id))?;
             }
@@ -1583,29 +1724,47 @@ impl Store {
         max_limit: usize,
         count_mode: bool,
     ) -> Result<(Vec<Event>, bool)> {
-        let mut out = EventCollector(Vec::new());
-        let more = self.scan_collect(filters, now, max_limit, count_mode, &mut out)?;
-        Ok((out.0, more))
+        let has_search = filters.iter().any(Filter::has_search);
+        // NIP-50: relevance ordering needs more candidates than the response
+        // limit, so the scan gathers up to the search budget.
+        let collect_cap = if has_search {
+            max_limit
+                .saturating_mul(SEARCH_BUDGET_MULTIPLIER)
+                .min(SEARCH_BUDGET_MAX)
+        } else {
+            max_limit
+        };
+        let mut out = EventCollector::new(collect_cap);
+        let more = self.scan_collect(filters, now, max_limit, count_mode, true, &mut out)?;
+        Ok((out.events, more))
     }
 
     /// Collects only `(created_at, id)` records of the matching events
-    /// (NIP-77 negentropy). Keeps the memory footprint at a few bytes per
-    /// record instead of materializing every full event.
+    /// (NIP-77 negentropy). Keeps the memory footprint small instead of
+    /// materializing every full event.
     fn scan_neg(&self, filter: &Filter, now: u64, max_items: usize) -> Result<(NegItems, bool)> {
-        let mut out = ItemCollector(Vec::new());
+        let collect_cap = if filter.has_search() {
+            max_items
+                .saturating_mul(SEARCH_BUDGET_MULTIPLIER)
+                .min(SEARCH_BUDGET_MAX)
+        } else {
+            max_items
+        };
+        let mut out = ItemCollector::new(collect_cap);
         let more = self.scan_collect(
             std::slice::from_ref(filter),
             now,
             max_items,
             false,
+            false,
             &mut out,
         )?;
-        Ok((out.0, more))
+        Ok((out.items, more))
     }
 
     /// Shared scan core: applies the filters through the index-selected
     /// candidate walks and collects into `out`. Returns `true` when the
-    /// scan stopped at the limit instead of exhausting the matches
+    /// scan stopped at a limit instead of exhausting the matches
     /// (NIP-67 EOSE completeness hint).
     #[allow(clippy::too_many_arguments)]
     fn scan_collect<C: ScanCollector>(
@@ -1614,6 +1773,7 @@ impl Store {
         now: u64,
         max_limit: usize,
         count_mode: bool,
+        sort_search: bool,
         out: &mut C,
     ) -> Result<bool> {
         if max_limit == 0 {
@@ -1624,38 +1784,69 @@ impl Store {
         // `more` is true when a scan stopped because of a limit instead of
         // exhausting the matching records (NIP-67 EOSE completeness hint).
         let mut more = false;
+        // Union of every search filter's terms, for the relevance ordering,
+        // and the response cap of the search results (min of the search
+        // filters' limits, bounded by the relay's max_limit).
+        let mut all_terms: Vec<String> = Vec::new();
+        let mut search_take = max_limit;
 
         for filter in filters {
-            if out.len() >= max_limit {
+            if out.full() {
                 more = true;
                 break;
             }
+            let has_search = filter.has_search();
             let limit = if count_mode {
                 max_limit
+            } else if has_search {
+                // NIP-50: the limit is applied after the relevance sort, so
+                // candidates are gathered up to the collection budget.
+                out.cap()
             } else {
                 filter.limit.unwrap_or(max_limit).min(max_limit)
             };
-            let terms = if filter.has_search() {
-                nip50::terms(filter.search.as_deref().unwrap_or(""))
+            let terms = if has_search {
+                let terms = nip50::terms(filter.search.as_deref().unwrap_or(""));
+                for t in &terms {
+                    if !all_terms.contains(t) {
+                        all_terms.push(t.clone());
+                    }
+                }
+                if let Some(l) = filter.limit {
+                    search_take = search_take.min(l);
+                }
+                terms
             } else {
                 Vec::new()
             };
-            let stop = self.scan_filter(
-                &rtxn, filter, &terms, now, limit, max_limit, &mut seen, out, &mut more,
-            )?;
+            out.reset_boundary();
+            let stop =
+                self.scan_filter(&rtxn, filter, &terms, now, limit, &mut seen, out, &mut more)?;
             if stop {
                 break;
             }
         }
         if !count_mode {
-            // NIP-01: newest events first; on equal created_at the event
-            // with the lowest id comes first.
-            ScanCollector::sort_key(out);
+            if sort_search && !all_terms.is_empty() {
+                // NIP-50: results are ordered by search relevance (how many
+                // of the query's terms the content matches), not by
+                // created_at, and the limit is applied after that ordering.
+                out.sort_relevance(&all_terms);
+                let take = search_take.min(max_limit);
+                if out.len() > take {
+                    more = true;
+                    out.truncate_to(take);
+                }
+            } else {
+                // NIP-01: newest events first; on equal created_at the event
+                // with the lowest id comes first.
+                ScanCollector::sort_key(out);
+            }
         }
         Ok(more)
     }
 
-    /// Returns `true` when the global limit was reached.
+    /// Returns `true` when the global collection cap was reached.
     #[allow(clippy::too_many_arguments)]
     fn scan_filter<C: ScanCollector>(
         &self,
@@ -1664,11 +1855,11 @@ impl Store {
         terms: &[String],
         now: u64,
         limit: usize,
-        max_limit: usize,
         seen: &mut HashSet<Vec<u8>>,
         out: &mut C,
         more: &mut bool,
     ) -> Result<bool> {
+        let cap = out.cap();
         let mut consider = |id: &[u8]| -> Result<bool> {
             consider_event(
                 self.events,
@@ -1685,12 +1876,11 @@ impl Store {
                 seen,
                 out,
                 limit,
-                max_limit,
             )
         };
 
         if let Some(ids) = &filter.ids {
-            for id in ids.iter().take(max_limit) {
+            for id in ids.iter().take(cap) {
                 if let Ok(id) = hex::decode(id)
                     && !consider(&id)?
                 {
@@ -1698,30 +1888,31 @@ impl Store {
                     return Ok(false);
                 }
             }
-            return Ok(out.len() >= max_limit);
+            return Ok(out.full());
         }
 
         if filter.has_search() {
-            // With the word index available, scan it for the first term and
-            // let `deliverable` verify the remaining terms against the
-            // content. Without the index, fall through to the time-range
-            // scans, where the terms are still checked per event.
+            // With the word index available, scan the index of every term
+            // and union the candidates (a note matching only the second
+            // term must still be found). Without the index, fall through to
+            // the time-range scans, where the terms are checked per event.
             if let Some(by_word) = self.by_word {
-                let Some(word) = terms.first() else {
-                    return Ok(false);
-                };
-                let start = {
-                    let mut v = word.as_bytes().to_vec();
-                    v.push(0x00);
-                    v
-                };
-                let end = {
-                    let mut v = word.as_bytes().to_vec();
-                    v.push(0x01);
-                    v
-                };
-                let _ = self.for_each(rtxn, by_word, &start, &end, &mut consider, more)?;
-                return Ok(out.len() >= max_limit);
+                for word in terms {
+                    let start = {
+                        let mut v = word.as_bytes().to_vec();
+                        v.push(0x00);
+                        v
+                    };
+                    let end = {
+                        let mut v = word.as_bytes().to_vec();
+                        v.push(0x01);
+                        v
+                    };
+                    if !self.for_each(rtxn, by_word, &start, &end, &mut consider, more)? {
+                        return Ok(false);
+                    }
+                }
+                return Ok(out.full());
             }
         }
 
@@ -1742,7 +1933,7 @@ impl Store {
                     return Ok(false);
                 }
             }
-            return Ok(out.len() >= max_limit);
+            return Ok(out.full());
         }
 
         if let Some((name, values)) = filter.tags.iter().next() {
@@ -1758,7 +1949,7 @@ impl Store {
                         return Ok(false);
                     }
                 }
-                return Ok(out.len() >= max_limit);
+                return Ok(out.full());
             }
             // Multi-letter tag names are not indexed (NIP-01 only requires
             // single-letter tags to be indexed): fall through to the
@@ -1774,7 +1965,7 @@ impl Store {
                     return Ok(false);
                 }
             }
-            return Ok(out.len() >= max_limit);
+            return Ok(out.full());
         }
 
         let start = created_key(since, &[0u8; ID_LEN]);
@@ -1823,10 +2014,9 @@ fn consider_event<C: ScanCollector>(
     seen: &mut HashSet<Vec<u8>>,
     out: &mut C,
     limit: usize,
-    max_limit: usize,
 ) -> Result<bool> {
-    if out.len() >= max_limit {
-        // The global limit is reached: stop the scan (and any remaining
+    if out.full() {
+        // The collection cap is reached: stop the scan (and any remaining
         // ranges of this filter) instead of walking them to completion.
         return Ok(false);
     }
@@ -1883,8 +2073,11 @@ fn deliverable(
         return Ok(false);
     }
     if !terms.is_empty() {
+        // NIP-50: an event matches when at least one query term is present
+        // in its content; the relevance ordering ranks events matching
+        // every term first.
         let content = event.content.to_lowercase();
-        if terms.iter().any(|t| !content.contains(t.as_str())) {
+        if !terms.iter().any(|t| content.contains(t.as_str())) {
             return Ok(false);
         }
     }
@@ -1960,7 +2153,7 @@ mod tests {
 
     #[test]
     fn insert_and_query() {
-        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0).unwrap();
+        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -1991,7 +2184,7 @@ mod tests {
 
     #[test]
     fn replaceable_and_deletion() {
-        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0).unwrap();
+        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2016,7 +2209,7 @@ mod tests {
 
     #[test]
     fn expired_events_are_filtered() {
-        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0).unwrap();
+        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2031,7 +2224,7 @@ mod tests {
 
     #[test]
     fn deletion_by_address_and_author() {
-        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0).unwrap();
+        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2090,7 +2283,7 @@ mod tests {
 
     #[test]
     fn deletion_requests_are_never_deleted() {
-        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0).unwrap();
+        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2128,7 +2321,7 @@ mod tests {
 
     #[test]
     fn metadata_and_follows_are_replaceable() {
-        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0).unwrap();
+        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2146,7 +2339,7 @@ mod tests {
 
     #[test]
     fn equal_timestamp_replaceable_keeps_lowest_id() {
-        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0).unwrap();
+        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2171,7 +2364,7 @@ mod tests {
 
     #[test]
     fn banned_events_are_removed_and_rejected() {
-        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0).unwrap();
+        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2199,7 +2392,7 @@ mod tests {
     fn ephemeral_events_are_not_stored() {
         // NIP-01: kinds 20000-29999 must not be stored (NIP-59 requires
         // kind 21059 in particular to never be stored).
-        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0).unwrap();
+        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2220,7 +2413,7 @@ mod tests {
 
     #[test]
     fn gift_wraps_to_are_deleted() {
-        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0).unwrap();
+        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2267,7 +2460,7 @@ mod tests {
             map_max_size: 32 * 1024 * 1024,
             ..config()
         };
-        let db = DbClient::open(&cfg, true, Arc::new(Default::default()), 0).unwrap();
+        let db = DbClient::open(&cfg, true, Arc::new(Default::default()), 0, 128).unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2300,7 +2493,7 @@ mod tests {
         // A pubkey's first event records its arrival; later events within
         // the trust window are rejected by the relay. Here we verify the
         // bookkeeping itself.
-        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0).unwrap();
+        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2328,7 +2521,7 @@ mod tests {
     #[test]
     fn expiry_enabled_toggles_at_runtime() {
         // A config reload must be able to enable/disable NIP-40 handling.
-        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0).unwrap();
+        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2362,7 +2555,7 @@ mod tests {
     fn multiletter_tag_filters_match() {
         // NIP-01 only requires single-letter tags to be indexed; filters on
         // longer tag names must still match via the full scan.
-        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0).unwrap();
+        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2388,6 +2581,96 @@ mod tests {
     }
 
     #[test]
+    fn delegated_events_match_delegator_queries() {
+        // NIP-26: REQ with `authors: [<delegator>]` must also return events
+        // published by a delegatee on the delegator's behalf.
+        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
+        let now = unix_now();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let delegator = "a".repeat(64);
+            let delegatee = "b".repeat(64);
+            let mut delegated = event(1, "delegated", now, vec![]);
+            delegated.pubkey = delegatee.clone();
+            delegated.tags = vec![vec![
+                "delegation".into(),
+                delegator.clone(),
+                "kind=1".into(),
+                "00".repeat(64),
+            ]];
+            delegated.id = nip01::compute_id(&delegated);
+            let own = event(1, "own", now, vec![]);
+
+            assert_eq!(db.put(delegated.clone(), now).await, PutOutcome::Stored);
+            assert_eq!(db.put(own.clone(), now).await, PutOutcome::Stored);
+
+            let f: Filter =
+                serde_json::from_value(serde_json::json!({"authors": [delegator]})).unwrap();
+            let (res, _) = db.query(vec![f], 500, now).await;
+            assert_eq!(res.len(), 1, "the delegated event is found");
+            assert_eq!(res[0].id, delegated.id);
+            // The delegatee's own key finds both its events.
+            let f: Filter =
+                serde_json::from_value(serde_json::json!({"authors": [delegatee]})).unwrap();
+            let (res, _) = db.query(vec![f], 500, now).await;
+            assert_eq!(res.len(), 1);
+        });
+    }
+
+    #[test]
+    fn search_results_are_relevance_ordered() {
+        // NIP-50: results are ordered by how well they match the query, and
+        // the limit is applied after that ordering. Partial matches rank
+        // below full matches.
+        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
+        let now = unix_now();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            // Two terms matched, but older than the single-term note.
+            let both = event(1, "nostr bitcoin and more", now - 100, vec![]);
+            let one = event(1, "nostr only", now, vec![]);
+            let none = event(1, "chess news", now, vec![]);
+            assert_eq!(db.put(both.clone(), now).await, PutOutcome::Stored);
+            assert_eq!(db.put(one.clone(), now).await, PutOutcome::Stored);
+            assert_eq!(db.put(none.clone(), now).await, PutOutcome::Stored);
+
+            let f: Filter =
+                serde_json::from_value(serde_json::json!({"search": "nostr bitcoin"})).unwrap();
+            let (res, more) = db.query(vec![f], 500, now).await;
+            assert_eq!(res.len(), 2);
+            assert_eq!(
+                res[0].id, both.id,
+                "the note matching both terms ranks first"
+            );
+            assert_eq!(res[1].id, one.id, "partial matches rank below");
+            assert!(!more, "both matches were delivered");
+            assert!(!res.iter().any(|e| e.id == none.id));
+        });
+    }
+
+    #[test]
+    fn created_at_ties_are_not_split_across_pages() {
+        // NIP-01 ordering / NIP-67: when the limit cuts inside a group of
+        // events sharing the oldest created_at, every event at that
+        // timestamp is included in the same response.
+        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
+        let now = unix_now();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            for i in 0..5 {
+                let e = event(1, &format!("tie-{i}"), now, vec![]);
+                assert_eq!(db.put(e, now).await, PutOutcome::Stored);
+            }
+            let f: Filter =
+                serde_json::from_value(serde_json::json!({"kinds": [1], "limit": 3})).unwrap();
+            let (res, more) = db.query(vec![f], 500, now).await;
+            assert_eq!(res.len(), 5, "all tied events are in one page");
+            assert!(!more, "the tie completed the scan");
+            assert!(res.windows(2).all(|w| w[0].created_at >= w[1].created_at));
+        });
+    }
+
+    #[test]
     fn search_works_without_word_index() {
         // NIP-50 must work even when database.search_index is disabled: the
         // relay falls back to a full scan with content term checks.
@@ -2395,7 +2678,7 @@ mod tests {
             search_index: false,
             ..config()
         };
-        let db = DbClient::open(&cfg, true, Arc::new(Default::default()), 0).unwrap();
+        let db = DbClient::open(&cfg, true, Arc::new(Default::default()), 0, 128).unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {

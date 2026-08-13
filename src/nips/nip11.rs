@@ -36,7 +36,7 @@ pub fn relay_info(config: &Config, stats: &Stats, self_pubkey: Option<&str>) -> 
             "payment_required": false,
             "restricted_writes": false,
             "created_at_lower_limit": 0,
-            "created_at_upper_limit": null,
+            "created_at_upper_limit": limits.max_created_at_future,
             "default_limit": limits.max_limit,
         },
         "retention": [

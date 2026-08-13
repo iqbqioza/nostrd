@@ -22,7 +22,12 @@ pub mod nip98;
 /// File-storage related NIPs (git NIP-34, file metadata NIP-94, HTTP file
 /// storage NIP-96) are deliberately not included per the project rules.
 /// The deprecated NIP-04 is also omitted.
+///
+/// Note: [`Config::supported_nips`] advertises only the relay-side NIPs
+/// (see `RELAY_NIPS`); this registry is kept as documentation of the whole
+/// landscape.
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub struct NipDef {
     pub num: u16,
     /// Human-readable title; kept for documentation only.
@@ -50,6 +55,7 @@ pub const CLIENT_NIPS: &[(&str, &str)] = &[
     ("F4", "Podcasts"),
 ];
 
+#[allow(dead_code)]
 pub const NIPS: &[NipDef] = &[
     NipDef {
         num: 1,

@@ -337,9 +337,6 @@ impl Conn {
         {
             let groups = self.relay.groups.read().await;
             for event in events {
-                if !self.is_authed() && nip70::is_protected(&event) {
-                    continue;
-                }
                 if !self.visible_to(&groups, &event) {
                     continue;
                 }
@@ -450,6 +447,12 @@ impl Conn {
             .db
             .count(filters.clone(), count_limit, unix_now())
             .await;
+        // NIP-70: protected events are only counted for authenticated
+        // clients, so COUNT never leaks them to unauthenticated peers.
+        let events: Vec<Event> = events
+            .into_iter()
+            .filter(|e| self.is_authed() || !nip70::is_protected(e))
+            .collect();
         self.send_json(nip45::count_response(sub_id, &filters, &events, more));
     }
 
@@ -465,11 +468,14 @@ impl Conn {
                 .iter()
                 .any(|t| t.len() >= 2 && t[0] == "p" && self.authed_pubkeys.contains(&t[1]))
     }
-
     /// Whether a stored or live event may be served on this connection
     /// (NIP-70 protected, NIP-59 gift-wrap recipient and NIP-29 group
     /// access checks).
     fn visible_to(&self, groups: &nip29::GroupStore, event: &Event) -> bool {
+        // NIP-70: protected events are only served to authenticated clients.
+        // The `-` tag constrains *publication* (author-only, enforced on the
+        // write path); NIP-43's relay-generated membership metadata carries
+        // it by spec while remaining readable to authenticated clients.
         if !self.is_authed() && nip70::is_protected(event) {
             return false;
         }
@@ -484,7 +490,6 @@ impl Conn {
                 .any(|pk| groups.visible_to(event, Some(pk)))
         }
     }
-
     /// Streams live events that match active subscriptions.
     ///
     /// `groups` is only present when the batch contains group events (the
@@ -496,6 +501,8 @@ impl Conn {
         if self.subs.is_empty() {
             return;
         }
+        // NIP-70: protected events are only delivered to authenticated
+        // clients.
         if !self.is_authed() && nip70::is_protected(event) {
             return;
         }

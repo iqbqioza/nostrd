@@ -3,9 +3,18 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Error, Result};
-use crate::nips::NIPS;
 
 pub const DEFAULT_CONFIG: &str = "nostrd.toml";
+
+/// NIPs with relay-side behaviour implemented by this relay, as advertised
+/// in the NIP-11 document. NIPs whose behaviour is purely client-side are
+/// deliberately not advertised (NIP-11: "Client-side NIPs SHOULD NOT be
+/// advertised"), and file-storage NIPs (34/94/95/96) are excluded per the
+/// project rules. NIP-33 was merged into NIP-01 but remains advertised for
+/// clients that check it.
+pub const RELAY_NIPS: &[u16] = &[
+    1, 9, 11, 13, 26, 29, 33, 40, 42, 43, 45, 50, 62, 67, 70, 77, 86, 98,
+];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -183,7 +192,7 @@ impl Default for LimitsConfig {
             max_subscriptions: 20,
             max_limit: 500,
             count_limit: 2_000,
-            max_sub_id_len: 256,
+            max_sub_id_len: 64,
             max_content_bytes: 64 * 1024,
             max_tags: 2_000,
             max_tag_value_bytes: 1_024,
@@ -271,12 +280,24 @@ impl Config {
     }
 
     /// The set of NIPs this relay claims to support (NIP-11).
+    ///
+    /// Only NIPs with actual relay-side behaviour are advertised: the NIP-11
+    /// spec says client-side NIPs SHOULD NOT be advertised, and advertising
+    /// them misleads clients (e.g. into relying on NIP-02 or NIP-05 features
+    /// this relay does not provide).
     pub fn supported_nips(&self) -> Vec<u16> {
         if !self.relay.enabled_nips.is_empty() {
-            return self.relay.enabled_nips.clone();
+            return self
+                .relay
+                .enabled_nips
+                .iter()
+                .copied()
+                .filter(|num| RELAY_NIPS.contains(num))
+                .collect();
         }
-        NIPS.iter()
-            .map(|n| n.num)
+        RELAY_NIPS
+            .iter()
+            .copied()
             .filter(|num| !self.relay.disabled_nips.contains(num))
             .collect()
     }
@@ -331,6 +352,29 @@ mod tests {
         assert!(cfg.supported_nips().contains(&1));
         assert!(cfg.supported_nips().contains(&11));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_relay_nips_are_advertised() {
+        let cfg = Config::default();
+        let nips = cfg.supported_nips();
+        // Relay-side NIPs are advertised.
+        for n in [
+            1, 9, 11, 13, 26, 29, 33, 40, 42, 43, 45, 50, 62, 67, 70, 77, 86, 98,
+        ] {
+            assert!(nips.contains(&n), "NIP-{n} must be advertised");
+        }
+        // Client-side NIPs must not be advertised (NIP-11).
+        for n in [2, 3, 5, 17, 19, 32, 51, 65, 68, 99] {
+            assert!(
+                !nips.contains(&n),
+                "client-side NIP-{n} must not be advertised"
+            );
+        }
+        // An explicit allowlist still only advertises relay-side NIPs.
+        let mut cfg = Config::default();
+        cfg.relay.enabled_nips = vec![1, 2, 50];
+        assert_eq!(cfg.supported_nips(), vec![1, 50]);
     }
 
     #[test]

@@ -34,7 +34,6 @@ const D: &str = "d";
 const P: &str = "p";
 const E: &str = "e";
 const A: &str = "a";
-const ROLE: &str = "role";
 const CODE: &str = "code";
 
 fn tag_value<'a>(event: &'a Event, name: &str) -> Option<&'a str> {
@@ -57,6 +56,13 @@ fn tag_values<'a>(event: &'a Event, name: &'static str) -> impl Iterator<Item = 
 /// Group id of a user or moderation event (from the `h` tag).
 pub fn group_id(event: &Event) -> Option<&str> {
     tag_value(event, H)
+}
+
+/// Whether the event is a group *action*: moderation events (9000-9020),
+/// join requests (9021) and leave requests (9022). These MUST carry an `h`
+/// tag naming the group they act on.
+pub fn is_group_action(event: &Event) -> bool {
+    (MOD_MIN..=MOD_MAX).contains(&event.kind) || event.kind == JOIN || event.kind == LEAVE
 }
 
 /// Whether the event is a group event at all: user and moderation events
@@ -162,13 +168,18 @@ impl GroupStore {
             if group.is_member(pubkey) {
                 return Err("duplicate: you are already a member of this group".into());
             }
-            if event_code(event).is_some_and(|c| group.has_invite(c)) {
+            if let Some(code) = event_code(event) {
+                if !group.has_invite(code) {
+                    return Err("restricted: invalid invite code".into());
+                }
                 return Ok(());
             }
             if group.settings.closed {
                 return Err("restricted: this group is closed".into());
             }
-            return Err("restricted: your join request is pending review".into());
+            // NIP-29: omitting the `closed` tag means join requests are
+            // honored; the relay admits the user right away.
+            return Ok(());
         }
 
         if event.kind == LEAVE {
@@ -206,20 +217,22 @@ impl GroupStore {
         let mut out = Vec::new();
         match event.kind {
             JOIN => {
-                // Only valid invite codes reach this point; admit the user.
-                if let Some(code) = event_code(event)
-                    && self.groups.get(gid).is_some_and(|g| g.has_invite(code))
-                {
+                // Joined via a valid invite code, or honored on an open
+                // group (not `closed`): admit the user with no privileges.
+                let admitted = if let Some(code) = event_code(event) {
+                    self.groups.get(gid).is_some_and(|g| g.has_invite(code))
+                } else {
+                    self.groups.get(gid).is_some_and(|g| !g.settings.closed)
+                };
+                if admitted {
                     let member = event.pubkey.clone();
                     if let Some(group) = self.groups.get_mut(gid) {
-                        group
-                            .members
-                            .entry(member.clone())
-                            .or_default()
-                            .insert("member".into());
+                        // Membership is the entry in the member map; roles
+                        // (granted only via `kind:9000`) decide privileges.
+                        group.members.entry(member.clone()).or_default();
                     }
                     if emit {
-                        out.push(build_put_user(gid, &member, &["member"], relay_pubkey, now));
+                        out.push(build_put_user(gid, &member, &[], relay_pubkey, now));
                         out.extend(self.membership_events(gid, relay_pubkey, now));
                     }
                 }
@@ -237,18 +250,16 @@ impl GroupStore {
             9000 => {
                 if let Some(group) = self.groups.get_mut(gid) {
                     // NIP-29: roles are carried as the elements after the
-                    // pubkey in each `p` tag (["p", <pubkey>, <role>...]);
-                    // a separate `role` tag is also accepted for leniency.
+                    // pubkey in each `p` tag (["p", <pubkey>, <role>...]).
+                    // The listed roles replace the user's previous roles
+                    // ("the user roles must just be updated"), and a `p` tag
+                    // without roles leaves the user a plain member.
                     for tag in event.tags.iter().filter(|t| t.len() >= 2 && t[0] == P) {
-                        let pk = &tag[1];
-                        let roles = group.members.entry(pk.clone()).or_default();
-                        for role in &tag[2..] {
-                            roles.insert(role.clone());
-                        }
-                    }
-                    for pk in tag_values(event, P) {
-                        let roles = group.members.entry(pk.to_string()).or_default();
-                        roles.extend(tag_values(event, ROLE).map(str::to_string));
+                        let pk = tag[1].clone();
+                        let roles: HashSet<String> = tag[2..].iter().cloned().collect();
+                        // An empty role list leaves the user a plain member
+                        // (replacing any previous roles).
+                        group.members.insert(pk, roles);
                     }
                 }
                 if emit {
@@ -724,12 +735,25 @@ mod tests {
         store.apply(&edit, "", 1, false);
         let msg_by_user = event(1, USER, Some("g1"), vec![]);
         assert!(store.validate_write(&msg_by_user).is_err());
-        // Join requests are pending review; admins add users.
+        // Join requests to an open group (not `closed`) are honored: the
+        // user is admitted without privileges.
         let join = event(JOIN, USER, Some("g1"), vec![]);
-        assert!(store.validate_write(&join).is_err());
-        let add = event(9000, ADMIN, Some("g1"), vec![vec![P.into(), USER.into()]]);
-        store.apply(&add, "", 1, false);
+        assert!(store.validate_write(&join).is_ok());
+        store.apply(&join, "", 1, false);
+        assert!(store.group("g1").unwrap().is_member(USER));
+        assert!(!store.group("g1").unwrap().is_admin(USER));
+        // A member of a restricted group may post.
         assert!(store.validate_write(&msg_by_user).is_ok());
+        // A duplicate join request is rejected with the `duplicate:` prefix.
+        let join = event(JOIN, USER, Some("g1"), vec![]);
+        assert_eq!(
+            store.validate_write(&join).unwrap_err(),
+            "duplicate: you are already a member of this group"
+        );
+        // Removing the user restores the restriction.
+        let remove = event(9001, ADMIN, Some("g1"), vec![vec![P.into(), USER.into()]]);
+        store.apply(&remove, "", 1, false);
+        assert!(store.validate_write(&msg_by_user).is_err());
     }
 
     #[test]
@@ -751,6 +775,62 @@ mod tests {
         assert!(store.validate_write(&join).is_ok());
         store.apply(&join, "", 1, false);
         assert!(store.group("g1").unwrap().is_member(USER));
+    }
+
+    #[test]
+    fn invalid_invite_code_is_final() {
+        let mut store = seeded();
+        let invite = event(
+            9009,
+            ADMIN,
+            Some("g1"),
+            vec![vec![CODE.into(), "abc".into()]],
+        );
+        store.apply(&invite, "", 1, false);
+        // A wrong code is rejected even on an otherwise open group.
+        let join = event(
+            JOIN,
+            USER,
+            Some("g1"),
+            vec![vec![CODE.into(), "wrong".into()]],
+        );
+        assert_eq!(
+            store.validate_write(&join).unwrap_err(),
+            "restricted: invalid invite code"
+        );
+        // A closed group honors a valid invite code.
+        let edit = event(9002, ADMIN, Some("g1"), vec![vec!["closed".into()]]);
+        store.apply(&edit, "", 1, false);
+        let join = event(
+            JOIN,
+            USER,
+            Some("g1"),
+            vec![vec![CODE.into(), "abc".into()]],
+        );
+        assert!(store.validate_write(&join).is_ok());
+    }
+
+    #[test]
+    fn put_user_roles_replace_previous_roles() {
+        // NIP-29: "the user roles must just be updated": a new kind:9000
+        // replaces the previous role set instead of extending it.
+        let mut store = seeded();
+        let put = event(
+            9000,
+            ADMIN,
+            Some("g1"),
+            vec![vec![P.into(), USER.into(), "ceo".into()]],
+        );
+        store.apply(&put, "", 1, false);
+        assert!(store.group("g1").unwrap().is_admin(USER));
+        let demote = event(9000, ADMIN, Some("g1"), vec![vec![P.into(), USER.into()]]);
+        store.apply(&demote, "", 1, false);
+        let group = store.group("g1").unwrap();
+        assert!(group.is_member(USER));
+        assert!(
+            !group.is_admin(USER),
+            "roles without privilege elements are not admins"
+        );
     }
 
     #[test]

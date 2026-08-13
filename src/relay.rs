@@ -212,6 +212,18 @@ impl Relay {
             );
         }
 
+        // NIP-29: group action events (moderation 9000-9020, join 9021 and
+        // leave 9022) MUST carry an `h` tag naming the group.
+        if cfg.nip_enabled(29)
+            && nip29::is_group_action(&event)
+            && nip29::group_id(&event).is_none()
+        {
+            return (
+                PutOutcome::Invalid("invalid: group events must carry an h tag".into()),
+                None,
+            );
+        }
+
         // NIP-29: group write access control.
         if cfg.nip_enabled(29) {
             // Group metadata events (39000-39005) MUST be created and signed
@@ -381,6 +393,18 @@ impl Relay {
                     PutOutcome::Invalid(
                         "restricted: this relay does not issue invite codes".into(),
                     ),
+                ));
+                continue;
+            }
+            // NIP-29: group action events MUST carry an `h` tag.
+            if cfg.nip_enabled(29)
+                && nip29::is_group_action(&event)
+                && nip29::group_id(&event).is_none()
+            {
+                self.stats.bump(&self.stats.events_rejected, 1);
+                results.push((
+                    id,
+                    PutOutcome::Invalid("invalid: group events must carry an h tag".into()),
                 ));
                 continue;
             }
@@ -791,6 +815,18 @@ impl Relay {
         // broadcast.
         if cfg.nip_enabled(42) && event.kind == crate::nips::nip42::AUTH_KIND {
             return Err("invalid: authentication events cannot be published".into());
+        }
+
+        // NIP-43: leave requests must be signed at the time of sending
+        // ("created_at MUST be now, plus or minus a few minutes") and MUST
+        // carry the NIP-70 `-` tag.
+        if cfg.nip_enabled(43) && event.kind == nip43::LEAVE {
+            if event.created_at.abs_diff(now) > 600 {
+                return Err("invalid: leave request is too old".into());
+            }
+            if !nip70::is_protected(event) {
+                return Err("invalid: leave request must carry a `-` tag".into());
+            }
         }
 
         // NIP-70: reposts must not embed a protected event; relays SHOULD

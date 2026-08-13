@@ -122,7 +122,7 @@ max_limit = 500
 count_limit = 2000
 
 # Maximum length of a subscription id.
-max_sub_id_len = 256
+max_sub_id_len = 64
 
 # Maximum bytes of an event's `content` field.
 max_content_bytes = 65536

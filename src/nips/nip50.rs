@@ -3,8 +3,6 @@
 //! Filters may carry a `search` string. The relay maintains a word index of
 //! event content and matches against all of the search terms.
 
-pub const MAX_INDEXED_WORDS: usize = 128;
-
 /// Tokenizes text into lowercase alphanumeric words of length >= 2.
 pub fn tokenize(text: &str) -> Vec<String> {
     let mut words = Vec::new();

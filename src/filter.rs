@@ -33,8 +33,14 @@ impl Filter {
         {
             return false;
         }
+        // NIP-26: events published under a delegation tag match filters on
+        // the delegator's pubkey as well as on the event's own author.
         if let Some(authors) = &self.authors
             && !authors.iter().any(|a| a == &ev.pubkey)
+            && !ev
+                .tags
+                .iter()
+                .any(|t| t.len() >= 2 && t[0] == "delegation" && authors.iter().any(|a| a == &t[1]))
         {
             return false;
         }
@@ -53,14 +59,15 @@ impl Filter {
         {
             return false;
         }
-        // NIP-50: every search term must appear in the content.
+        // NIP-50: an event matches when at least one search term appears in
+        // the content; the database scan ranks full matches first.
         if let Some(search) = self.search.as_deref()
             && !search.trim().is_empty()
         {
             let content = ev.content.to_lowercase();
-            if crate::nips::nip50::terms(search)
+            if !crate::nips::nip50::terms(search)
                 .iter()
-                .any(|term| !content.contains(term.as_str()))
+                .any(|term| content.contains(term.as_str()))
             {
                 return false;
             }
@@ -148,10 +155,13 @@ mod tests {
         let f: Filter = serde_json::from_value(serde_json::json!({"search": "nostr"})).unwrap();
         assert!(f.matches(&hit));
         assert!(!f.matches(&e));
-        // All terms must be present.
+        // At least one term must be present; partial matches pass.
         let f: Filter =
             serde_json::from_value(serde_json::json!({"search": "nostr bitcoin"})).unwrap();
-        assert!(!f.matches(&hit));
+        assert!(f.matches(&hit));
+        let miss: Filter =
+            serde_json::from_value(serde_json::json!({"search": "bitcoin only"})).unwrap();
+        assert!(!miss.matches(&hit));
         // Empty search strings are ignored.
         let f: Filter = serde_json::from_value(serde_json::json!({"search": "  "})).unwrap();
         assert!(f.matches(&hit));
