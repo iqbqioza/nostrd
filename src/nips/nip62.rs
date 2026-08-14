@@ -55,7 +55,7 @@ pub fn tag_matches(tag: &str, host: &str, port: u16, public_url: &str) -> bool {
     tag_host == our_host && (tag_port == our_port || tag_port.is_none())
 }
 
-fn authority_of(host: &str, port: u16, public_url: &str) -> String {
+pub(crate) fn authority_of(host: &str, port: u16, public_url: &str) -> String {
     if let Some(rest) = public_url
         .strip_prefix("wss://")
         .or_else(|| public_url.strip_prefix("ws://"))
@@ -66,7 +66,7 @@ fn authority_of(host: &str, port: u16, public_url: &str) -> String {
     format!("{host}:{port}")
 }
 
-fn split_host_port(authority: &str) -> (&str, Option<u16>) {
+pub(crate) fn split_host_port(authority: &str) -> (&str, Option<u16>) {
     if let Some((host, port)) = authority.rsplit_once(':')
         && let Ok(port) = port.parse::<u16>()
     {

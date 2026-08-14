@@ -403,6 +403,7 @@ async fn livekit_supported(State(relay): State<Arc<Relay>>) -> impl IntoResponse
 async fn livekit_token(
     State(relay): State<Arc<Relay>>,
     headers: HeaderMap,
+    uri: axum::http::Uri,
     AxPath(group): AxPath<String>,
 ) -> impl IntoResponse {
     let cfg = relay.config.read().await;
@@ -428,9 +429,17 @@ async fn livekit_token(
         );
     };
     // NIP-29: the auth event's `u` tag must point at this group's livekit
-    // token endpoint, and its `method` tag must match the GET request.
+    // token endpoint (exact path and query), and its `method` tag must
+    // match the GET request.
     let authed = crate::nips::nip98::verify(&encoded, None, relay.secp(), false, "GET", |url| {
-        url_path(url) == Some(expected_path.as_str())
+        crate::nips::nip98::matches_request_url(
+            url,
+            &cfg.server.host,
+            cfg.server.port,
+            &cfg.relay.public_url,
+            &expected_path,
+            uri.query(),
+        )
     })
     .await;
     match authed {
@@ -460,22 +469,6 @@ async fn group_allows(relay: &Relay, group: &str, pubkey: &str) -> bool {
         None => true,
         Some(g) => !g.settings.private && !g.settings.restricted || g.is_member(pubkey),
     }
-}
-
-/// The path component of an absolute URL, e.g. `/x/y` for
-/// `https://host/x/y?q=1`.
-pub(crate) fn url_path(url: &str) -> Option<&str> {
-    let rest = url
-        .strip_prefix("https://")
-        .or_else(|| url.strip_prefix("http://"))
-        .or_else(|| url.strip_prefix("wss://"))
-        .or_else(|| url.strip_prefix("ws://"))?;
-    let path_start = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let path = &rest[path_start..];
-    if path.is_empty() {
-        return None;
-    }
-    Some(path.split(['?', '#']).next().unwrap_or(path))
 }
 
 fn issue_livekit_token(cfg: &Config, group: &str, pubkey: &str) -> Result<String> {
@@ -629,25 +622,5 @@ async fn reload_handler(
             }
             _ = shutdown.changed() => break,
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::url_path;
-
-    #[test]
-    fn url_path_parsing() {
-        assert_eq!(
-            url_path("https://relay.example.com/.well-known/nip29/livekit/pizza"),
-            Some("/.well-known/nip29/livekit/pizza")
-        );
-        assert_eq!(
-            url_path("http://127.0.0.1:8080/.well-known/nip29/livekit/g1?x=1"),
-            Some("/.well-known/nip29/livekit/g1")
-        );
-        assert_eq!(url_path("wss://relay.example.com"), None);
-        assert_eq!(url_path("https://relay.example.com/"), Some("/"));
-        assert_eq!(url_path("not a url"), None);
     }
 }

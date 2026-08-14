@@ -18,7 +18,6 @@ use serde_json::{Value, json};
 use tokio::sync::watch;
 
 use crate::nips::nip11::relay_info;
-use crate::nips::nip62;
 use crate::nips::nip98;
 use crate::relay::Relay;
 use crate::stats::unix_now;
@@ -85,7 +84,7 @@ pub async fn rpc_handler(
         )
             .into_response();
     }
-    if !rpc_authenticated(&relay, &headers, uri.path()).await {
+    if !rpc_authenticated(&relay, &headers, &uri).await {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "unauthorized" })),
@@ -376,9 +375,10 @@ fn ct_eq(a: &str, b: &str) -> bool {
 
 /// NIP-86 authentication: either the bearer `management_token` or a NIP-98
 /// event by `admin_pubkey` whose `payload` tag is present and whose `u` tag
-/// matches this relay's URL, including the request path (NIP-98: "the `u`
-/// tag MUST be exactly the same as the absolute request URL").
-async fn rpc_authenticated(relay: &Relay, headers: &HeaderMap, request_path: &str) -> bool {
+/// matches this relay's URL, including the request path and query
+/// (NIP-98: "the `u` tag MUST be exactly the same as the absolute request
+/// URL"; the scheme is normalized so TLS-terminating proxies keep working).
+async fn rpc_authenticated(relay: &Relay, headers: &HeaderMap, uri: &axum::http::Uri) -> bool {
     let cfg = relay.config.read().await;
     if !cfg.server.management_token.is_empty()
         && let Some(token) = headers
@@ -401,12 +401,14 @@ async fn rpc_authenticated(relay: &Relay, headers: &HeaderMap, request_path: &st
             true,
             "POST",
             |url| {
-                nip62::tag_matches(
+                nip98::matches_request_url(
                     url,
                     &cfg.server.host,
                     cfg.server.port,
                     &cfg.relay.public_url,
-                ) && crate::server::url_path(url).unwrap_or("/") == request_path
+                    uri.path(),
+                    uri.query(),
+                )
             },
         )
         .await

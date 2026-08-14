@@ -74,6 +74,60 @@ pub async fn verify(
     Some(event.pubkey)
 }
 
+/// NIP-98: the `u` tag MUST be the absolute request URL. The scheme is
+/// normalized (`wss`/`https` and `ws`/`http`, including the `nostr+`
+/// variants) so that clients behind TLS-terminating proxies that sign
+/// with the `wss` form still work; the host, port, path and query must
+/// match exactly.
+pub fn matches_request_url(
+    tag: &str,
+    host: &str,
+    port: u16,
+    public_url: &str,
+    request_path: &str,
+    request_query: Option<&str>,
+) -> bool {
+    let Some(rest) = tag
+        .strip_prefix("wss://")
+        .or_else(|| tag.strip_prefix("https://"))
+        .or_else(|| tag.strip_prefix("nostr+https://"))
+        .or_else(|| tag.strip_prefix("ws://"))
+        .or_else(|| tag.strip_prefix("http://"))
+        .or_else(|| tag.strip_prefix("nostr+http://"))
+    else {
+        return false;
+    };
+    let (authority, path) = match rest.split_once('/') {
+        Some((a, p)) => (a, format!("/{p}")),
+        // A bare host is equivalent to the "/" path.
+        None => (rest, "/".to_string()),
+    };
+    let (tag_path, tag_query) = match path.split_once('?') {
+        Some((p, q)) => (p, Some(q)),
+        None => (path.as_str(), None),
+    };
+    if tag_path != request_path || tag_query.unwrap_or("") != request_query.unwrap_or("") {
+        return false;
+    }
+    authority_matches(authority, host, port, public_url)
+}
+
+fn authority_matches(authority: &str, host: &str, port: u16, public_url: &str) -> bool {
+    let our_authority = crate::nips::nip62::authority_of(host, port, public_url);
+    let (our_host, our_port) = crate::nips::nip62::split_host_port(&our_authority);
+    let (tag_host, tag_port) = crate::nips::nip62::split_host_port(authority);
+    if tag_host != our_host {
+        return false;
+    }
+    match (tag_port, our_port) {
+        (Some(tp), Some(op)) => tp == op,
+        // An omitted port means the default port of the scheme.
+        (None, Some(op)) => op == 80 || op == 443,
+        (None, None) => true,
+        (Some(_), None) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,5 +191,170 @@ mod tests {
                 .is_none()
             );
         });
+    }
+
+    #[test]
+    fn request_url_matches_exactly() {
+        let host = "relay.example.com";
+        let port = 8080;
+        let public = "";
+        // Exact match.
+        assert!(matches_request_url(
+            "https://relay.example.com:8080/ws",
+            host,
+            port,
+            public,
+            "/ws",
+            None
+        ));
+        // Scheme normalization: wss and http are accepted too.
+        assert!(matches_request_url(
+            "wss://relay.example.com:8080/ws",
+            host,
+            port,
+            public,
+            "/ws",
+            None
+        ));
+        assert!(matches_request_url(
+            "nostr+https://relay.example.com:8080/ws",
+            host,
+            port,
+            public,
+            "/ws",
+            None
+        ));
+        // The query must match exactly, including parameter order.
+        assert!(matches_request_url(
+            "https://relay.example.com:8080/ws?a=1&b=2",
+            host,
+            port,
+            public,
+            "/ws",
+            Some("a=1&b=2")
+        ));
+        assert!(!matches_request_url(
+            "https://relay.example.com:8080/ws?a=1&b=2",
+            host,
+            port,
+            public,
+            "/ws",
+            Some("b=2&a=1")
+        ));
+        // A query on one side but not the other is a mismatch.
+        assert!(!matches_request_url(
+            "https://relay.example.com:8080/ws?a=1",
+            host,
+            port,
+            public,
+            "/ws",
+            None
+        ));
+        assert!(!matches_request_url(
+            "https://relay.example.com:8080/ws",
+            host,
+            port,
+            public,
+            "/ws",
+            Some("a=1")
+        ));
+        // The path must match exactly.
+        assert!(!matches_request_url(
+            "https://relay.example.com:8080/ws/",
+            host,
+            port,
+            public,
+            "/ws",
+            None
+        ));
+        assert!(!matches_request_url(
+            "https://relay.example.com:8080/other",
+            host,
+            port,
+            public,
+            "/ws",
+            None
+        ));
+        // Host and port must match; a non-default port may not be omitted.
+        assert!(!matches_request_url(
+            "https://evil.example.com:8080/ws",
+            host,
+            port,
+            public,
+            "/ws",
+            None
+        ));
+        assert!(!matches_request_url(
+            "https://relay.example.com:9999/ws",
+            host,
+            port,
+            public,
+            "/ws",
+            None
+        ));
+        assert!(!matches_request_url(
+            "https://relay.example.com/ws",
+            host,
+            port,
+            public,
+            "/ws",
+            None
+        ));
+        // Unsupported schemes are rejected.
+        assert!(!matches_request_url(
+            "ftp://relay.example.com:8080/ws",
+            host,
+            port,
+            public,
+            "/ws",
+            None
+        ));
+        // A bare host matches the "/" path.
+        assert!(matches_request_url(
+            "https://relay.example.com:8080",
+            host,
+            port,
+            public,
+            "/",
+            None
+        ));
+    }
+
+    #[test]
+    fn request_url_default_port_and_public_url() {
+        // Default ports may be omitted from the tag.
+        assert!(matches_request_url(
+            "wss://relay.example.com/ws",
+            "relay.example.com",
+            443,
+            "",
+            "/ws",
+            None
+        ));
+        assert!(matches_request_url(
+            "ws://relay.example.com/",
+            "relay.example.com",
+            80,
+            "",
+            "/",
+            None
+        ));
+        // public_url overrides the configured host:port.
+        assert!(matches_request_url(
+            "wss://public.example.net/ws",
+            "127.0.0.1",
+            8080,
+            "wss://public.example.net",
+            "/ws",
+            None
+        ));
+        assert!(!matches_request_url(
+            "wss://public.example.net:8443/ws",
+            "127.0.0.1",
+            8080,
+            "wss://public.example.net",
+            "/ws",
+            None
+        ));
     }
 }
