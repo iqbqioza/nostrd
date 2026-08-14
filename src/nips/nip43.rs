@@ -158,13 +158,17 @@ impl RoleStore {
 
     /// Rebuilds the role store from the stored role definitions and
     /// membership lists (only the latest addressable/replaceable versions
-    /// are retained in the database).
-    pub async fn rebuild(&mut self, db: &DbClient) {
+    /// are retained in the database). Only events signed by the relay's own
+    /// key are honored (NIP-43: these MUST be signed by the `self` pubkey).
+    pub async fn rebuild(&mut self, db: &DbClient, relay_pubkey: &str) {
         let filter: Filter =
             serde_json::from_value(json!({ "kinds": [ROLE_DEFINITION, MEMBERSHIP_LIST] }))
                 .expect("static filter");
         let (events, _) = db.query(vec![filter], 1_000_000, unix_now()).await;
         for event in events {
+            if event.pubkey != relay_pubkey {
+                continue;
+            }
             match event.kind {
                 ROLE_DEFINITION => {
                     let Some(id) = tag_value(&event, "d") else {
@@ -246,5 +250,82 @@ mod tests {
         let add = store.add_user_event("c308e1f8", "relaypub", now);
         assert_eq!(add.kind, ADD_USER);
         assert!(add.tags.contains(&vec!["p".into(), "c308e1f8".into()]));
+    }
+
+    #[test]
+    fn rebuild_ignores_foreign_events() {
+        use crate::nips::nip01;
+        use std::sync::Arc;
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir()
+            .join("nostrd-nip43-test")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        let cfg = crate::config::DatabaseConfig {
+            path,
+            ..Default::default()
+        };
+        let db = crate::db::DbClient::open(
+            &cfg,
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay_pk = "aa".repeat(32);
+            let foreign_pk = "bb".repeat(32);
+            // NIP-43: kind 33534 must be signed by the relay's own key; an
+            // event signed by anyone else must not feed the role store.
+            let relay_role = Event {
+                id: String::new(),
+                pubkey: relay_pk.clone(),
+                created_at: 100,
+                kind: ROLE_DEFINITION,
+                tags: vec![
+                    vec!["-".into()],
+                    vec!["d".into(), "king".into()],
+                    vec!["label".into(), "real".into()],
+                ],
+                content: String::new(),
+                sig: String::new(),
+            };
+            let foreign_role = Event {
+                id: String::new(),
+                pubkey: foreign_pk,
+                created_at: 200,
+                kind: ROLE_DEFINITION,
+                tags: vec![
+                    vec!["-".into()],
+                    vec!["d".into(), "king".into()],
+                    vec!["label".into(), "fake".into()],
+                ],
+                content: String::new(),
+                sig: String::new(),
+            };
+            let mut events = vec![relay_role, foreign_role];
+            for ev in &mut events {
+                ev.id = nip01::compute_id(ev);
+            }
+            let now = unix_now();
+            assert_eq!(
+                db.put(events[0].clone(), now).await,
+                crate::db::PutOutcome::Stored
+            );
+            assert_eq!(
+                db.put(events[1].clone(), now).await,
+                crate::db::PutOutcome::Stored
+            );
+
+            let mut store = RoleStore::default();
+            store.rebuild(&db, &relay_pk).await;
+            assert_eq!(store.roles.len(), 1);
+            assert_eq!(store.roles["king"].label, "real");
+        });
     }
 }

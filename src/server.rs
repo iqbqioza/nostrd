@@ -119,7 +119,12 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
     // Rebuild the NIP-43 role store from the stored role definitions and
     // membership lists.
     if relay.config.read().await.nip_enabled(43) {
-        relay.roles.write().await.rebuild(&relay.db).await;
+        relay
+            .roles
+            .write()
+            .await
+            .rebuild(&relay.db, &relay.relay_pubkey().unwrap_or_default())
+            .await;
     }
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);

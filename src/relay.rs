@@ -872,6 +872,23 @@ impl Relay {
             return Err("invalid: authentication events cannot be published".into());
         }
 
+        // NIP-43: role definitions, membership lists and add/remove user
+        // events MUST be signed by the relay's own key ("the pubkey
+        // specified in the `self` field of the relay's NIP-11 document");
+        // events signed by anyone else are rejected.
+        if cfg.nip_enabled(43)
+            && matches!(
+                event.kind,
+                nip43::ROLE_DEFINITION
+                    | nip43::MEMBERSHIP_LIST
+                    | nip43::ADD_USER
+                    | nip43::REMOVE_USER
+            )
+            && Some(event.pubkey.as_str()) != self.relay_pubkey().as_deref()
+        {
+            return Err("blocked: relay metadata must be published by the relay".into());
+        }
+
         // NIP-43: leave requests must be signed at the time of sending
         // ("created_at MUST be now, plus or minus a few minutes") and MUST
         // carry the NIP-70 `-` tag.
