@@ -16,7 +16,7 @@ use tokio::sync::watch;
 use crate::nips::nip11::relay_info;
 use crate::nips::nip98;
 use crate::relay::Relay;
-use crate::stats::unix_now;
+use crate::util::unix_now;
 
 // ----- legacy REST endpoints (localhost management port) -----
 

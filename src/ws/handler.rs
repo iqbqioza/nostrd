@@ -11,20 +11,20 @@ use super::value_string;
 use crate::event::Event;
 use crate::filter::Filter;
 use crate::nips::{nip29, nip40, nip42, nip45, nip70, nip77};
-use crate::stats::unix_now;
+use crate::util::unix_now;
 
 impl super::Conn {
     pub(crate) async fn handle_text(&mut self, text: &str) {
         let Ok(value) = serde_json::from_str::<Value>(text) else {
-            self.notice("error: invalid json");
+            self.send_notice("error: invalid json");
             return;
         };
         let Some(msg) = value.as_array() else {
-            self.notice("error: expected an array message");
+            self.send_notice("error: expected an array message");
             return;
         };
         let Some(Some(kind)) = msg.first().map(|v| v.as_str()) else {
-            self.notice("error: message type must be a string");
+            self.send_notice("error: message type must be a string");
             return;
         };
 
@@ -74,7 +74,7 @@ impl super::Conn {
             "PING" => {}
             other => {
                 self.flush_pending_events().await;
-                self.notice(&format!("error: unsupported message type {other}"));
+                self.send_notice(&format!("error: unsupported message type {other}"));
             }
         }
     }
@@ -92,13 +92,13 @@ impl super::Conn {
     pub(crate) async fn queue_event(&mut self, rest: &[Value]) {
         self.relay.stats.bump(&self.relay.stats.events_received, 1);
         if rest.is_empty() {
-            self.notice("error: EVENT requires an event object");
+            self.send_notice("error: EVENT requires an event object");
             return;
         }
         let event: Event = match serde_json::from_value(rest[0].clone()) {
             Ok(event) => event,
             Err(_) => {
-                self.notice("error: invalid event object");
+                self.send_notice("error: invalid event object");
                 return;
             }
         };
@@ -118,24 +118,24 @@ impl super::Conn {
         for (id, outcome) in outcomes {
             match outcome {
                 crate::db::PutOutcome::Stored | crate::db::PutOutcome::Replaced => {
-                    self.ok(&id, true, "");
+                    self.send_ok(&id, true, "");
                 }
                 crate::db::PutOutcome::Ephemeral => {
                     // NIP-01: ephemeral kinds are delivered live but never
                     // stored; the NIP-01 `mute:` prefix acknowledges this.
-                    self.ok(&id, true, "mute: ephemeral event not stored");
+                    self.send_ok(&id, true, "mute: ephemeral event not stored");
                 }
                 crate::db::PutOutcome::Duplicate => {
-                    self.ok(&id, true, "duplicate: event already stored");
+                    self.send_ok(&id, true, "duplicate: event already stored");
                 }
                 crate::db::PutOutcome::Invalid(reason) => {
-                    self.ok(&id, false, &reason);
+                    self.send_ok(&id, false, &reason);
                 }
                 crate::db::PutOutcome::Expired => {
-                    self.ok(&id, false, "invalid: event has expired");
+                    self.send_ok(&id, false, "invalid: event has expired");
                 }
                 crate::db::PutOutcome::PreviouslyDeleted => {
-                    self.ok(&id, false, "blocked: event has been deleted");
+                    self.send_ok(&id, false, "blocked: event has been deleted");
                 }
             }
         }
@@ -143,13 +143,13 @@ impl super::Conn {
 
     pub(crate) async fn handle_req(&mut self, rest: &[Value]) {
         if rest.len() < 2 {
-            self.notice("error: REQ requires a subscription id and filters");
+            self.send_notice("error: REQ requires a subscription id and filters");
             return;
         }
         let sub_id = match rest[0].as_str() {
             Some(id) => id,
             None => {
-                self.notice("error: subscription id must be a string");
+                self.send_notice("error: subscription id must be a string");
                 return;
             }
         };
@@ -164,11 +164,11 @@ impl super::Conn {
             )
         };
         if sub_id.is_empty() {
-            self.closed(sub_id, "invalid: subscription id must not be empty");
+            self.send_closed(sub_id, "invalid: subscription id must not be empty");
             return;
         }
         if sub_id.len() > max_sub_id_len {
-            self.closed(sub_id, "invalid: subscription id too long");
+            self.send_closed(sub_id, "invalid: subscription id too long");
             return;
         }
 
@@ -177,17 +177,17 @@ impl super::Conn {
             match serde_json::from_value::<Filter>(f.clone()) {
                 Ok(filter) => filters.push(filter),
                 Err(_) => {
-                    self.closed(sub_id, "invalid: invalid filter");
+                    self.send_closed(sub_id, "invalid: invalid filter");
                     return;
                 }
             }
         }
         if filters.is_empty() {
-            self.closed(sub_id, "invalid: REQ requires at least one filter");
+            self.send_closed(sub_id, "invalid: REQ requires at least one filter");
             return;
         }
         if filters.len() > max_filters {
-            self.closed(sub_id, "invalid: too many filters");
+            self.send_closed(sub_id, "invalid: too many filters");
             return;
         }
 
@@ -195,14 +195,14 @@ impl super::Conn {
             && !self.relay.config.read().await.nip_enabled(50);
 
         if self.relay.config.read().await.server.require_auth && !self.is_authed() {
-            self.closed(
+            self.send_closed(
                 sub_id,
                 "auth-required: please authenticate before subscribing",
             );
             return;
         }
         if self.subs.len() >= max_subscriptions {
-            self.closed(sub_id, "error: too many subscriptions");
+            self.send_closed(sub_id, "error: too many subscriptions");
             return;
         }
 
@@ -211,7 +211,7 @@ impl super::Conn {
             for f in &mut stored {
                 f.search = None;
             }
-            self.notice("search is not enabled on this relay");
+            self.send_notice("search is not enabled on this relay");
         }
 
         // Bound the memory held by this connection's subscriptions: each
@@ -232,7 +232,7 @@ impl super::Conn {
             .saturating_sub(replacing.unwrap_or(0))
             .saturating_add(sub_bytes);
         if next_total > sub_bytes_limit {
-            self.closed(sub_id, "error: too many subscriptions");
+            self.send_closed(sub_id, "error: too many subscriptions");
             return;
         }
         self.sub_bytes = next_total;
@@ -273,7 +273,7 @@ impl super::Conn {
 
     pub(crate) fn handle_close(&mut self, rest: &[Value]) {
         let Some(Some(sub_id)) = rest.first().map(|v| v.as_str()) else {
-            self.notice("error: CLOSE requires a subscription id");
+            self.send_notice("error: CLOSE requires a subscription id");
             return;
         };
         if let Some((_, bytes)) = self.subs.remove(sub_id) {
@@ -287,17 +287,17 @@ impl super::Conn {
 
     pub(crate) async fn handle_auth(&mut self, rest: &[Value]) {
         if !self.relay.config.read().await.nip_enabled(42) {
-            self.notice("error: authentication is not enabled on this relay");
+            self.send_notice("error: authentication is not enabled on this relay");
             return;
         }
         if rest.is_empty() {
-            self.notice("error: AUTH requires an event object");
+            self.send_notice("error: AUTH requires an event object");
             return;
         }
         let event: Event = match serde_json::from_value(rest[0].clone()) {
             Ok(event) => event,
             Err(_) => {
-                self.notice("error: invalid auth event");
+                self.send_notice("error: invalid auth event");
                 return;
             }
         };
@@ -331,20 +331,20 @@ impl super::Conn {
 
     pub(crate) async fn handle_count(&mut self, rest: &[Value]) {
         if rest.len() < 2 {
-            self.notice("error: COUNT requires a subscription id and filters");
+            self.send_notice("error: COUNT requires a subscription id and filters");
             return;
         }
         let Some(sub_id) = rest[0].as_str() else {
-            self.notice("error: subscription id must be a string");
+            self.send_notice("error: subscription id must be a string");
             return;
         };
         // NIP-45: refusals must be answered with a CLOSED message.
         if !self.relay.config.read().await.nip_enabled(45) {
-            self.closed(sub_id, "error: counting is not enabled on this relay");
+            self.send_closed(sub_id, "error: counting is not enabled on this relay");
             return;
         }
         if self.relay.config.read().await.server.require_auth && !self.is_authed() {
-            self.closed(sub_id, "auth-required: please authenticate before counting");
+            self.send_closed(sub_id, "auth-required: please authenticate before counting");
             return;
         }
         let mut filters = Vec::new();
@@ -352,7 +352,7 @@ impl super::Conn {
             match serde_json::from_value::<Filter>(f.clone()) {
                 Ok(filter) => filters.push(filter),
                 Err(_) => {
-                    self.closed(sub_id, "invalid: invalid filter");
+                    self.send_closed(sub_id, "invalid: invalid filter");
                     return;
                 }
             }
@@ -475,27 +475,27 @@ impl super::Conn {
 
     // ----- NIP-77 negentropy -----
 
-    pub(crate) fn neg_err(&mut self, sub_id: &str, reason: &str) {
+    pub(crate) fn send_neg_err(&mut self, sub_id: &str, reason: &str) {
         self.send_json(json!(["NEG-ERR", sub_id, reason]));
     }
 
-    pub(crate) fn neg_msg(&mut self, sub_id: &str, message: &[u8]) {
+    pub(crate) fn send_neg_msg(&mut self, sub_id: &str, message: &[u8]) {
         self.send_json(json!(["NEG-MSG", sub_id, hex::encode(message)]));
     }
 
     pub(crate) async fn handle_neg_open(&mut self, rest: &[Value]) {
         if !self.relay.config.read().await.nip_enabled(77) {
-            self.notice("error: negentropy is not enabled on this relay");
+            self.send_notice("error: negentropy is not enabled on this relay");
             return;
         }
         if rest.len() < 3 {
-            self.notice("error: NEG-OPEN requires a subscription id, filter and message");
+            self.send_notice("error: NEG-OPEN requires a subscription id, filter and message");
             return;
         }
         let sub_id = match value_string(&rest[0]) {
             Some(id) if !id.is_empty() => id,
             _ => {
-                self.notice("error: NEG-OPEN subscription id must be a non-empty string");
+                self.send_notice("error: NEG-OPEN subscription id must be a non-empty string");
                 return;
             }
         };
@@ -506,29 +506,29 @@ impl super::Conn {
                 filter
             }
             Err(_) => {
-                self.notice("error: invalid NEG-OPEN filter");
+                self.send_notice("error: invalid NEG-OPEN filter");
                 return;
             }
         };
         let Some(initial) = rest[2].as_str() else {
-            self.notice("error: NEG-OPEN message must be hex");
+            self.send_notice("error: NEG-OPEN message must be hex");
             return;
         };
         let Ok(initial) = hex::decode(initial) else {
-            self.notice("error: NEG-OPEN message must be hex");
+            self.send_notice("error: NEG-OPEN message must be hex");
             return;
         };
         // NIP-42: an auth-requiring relay applies the same policy to
         // negentropy subscriptions as to REQ subscriptions.
         if self.relay.config.read().await.server.require_auth && !self.is_authed() {
-            self.neg_err(&sub_id, "auth-required: please authenticate before syncing");
+            self.send_neg_err(&sub_id, "auth-required: please authenticate before syncing");
             return;
         }
 
         let max_items = self.relay.config.read().await.limits.neg_max_items;
         let max_subs = self.relay.config.read().await.limits.max_subscriptions;
         if self.neg.len() >= max_subs {
-            self.neg_err(&sub_id, "error: too many subscriptions");
+            self.send_neg_err(&sub_id, "error: too many subscriptions");
             return;
         }
         let now = unix_now();
@@ -598,51 +598,51 @@ impl super::Conn {
             Ok(response) => {
                 self.neg_total += items.len();
                 self.neg.insert(sub_id.clone(), items);
-                self.neg_msg(&sub_id, &response);
+                self.send_neg_msg(&sub_id, &response);
             }
             Err(reason) => {
-                self.neg_err(&sub_id, &format!("error: {reason}"));
+                self.send_neg_err(&sub_id, &format!("error: {reason}"));
             }
         }
     }
 
     pub(crate) async fn handle_neg_msg(&mut self, rest: &[Value]) {
         if rest.len() < 2 {
-            self.notice("error: NEG-MSG requires a subscription id and message");
+            self.send_notice("error: NEG-MSG requires a subscription id and message");
             return;
         }
         let Some(sub_id) = value_string(&rest[0]) else {
-            self.notice("error: NEG-MSG subscription id must be a string");
+            self.send_notice("error: NEG-MSG subscription id must be a string");
             return;
         };
         let Some(message) = rest[1].as_str() else {
-            self.notice("error: NEG-MSG message must be hex");
+            self.send_notice("error: NEG-MSG message must be hex");
             return;
         };
         let Ok(message) = hex::decode(message) else {
-            self.notice("error: NEG-MSG message must be hex");
+            self.send_notice("error: NEG-MSG message must be hex");
             return;
         };
         let Some(items) = self.neg.get(&sub_id) else {
-            self.neg_err(&sub_id, "closed: unknown subscription");
+            self.send_neg_err(&sub_id, "closed: unknown subscription");
             return;
         };
         match nip77::respond(items, &message) {
-            Ok(response) => self.neg_msg(&sub_id, &response),
+            Ok(response) => self.send_neg_msg(&sub_id, &response),
             Err(reason) => {
                 // NIP-77: "After a NEG-ERR is issued, the subscription is
                 // considered to be closed."
                 if let Some(items) = self.neg.remove(&sub_id) {
                     self.neg_total = self.neg_total.saturating_sub(items.len());
                 }
-                self.neg_err(&sub_id, &format!("error: {reason}"));
+                self.send_neg_err(&sub_id, &format!("error: {reason}"));
             }
         }
     }
 
     pub(crate) fn handle_neg_close(&mut self, rest: &[Value]) {
         let Some(sub_id) = rest.first().and_then(value_string) else {
-            self.notice("error: NEG-CLOSE requires a subscription id");
+            self.send_notice("error: NEG-CLOSE requires a subscription id");
             return;
         };
         if let Some(items) = self.neg.remove(&sub_id) {

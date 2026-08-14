@@ -8,6 +8,7 @@ mod nips;
 mod relay;
 mod server;
 mod stats;
+mod util;
 mod ws;
 
 use clap::Parser;

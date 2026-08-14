@@ -16,7 +16,8 @@ use crate::event::Event;
 use crate::nips::nip29::{self, GroupStore};
 use crate::nips::nip43::{self, RoleStore};
 use crate::nips::{nip01, nip09, nip62};
-use crate::stats::{Stats, unix_now};
+use crate::stats::Stats;
+use crate::util::unix_now;
 
 pub struct Relay {
     pub config: Arc<RwLock<Config>>,

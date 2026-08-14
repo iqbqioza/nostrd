@@ -13,7 +13,7 @@ use serde_json::json;
 use crate::db::DbClient;
 use crate::event::Event;
 use crate::filter::Filter;
-use crate::stats::unix_now;
+use crate::util::unix_now;
 
 pub const ROLE_DEFINITION: u64 = 33534;
 pub const MEMBERSHIP_LIST: u64 = 13534;

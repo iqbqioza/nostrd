@@ -9,7 +9,7 @@ use secp256k1::Secp256k1;
 
 use crate::event::Event;
 use crate::nips::nip01;
-use crate::stats::unix_now;
+use crate::util::unix_now;
 
 pub const AUTH_KIND: u64 = 27235;
 pub const PAYLOAD_TAG: &str = "payload";

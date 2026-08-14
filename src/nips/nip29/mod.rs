@@ -1,14 +1,19 @@
 //! NIP-29: Relay-based Groups.
 //!
-//! Groups are identified by an id carried in the `h` tag of user and
-//! moderation events and in the `d` tag of the relay-generated metadata
-//! events (kinds 39000-39005). The relay maintains the authoritative group
-//! state in memory, rebuilt from the stored moderation events on startup.
-//!
-//! Moderation policy implemented here: any user with at least one role (from
-//! a `kind:9000` put-user event or a `kind:9007` group creation) is an admin
-//! and may send moderation events; the relay's own key is always an admin.
+//! The group state machine (access control, moderation application and
+//! read visibility) lives here; the relay-generated metadata events are
+//! built by the [`events`] module.
 
+pub(crate) mod events;
+
+use events::{
+    apply_settings, build_admins_event, build_members_event, build_meta_event, build_pins_event,
+    build_put_user, build_remove_user,
+};
+
+/// Moderation policy implemented here: any user with at least one role (from
+/// a `kind:9000` put-user event or a `kind:9007` group creation) is an admin
+/// and may send moderation events; the relay's own key is always an admin.
 use std::collections::{HashMap, HashSet};
 
 use serde_json::json;
@@ -16,7 +21,7 @@ use serde_json::json;
 use crate::db::DbClient;
 use crate::event::Event;
 use crate::filter::Filter;
-use crate::stats::unix_now;
+use crate::util::unix_now;
 
 pub const GROUP_META: u64 = 39000;
 pub const GROUP_ADMINS: u64 = 39001;
@@ -527,149 +532,6 @@ fn validate_edit_metadata(
     }
     Ok(())
 }
-/// Applies metadata tags of a `kind:9002` event to the group settings.
-fn apply_settings(group: &mut Group, event: &Event) {
-    let mut settings = GroupSettings::default();
-    for tag in &event.tags {
-        if tag.is_empty() {
-            continue;
-        }
-        match tag[0].as_str() {
-            "name" | "picture" | "banner" | "about" => {
-                if let Some(value) = tag.get(1) {
-                    match tag[0].as_str() {
-                        "name" => settings.name = value.clone(),
-                        "picture" => settings.picture = value.clone(),
-                        "banner" => settings.banner = value.clone(),
-                        _ => settings.about = value.clone(),
-                    }
-                }
-            }
-            "private" => settings.private = true,
-            "restricted" => settings.restricted = true,
-            "closed" => settings.closed = true,
-            "hidden" => settings.hidden = true,
-            "supported_kinds" => {
-                settings.supported_kinds =
-                    Some(tag[1..].iter().filter_map(|k| k.parse().ok()).collect())
-            }
-            _ => {}
-        }
-    }
-    group.settings = settings;
-}
-
-fn base_event(kind: u64, gid: &str, relay_pubkey: &str, now: u64) -> Event {
-    Event {
-        id: String::new(),
-        pubkey: relay_pubkey.to_string(),
-        created_at: now,
-        kind,
-        tags: vec![vec![D.to_string(), gid.to_string()]],
-        content: String::new(),
-        sig: String::new(),
-    }
-}
-
-fn build_meta_event(gid: &str, group: Option<&Group>, relay_pubkey: &str, now: u64) -> Event {
-    let Some(group) = group else {
-        return base_event(GROUP_META, gid, relay_pubkey, now);
-    };
-    let mut event = base_event(GROUP_META, gid, relay_pubkey, now);
-    let s = &group.settings;
-    for (name, value) in [
-        ("name", &s.name),
-        ("picture", &s.picture),
-        ("banner", &s.banner),
-        ("about", &s.about),
-    ] {
-        if !value.is_empty() {
-            event.tags.push(vec![name.to_string(), value.clone()]);
-        }
-    }
-    if s.private {
-        event.tags.push(vec!["private".into()]);
-    }
-    if s.restricted {
-        event.tags.push(vec!["restricted".into()]);
-    }
-    if s.closed {
-        event.tags.push(vec!["closed".into()]);
-    }
-    if s.hidden {
-        event.tags.push(vec!["hidden".into()]);
-    }
-    if let Some(kinds) = &s.supported_kinds {
-        let mut tag = vec!["supported_kinds".to_string()];
-        tag.extend(kinds.iter().map(u64::to_string));
-        event.tags.push(tag);
-    }
-    if let Some(parent) = &group.parent {
-        event.tags.push(vec!["parent".to_string(), parent.clone()]);
-    }
-    for child in &group.children {
-        event.tags.push(vec!["child".to_string(), child.clone()]);
-    }
-    event
-}
-
-fn build_admins_event(gid: &str, group: Option<&Group>, relay_pubkey: &str, now: u64) -> Event {
-    let mut event = base_event(GROUP_ADMINS, gid, relay_pubkey, now);
-    if let Some(group) = group {
-        let mut admins: Vec<(String, Vec<String>)> = group
-            .members
-            .iter()
-            .filter(|(_, roles)| !roles.is_empty())
-            .map(|(pk, roles)| (pk.clone(), roles.iter().cloned().collect()))
-            .collect();
-        admins.sort();
-        for (pk, roles) in admins {
-            let mut tag = vec![P.to_string(), pk];
-            tag.extend(roles);
-            event.tags.push(tag);
-        }
-    }
-    event
-}
-
-fn build_members_event(gid: &str, group: Option<&Group>, relay_pubkey: &str, now: u64) -> Event {
-    let mut event = base_event(GROUP_MEMBERS, gid, relay_pubkey, now);
-    if let Some(group) = group {
-        let mut members: Vec<String> = group.members.keys().cloned().collect();
-        members.sort();
-        for pk in members {
-            event.tags.push(vec![P.to_string(), pk]);
-        }
-    }
-    event
-}
-
-fn build_pins_event(gid: &str, group: Option<&Group>, relay_pubkey: &str, now: u64) -> Event {
-    let mut event = base_event(GROUP_PINS, gid, relay_pubkey, now);
-    if let Some(group) = group {
-        for (tag, value) in &group.pins {
-            event.tags.push(vec![tag.clone(), value.clone()]);
-        }
-    }
-    event
-}
-
-fn build_put_user(gid: &str, member: &str, roles: &[&str], relay_pubkey: &str, now: u64) -> Event {
-    let mut event = base_event(9000, gid, relay_pubkey, now);
-    event.tags[0] = vec![H.to_string(), gid.to_string()];
-    let mut tag = vec![P.to_string(), member.to_string()];
-    tag.extend(roles.iter().map(|r| r.to_string()));
-    event.tags.push(tag);
-    event
-}
-
-fn build_remove_user(gid: &str, member: &str, relay_pubkey: &str, now: u64) -> Event {
-    let mut event = base_event(9001, gid, relay_pubkey, now);
-    event.tags[0] = vec![H.to_string(), gid.to_string()];
-    event.tags.push(vec![P.to_string(), member.to_string()]);
-    event
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

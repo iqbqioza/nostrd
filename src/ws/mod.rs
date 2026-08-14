@@ -91,17 +91,17 @@ impl Conn {
         }
     }
 
-    pub(crate) fn notice(&mut self, text: &str) {
+    pub(crate) fn send_notice(&mut self, text: &str) {
         self.send_json(json!(["NOTICE", text]));
     }
 
     /// NIP-01 CLOSED: a REQ was rejected or ended, with a machine-readable
     /// reason.
-    pub(crate) fn closed(&mut self, sub_id: &str, reason: &str) {
+    pub(crate) fn send_closed(&mut self, sub_id: &str, reason: &str) {
         self.send_json(json!(["CLOSED", sub_id, reason]));
     }
 
-    pub(crate) fn ok(&mut self, id: &str, accepted: bool, message: &str) {
+    pub(crate) fn send_ok(&mut self, id: &str, accepted: bool, message: &str) {
         self.send_json(json!(["OK", id, accepted, message]));
     }
 
@@ -234,7 +234,7 @@ pub async fn handle_connection(mut socket: WebSocket, relay: Arc<Relay>) {
                 match incoming {
                     Some(Ok(Message::Text(text))) => {
                         if text.len() > max_msg_size {
-                            conn.notice("error: message too large");
+                            conn.send_notice("error: message too large");
                             break;
                         }
                         conn.in_msgs += 1;
@@ -248,7 +248,7 @@ pub async fn handle_connection(mut socket: WebSocket, relay: Arc<Relay>) {
                     }
                     Some(Ok(Message::Binary(data))) => {
                         if data.len() > max_msg_size {
-                            conn.notice("error: message too large");
+                            conn.send_notice("error: message too large");
                             break;
                         }
                         let text = String::from_utf8_lossy(&data).into_owned();
@@ -276,7 +276,7 @@ pub async fn handle_connection(mut socket: WebSocket, relay: Arc<Relay>) {
                     {
                         Ok(Some(Ok(Message::Text(text)))) => {
                             if text.len() > max_msg_size {
-                                conn.notice("error: message too large");
+                                conn.send_notice("error: message too large");
                                 too_large = true;
                                 break;
                             }
@@ -286,7 +286,7 @@ pub async fn handle_connection(mut socket: WebSocket, relay: Arc<Relay>) {
                         }
                         Ok(Some(Ok(Message::Binary(data)))) => {
                             if data.len() > max_msg_size {
-                                conn.notice("error: message too large");
+                                conn.send_notice("error: message too large");
                                 too_large = true;
                                 break;
                             }

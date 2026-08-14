@@ -1,8 +1,8 @@
+use serde_json::{Value, json};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde_json::{Value, json};
+use crate::util::unix_now;
 
 #[derive(Debug, Default)]
 pub struct Stats {
@@ -68,11 +68,4 @@ impl Stats {
             "db_size_bytes": self.db_size_bytes.load(Ordering::Relaxed),
         })
     }
-}
-
-pub fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }

@@ -14,7 +14,7 @@ use base64::Engine;
 use crate::config::Config;
 use crate::error::Result;
 use crate::relay::Relay;
-use crate::stats::unix_now;
+use crate::util::unix_now;
 
 // ----- NIP-29 LiveKit integration -----
 
