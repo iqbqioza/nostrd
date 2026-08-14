@@ -1,120 +1,20 @@
-use std::collections::HashMap;
-use std::sync::Arc;
+//! Protocol message handlers (NIP-01/42/45/67/70/77) and the live
+//! delivery path. Every method operates on the [`super::Conn`] state; the
+//! connection loop itself lives in `super`.
 
-use axum::extract::ws::{Message, WebSocket};
-use futures_util::{SinkExt, StreamExt};
+use axum::extract::ws::Message;
 use serde_json::{Value, json};
+
+use super::EVENT_BATCH;
+use super::value_string;
 
 use crate::event::Event;
 use crate::filter::Filter;
 use crate::nips::{nip29, nip40, nip42, nip45, nip70, nip77};
-use crate::relay::Relay;
-use crate::stats::Stats;
 use crate::stats::unix_now;
 
-/// Secondary bound on the number of queued messages (a long tail of small
-/// messages must not outgrow the VecDeque either).
-const OUT_QUEUE_LIMIT: usize = 4096;
-/// Events queued on a connection before they are accepted as one database
-/// batch (the batch shares a single write commit).
-const EVENT_BATCH: usize = 64;
-
-pub struct Conn {
-    relay: Arc<Relay>,
-    /// Outgoing messages awaiting a TCP write, drained by the connection
-    /// loop after every select iteration.
-    outgoing: std::collections::VecDeque<Message>,
-    /// Bytes currently queued in `outgoing`; the byte cap decides whether a
-    /// new message is queued or dropped.
-    out_bytes: usize,
-    /// Per-connection byte cap for the outgoing queue (`limits.max_out_queue_bytes`,
-    /// cached once per connection).
-    out_queue_bytes: usize,
-    /// Subscription id -> (filters, serialized filter bytes).
-    subs: HashMap<String, (Vec<Filter>, usize)>,
-    /// Bytes held by the filters of all active subscriptions.
-    sub_bytes: usize,
-    /// NIP-77 negentropy state per subscription id.
-    neg: HashMap<String, Vec<nip77::Item>>,
-    /// Total number of negentropy items held across all open NEG-OPEN
-    /// subscriptions, so that a connection cannot pin more than twice the
-    /// configured per-query maximum in memory.
-    neg_total: usize,
-    challenge: String,
-    /// Every pubkey authenticated on this connection (NIP-42: all of them
-    /// are treated as authenticated).
-    authed_pubkeys: Vec<String>,
-    /// Events received but not yet accepted; flushed in batches so the
-    /// database commit cost is amortized over many events.
-    pending_events: Vec<Event>,
-    /// Whether this connection delivers NIP-40 expired events live. Cached
-    /// from the config on connect and refreshed whenever a message arrives,
-    /// so the per-batch live path avoids the shared config lock.
-    expiry_enabled: bool,
-    /// Whether NIP-59 gift wraps are only served to their recipients
-    /// (enforced with NIP-42 auth; false when NIP-42 is disabled).
-    giftwrap_restricted: bool,
-    dropped: u64,
-    /// Per-connection message/byte counters, flushed into the shared stats
-    /// once on disconnect so that a million connections do not hammer the
-    /// same cache lines for every single message.
-    in_msgs: u64,
-    in_bytes: u64,
-    out_msgs: u64,
-    out_bytes_total: u64,
-}
-
-impl Conn {
-    fn send(&mut self, msg: Message) {
-        let size = message_size(&msg);
-        let over_byte_cap =
-            !self.outgoing.is_empty() && self.out_bytes.saturating_add(size) > self.out_queue_bytes;
-        if self.outgoing.len() >= OUT_QUEUE_LIMIT || over_byte_cap {
-            self.dropped += 1;
-            self.relay.stats.bump(&self.relay.stats.buffers_dropped, 1);
-            return;
-        }
-        self.out_bytes += size;
-        self.out_msgs += 1;
-        self.out_bytes_total += size as u64;
-        self.outgoing.push_back(msg);
-    }
-
-    fn send_json(&mut self, value: Value) {
-        if let Ok(text) = serde_json::to_string(&value) {
-            self.send(Message::Text(text.into()));
-        }
-    }
-
-    fn notice(&mut self, text: &str) {
-        self.send_json(json!(["NOTICE", text]));
-    }
-
-    /// NIP-01 CLOSED: a REQ was rejected or ended, with a machine-readable
-    /// reason.
-    fn closed(&mut self, sub_id: &str, reason: &str) {
-        self.send_json(json!(["CLOSED", sub_id, reason]));
-    }
-
-    fn ok(&mut self, id: &str, accepted: bool, message: &str) {
-        self.send_json(json!(["OK", id, accepted, message]));
-    }
-
-    /// Whether the connection is authenticated (with any pubkey).
-    fn is_authed(&self) -> bool {
-        !self.authed_pubkeys.is_empty()
-    }
-
-    async fn send_auth_challenge(&mut self) {
-        let enabled = {
-            let cfg = self.relay.config.read().await;
-            cfg.nip_enabled(42) && cfg.server.send_auth_challenge
-        };
-        if enabled {
-            self.send_json(nip42::auth_message(&self.challenge));
-        }
-    }
-    async fn handle_text(&mut self, text: &str) {
+impl super::Conn {
+    pub(crate) async fn handle_text(&mut self, text: &str) {
         let Ok(value) = serde_json::from_str::<Value>(text) else {
             self.notice("error: invalid json");
             return;
@@ -180,7 +80,7 @@ impl Conn {
     }
 
     /// Queues an already-parsed event for batched acceptance.
-    async fn queue_event_value(&mut self, event: Event) {
+    pub(crate) async fn queue_event_value(&mut self, event: Event) {
         self.relay.stats.bump(&self.relay.stats.events_received, 1);
         self.pending_events.push(event);
         if self.pending_events.len() >= EVENT_BATCH {
@@ -189,7 +89,7 @@ impl Conn {
     }
 
     /// Queues an EVENT message for batched acceptance (generic path).
-    async fn queue_event(&mut self, rest: &[Value]) {
+    pub(crate) async fn queue_event(&mut self, rest: &[Value]) {
         self.relay.stats.bump(&self.relay.stats.events_received, 1);
         if rest.is_empty() {
             self.notice("error: EVENT requires an event object");
@@ -206,7 +106,7 @@ impl Conn {
     }
 
     /// Accepts the queued events in one database batch and sends the OKs.
-    async fn flush_pending_events(&mut self) {
+    pub(crate) async fn flush_pending_events(&mut self) {
         if self.pending_events.is_empty() {
             return;
         }
@@ -241,7 +141,7 @@ impl Conn {
         }
     }
 
-    async fn handle_req(&mut self, rest: &[Value]) {
+    pub(crate) async fn handle_req(&mut self, rest: &[Value]) {
         if rest.len() < 2 {
             self.notice("error: REQ requires a subscription id and filters");
             return;
@@ -371,7 +271,7 @@ impl Conn {
         }
     }
 
-    fn handle_close(&mut self, rest: &[Value]) {
+    pub(crate) fn handle_close(&mut self, rest: &[Value]) {
         let Some(Some(sub_id)) = rest.first().map(|v| v.as_str()) else {
             self.notice("error: CLOSE requires a subscription id");
             return;
@@ -385,7 +285,7 @@ impl Conn {
         }
     }
 
-    async fn handle_auth(&mut self, rest: &[Value]) {
+    pub(crate) async fn handle_auth(&mut self, rest: &[Value]) {
         if !self.relay.config.read().await.nip_enabled(42) {
             self.notice("error: authentication is not enabled on this relay");
             return;
@@ -429,7 +329,7 @@ impl Conn {
         self.send_json(nip42::ok(&id, accepted));
     }
 
-    async fn handle_count(&mut self, rest: &[Value]) {
+    pub(crate) async fn handle_count(&mut self, rest: &[Value]) {
         if rest.len() < 2 {
             self.notice("error: COUNT requires a subscription id and filters");
             return;
@@ -476,7 +376,7 @@ impl Conn {
     /// only be served to their recipients, i.e. authenticated users whose
     /// pubkey appears in a `p` tag of the wrap (enforced with NIP-42 auth;
     /// skipped when NIP-42 is disabled).
-    fn gift_wrap_visible(&self, event: &Event) -> bool {
+    pub(crate) fn gift_wrap_visible(&self, event: &Event) -> bool {
         !self.giftwrap_restricted
             || event.kind != crate::nips::nip62::GIFT_WRAP_KIND
             || event
@@ -487,7 +387,7 @@ impl Conn {
     /// Whether a stored or live event may be served on this connection
     /// (NIP-70 protected, NIP-59 gift-wrap recipient and NIP-29 group
     /// access checks).
-    fn visible_to(&self, groups: &nip29::GroupStore, event: &Event) -> bool {
+    pub(crate) fn visible_to(&self, groups: &nip29::GroupStore, event: &Event) -> bool {
         // NIP-70: protected events are only served to authenticated clients.
         // The `-` tag constrains *publication* (author-only, enforced on the
         // write path); NIP-43's relay-generated membership metadata carries
@@ -512,7 +412,7 @@ impl Conn {
     /// caller skips the lock otherwise); `expiry_enabled` is a per-connection
     /// cache refreshed whenever a message arrives, so the hot live path does
     /// not acquire the shared config lock once per batch per connection.
-    fn deliver_live(&mut self, event: &Event, groups: Option<&nip29::GroupStore>) {
+    pub(crate) fn deliver_live(&mut self, event: &Event, groups: Option<&nip29::GroupStore>) {
         // Fast path: most connections have no subscriptions.
         if self.subs.is_empty() {
             return;
@@ -575,15 +475,15 @@ impl Conn {
 
     // ----- NIP-77 negentropy -----
 
-    fn neg_err(&mut self, sub_id: &str, reason: &str) {
+    pub(crate) fn neg_err(&mut self, sub_id: &str, reason: &str) {
         self.send_json(json!(["NEG-ERR", sub_id, reason]));
     }
 
-    fn neg_msg(&mut self, sub_id: &str, message: &[u8]) {
+    pub(crate) fn neg_msg(&mut self, sub_id: &str, message: &[u8]) {
         self.send_json(json!(["NEG-MSG", sub_id, hex::encode(message)]));
     }
 
-    async fn handle_neg_open(&mut self, rest: &[Value]) {
+    pub(crate) async fn handle_neg_open(&mut self, rest: &[Value]) {
         if !self.relay.config.read().await.nip_enabled(77) {
             self.notice("error: negentropy is not enabled on this relay");
             return;
@@ -706,7 +606,7 @@ impl Conn {
         }
     }
 
-    async fn handle_neg_msg(&mut self, rest: &[Value]) {
+    pub(crate) async fn handle_neg_msg(&mut self, rest: &[Value]) {
         if rest.len() < 2 {
             self.notice("error: NEG-MSG requires a subscription id and message");
             return;
@@ -740,7 +640,7 @@ impl Conn {
         }
     }
 
-    fn handle_neg_close(&mut self, rest: &[Value]) {
+    pub(crate) fn handle_neg_close(&mut self, rest: &[Value]) {
         let Some(sub_id) = rest.first().and_then(value_string) else {
             self.notice("error: NEG-CLOSE requires a subscription id");
             return;
@@ -749,262 +649,4 @@ impl Conn {
             self.neg_total = self.neg_total.saturating_sub(items.len());
         }
     }
-}
-
-fn value_string(value: &Value) -> Option<String> {
-    match value {
-        Value::String(s) => Some(s.clone()),
-        Value::Number(n) => Some(n.to_string()),
-        _ => None,
-    }
-}
-
-fn message_size(msg: &Message) -> usize {
-    match msg {
-        Message::Text(text) => text.len(),
-        Message::Binary(data) | Message::Ping(data) | Message::Pong(data) => data.len(),
-        Message::Close(_) => 0,
-    }
-}
-
-/// Releases the connection's accounting when the connection task ends, no
-/// matter how it ends. A panic anywhere in the connection handling would
-/// otherwise skip the disconnect cleanup and leak the `connections_active`
-/// counter, slowly refusing every new connection.
-struct ConnectionGuard(Arc<Stats>);
-
-impl Drop for ConnectionGuard {
-    fn drop(&mut self) {
-        self.0
-            .connections_active
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-
-pub async fn handle_connection(mut socket: WebSocket, relay: Arc<Relay>) {
-    let active = relay
-        .stats
-        .connections_active
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        + 1;
-    relay.stats.bump(&relay.stats.connections_total, 1);
-
-    let max_connections = relay.config.read().await.limits.max_connections;
-    if active > max_connections as u64 {
-        relay
-            .stats
-            .connections_active
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-        let _ = socket.close().await;
-        return;
-    }
-    let _guard = ConnectionGuard(relay.stats.clone());
-
-    let (mut sender, mut receiver) = socket.split();
-    let (max_msg_size, out_queue_bytes, expiry_enabled, giftwrap_restricted) = {
-        let cfg = relay.config.read().await;
-        (
-            cfg.limits.max_ws_message_size,
-            cfg.limits.max_out_queue_bytes,
-            cfg.nip_enabled(40),
-            cfg.nip_enabled(42),
-        )
-    };
-
-    let challenge = nip42::generate_challenge();
-
-    let mut conn = Conn {
-        relay,
-        outgoing: std::collections::VecDeque::new(),
-        out_bytes: 0,
-        out_queue_bytes,
-        subs: HashMap::new(),
-        sub_bytes: 0,
-        neg: HashMap::new(),
-        neg_total: 0,
-        challenge,
-        authed_pubkeys: Vec::new(),
-        pending_events: Vec::new(),
-        expiry_enabled,
-        giftwrap_restricted,
-        dropped: 0,
-        in_msgs: 0,
-        in_bytes: 0,
-        out_msgs: 0,
-        out_bytes_total: 0,
-    };
-    conn.send_auth_challenge().await;
-
-    // The live receiver is created lazily on the first REQ: connections
-    // that only publish never register with the broadcast channel, so they
-    // are not woken up by live events at all.
-    let mut live: Option<tokio::sync::broadcast::Receiver<Arc<Vec<Event>>>> = None;
-
-    // A single task per connection: incoming messages and live batches are
-    // processed in the same loop, and outgoing messages are flushed to the
-    // socket after every iteration. This halves the task count (no separate
-    // writer task) and the per-connection channel.
-    loop {
-        // Drain pending outgoing messages. A slow reader stalls only its
-        // own connection (outgoing is bounded, so new messages are dropped).
-        while let Some(msg) = conn.outgoing.pop_front() {
-            conn.out_bytes = conn.out_bytes.saturating_sub(message_size(&msg));
-            if sender.send(msg).await.is_err() {
-                break;
-            }
-        }
-        let live_fut = async {
-            match live.as_mut() {
-                Some(rx) => rx.recv().await,
-                None => std::future::pending().await,
-            }
-        };
-        tokio::select! {
-            incoming = receiver.next() => {
-                match incoming {
-                    Some(Ok(Message::Text(text))) => {
-                        if text.len() > max_msg_size {
-                            conn.notice("error: message too large");
-                            break;
-                        }
-                        conn.in_msgs += 1;
-                        conn.in_bytes += text.len() as u64;
-                        conn.handle_text(&text).await;
-                        // Refresh the cached NIP-40/NIP-42 flags so config
-                        // reloads take effect for live delivery.
-                        let cfg = conn.relay.config.read().await;
-                        conn.expiry_enabled = cfg.nip_enabled(40);
-                        conn.giftwrap_restricted = cfg.nip_enabled(42);
-                    }
-                    Some(Ok(Message::Binary(data))) => {
-                        if data.len() > max_msg_size {
-                            conn.notice("error: message too large");
-                            break;
-                        }
-                        let text = String::from_utf8_lossy(&data).into_owned();
-                        conn.in_msgs += 1;
-                        conn.in_bytes += data.len() as u64;
-                        conn.handle_text(&text).await;
-                        let cfg = conn.relay.config.read().await;
-                        conn.expiry_enabled = cfg.nip_enabled(40);
-                        conn.giftwrap_restricted = cfg.nip_enabled(42);
-                    }
-                    Some(Ok(Message::Close(_))) | None => break,
-                    Some(Ok(_)) => {}
-                    Some(Err(_)) => break,
-                }
-                // Batch window: keep reading for a moment so consecutive
-                // EVENT messages from a busy publisher share one database
-                // commit, then flush the queue when the socket is idle.
-                let mut too_large = false;
-                loop {
-                    match tokio::time::timeout(
-                        std::time::Duration::from_millis(1),
-                        receiver.next(),
-                    )
-                    .await
-                    {
-                        Ok(Some(Ok(Message::Text(text)))) => {
-                            if text.len() > max_msg_size {
-                                conn.notice("error: message too large");
-                                too_large = true;
-                                break;
-                            }
-                            conn.in_msgs += 1;
-                            conn.in_bytes += text.len() as u64;
-                            conn.handle_text(&text).await;
-                        }
-                        Ok(Some(Ok(Message::Binary(data)))) => {
-                            if data.len() > max_msg_size {
-                                conn.notice("error: message too large");
-                                too_large = true;
-                                break;
-                            }
-                            let text = String::from_utf8_lossy(&data).into_owned();
-                            conn.in_msgs += 1;
-                            conn.in_bytes += data.len() as u64;
-                            conn.handle_text(&text).await;
-                        }
-                        _ => break,
-                    }
-                }
-                if too_large {
-                    break;
-                }
-                conn.flush_pending_events().await;
-                // Subscribe to live events once the first REQ arrives and
-                // drop the receiver again when every subscription is closed,
-                // so connections without active subscriptions are never
-                // woken by live events.
-                if live.is_none() && !conn.subs.is_empty() {
-                    live = Some(conn.relay.live.subscribe());
-                } else if live.is_some() && conn.subs.is_empty() {
-                    live = None;
-                }
-            }
-            live_batch = live_fut => {
-                match live_batch {
-                    Ok(batch) => {
-                        // The group store lock is only taken when the batch
-                        // actually contains group events (rare); ordinary
-                        // traffic skips the shared lock entirely.
-                        let has_group_events =
-                            batch.iter().any(nip29::is_group_event);
-                        // The store Arc stays alive for the whole batch so
-                        // the read guard can borrow it; the lock is only
-                        // taken for batches containing group events.
-                        let store = Arc::clone(&conn.relay.groups);
-                        let guard = if has_group_events {
-                            Some(store.read().await)
-                        } else {
-                            None
-                        };
-                        let groups = guard.as_deref();
-                        for event in batch.iter() {
-                            conn.deliver_live(event, groups);
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        }
-    }
-
-    // Events received but not yet batched are accepted before closing, so
-    // a client that disconnects without waiting for its OKs does not lose
-    // them. The live broadcast of these events still reaches subscribers.
-    conn.flush_pending_events().await;
-
-    // Final flush: deliver any queued messages (e.g. NOTICEs) before
-    // closing the connection.
-    while let Some(msg) = conn.outgoing.pop_front() {
-        conn.out_bytes = conn.out_bytes.saturating_sub(message_size(&msg));
-        if sender.send(msg).await.is_err() {
-            break;
-        }
-    }
-    let _ = sender.close().await;
-
-    // Flush the per-connection counters into the shared stats once, so the
-    // hot per-message path never contends on the shared atomics.
-    conn.relay
-        .stats
-        .bump(&conn.relay.stats.messages_in, conn.in_msgs);
-    conn.relay
-        .stats
-        .bump(&conn.relay.stats.bytes_in, conn.in_bytes);
-    conn.relay
-        .stats
-        .bump(&conn.relay.stats.messages_out, conn.out_msgs);
-    conn.relay
-        .stats
-        .bump(&conn.relay.stats.bytes_out, conn.out_bytes_total);
-
-    // Release the connection's accounting: any subscriptions still open at
-    // disconnect were never CLOSE'd, so decrement them here.
-    conn.relay
-        .stats
-        .subscriptions_active
-        .fetch_sub(conn.subs.len() as u64, std::sync::atomic::Ordering::Relaxed);
 }
