@@ -159,7 +159,7 @@ impl Default for RelayConfig {
             pubkey: String::new(),
             contact: String::new(),
             icon: String::new(),
-            software: "https://github.com/nostrd/nostrd".into(),
+            software: "https://github.com/iqbqioza/nostrd".into(),
             version: env!("CARGO_PKG_VERSION").into(),
             post_policy: String::new(),
             private_key: String::new(),

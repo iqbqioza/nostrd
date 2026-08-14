@@ -164,6 +164,13 @@ new_pubkey_min_age_secs = 0
 # are dropped (protects memory against slow readers).
 max_out_queue_bytes = 262144
 
+# Overload protection: when the database thread's queue holds more than this
+# many pending messages (or db_queue_events pending events), new database
+# requests fail fast instead of accumulating in memory. Keeps the relay up
+# under sustained overload instead of running out of memory.
+db_queue_msgs = 4096
+db_queue_events = 262144
+
 # Maximum total bytes of subscription filters held per connection.
 max_sub_bytes = 524288
 

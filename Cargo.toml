@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 description = "A minimal and stable Nostr relay server"
 license = "MIT"
-repository = "https://github.com/nostrd/nostrd"
+repository = "https://github.com/iqbqioza/nostrd"
 
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
