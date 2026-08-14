@@ -15,15 +15,19 @@ pub const PK_BYTES: usize = 32;
 pub const SIG_BYTES: usize = 64;
 
 /// Canonical serialization of an event without the `id` and `sig` fields.
+///
+/// The payload is serialized directly from a tuple — the `serde_json::json!`
+/// macro would build an intermediate `Value` tree first, doubling the
+/// allocation work on this hot path (every published event is hashed here).
 pub fn canonical_payload(event: &Event) -> Vec<u8> {
-    serde_json::to_vec(&serde_json::json!([
-        0,
-        event.pubkey,
+    serde_json::to_vec(&(
+        0u8,
+        &event.pubkey,
         event.created_at,
         event.kind,
-        event.tags,
-        event.content
-    ]))
+        &event.tags,
+        &event.content,
+    ))
     .expect("canonical serialization cannot fail")
 }
 
