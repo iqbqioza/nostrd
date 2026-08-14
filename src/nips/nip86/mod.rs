@@ -399,16 +399,7 @@ async fn rpc_authenticated(relay: &Relay, headers: &HeaderMap, uri: &axum::http:
             relay.secp(),
             true,
             "POST",
-            |url| {
-                nip98::matches_request_url(
-                    url,
-                    &cfg.server.host,
-                    cfg.server.port,
-                    &cfg.relay.public_url,
-                    uri.path(),
-                    uri.query(),
-                )
-            },
+            |url| nip98::matches_request_url(url, &cfg.relay_identity(), uri.path(), uri.query()),
         )
         .await
         .is_some()

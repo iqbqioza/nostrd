@@ -64,9 +64,7 @@ pub(crate) async fn livekit_token(
     let authed = crate::nips::nip98::verify(&encoded, None, relay.secp(), false, "GET", |url| {
         crate::nips::nip98::matches_request_url(
             url,
-            &cfg.server.host,
-            cfg.server.port,
-            &cfg.relay.public_url,
+            &cfg.relay_identity(),
             &expected_path,
             uri.query(),
         )

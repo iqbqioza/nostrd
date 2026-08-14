@@ -22,6 +22,16 @@ use crate::nips::{nip40, nip50};
 /// private/hidden group content from non-members, mirroring the REQ path.
 pub(crate) type NegItems = Vec<(u64, [u8; 32], bool, Option<String>, bool)>;
 
+/// The database handles and transaction of one scan, bundled so the
+/// per-candidate checks stay readable.
+struct ScanContext<'tx> {
+    events: Database<Bytes, Bytes>,
+    deleted: Database<Bytes, Bytes>,
+    banned: Database<Bytes, Bytes>,
+    expiry_enabled: bool,
+    rtxn: &'tx RoTxn<'tx>,
+}
+
 /// NIP-50 search collection budget: the scan gathers up to this many
 /// candidates (instead of the response limit) so that the relevance
 /// ordering can pick the best matches before the limit is applied.
@@ -351,23 +361,17 @@ impl Store {
         more: &mut bool,
     ) -> Result<bool> {
         let cap = out.cap();
+        let ctx = ScanContext {
+            events: self.events,
+            deleted: self.deleted,
+            banned: self.banned,
+            expiry_enabled: self
+                .expiry_enabled
+                .load(std::sync::atomic::Ordering::Relaxed),
+            rtxn,
+        };
         let mut consider = |id: &[u8]| -> Result<bool> {
-            consider_event(
-                self.events,
-                self.deleted,
-                self.banned,
-                self.expiry,
-                self.expiry_enabled
-                    .load(std::sync::atomic::Ordering::Relaxed),
-                rtxn,
-                id,
-                filter,
-                terms,
-                now,
-                seen,
-                out,
-                limit,
-            )
+            consider_event(&ctx, id, filter, terms, now, seen, out, limit)
         };
 
         if let Some(ids) = &filter.ids {
@@ -575,12 +579,7 @@ impl Store {
 
 #[allow(clippy::too_many_arguments)]
 fn consider_event<C: ScanCollector>(
-    events: Database<Bytes, Bytes>,
-    deleted: Database<Bytes, Bytes>,
-    banned: Database<Bytes, Bytes>,
-    _expiry: Database<Bytes, Bytes>,
-    expiry_enabled: bool,
-    rtxn: &RoTxn,
+    ctx: &ScanContext<'_>,
     id: &[u8],
     filter: &Filter,
     terms: &[String],
@@ -597,22 +596,13 @@ fn consider_event<C: ScanCollector>(
     if seen.contains(id) {
         return Ok(true);
     }
-    let Some(raw) = events.get(rtxn, id)? else {
+    let Some(raw) = ctx.events.get(ctx.rtxn, id)? else {
         return Ok(true);
     };
     let Ok(event) = serde_json::from_slice::<Event>(raw) else {
         return Ok(true);
     };
-    if !is_deliverable(
-        deleted,
-        banned,
-        expiry_enabled,
-        rtxn,
-        &event,
-        filter,
-        terms,
-        now,
-    )? {
+    if !is_deliverable(ctx, &event, filter, terms, now)? {
         return Ok(true);
     }
     seen.insert(id.to_vec());
@@ -620,12 +610,8 @@ fn consider_event<C: ScanCollector>(
     Ok(out.push(event, id, limit))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn is_deliverable(
-    deleted: Database<Bytes, Bytes>,
-    banned: Database<Bytes, Bytes>,
-    expiry_enabled: bool,
-    rtxn: &RoTxn,
+    ctx: &ScanContext<'_>,
     event: &Event,
     filter: &Filter,
     terms: &[String],
@@ -634,13 +620,13 @@ fn is_deliverable(
     let Some(id) = event.id_bytes() else {
         return Ok(false);
     };
-    if deleted.get(rtxn, &id)?.is_some() {
+    if ctx.deleted.get(ctx.rtxn, &id)?.is_some() {
         return Ok(false);
     }
-    if banned.get(rtxn, &id)?.is_some() {
+    if ctx.banned.get(ctx.rtxn, &id)?.is_some() {
         return Ok(false);
     }
-    if expiry_enabled
+    if ctx.expiry_enabled
         && let Some(exp) = nip40::expiry(event)
         && exp < now
     {

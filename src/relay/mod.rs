@@ -172,12 +172,7 @@ impl Relay {
         // never accept anything from it again.
         if cfg.nip_enabled(62)
             && nip62::is_vanish(&event)
-            && nip62::targets_us(
-                &event,
-                &cfg.server.host,
-                cfg.server.port,
-                &cfg.relay.public_url,
-            )
+            && nip62::targets_us(&event, &cfg.relay_identity())
             && let Some(pubkey) = event.pubkey_bytes()
         {
             let pubkey_hex = hex::encode(pubkey);
@@ -423,12 +418,7 @@ impl Relay {
             }
             if cfg.nip_enabled(62)
                 && nip62::is_vanish(&event)
-                && nip62::targets_us(
-                    &event,
-                    &cfg.server.host,
-                    cfg.server.port,
-                    &cfg.relay.public_url,
-                )
+                && nip62::targets_us(&event, &cfg.relay_identity())
             {
                 vanishes.push((id, event));
                 continue;

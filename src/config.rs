@@ -312,6 +312,16 @@ impl Config {
             .collect()
     }
 
+    /// The relay's own URL identity (host:port plus the optional public
+    /// URL), used by the NIP-42/62/98 tag validations.
+    pub fn relay_identity(&self) -> crate::nips::nip62::RelayIdentity<'_> {
+        crate::nips::nip62::RelayIdentity::new(
+            &self.server.host,
+            self.server.port,
+            &self.relay.public_url,
+        )
+    }
+
     pub fn nip_enabled(&self, num: u16) -> bool {
         if !self.relay.enabled_nips.is_empty() {
             return self.relay.enabled_nips.contains(&num);

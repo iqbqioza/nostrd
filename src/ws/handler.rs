@@ -308,9 +308,7 @@ impl super::Conn {
                 &self.challenge,
                 self.relay.secp(),
                 unix_now(),
-                &cfg.server.host,
-                cfg.server.port,
-                &cfg.relay.public_url,
+                &cfg.relay_identity(),
             )
         };
         if accepted {

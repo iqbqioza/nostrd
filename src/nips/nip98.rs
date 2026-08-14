@@ -81,9 +81,7 @@ pub async fn verify(
 /// match exactly.
 pub fn matches_request_url(
     tag: &str,
-    host: &str,
-    port: u16,
-    public_url: &str,
+    identity: &crate::nips::nip62::RelayIdentity<'_>,
     request_path: &str,
     request_query: Option<&str>,
 ) -> bool {
@@ -109,11 +107,11 @@ pub fn matches_request_url(
     if tag_path != request_path || tag_query.unwrap_or("") != request_query.unwrap_or("") {
         return false;
     }
-    authority_matches(authority, host, port, public_url)
+    authority_matches(authority, identity)
 }
 
-fn authority_matches(authority: &str, host: &str, port: u16, public_url: &str) -> bool {
-    let our_authority = crate::nips::nip62::authority_of(host, port, public_url);
+fn authority_matches(authority: &str, identity: &crate::nips::nip62::RelayIdentity<'_>) -> bool {
+    let our_authority = crate::nips::nip62::authority_of(identity);
     let (our_host, our_port) = crate::nips::nip62::split_host_port(&our_authority);
     let (tag_host, tag_port) = crate::nips::nip62::split_host_port(authority);
     if tag_host != our_host {
@@ -132,6 +130,7 @@ fn authority_matches(authority: &str, host: &str, port: u16, public_url: &str) -
 mod tests {
     use super::*;
     use crate::nips::nip01::compute_id;
+    use crate::nips::nip62::RelayIdentity;
     use secp256k1::{Keypair, XOnlyPublicKey};
 
     fn signed_event(method: Option<&str>, url: &str, created: u64) -> Event {
@@ -195,126 +194,96 @@ mod tests {
 
     #[test]
     fn request_url_matches_exactly() {
-        let host = "relay.example.com";
-        let port = 8080;
-        let public = "";
+        let identity = RelayIdentity::new("relay.example.com", 8080, "");
         // Exact match.
         assert!(matches_request_url(
             "https://relay.example.com:8080/ws",
-            host,
-            port,
-            public,
+            &identity,
             "/ws",
             None
         ));
         // Scheme normalization: wss and http are accepted too.
         assert!(matches_request_url(
             "wss://relay.example.com:8080/ws",
-            host,
-            port,
-            public,
+            &identity,
             "/ws",
             None
         ));
         assert!(matches_request_url(
             "nostr+https://relay.example.com:8080/ws",
-            host,
-            port,
-            public,
+            &identity,
             "/ws",
             None
         ));
         // The query must match exactly, including parameter order.
         assert!(matches_request_url(
             "https://relay.example.com:8080/ws?a=1&b=2",
-            host,
-            port,
-            public,
+            &identity,
             "/ws",
             Some("a=1&b=2")
         ));
         assert!(!matches_request_url(
             "https://relay.example.com:8080/ws?a=1&b=2",
-            host,
-            port,
-            public,
+            &identity,
             "/ws",
             Some("b=2&a=1")
         ));
         // A query on one side but not the other is a mismatch.
         assert!(!matches_request_url(
             "https://relay.example.com:8080/ws?a=1",
-            host,
-            port,
-            public,
+            &identity,
             "/ws",
             None
         ));
         assert!(!matches_request_url(
             "https://relay.example.com:8080/ws",
-            host,
-            port,
-            public,
+            &identity,
             "/ws",
             Some("a=1")
         ));
         // The path must match exactly.
         assert!(!matches_request_url(
             "https://relay.example.com:8080/ws/",
-            host,
-            port,
-            public,
+            &identity,
             "/ws",
             None
         ));
         assert!(!matches_request_url(
             "https://relay.example.com:8080/other",
-            host,
-            port,
-            public,
+            &identity,
             "/ws",
             None
         ));
         // Host and port must match; a non-default port may not be omitted.
         assert!(!matches_request_url(
             "https://evil.example.com:8080/ws",
-            host,
-            port,
-            public,
+            &identity,
             "/ws",
             None
         ));
         assert!(!matches_request_url(
             "https://relay.example.com:9999/ws",
-            host,
-            port,
-            public,
+            &identity,
             "/ws",
             None
         ));
         assert!(!matches_request_url(
             "https://relay.example.com/ws",
-            host,
-            port,
-            public,
+            &identity,
             "/ws",
             None
         ));
         // Unsupported schemes are rejected.
         assert!(!matches_request_url(
             "ftp://relay.example.com:8080/ws",
-            host,
-            port,
-            public,
+            &identity,
             "/ws",
             None
         ));
         // A bare host matches the "/" path.
         assert!(matches_request_url(
             "https://relay.example.com:8080",
-            host,
-            port,
-            public,
+            &identity,
             "/",
             None
         ));
@@ -323,36 +292,31 @@ mod tests {
     #[test]
     fn request_url_default_port_and_public_url() {
         // Default ports may be omitted from the tag.
+        let identity = RelayIdentity::new("relay.example.com", 443, "");
         assert!(matches_request_url(
             "wss://relay.example.com/ws",
-            "relay.example.com",
-            443,
-            "",
+            &identity,
             "/ws",
             None
         ));
+        let identity = RelayIdentity::new("relay.example.com", 80, "");
         assert!(matches_request_url(
             "ws://relay.example.com/",
-            "relay.example.com",
-            80,
-            "",
+            &identity,
             "/",
             None
         ));
         // public_url overrides the configured host:port.
+        let identity = RelayIdentity::new("127.0.0.1", 8080, "wss://public.example.net");
         assert!(matches_request_url(
             "wss://public.example.net/ws",
-            "127.0.0.1",
-            8080,
-            "wss://public.example.net",
+            &identity,
             "/ws",
             None
         ));
         assert!(!matches_request_url(
             "wss://public.example.net:8443/ws",
-            "127.0.0.1",
-            8080,
-            "wss://public.example.net",
+            &identity,
             "/ws",
             None
         ));
