@@ -283,14 +283,18 @@ fn is_websocket_request(headers: &HeaderMap) -> bool {
         return false;
     }
     // Behind a proxy the request scheme is announced with
-    // X-Forwarded-Proto; a WebSocket connection must be ws or wss.
+    // X-Forwarded-Proto. The value is the scheme the client used to reach
+    // the proxy: `wss`/`ws` for a direct WebSocket connection, or
+    // `https`/`http` when the proxy terminates TLS (e.g. Cloudflare
+    // Tunnel), in which case the WebSocket upgrade is decided by the
+    // upgrade headers alone.
     match headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
     {
         Some(proto) => {
             let proto = proto.to_ascii_lowercase();
-            proto == "ws" || proto == "wss"
+            matches!(proto.as_str(), "ws" | "wss" | "http" | "https")
         }
         None => true,
     }
