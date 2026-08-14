@@ -1,3 +1,6 @@
+//! NIP modules and the documentation registry of the Nostr
+//! proposal landscape.
+
 pub mod nip01;
 pub mod nip09;
 pub mod nip11;

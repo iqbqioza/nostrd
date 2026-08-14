@@ -3,6 +3,7 @@
 //! message handlers (REQ/EVENT/AUTH/COUNT/NEG) live in [`handler`].
 
 mod handler;
+mod negentropy;
 
 use std::collections::HashMap;
 use std::sync::Arc;

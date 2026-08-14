@@ -1,3 +1,5 @@
+//! NIP-01 subscription filters and the in-memory match.
+
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};

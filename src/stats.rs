@@ -1,3 +1,6 @@
+//! Shared counters reported by `nostrd stats` and the NIP-11
+//! information document.
+
 use serde_json::{Value, json};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

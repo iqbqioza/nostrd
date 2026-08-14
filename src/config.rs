@@ -1,3 +1,6 @@
+//! `nostrd.toml` configuration: relay identity, server binding,
+//! limits, database, daemon paths and NIP toggles.
+
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
