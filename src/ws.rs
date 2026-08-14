@@ -132,7 +132,16 @@ impl Conn {
             // database commit cost is paid once per batch instead of once
             // per event; the batch is flushed when it is full, when the
             // socket is momentarily idle, or before any other message.
-            "EVENT" => self.queue_event(&msg[1..]).await,
+            "EVENT" => {
+                // Fast path: the message is parsed directly as a
+                // `(verb, event)` pair in a single JSON pass, avoiding the
+                // generic Value parse plus its clone. The generic path is
+                // only taken for malformed messages (to emit the NOTICE).
+                match serde_json::from_str::<(String, Event)>(text) {
+                    Ok((_, event)) => self.queue_event_value(event).await,
+                    Err(_) => self.queue_event(&msg[1..]).await,
+                }
+            }
             "REQ" => {
                 self.flush_pending_events().await;
                 self.handle_req(&msg[1..]).await;
@@ -169,7 +178,16 @@ impl Conn {
         }
     }
 
-    /// Queues an EVENT message for batched acceptance.
+    /// Queues an already-parsed event for batched acceptance.
+    async fn queue_event_value(&mut self, event: Event) {
+        self.relay.stats.bump(&self.relay.stats.events_received, 1);
+        self.pending_events.push(event);
+        if self.pending_events.len() >= EVENT_BATCH {
+            self.flush_pending_events().await;
+        }
+    }
+
+    /// Queues an EVENT message for batched acceptance (generic path).
     async fn queue_event(&mut self, rest: &[Value]) {
         self.relay.stats.bump(&self.relay.stats.events_received, 1);
         if rest.is_empty() {
@@ -183,10 +201,7 @@ impl Conn {
                 return;
             }
         };
-        self.pending_events.push(event);
-        if self.pending_events.len() >= EVENT_BATCH {
-            self.flush_pending_events().await;
-        }
+        self.queue_event_value(event).await;
     }
 
     /// Accepts the queued events in one database batch and sends the OKs.
@@ -533,8 +548,27 @@ impl Conn {
             .filter(|(_, (filters, _))| filters.iter().any(|f| f.matches(event)))
             .map(|(sub_id, _)| sub_id.clone())
             .collect();
+        if matching.is_empty() {
+            return;
+        }
+        // Serialize the event once and wrap it per subscription: the JSON
+        // of a large event would otherwise be encoded once per matching
+        // subscription (a hot path on busy relays).
+        let Ok(event_json) = serde_json::to_string(event) else {
+            return;
+        };
+        let mut out = String::with_capacity(event_json.len() + 32);
         for sub_id in matching {
-            self.send_json(json!(["EVENT", sub_id, event]));
+            let Ok(sub_json) = serde_json::to_string(&sub_id) else {
+                continue;
+            };
+            out.clear();
+            out.push_str("[\"EVENT\",");
+            out.push_str(&sub_json);
+            out.push(',');
+            out.push_str(&event_json);
+            out.push(']');
+            self.send(Message::Text(out.clone().into()));
         }
     }
 

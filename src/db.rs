@@ -162,6 +162,11 @@ enum Msg {
 #[derive(Clone)]
 pub struct DbClient {
     tx: mpsc::UnboundedSender<Msg>,
+    /// Dedicated channel for read-only requests: they are served by a
+    /// separate thread that never takes the write lock, so reads keep
+    /// working even when the writer is stalled (a slow disk or an external
+    /// lock holder cannot take the relay down for readers).
+    read_tx: mpsc::UnboundedSender<Msg>,
     errors: Arc<std::sync::atomic::AtomicU64>,
     expiry: Arc<std::sync::atomic::AtomicBool>,
     /// Seconds a request may wait for the database thread before timing out
@@ -169,6 +174,17 @@ pub struct DbClient {
     /// is stuck: timed-out requests fail with a clear error instead of
     /// hanging the connection.
     timeout_secs: u64,
+    /// Messages queued but not yet drained by the database thread. When the
+    /// queue grows past the configured caps, new requests fail fast instead
+    /// of piling up in memory: the relay keeps serving (slowly) instead of
+    /// running out of memory.
+    pending_msgs: Arc<std::sync::atomic::AtomicUsize>,
+    /// Events inside the queued `PutBatch`/`Put` messages (the dominant
+    /// memory of the queue).
+    pending_events: Arc<std::sync::atomic::AtomicUsize>,
+    /// Caps for the counters above.
+    max_pending_msgs: usize,
+    max_pending_events: usize,
 }
 
 impl DbClient {
@@ -178,11 +194,159 @@ impl DbClient {
         errors: Arc<std::sync::atomic::AtomicU64>,
         request_timeout_secs: u64,
         max_indexed_words: usize,
+        max_pending_msgs: usize,
+        max_pending_events: usize,
     ) -> Result<DbClient> {
         let expiry = Arc::new(std::sync::atomic::AtomicBool::new(expiry_enabled));
         let store = Store::open(cfg, Arc::clone(&expiry), max_indexed_words)?;
         let (tx, mut rx) = mpsc::unbounded_channel();
+        let (read_tx, mut read_rx) = mpsc::unbounded_channel();
         let thread_errors = Arc::clone(&errors);
+        let pending_msgs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pending_events = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let thread_pending_msgs = Arc::clone(&pending_msgs);
+        let thread_pending_events = Arc::clone(&pending_events);
+        let read_pending = Arc::clone(&pending_msgs);
+        // Dedicated reader thread: serves Query/Count/NEG and the small
+        // lookups without ever taking the LMDB write lock.
+        {
+            let read_store = store.clone_for_reader();
+            let read_errors = Arc::clone(&errors);
+            std::thread::spawn(move || {
+                'reader: loop {
+                    let Some(msg) = read_rx.blocking_recv() else {
+                        break;
+                    };
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let shutdown = match msg {
+                            Msg::Query {
+                                filters,
+                                limit,
+                                now,
+                                reply,
+                            } => {
+                                let out = match read_store.scan(&filters, now, limit, false) {
+                                    Ok(out) => out,
+                                    Err(e) => {
+                                        db_error(&read_errors, &e);
+                                        (Vec::new(), false)
+                                    }
+                                };
+                                let _ = reply.send(out);
+                                false
+                            }
+                            Msg::NegQuery {
+                                filter,
+                                limit,
+                                now,
+                                reply,
+                            } => {
+                                let out = match read_store.scan_neg(&filter, now, limit) {
+                                    Ok(out) => out,
+                                    Err(e) => {
+                                        db_error(&read_errors, &e);
+                                        (Vec::new(), false)
+                                    }
+                                };
+                                let _ = reply.send(out);
+                                false
+                            }
+                            Msg::Count {
+                                filters,
+                                limit,
+                                now,
+                                reply,
+                            } => {
+                                let out = match read_store.scan(&filters, now, limit, true) {
+                                    Ok(out) => out,
+                                    Err(e) => {
+                                        db_error(&read_errors, &e);
+                                        (Vec::new(), false)
+                                    }
+                                };
+                                let _ = reply.send(out);
+                                false
+                            }
+                            Msg::PrefixExists { prefix, reply } => {
+                                let exists = match read_store.event_id_prefix_exists(&prefix) {
+                                    Ok(exists) => exists,
+                                    Err(e) => {
+                                        db_error(&read_errors, &e);
+                                        false
+                                    }
+                                };
+                                let _ = reply.send(exists);
+                                false
+                            }
+                            Msg::PrefixesExist { prefixes, reply } => {
+                                let mut out = Vec::with_capacity(prefixes.len());
+                                for prefix in &prefixes {
+                                    let exists = match read_store.event_id_prefix_exists(prefix) {
+                                        Ok(exists) => exists,
+                                        Err(e) => {
+                                            db_error(&read_errors, &e);
+                                            false
+                                        }
+                                    };
+                                    out.push(exists);
+                                }
+                                let _ = reply.send(out);
+                                false
+                            }
+                            Msg::ReplaceableCreatedAt {
+                                kind,
+                                pubkey,
+                                d,
+                                reply,
+                            } => {
+                                let created =
+                                    match read_store.replaceable_created_at(kind, &pubkey, &d) {
+                                        Ok(created) => created,
+                                        Err(e) => {
+                                            db_error(&read_errors, &e);
+                                            None
+                                        }
+                                    };
+                                let _ = reply.send(created);
+                                false
+                            }
+                            Msg::ListBanned { reply } => {
+                                let banned = match read_store.list_banned() {
+                                    Ok(banned) => banned,
+                                    Err(e) => {
+                                        db_error(&read_errors, &e);
+                                        Vec::new()
+                                    }
+                                };
+                                let _ = reply.send(banned);
+                                false
+                            }
+                            Msg::DatabaseSize { reply } => {
+                                let _ = reply.send(read_store.size_on_disk());
+                                false
+                            }
+                            #[cfg(test)]
+                            Msg::MapSize { reply } => {
+                                let _ = reply.send(read_store.env.info().map_size as u64);
+                                false
+                            }
+                            Msg::Shutdown => true,
+                            _ => unreachable!("read channel received a write message"),
+                        };
+                        read_pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        shutdown
+                    }));
+                    match result {
+                        Ok(true) => break 'reader,
+                        Ok(false) => {}
+                        Err(_) => {
+                            log::error!("reader thread recovered from a panic");
+                            read_pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
+            });
+        }
         std::thread::spawn(move || {
             // Puts are applied in batches sharing one write transaction so
             // that the LMDB commit cost (a full fsync by default) is paid
@@ -223,6 +387,15 @@ impl DbClient {
                             Err(_) => break,
                         }
                     }
+                    let drained_msgs = msgs.len();
+                    let drained_events: usize = msgs
+                        .iter()
+                        .map(|m| match m {
+                            Msg::PutBatch { events, .. } => events.len(),
+                            Msg::Put { .. } => 1,
+                            _ => 0,
+                        })
+                        .sum();
                     for msg in msgs {
                         match msg {
                             Msg::Put { event, now, reply } => {
@@ -476,6 +649,13 @@ impl DbClient {
                             }
                         }
                     }
+                    // Release the queued-work accounting of everything the
+                    // drain processed (the batch counters are approximate:
+                    // messages in the middle of the drain still count).
+                    thread_pending_msgs
+                        .fetch_sub(drained_msgs, std::sync::atomic::Ordering::Relaxed);
+                    thread_pending_events
+                        .fetch_sub(drained_events, std::sync::atomic::Ordering::Relaxed);
                     // Flush the batch before blocking again: clients await
                     // their replies, so a pending batch must not wait for
                     // the next message or every requestor deadlocks.
@@ -511,9 +691,14 @@ impl DbClient {
         });
         Ok(DbClient {
             tx,
+            read_tx,
             errors,
             expiry,
             timeout_secs: request_timeout_secs,
+            pending_msgs,
+            pending_events,
+            max_pending_msgs: max_pending_msgs.max(1),
+            max_pending_events: max_pending_events.max(1),
         })
     }
 
@@ -524,8 +709,47 @@ impl DbClient {
     }
 
     async fn request<R: Default>(&self, make: impl FnOnce(oneshot::Sender<R>) -> Msg) -> R {
+        self.request_with(make, &self.tx).await
+    }
+
+    /// Sends a read-only request to the dedicated reader thread.
+    async fn request_read<R: Default>(&self, make: impl FnOnce(oneshot::Sender<R>) -> Msg) -> R {
+        self.request_with(make, &self.read_tx).await
+    }
+
+    async fn request_with<R: Default>(
+        &self,
+        make: impl FnOnce(oneshot::Sender<R>) -> Msg,
+        channel: &mpsc::UnboundedSender<Msg>,
+    ) -> R {
+        // Overload protection: when the database thread's queue is already
+        // deep, new requests fail fast instead of accumulating in memory.
+        // Callers degrade gracefully (empty replies, error outcomes).
+        if self.pending_msgs.load(std::sync::atomic::Ordering::Relaxed) >= self.max_pending_msgs
+            || self
+                .pending_events
+                .load(std::sync::atomic::Ordering::Relaxed)
+                >= self.max_pending_events
+        {
+            // Surface the overload in the stats (db_errors).
+            self.errors
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return R::default();
+        }
         let (tx, rx) = oneshot::channel();
-        if self.tx.send(make(tx)).is_err() {
+        let msg = make(tx);
+        self.pending_msgs
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if let Msg::PutBatch { events, .. } = &msg {
+            self.pending_events
+                .fetch_add(events.len(), std::sync::atomic::Ordering::Relaxed);
+        } else if let Msg::Put { .. } = &msg {
+            self.pending_events
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if channel.send(msg).is_err() {
+            self.pending_msgs
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             return R::default();
         }
         if self.timeout_secs == 0 {
@@ -542,7 +766,7 @@ impl DbClient {
     }
 
     pub async fn query(&self, filters: Vec<Filter>, limit: usize, now: u64) -> (Vec<Event>, bool) {
-        self.request(|reply| Msg::Query {
+        self.request_read(|reply| Msg::Query {
             filters,
             limit,
             now,
@@ -566,7 +790,7 @@ impl DbClient {
     /// NIP-77: returns only `(created_at, id)` records of the matching
     /// events, keeping the memory footprint at a few bytes per record.
     pub async fn neg_items(&self, filter: Filter, limit: usize, now: u64) -> (NegItems, bool) {
-        self.request(|reply| Msg::NegQuery {
+        self.request_read(|reply| Msg::NegQuery {
             filter,
             limit,
             now,
@@ -576,7 +800,7 @@ impl DbClient {
     }
 
     pub async fn count(&self, filters: Vec<Filter>, limit: usize, now: u64) -> (Vec<Event>, bool) {
-        self.request(|reply| Msg::Count {
+        self.request_read(|reply| Msg::Count {
             filters,
             limit,
             now,
@@ -620,7 +844,7 @@ impl DbClient {
     }
 
     pub async fn event_id_prefix_exists(&self, prefix: &[u8]) -> bool {
-        self.request(|reply| Msg::PrefixExists {
+        self.request_read(|reply| Msg::PrefixExists {
             prefix: prefix.to_vec(),
             reply,
         })
@@ -629,7 +853,7 @@ impl DbClient {
 
     /// Checks many event-id prefixes in a single database round trip.
     pub async fn prefixes_exist(&self, prefixes: Vec<Vec<u8>>) -> Vec<bool> {
-        self.request(|reply| Msg::PrefixesExist { prefixes, reply })
+        self.request_read(|reply| Msg::PrefixesExist { prefixes, reply })
             .await
     }
 
@@ -658,14 +882,14 @@ impl DbClient {
     }
 
     pub async fn list_banned_events(&self) -> Vec<(String, String)> {
-        self.request(|reply| Msg::ListBanned { reply }).await
+        self.request_read(|reply| Msg::ListBanned { reply }).await
     }
 
     /// The created_at of the stored version of a replaceable/addressable
     /// event, used by the relay to stamp its generated events strictly
     /// newer.
     pub async fn replaceable_created_at(&self, kind: u64, pubkey: &str, d: &str) -> Option<u64> {
-        self.request(|reply| Msg::ReplaceableCreatedAt {
+        self.request_read(|reply| Msg::ReplaceableCreatedAt {
             kind,
             pubkey: pubkey.to_string(),
             d: d.to_string(),
@@ -679,17 +903,18 @@ impl DbClient {
     }
 
     pub async fn size_on_disk(&self) -> u64 {
-        self.request(|reply| Msg::DatabaseSize { reply }).await
+        self.request_read(|reply| Msg::DatabaseSize { reply }).await
     }
 
     /// Current memory map size in bytes (used by tests to verify growth).
     #[cfg(test)]
     pub async fn map_size_now(&self) -> u64 {
-        self.request(|reply| Msg::MapSize { reply }).await
+        self.request_read(|reply| Msg::MapSize { reply }).await
     }
 
     pub fn shutdown(&self) {
         let _ = self.tx.send(Msg::Shutdown);
+        let _ = self.read_tx.send(Msg::Shutdown);
     }
 }
 
@@ -1175,6 +1400,31 @@ impl Store {
 
     fn size_on_disk(&self) -> u64 {
         self.env.real_disk_size().unwrap_or(0)
+    }
+
+    /// A copy of the store for the dedicated reader thread: the heed `Env`
+    /// handle is reference-counted and the database handles are plain ids,
+    /// so both threads share the same underlying environment.
+    fn clone_for_reader(&self) -> Store {
+        Store {
+            env: self.env.clone(),
+            events: self.events,
+            by_created: self.by_created,
+            by_pubkey: self.by_pubkey,
+            by_kind: self.by_kind,
+            by_tag: self.by_tag,
+            by_word: self.by_word,
+            deleted: self.deleted,
+            expiry: self.expiry,
+            replaceable: self.replaceable,
+            vanish: self.vanish,
+            banned: self.banned,
+            first_seen: self.first_seen,
+            expiry_enabled: Arc::clone(&self.expiry_enabled),
+            max_indexed_words: self.max_indexed_words,
+            map_max_size: self.map_max_size,
+            page_size: self.page_size,
+        }
     }
 }
 
@@ -2299,7 +2549,16 @@ mod tests {
 
     #[test]
     fn insert_and_query() {
-        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
+        let db = DbClient::open(
+            &config(),
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2330,7 +2589,16 @@ mod tests {
 
     #[test]
     fn replaceable_and_deletion() {
-        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
+        let db = DbClient::open(
+            &config(),
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2355,7 +2623,16 @@ mod tests {
 
     #[test]
     fn expired_events_are_filtered() {
-        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
+        let db = DbClient::open(
+            &config(),
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2370,7 +2647,16 @@ mod tests {
 
     #[test]
     fn deletion_by_address_and_author() {
-        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
+        let db = DbClient::open(
+            &config(),
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2429,7 +2715,16 @@ mod tests {
 
     #[test]
     fn deletion_requests_are_never_deleted() {
-        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
+        let db = DbClient::open(
+            &config(),
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2467,7 +2762,16 @@ mod tests {
 
     #[test]
     fn metadata_and_follows_are_replaceable() {
-        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
+        let db = DbClient::open(
+            &config(),
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2485,7 +2789,16 @@ mod tests {
 
     #[test]
     fn equal_timestamp_replaceable_keeps_lowest_id() {
-        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
+        let db = DbClient::open(
+            &config(),
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2510,7 +2823,16 @@ mod tests {
 
     #[test]
     fn banned_events_are_removed_and_rejected() {
-        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
+        let db = DbClient::open(
+            &config(),
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2538,7 +2860,16 @@ mod tests {
     fn ephemeral_events_are_not_stored() {
         // NIP-01: kinds 20000-29999 must not be stored (NIP-59 requires
         // kind 21059 in particular to never be stored).
-        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
+        let db = DbClient::open(
+            &config(),
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2559,7 +2890,16 @@ mod tests {
 
     #[test]
     fn gift_wraps_to_are_deleted() {
-        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
+        let db = DbClient::open(
+            &config(),
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2606,7 +2946,16 @@ mod tests {
             map_max_size: 32 * 1024 * 1024,
             ..config()
         };
-        let db = DbClient::open(&cfg, true, Arc::new(Default::default()), 0, 128).unwrap();
+        let db = DbClient::open(
+            &cfg,
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2639,7 +2988,16 @@ mod tests {
         // A pubkey's first event records its arrival; later events within
         // the trust window are rejected by the relay. Here we verify the
         // bookkeeping itself.
-        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
+        let db = DbClient::open(
+            &config(),
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2667,7 +3025,16 @@ mod tests {
     #[test]
     fn expiry_enabled_toggles_at_runtime() {
         // A config reload must be able to enable/disable NIP-40 handling.
-        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
+        let db = DbClient::open(
+            &config(),
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2701,7 +3068,16 @@ mod tests {
     fn multiletter_tag_filters_match() {
         // NIP-01 only requires single-letter tags to be indexed; filters on
         // longer tag names must still match via the full scan.
-        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
+        let db = DbClient::open(
+            &config(),
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2730,7 +3106,16 @@ mod tests {
     fn delegated_events_match_delegator_queries() {
         // NIP-26: REQ with `authors: [<delegator>]` must also return events
         // published by a delegatee on the delegator's behalf.
-        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
+        let db = DbClient::open(
+            &config(),
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2768,7 +3153,16 @@ mod tests {
         // NIP-50: results are ordered by how well they match the query, and
         // the limit is applied after that ordering. Partial matches rank
         // below full matches.
-        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
+        let db = DbClient::open(
+            &config(),
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2799,7 +3193,16 @@ mod tests {
         // NIP-01 ordering / NIP-67: when the limit cuts inside a group of
         // events sharing the oldest created_at, every event at that
         // timestamp is included in the same response.
-        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
+        let db = DbClient::open(
+            &config(),
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2822,7 +3225,16 @@ mod tests {
         // events by either author; the limit must not be consumed by the
         // first author's range alone, and older events of the other author
         // must not displace newer ones.
-        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
+        let db = DbClient::open(
+            &config(),
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2860,7 +3272,16 @@ mod tests {
         // NIP-40: "An expiration timestamp does not affect storage of
         // ephemeral events": an ephemeral event with a past expiration is
         // still handled as ephemeral (delivered live, never stored).
-        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
+        let db = DbClient::open(
+            &config(),
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2882,7 +3303,16 @@ mod tests {
         // NIP-70/NIP-29: the negentropy items carry the protected flag and
         // the group id so the connection layer can mirror the REQ path's
         // visibility rules.
-        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
+        let db = DbClient::open(
+            &config(),
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2914,7 +3344,16 @@ mod tests {
         // NIP-45: the relay's count limit cuts exactly — the created_at
         // boundary continuation of the REQ path (NIP-67) must not inflate
         // the count beyond the cap or hide the `approximate` flag.
-        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
+        let db = DbClient::open(
+            &config(),
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2943,7 +3382,16 @@ mod tests {
         // NIP-01: kind 0/3/10000-19999 are replaced per (pubkey, kind) —
         // a `d` tag must not create a separate slot that keeps old versions
         // alive.
-        let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128).unwrap();
+        let db = DbClient::open(
+            &config(),
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -2964,6 +3412,43 @@ mod tests {
     }
 
     #[test]
+    fn request_fails_fast_when_the_queue_is_full() {
+        // Overload protection: with a full queue, new requests fail fast
+        // instead of accumulating in memory, and the overload is surfaced
+        // in the stats error counter.
+        let errors = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let db = DbClient::open(&config(), true, Arc::clone(&errors), 0, 128, 4, 8).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let now = unix_now();
+            let ev = event(1, "x", now, vec![]);
+            // Simulate a full queue: the message cap is exceeded.
+            db.pending_msgs
+                .store(4, std::sync::atomic::Ordering::Relaxed);
+            let out = db.put(ev.clone(), now).await;
+            assert!(
+                matches!(out, PutOutcome::Invalid(_)),
+                "must fail fast when the queue is full: {out:?}"
+            );
+            assert_eq!(errors.load(std::sync::atomic::Ordering::Relaxed), 1);
+            // The event cap is also enforced.
+            db.pending_msgs
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+            db.pending_events
+                .store(8, std::sync::atomic::Ordering::Relaxed);
+            let out = db.put(ev, now).await;
+            assert!(matches!(out, PutOutcome::Invalid(_)));
+            // With the queue drained, requests are served again.
+            db.pending_events
+                .store(0, std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(
+                db.put(event(1, "y", now, vec![]), now).await,
+                PutOutcome::Stored
+            );
+        });
+    }
+
+    #[test]
     fn search_works_without_word_index() {
         // NIP-50 must work even when database.search_index is disabled: the
         // relay falls back to a full scan with content term checks.
@@ -2971,7 +3456,16 @@ mod tests {
             search_index: false,
             ..config()
         };
-        let db = DbClient::open(&cfg, true, Arc::new(Default::default()), 0, 128).unwrap();
+        let db = DbClient::open(
+            &cfg,
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
         let now = unix_now();
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {

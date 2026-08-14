@@ -193,8 +193,15 @@ impl Relay {
         if cfg.limits.new_pubkey_min_age_secs > 0
             && let Some(pubkey) = event.pubkey_bytes()
         {
-            let (created, first_seen) =
-                self.db.touch_first_seen_batch(vec![(pubkey, now)]).await[0];
+            let first_seens = self.db.touch_first_seen_batch(vec![(pubkey, now)]).await;
+            let Some(&(created, first_seen)) = first_seens.first() else {
+                // The database is unavailable or overloaded: fail closed.
+                self.stats.bump(&self.stats.events_rejected, 1);
+                return (
+                    PutOutcome::Invalid("error: database unavailable".into()),
+                    None,
+                );
+            };
             if !created && now.saturating_sub(first_seen) < cfg.limits.new_pubkey_min_age_secs {
                 self.stats.bump(&self.stats.events_rejected, 1);
                 return (
@@ -516,24 +523,38 @@ impl Relay {
                 .map(|e| (e.pubkey_bytes().unwrap_or([0u8; 32]), now))
                 .collect();
             let first_seens = self.db.touch_first_seen_batch(entries).await;
-            let mut kept = Vec::with_capacity(puts.len());
-            let mut kept_slots = Vec::with_capacity(put_slots.len());
-            for ((event, slot), (created, first_seen)) in
-                puts.into_iter().zip(put_slots).zip(first_seens)
-            {
-                if !created && now.saturating_sub(first_seen) < min_age {
+            if first_seens.len() != puts.len() {
+                // The database is unavailable or overloaded: every pending
+                // event of the batch fails closed.
+                for (event, slot) in puts.into_iter().zip(put_slots) {
                     self.stats.bump(&self.stats.events_rejected, 1);
                     results[slot] = (
                         event.id,
-                        PutOutcome::Invalid("restricted: your account is too new".into()),
+                        PutOutcome::Invalid("error: database unavailable".into()),
                     );
-                } else {
-                    kept.push(event);
-                    kept_slots.push(slot);
                 }
+                puts = Vec::new();
+                put_slots = Vec::new();
+            } else {
+                let mut kept = Vec::with_capacity(puts.len());
+                let mut kept_slots = Vec::with_capacity(put_slots.len());
+                for ((event, slot), (created, first_seen)) in
+                    puts.into_iter().zip(put_slots).zip(first_seens)
+                {
+                    if !created && now.saturating_sub(first_seen) < min_age {
+                        self.stats.bump(&self.stats.events_rejected, 1);
+                        results[slot] = (
+                            event.id,
+                            PutOutcome::Invalid("restricted: your account is too new".into()),
+                        );
+                    } else {
+                        kept.push(event);
+                        kept_slots.push(slot);
+                    }
+                }
+                puts = kept;
+                put_slots = kept_slots;
             }
-            puts = kept;
-            put_slots = kept_slots;
         }
 
         let mut outcomes = if puts.is_empty() {

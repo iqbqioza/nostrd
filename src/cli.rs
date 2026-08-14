@@ -174,6 +174,8 @@ fn open_db(cfg: &Config) -> Result<crate::db::DbClient> {
         std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         cfg.limits.db_request_timeout_secs,
         cfg.limits.max_indexed_words,
+        cfg.limits.db_queue_msgs,
+        cfg.limits.db_queue_events,
     )
 }
 

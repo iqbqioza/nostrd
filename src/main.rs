@@ -15,6 +15,11 @@ use clap::Parser;
 use crate::cli::Cli;
 
 fn main() {
+    // Log every panic so that a fault in any task is visible in the logs
+    // (spawned tasks are contained; the relay keeps serving).
+    std::panic::set_hook(Box::new(|info| {
+        log::error!("panic: {info}");
+    }));
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     let mut cli = Cli::parse();

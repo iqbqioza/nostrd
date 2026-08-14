@@ -102,6 +102,11 @@ pub struct LimitsConfig {
     /// Maximum bytes of outgoing messages queued for a single connection
     /// before new ones are dropped (protects memory against slow readers).
     pub max_out_queue_bytes: usize,
+    /// Overload protection: when the database thread's queue holds more than
+    /// this many pending messages (or `db_queue_events` events), new
+    /// database requests fail fast instead of accumulating in memory.
+    pub db_queue_msgs: usize,
+    pub db_queue_events: usize,
     /// Maximum total bytes of subscription filters held by a single
     /// connection.
     pub max_sub_bytes: usize,
@@ -204,6 +209,8 @@ impl Default for LimitsConfig {
             db_request_timeout_secs: 30,
             new_pubkey_min_age_secs: 0,
             max_out_queue_bytes: 256 * 1024,
+            db_queue_msgs: 4_096,
+            db_queue_events: 262_144,
             max_sub_bytes: 512 * 1024,
             live_batch_interval_ms: 10,
             live_batch_size: 64,
