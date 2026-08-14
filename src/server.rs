@@ -323,12 +323,26 @@ async fn ws_handler(State(relay): State<Arc<Relay>>, request: Request) -> Respon
     if !is_websocket_request(request.headers()) {
         // Not a WebSocket handshake: serve the NIP-11 info document.
         let cfg = relay.config.read().await;
-        return Json(relay_info(
+        let body = Json(relay_info(
             &cfg,
             &relay.stats,
             relay.relay_pubkey().as_deref(),
-        ))
-        .into_response();
+        ));
+        let mut response = body.into_response();
+        // Serve with the NIP-11 media type when the client asked for it;
+        // some clients only accept `application/nostr+json`.
+        let wants_nostr_json = request
+            .headers()
+            .get(axum::http::header::ACCEPT)
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|a| a.contains("application/nostr+json"));
+        if wants_nostr_json {
+            response.headers_mut().insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/nostr+json"),
+            );
+        }
+        return response;
     }
     let (mut parts, _) = request.into_parts();
     match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {

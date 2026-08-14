@@ -14,15 +14,15 @@ use crate::stats::Stats;
 
 pub fn relay_info(config: &Config, stats: &Stats, self_pubkey: Option<&str>) -> Value {
     let limits = &config.limits;
+    // NIP-11: any field may be omitted. Empty string fields are omitted
+    // too: some clients try to decode the pubkey/icon as data and fail on
+    // an empty value.
     let mut info = json!({
         "name": config.relay.name,
         "description": config.relay.description,
-        "pubkey": config.relay.pubkey,
-        "contact": config.relay.contact,
         "supported_nips": config.supported_nips(),
         "software": config.relay.software,
         "version": config.relay.version,
-        "icon": config.relay.icon,
         "limitation": {
             "max_message_length": limits.max_ws_message_size,
             "max_subscriptions": limits.max_subscriptions,
@@ -58,6 +58,17 @@ pub fn relay_info(config: &Config, stats: &Stats, self_pubkey: Option<&str>) -> 
     });
     if let Some(self_pubkey) = self_pubkey {
         info["self"] = json!(self_pubkey);
+    }
+    for field in [
+        "pubkey",
+        "contact",
+        "icon",
+        "posting_policy",
+        "payments_url",
+    ] {
+        if info.get(field).and_then(Value::as_str) == Some("") {
+            info.as_object_mut().unwrap().remove(field);
+        }
     }
     if config.nip_enabled(29) {
         info["nip29"] = json!({ "subgroups": true });
