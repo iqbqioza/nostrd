@@ -9,6 +9,7 @@ use crate::event::Event;
 use crate::filter::Filter;
 use crate::nips::{nip29, nip40, nip42, nip45, nip70, nip77};
 use crate::relay::Relay;
+use crate::stats::Stats;
 use crate::stats::unix_now;
 
 /// Secondary bound on the number of queued messages (a long tail of small
@@ -766,6 +767,20 @@ fn message_size(msg: &Message) -> usize {
     }
 }
 
+/// Releases the connection's accounting when the connection task ends, no
+/// matter how it ends. A panic anywhere in the connection handling would
+/// otherwise skip the disconnect cleanup and leak the `connections_active`
+/// counter, slowly refusing every new connection.
+struct ConnectionGuard(Arc<Stats>);
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        self.0
+            .connections_active
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 pub async fn handle_connection(mut socket: WebSocket, relay: Arc<Relay>) {
     let active = relay
         .stats
@@ -783,6 +798,7 @@ pub async fn handle_connection(mut socket: WebSocket, relay: Arc<Relay>) {
         let _ = socket.close().await;
         return;
     }
+    let _guard = ConnectionGuard(relay.stats.clone());
 
     let (mut sender, mut receiver) = socket.split();
     let (max_msg_size, out_queue_bytes, expiry_enabled, giftwrap_restricted) = {
@@ -991,8 +1007,4 @@ pub async fn handle_connection(mut socket: WebSocket, relay: Arc<Relay>) {
         .stats
         .subscriptions_active
         .fetch_sub(conn.subs.len() as u64, std::sync::atomic::Ordering::Relaxed);
-    conn.relay
-        .stats
-        .connections_active
-        .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
 }
