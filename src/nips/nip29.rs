@@ -184,6 +184,10 @@ impl GroupStore {
                 return Ok(());
             }
             if group.settings.closed {
+                // NIP-29: `closed` means join requests are ignored — the
+                // request is rejected (final) and not stored. Admission to
+                // a closed group happens via an invite code or a kind:9000
+                // issued by an admin.
                 return Err("restricted: this group is closed".into());
             }
             // NIP-29: omitting the `closed` tag means join requests are
@@ -228,6 +232,8 @@ impl GroupStore {
             JOIN => {
                 // Joined via a valid invite code, or honored on an open
                 // group (not `closed`): admit the user with no privileges.
+                // A closed group without a valid code leaves the request
+                // pending for an admin to review.
                 let admitted = if let Some(code) = event_code(event) {
                     self.groups.get(gid).is_some_and(|g| g.has_invite(code))
                 } else {
@@ -848,6 +854,9 @@ mod tests {
 
     #[test]
     fn closed_group_rejects_joins() {
+        // NIP-29: `closed` means join requests are ignored — rejected and
+        // not stored; admission happens via an invite code or an admin's
+        // kind:9000.
         let mut store = seeded();
         let edit = event(9002, ADMIN, Some("g1"), vec![vec!["closed".into()]]);
         store.apply(&edit, "", 1, false);
