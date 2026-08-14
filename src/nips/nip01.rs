@@ -102,6 +102,32 @@ mod tests {
         );
     }
 
+    /// NIP-01: the escaping rules for the canonical serialization — a line
+    /// break, double quote, backslash, carriage return, tab, backspace and
+    /// form feed must be escaped as `\n \" \\ \r \t \b \f` and all other
+    /// characters must be included verbatim (UTF-8).
+    #[test]
+    fn canonical_payload_escapes_per_nip01() {
+        let ev = Event {
+            id: String::new(),
+            pubkey: "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d".into(),
+            created_at: 1_600_000_000,
+            kind: 1,
+            tags: vec![vec![
+                "quote\"backslash\\tab\t".into(),
+                "line\ncr\rbs\x08ff\x0c".into(),
+            ]],
+            content: "日本語 ünïcode \n\t\"\\\r\x08\x0c end".into(),
+            sig: String::new(),
+        };
+        // Hand-written canonical JSON per the NIP-01 escaping table.
+        let expected = b"[0,\"3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d\",1600000000,1,[[\"quote\\\"backslash\\\\tab\\t\",\"line\\ncr\\rbs\\bff\\f\"]],\"\xe6\x97\xa5\xe6\x9c\xac\xe8\xaa\x9e \xc3\xbcn\xc3\xafcode \\n\\t\\\"\\\\\\r\\b\\f end\"]";
+        assert_eq!(canonical_payload(&ev), expected);
+        // The id is the sha256 of the escaped serialization.
+        let id = Sha256::digest(expected);
+        assert_eq!(compute_id(&ev), hex::encode(id));
+    }
+
     #[test]
     fn replaceable_ranges() {
         assert!(is_replaceable_kind(0));
