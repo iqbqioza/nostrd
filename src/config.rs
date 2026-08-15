@@ -40,8 +40,6 @@ pub struct RelayConfig {
     pub pubkey: String,
     pub contact: String,
     pub icon: String,
-    pub software: String,
-    pub version: String,
     pub post_policy: String,
     /// Hex-encoded secret key of the relay itself. When set, the relay can
     /// sign and publish NIP-29 group metadata events.
@@ -162,8 +160,6 @@ impl Default for RelayConfig {
             pubkey: String::new(),
             contact: String::new(),
             icon: String::new(),
-            software: "https://github.com/iqbqioza/nostrd".into(),
-            version: env!("CARGO_PKG_VERSION").into(),
             post_policy: String::new(),
             private_key: String::new(),
             public_url: String::new(),

@@ -37,12 +37,6 @@ contact = ""
 # Relay icon URL.
 icon = ""
 
-# Software URL advertised in the info document.
-software = "https://github.com/iqbqioza/nostrd"
-
-# Software version string.
-version = "0.1.0"
-
 # Posting policy text advertised in the info document.
 post_policy = ""
 
