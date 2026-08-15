@@ -1,3 +1,5 @@
+//! The wire representation of a Nostr event.
+
 use serde::{Deserialize, Serialize};
 
 use crate::nips::nip01;

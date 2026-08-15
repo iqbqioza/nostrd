@@ -1,3 +1,5 @@
+//! NIP-01 subscription filters and the in-memory match.
+
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
@@ -74,7 +76,7 @@ impl Filter {
         }
         self.tags.iter().all(|(name, value)| {
             let tag_name = name.strip_prefix('#').unwrap_or(name);
-            let values = string_values(value);
+            let values = tag_string_values(value);
             values.iter().any(|v| {
                 ev.tags
                     .iter()
@@ -88,7 +90,9 @@ impl Filter {
     }
 }
 
-fn string_values(value: &Value) -> Vec<String> {
+/// The string values of a filter tag attribute (a single
+/// string or an array of strings); other value kinds yield nothing.
+pub(crate) fn tag_string_values(value: &Value) -> Vec<String> {
     match value {
         Value::String(s) => vec![s.clone()],
         Value::Array(items) => items

@@ -1,3 +1,8 @@
+//! nostrd: a minimal, stable Nostr relay server.
+//!
+//! See the `cli` module for the subcommands (`start`/`stop`/`restart`/
+//! `stats`/`check`/`init`) and `server` for the HTTP/WebSocket front.
+
 mod cli;
 mod config;
 mod db;
@@ -8,6 +13,7 @@ mod nips;
 mod relay;
 mod server;
 mod stats;
+mod util;
 mod ws;
 
 use clap::Parser;

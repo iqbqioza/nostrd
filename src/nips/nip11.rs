@@ -21,8 +21,8 @@ pub fn relay_info(config: &Config, stats: &Stats, self_pubkey: Option<&str>) -> 
         "name": config.relay.name,
         "description": config.relay.description,
         "supported_nips": config.supported_nips(),
-        "software": config.relay.software,
-        "version": config.relay.version,
+        "software": env!("CARGO_PKG_REPOSITORY"),
+        "version": env!("CARGO_PKG_VERSION"),
         "limitation": {
             "max_message_length": limits.max_ws_message_size,
             "max_subscriptions": limits.max_subscriptions,
@@ -67,7 +67,9 @@ pub fn relay_info(config: &Config, stats: &Stats, self_pubkey: Option<&str>) -> 
         "payments_url",
     ] {
         if info.get(field).and_then(Value::as_str) == Some("") {
-            info.as_object_mut().unwrap().remove(field);
+            info.as_object_mut()
+                .expect("relay_info builds an object")
+                .remove(field);
         }
     }
     if config.nip_enabled(29) {

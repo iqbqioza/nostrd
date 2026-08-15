@@ -1,3 +1,6 @@
+//! `nostrd.toml` configuration: relay identity, server binding,
+//! limits, database, daemon paths and NIP toggles.
+
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -37,8 +40,6 @@ pub struct RelayConfig {
     pub pubkey: String,
     pub contact: String,
     pub icon: String,
-    pub software: String,
-    pub version: String,
     pub post_policy: String,
     /// Hex-encoded secret key of the relay itself. When set, the relay can
     /// sign and publish NIP-29 group metadata events.
@@ -159,8 +160,6 @@ impl Default for RelayConfig {
             pubkey: String::new(),
             contact: String::new(),
             icon: String::new(),
-            software: "https://github.com/iqbqioza/nostrd".into(),
-            version: env!("CARGO_PKG_VERSION").into(),
             post_policy: String::new(),
             private_key: String::new(),
             public_url: String::new(),
@@ -204,7 +203,7 @@ impl Default for LimitsConfig {
             max_created_at_future: 60 * 60,
             require_pow: 0,
             max_indexed_words: 128,
-            buffer_size: 1_024,
+            buffer_size: 2_048,
             neg_max_items: 100_000,
             db_request_timeout_secs: 30,
             new_pubkey_min_age_secs: 0,
@@ -307,6 +306,16 @@ impl Config {
             .copied()
             .filter(|num| !self.relay.disabled_nips.contains(num))
             .collect()
+    }
+
+    /// The relay's own URL identity (host:port plus the optional public
+    /// URL), used by the NIP-42/62/98 tag validations.
+    pub fn relay_identity(&self) -> crate::nips::nip62::RelayIdentity<'_> {
+        crate::nips::nip62::RelayIdentity::new(
+            &self.server.host,
+            self.server.port,
+            &self.relay.public_url,
+        )
     }
 
     pub fn nip_enabled(&self, num: u16) -> bool {

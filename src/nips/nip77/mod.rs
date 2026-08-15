@@ -1,16 +1,21 @@
 //! NIP-77: Negentropy Syncing.
 //!
-//! A from-scratch implementation of the Negentropy protocol V1 (range-based
-//! set reconciliation) used by the `NEG-OPEN`/`NEG-MSG`/`NEG-CLOSE` websocket
-//! messages. This module only implements the server side: given a client
-//! message and the relay's own item set it produces the response message.
-//!
-//! Binary format (see the NIP-77 appendix):
-//! - items are sorted by (timestamp, id), ascending;
-//! - a message is `0x61` (protocol version) followed by adjacent ranges;
-//! - each range: upper bound, mode varint (0=skip, 1=fingerprint, 2=id list),
-//!   and a payload.
+//! The reconciliation protocol (items, fingerprints, range splitting) lives
+//! here; the binary encoding is in [`codec`].
 
+mod codec;
+
+use codec::{parse_message, write_bound, write_varint};
+
+/// A from-scratch implementation of the Negentropy protocol V1 (range-based
+/// set reconciliation). This module only implements the server side: given
+/// a client message and the relay's own item set it produces the response.
+///
+/// Binary format (see the NIP-77 appendix):
+/// - items are sorted by (timestamp, id), ascending;
+/// - a message is `0x61` (protocol version) followed by adjacent ranges;
+/// - each range: upper bound, mode varint (0=skip, 1=fingerprint, 2=id list),
+///   and a payload.
 use std::cmp::Ordering;
 
 use sha2::{Digest, Sha256};
@@ -90,129 +95,6 @@ fn fingerprint(items: &[Item]) -> [u8; 16] {
     hasher.update(&count_buf[..count_len]);
     let digest = hasher.finalize();
     digest[..16].try_into().unwrap()
-}
-
-// ----- varint -----
-
-fn write_varint(out: &mut [u8], mut value: u64) -> usize {
-    // Most significant base-128 digit first; high bit set on all but the last.
-    let mut digits = [0u8; 10];
-    let mut n = 0;
-    loop {
-        digits[n] = (value & 0x7f) as u8;
-        value >>= 7;
-        n += 1;
-        if value == 0 {
-            break;
-        }
-    }
-    for (i, &d) in digits[..n].iter().rev().enumerate() {
-        out[i] = if i + 1 == n { d } else { d | 0x80 };
-    }
-    n
-}
-
-fn read_varint(data: &[u8], pos: &mut usize) -> Result<u64, String> {
-    let mut value = 0u64;
-    loop {
-        let b = *data
-            .get(*pos)
-            .ok_or_else(|| "truncated varint".to_string())?;
-        *pos += 1;
-        value = value
-            .checked_mul(128)
-            .and_then(|v| v.checked_add((b & 0x7f) as u64))
-            .ok_or_else(|| "varint overflow".to_string())?;
-        if b & 0x80 == 0 {
-            return Ok(value);
-        }
-    }
-}
-
-// ----- bound encoding -----
-
-/// Encodes a bound. `prev_ts` tracks the offset delta encoding.
-fn write_bound(out: &mut Vec<u8>, bound: &Bound, prev_ts: &mut u64) {
-    let encoded = if bound.ts == u64::MAX {
-        0
-    } else {
-        1 + (bound.ts.saturating_sub(*prev_ts))
-    };
-    *prev_ts = bound.ts;
-    let mut buf = [0u8; 10];
-    let n = write_varint(&mut buf, encoded);
-    out.extend_from_slice(&buf[..n]);
-    let n = write_varint(&mut buf, bound.prefix.len() as u64);
-    out.extend_from_slice(&buf[..n]);
-    out.extend_from_slice(&bound.prefix);
-}
-
-fn read_bound(data: &[u8], pos: &mut usize, prev_ts: &mut u64) -> Result<Bound, String> {
-    let encoded = read_varint(data, pos)?;
-    let ts = if encoded == 0 {
-        u64::MAX
-    } else {
-        prev_ts.saturating_add(encoded - 1)
-    };
-    *prev_ts = ts;
-    let len = read_varint(data, pos)? as usize;
-    if len > 32 {
-        return Err("bound prefix too long".into());
-    }
-    let prefix = data
-        .get(*pos..*pos + len)
-        .ok_or_else(|| "truncated bound prefix".to_string())?
-        .to_vec();
-    *pos += len;
-    Ok(Bound { ts, prefix })
-}
-
-// ----- message parsing -----
-
-fn parse_message(data: &[u8]) -> Result<Vec<Range>, String> {
-    if data.is_empty() {
-        return Err("empty message".into());
-    }
-    if data[0] != PROTOCOL_VERSION {
-        return Err("unsupported protocol version".into());
-    }
-    let mut pos = 1usize;
-    let mut prev_ts = 0u64;
-    let mut ranges = Vec::new();
-    while pos < data.len() {
-        let upper = read_bound(data, &mut pos, &mut prev_ts)?;
-        let mode = read_varint(data, &mut pos)?;
-        let mode = match mode {
-            0 => Mode::Skip,
-            1 => {
-                let mut fp = [0u8; 16];
-                let end = pos + 16;
-                let bytes = data
-                    .get(pos..end)
-                    .ok_or_else(|| "truncated fingerprint".to_string())?;
-                fp.copy_from_slice(bytes);
-                pos = end;
-                Mode::Fingerprint(fp)
-            }
-            2 => {
-                let len = read_varint(data, &mut pos)? as usize;
-                if len > 10_000_000 {
-                    return Err("id list too long".into());
-                }
-                let end = pos
-                    .checked_add(len * 32)
-                    .ok_or_else(|| "id list too long".to_string())?;
-                if end > data.len() {
-                    return Err("truncated id list".into());
-                }
-                pos = end;
-                Mode::IdList
-            }
-            other => return Err(format!("unknown mode {other}")),
-        };
-        ranges.push(Range { upper, mode });
-    }
-    Ok(ranges)
 }
 
 // ----- server response -----
@@ -356,7 +238,7 @@ mod tests {
             let mut buf = [0u8; 10];
             let n = write_varint(&mut buf, value);
             let mut pos = 0;
-            assert_eq!(read_varint(&buf[..n], &mut pos).unwrap(), value);
+            assert_eq!(codec::read_varint(&buf[..n], &mut pos).unwrap(), value);
             assert_eq!(pos, n);
         }
     }
@@ -481,11 +363,11 @@ mod tests {
         let mut pos = 1usize;
         let mut prev = 0u64;
         for _ in &ranges {
-            read_bound(&resp, &mut pos, &mut prev).unwrap();
-            match read_varint(&resp, &mut pos).unwrap() {
+            codec::read_bound(&resp, &mut pos, &mut prev).unwrap();
+            match codec::read_varint(&resp, &mut pos).unwrap() {
                 1 => pos += 16,
                 2 => {
-                    let count = read_varint(&resp, &mut pos).unwrap();
+                    let count = codec::read_varint(&resp, &mut pos).unwrap();
                     assert_eq!(count, 75);
                     pos += count as usize * 32;
                 }

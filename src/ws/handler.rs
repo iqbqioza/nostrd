@@ -1,0 +1,473 @@
+//! Protocol message handlers (NIP-01/42/45/67/70/77) and the live
+//! delivery path. Every method operates on the [`super::Conn`] state; the
+//! connection loop itself lives in `super`.
+
+use axum::extract::ws::Message;
+use serde_json::{Value, json};
+
+use super::EVENT_BATCH;
+
+use crate::event::Event;
+use crate::filter::Filter;
+use crate::nips::{nip29, nip40, nip42, nip45, nip70};
+use crate::util::unix_now;
+
+impl super::Conn {
+    pub(crate) async fn handle_text(&mut self, text: &str) {
+        let Ok(value) = serde_json::from_str::<Value>(text) else {
+            self.send_notice("error: invalid json");
+            return;
+        };
+        let Some(msg) = value.as_array() else {
+            self.send_notice("error: expected an array message");
+            return;
+        };
+        let Some(Some(kind)) = msg.first().map(|v| v.as_str()) else {
+            self.send_notice("error: message type must be a string");
+            return;
+        };
+
+        match kind {
+            // EVENT messages are queued and accepted in batches so the
+            // database commit cost is paid once per batch instead of once
+            // per event; the batch is flushed when it is full, when the
+            // socket is momentarily idle, or before any other message.
+            "EVENT" => {
+                // Fast path: the message is parsed directly as a
+                // `(verb, event)` pair in a single JSON pass, avoiding the
+                // generic Value parse plus its clone. The generic path is
+                // only taken for malformed messages (to emit the NOTICE).
+                match serde_json::from_str::<(String, Event)>(text) {
+                    Ok((_, event)) => self.queue_event_value(event).await,
+                    Err(_) => self.queue_event(&msg[1..]).await,
+                }
+            }
+            "REQ" => {
+                self.flush_pending_events().await;
+                self.handle_req(&msg[1..]).await;
+            }
+            "CLOSE" => {
+                self.flush_pending_events().await;
+                self.handle_close(&msg[1..]);
+            }
+            "AUTH" => {
+                self.flush_pending_events().await;
+                self.handle_auth(&msg[1..]).await;
+            }
+            "COUNT" => {
+                self.flush_pending_events().await;
+                self.handle_count(&msg[1..]).await;
+            }
+            "NEG-OPEN" => {
+                self.flush_pending_events().await;
+                self.handle_neg_open(&msg[1..]).await;
+            }
+            "NEG-MSG" => {
+                self.flush_pending_events().await;
+                self.handle_neg_msg(&msg[1..]).await;
+            }
+            "NEG-CLOSE" => {
+                self.flush_pending_events().await;
+                self.handle_neg_close(&msg[1..]);
+            }
+            "PING" => {}
+            other => {
+                self.flush_pending_events().await;
+                self.send_notice(&format!("error: unsupported message type {other}"));
+            }
+        }
+    }
+
+    /// Queues an already-parsed event for batched acceptance.
+    pub(crate) async fn queue_event_value(&mut self, event: Event) {
+        self.relay.stats.bump(&self.relay.stats.events_received, 1);
+        self.pending_events.push(event);
+        if self.pending_events.len() >= EVENT_BATCH {
+            self.flush_pending_events().await;
+        }
+    }
+
+    /// Queues an EVENT message for batched acceptance (generic path).
+    pub(crate) async fn queue_event(&mut self, rest: &[Value]) {
+        self.relay.stats.bump(&self.relay.stats.events_received, 1);
+        if rest.is_empty() {
+            self.send_notice("error: EVENT requires an event object");
+            return;
+        }
+        let event: Event = match serde_json::from_value(rest[0].clone()) {
+            Ok(event) => event,
+            Err(_) => {
+                self.send_notice("error: invalid event object");
+                return;
+            }
+        };
+        self.queue_event_value(event).await;
+    }
+
+    /// Accepts the queued events in one database batch and sends the OKs.
+    pub(crate) async fn flush_pending_events(&mut self) {
+        if self.pending_events.is_empty() {
+            return;
+        }
+        let events = std::mem::take(&mut self.pending_events);
+        let outcomes = self
+            .relay
+            .accept_events_batch(events, &self.authed_pubkeys)
+            .await;
+        for (id, outcome) in outcomes {
+            match outcome {
+                crate::db::PutOutcome::Stored | crate::db::PutOutcome::Replaced => {
+                    self.send_ok(&id, true, "");
+                }
+                crate::db::PutOutcome::Ephemeral => {
+                    // NIP-01: ephemeral kinds are delivered live but never
+                    // stored; the NIP-01 `mute:` prefix acknowledges this.
+                    self.send_ok(&id, true, "mute: ephemeral event not stored");
+                }
+                crate::db::PutOutcome::Duplicate => {
+                    self.send_ok(&id, true, "duplicate: event already stored");
+                }
+                crate::db::PutOutcome::Invalid(reason) => {
+                    self.send_ok(&id, false, &reason);
+                }
+                crate::db::PutOutcome::Expired => {
+                    self.send_ok(&id, false, "invalid: event has expired");
+                }
+                crate::db::PutOutcome::PreviouslyDeleted => {
+                    self.send_ok(&id, false, "blocked: event has been deleted");
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn handle_req(&mut self, rest: &[Value]) {
+        if rest.len() < 2 {
+            self.send_notice("error: REQ requires a subscription id and filters");
+            return;
+        }
+        let sub_id = match rest[0].as_str() {
+            Some(id) => id,
+            None => {
+                self.send_notice("error: subscription id must be a string");
+                return;
+            }
+        };
+
+        let cfg = self.relay.config.read().await;
+        let (max_sub_id_len, max_filters, max_subscriptions, max_limit) = (
+            cfg.limits.max_sub_id_len,
+            cfg.limits.max_filters,
+            cfg.limits.max_subscriptions,
+            cfg.limits.max_limit,
+        );
+        let search_enabled = cfg.nip_enabled(50);
+        let require_auth = cfg.server.require_auth;
+        let sub_bytes_limit = cfg.limits.max_sub_bytes;
+        let eose_hint = cfg.nip_enabled(67);
+        drop(cfg);
+        if sub_id.is_empty() {
+            self.send_closed(sub_id, "invalid: subscription id must not be empty");
+            return;
+        }
+        if sub_id.len() > max_sub_id_len {
+            self.send_closed(sub_id, "invalid: subscription id too long");
+            return;
+        }
+
+        let mut filters = Vec::new();
+        for f in &rest[1..] {
+            match serde_json::from_value::<Filter>(f.clone()) {
+                Ok(filter) => filters.push(filter),
+                Err(_) => {
+                    self.send_closed(sub_id, "invalid: invalid filter");
+                    return;
+                }
+            }
+        }
+        if filters.is_empty() {
+            self.send_closed(sub_id, "invalid: REQ requires at least one filter");
+            return;
+        }
+        if filters.len() > max_filters {
+            self.send_closed(sub_id, "invalid: too many filters");
+            return;
+        }
+
+        let search_disabled = filters.iter().any(|f| f.has_search()) && !search_enabled;
+
+        if require_auth && !self.is_authed() {
+            self.send_closed(
+                sub_id,
+                "auth-required: please authenticate before subscribing",
+            );
+            return;
+        }
+        if self.subs.len() >= max_subscriptions {
+            self.send_closed(sub_id, "error: too many subscriptions");
+            return;
+        }
+
+        let mut stored = filters.clone();
+        if search_disabled {
+            for f in &mut stored {
+                f.search = None;
+            }
+            self.send_notice("search is not enabled on this relay");
+        }
+
+        // Bound the memory held by this connection's subscriptions: each
+        // filter is bounded by the message size limit, so without a cap a
+        // connection could pin many megabytes of filter data.
+        let sub_bytes: usize = stored
+            .iter()
+            .map(|f| {
+                serde_json::to_string(f)
+                    .map(|s| s.len())
+                    .unwrap_or_default()
+            })
+            .sum();
+        let replacing = self.subs.get(sub_id).map(|(_, bytes)| *bytes);
+        let next_total = self
+            .sub_bytes
+            .saturating_sub(replacing.unwrap_or(0))
+            .saturating_add(sub_bytes);
+        if next_total > sub_bytes_limit {
+            self.send_closed(sub_id, "error: too many subscriptions");
+            return;
+        }
+        self.sub_bytes = next_total;
+        self.subs
+            .insert(sub_id.to_string(), (stored.clone(), sub_bytes));
+        if replacing.is_none() {
+            self.relay
+                .stats
+                .bump(&self.relay.stats.subscriptions_total, 1);
+            self.relay
+                .stats
+                .bump(&self.relay.stats.subscriptions_active, 1);
+        }
+
+        let now = unix_now();
+        let (events, more) = self.relay.db.query(stored, max_limit, now).await;
+        let mut to_send = Vec::new();
+        {
+            let groups = self.relay.groups.read().await;
+            for event in events {
+                if !self.visible_to(&groups, &event) {
+                    continue;
+                }
+                to_send.push(event);
+            }
+        }
+        for event in to_send {
+            self.send_json(json!(["EVENT", sub_id, event]));
+        }
+        // NIP-67: EOSE completeness hint.
+        if eose_hint {
+            let hint = if more { "more" } else { "finish" };
+            self.send_json(json!(["EOSE", sub_id, [hint]]));
+        } else {
+            self.send_json(json!(["EOSE", sub_id]));
+        }
+    }
+
+    pub(crate) fn handle_close(&mut self, rest: &[Value]) {
+        let Some(Some(sub_id)) = rest.first().map(|v| v.as_str()) else {
+            self.send_notice("error: CLOSE requires a subscription id");
+            return;
+        };
+        if let Some((_, bytes)) = self.subs.remove(sub_id) {
+            self.sub_bytes = self.sub_bytes.saturating_sub(bytes);
+            self.relay
+                .stats
+                .subscriptions_active
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) async fn handle_auth(&mut self, rest: &[Value]) {
+        if !self.relay.config.read().await.nip_enabled(42) {
+            self.send_notice("error: authentication is not enabled on this relay");
+            return;
+        }
+        if rest.is_empty() {
+            self.send_notice("error: AUTH requires an event object");
+            return;
+        }
+        let event: Event = match serde_json::from_value(rest[0].clone()) {
+            Ok(event) => event,
+            Err(_) => {
+                self.send_notice("error: invalid auth event");
+                return;
+            }
+        };
+        let id = event.id.clone();
+        let accepted = {
+            let cfg = self.relay.config.read().await;
+            nip42::verify(
+                &event,
+                &self.challenge,
+                self.relay.secp(),
+                unix_now(),
+                &cfg.relay_identity(),
+            )
+        };
+        if accepted {
+            // NIP-42: all authenticated pubkeys are treated as authenticated.
+            // Bound the list: repeated AUTHs with the same key are
+            // deduplicated and the number of distinct keys is capped so a
+            // connection cannot grow this vector (or the per-event
+            // visibility scan over it) without limit.
+            if !self.authed_pubkeys.iter().any(|pk| pk == &event.pubkey)
+                && self.authed_pubkeys.len() < 64
+            {
+                self.authed_pubkeys.push(event.pubkey.clone());
+            }
+        }
+        self.send_json(nip42::ok(&id, accepted));
+    }
+
+    pub(crate) async fn handle_count(&mut self, rest: &[Value]) {
+        if rest.len() < 2 {
+            self.send_notice("error: COUNT requires a subscription id and filters");
+            return;
+        }
+        let Some(sub_id) = rest[0].as_str() else {
+            self.send_notice("error: subscription id must be a string");
+            return;
+        };
+        // NIP-45: refusals must be answered with a CLOSED message.
+        if !self.relay.config.read().await.nip_enabled(45) {
+            self.send_closed(sub_id, "error: counting is not enabled on this relay");
+            return;
+        }
+        if self.relay.config.read().await.server.require_auth && !self.is_authed() {
+            self.send_closed(sub_id, "auth-required: please authenticate before counting");
+            return;
+        }
+        let mut filters = Vec::new();
+        for f in &rest[1..] {
+            match serde_json::from_value::<Filter>(f.clone()) {
+                Ok(filter) => filters.push(filter),
+                Err(_) => {
+                    self.send_closed(sub_id, "invalid: invalid filter");
+                    return;
+                }
+            }
+        }
+        let count_limit = self.relay.config.read().await.limits.count_limit;
+        let (events, more) = self
+            .relay
+            .db
+            .count(filters.clone(), count_limit, unix_now())
+            .await;
+        // NIP-70: protected events are only counted for authenticated
+        // clients, so COUNT never leaks them to unauthenticated peers.
+        let events: Vec<Event> = events
+            .into_iter()
+            .filter(|e| self.is_authed() || !nip70::is_protected(e))
+            .collect();
+        self.send_json(nip45::count_response(sub_id, &filters, &events, more));
+    }
+
+    /// NIP-59 / NIP-17: gift wraps are signed by random keys, so they may
+    /// only be served to their recipients, i.e. authenticated users whose
+    /// pubkey appears in a `p` tag of the wrap (enforced with NIP-42 auth;
+    /// skipped when NIP-42 is disabled).
+    pub(crate) fn gift_wrap_visible(&self, event: &Event) -> bool {
+        !self.giftwrap_restricted
+            || event.kind != crate::nips::nip62::GIFT_WRAP_KIND
+            || event
+                .tags
+                .iter()
+                .any(|t| t.len() >= 2 && t[0] == "p" && self.authed_pubkeys.contains(&t[1]))
+    }
+    /// Whether a stored or live event may be served on this connection
+    /// (NIP-70 protected, NIP-59 gift-wrap recipient and NIP-29 group
+    /// access checks).
+    pub(crate) fn visible_to(&self, groups: &nip29::GroupStore, event: &Event) -> bool {
+        // NIP-70: protected events are only served to authenticated clients.
+        // The `-` tag constrains *publication* (author-only, enforced on the
+        // write path); NIP-43's relay-generated membership metadata carries
+        // it by spec while remaining readable to authenticated clients.
+        if !self.is_authed() && nip70::is_protected(event) {
+            return false;
+        }
+        if !self.gift_wrap_visible(event) {
+            return false;
+        }
+        if self.authed_pubkeys.is_empty() {
+            groups.visible_to(event, None)
+        } else {
+            self.authed_pubkeys
+                .iter()
+                .any(|pk| groups.visible_to(event, Some(pk)))
+        }
+    }
+    /// Streams live events that match active subscriptions.
+    ///
+    /// `groups` is only present when the batch contains group events (the
+    /// caller skips the lock otherwise); `expiry_enabled` is a per-connection
+    /// cache refreshed whenever a message arrives, so the hot live path does
+    /// not acquire the shared config lock once per batch per connection.
+    pub(crate) fn deliver_live(&mut self, event: &Event, groups: Option<&nip29::GroupStore>) {
+        // Fast path: most connections have no subscriptions.
+        if self.subs.is_empty() {
+            return;
+        }
+        // NIP-70: protected events are only delivered to authenticated
+        // clients.
+        if !self.is_authed() && nip70::is_protected(event) {
+            return;
+        }
+        // NIP-59: gift wraps are only delivered to their recipients, even
+        // when the batch contains no group events (visible_to is only
+        // reached when the groups lock was taken).
+        if !self.gift_wrap_visible(event) {
+            return;
+        }
+        if let Some(groups) = groups
+            && !self.visible_to(groups, event)
+        {
+            return;
+        }
+        // NIP-40: expired stored events are not delivered live; ephemeral
+        // kinds are exempt ("an expiration timestamp does not affect
+        // storage of ephemeral events").
+        if self.expiry_enabled
+            && !(20000..30000).contains(&event.kind)
+            && let Some(exp) = nip40::expiry(event)
+            && exp < unix_now()
+        {
+            return;
+        }
+        let matching: Vec<String> = self
+            .subs
+            .iter()
+            .filter(|(_, (filters, _))| filters.iter().any(|f| f.matches(event)))
+            .map(|(sub_id, _)| sub_id.clone())
+            .collect();
+        if matching.is_empty() {
+            return;
+        }
+        // Serialize the event once and wrap it per subscription: the JSON
+        // of a large event would otherwise be encoded once per matching
+        // subscription (a hot path on busy relays).
+        let Ok(event_json) = serde_json::to_string(event) else {
+            return;
+        };
+        let mut out = String::with_capacity(event_json.len() + 32);
+        for sub_id in matching {
+            let Ok(sub_json) = serde_json::to_string(&sub_id) else {
+                continue;
+            };
+            out.clear();
+            out.push_str("[\"EVENT\",");
+            out.push_str(&sub_json);
+            out.push(',');
+            out.push_str(&event_json);
+            out.push(']');
+            self.send(Message::Text(out.clone().into()));
+        }
+    }
+}

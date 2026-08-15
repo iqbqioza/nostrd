@@ -1,3 +1,5 @@
+//! Error type shared across the crate.
+
 use std::fmt;
 
 pub type Result<T> = std::result::Result<T, Error>;

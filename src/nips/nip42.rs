@@ -29,15 +29,12 @@ pub fn generate_challenge() -> String {
 ///
 /// Per NIP-42 the `relay` tag must match the relay's own URL; `host`, `port`
 /// and `public_url` identify this relay.
-#[allow(clippy::too_many_arguments)]
 pub fn verify(
     event: &Event,
     challenge: &str,
     secp: &Secp256k1<secp256k1::All>,
     now: u64,
-    host: &str,
-    port: u16,
-    public_url: &str,
+    identity: &crate::nips::nip62::RelayIdentity<'_>,
 ) -> bool {
     if event.kind != AUTH_KIND {
         return false;
@@ -53,9 +50,7 @@ pub fn verify(
         .iter()
         .any(|t| t.len() >= 2 && t[0] == CHALLENGE_TAG && t[1] == challenge);
     let has_relay = event.tags.iter().any(|t| {
-        t.len() >= 2
-            && t[0] == RELAY_TAG
-            && crate::nips::nip62::tag_matches(&t[1], host, port, public_url)
+        t.len() >= 2 && t[0] == RELAY_TAG && crate::nips::nip62::tag_matches(&t[1], identity)
     });
     has_challenge && has_relay
 }
@@ -72,6 +67,7 @@ pub fn ok(id: &str, accepted: bool) -> Value {
 mod tests {
     use super::*;
     use crate::nips::nip01::compute_id;
+    use crate::nips::nip62::RelayIdentity;
     use secp256k1::{Keypair, XOnlyPublicKey};
 
     fn event(created: u64, tags: Vec<Vec<String>>) -> Event {
@@ -132,9 +128,7 @@ mod tests {
             "right",
             &secp,
             1_700_000_000,
-            "localhost",
-            8080,
-            ""
+            &RelayIdentity::new("localhost", 8080, "")
         ));
     }
 
@@ -154,9 +148,7 @@ mod tests {
             "abc",
             &secp,
             1_700_000_000,
-            "localhost",
-            8080,
-            ""
+            &RelayIdentity::new("localhost", 8080, "")
         ));
     }
 
@@ -172,7 +164,13 @@ mod tests {
                 vec!["challenge".into(), "abc".into()],
             ],
         );
-        assert!(!verify(&ev, "abc", &secp, now, "localhost", 8080, ""));
+        assert!(!verify(
+            &ev,
+            "abc",
+            &secp,
+            now,
+            &RelayIdentity::new("localhost", 8080, "")
+        ));
         // Wrong port is also rejected.
         let ev = signed_event(
             now,
@@ -181,7 +179,13 @@ mod tests {
                 vec!["challenge".into(), "abc".into()],
             ],
         );
-        assert!(!verify(&ev, "abc", &secp, now, "localhost", 8080, ""));
+        assert!(!verify(
+            &ev,
+            "abc",
+            &secp,
+            now,
+            &RelayIdentity::new("localhost", 8080, "")
+        ));
         // A matching URL passes the relay check.
         let ev = signed_event(
             now,
@@ -190,7 +194,13 @@ mod tests {
                 vec!["challenge".into(), "abc".into()],
             ],
         );
-        assert!(verify(&ev, "abc", &secp, now, "localhost", 8080, ""));
+        assert!(verify(
+            &ev,
+            "abc",
+            &secp,
+            now,
+            &RelayIdentity::new("localhost", 8080, "")
+        ));
         // public_url takes precedence over host:port.
         let ev = signed_event(
             now,
@@ -204,9 +214,7 @@ mod tests {
             "abc",
             &secp,
             now,
-            "127.0.0.1",
-            8080,
-            "wss://public.example.net"
+            &RelayIdentity::new("127.0.0.1", 8080, "wss://public.example.net")
         ));
     }
 }

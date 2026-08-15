@@ -1,3 +1,6 @@
+//! Command-line interface: configuration handling, daemon
+//! management and the foreground server entry point.
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 

@@ -1,0 +1,684 @@
+//! Query engine.
+//!
+//! Applies filters through index-selected range walks and collects the
+//! matches for REQ (full events), COUNT (counts) and NIP-77 negentropy
+//! (`(created_at, id)` records). Every scan shares the same collector
+//! machinery, the NIP-01 ordering rules and the NIP-67 completeness flag.
+
+use std::collections::HashSet;
+
+use heed::types::Bytes;
+use heed::{Database, RoTxn};
+
+use super::store::{ID_LEN, Store, TAG_VALUE_MAX, created_key, kind_key, pubkey_key, tag_range};
+use crate::error::Result;
+use crate::event::Event;
+use crate::filter::Filter;
+use crate::nips::{nip40, nip50};
+
+/// `(created_at, id, protected, group_id, is_meta)` records returned by the
+/// NIP-77 negentropy query. The visibility flags let the connection layer
+/// withhold NIP-70 protected events from unauthenticated peers and NIP-29
+/// private/hidden group content from non-members, mirroring the REQ path.
+pub(crate) type NegItems = Vec<(u64, [u8; 32], bool, Option<String>, bool)>;
+
+/// The database handles and transaction of one scan, bundled so the
+/// per-candidate checks stay readable.
+struct ScanContext<'tx> {
+    events: Database<Bytes, Bytes>,
+    deleted: Database<Bytes, Bytes>,
+    banned: Database<Bytes, Bytes>,
+    expiry_enabled: bool,
+    rtxn: &'tx RoTxn<'tx>,
+}
+
+/// The per-filter parameters of one scan pass.
+struct FilterScan<'a> {
+    filter: &'a Filter,
+    terms: &'a [String],
+    now: u64,
+    limit: usize,
+}
+
+/// The mutable collection state shared by the candidates of a scan pass.
+struct Collect<'a, C: ScanCollector> {
+    seen: &'a mut HashSet<Vec<u8>>,
+    out: &'a mut C,
+}
+
+/// NIP-50 search collection budget: the scan gathers up to this many
+/// candidates (instead of the response limit) so that the relevance
+/// ordering can pick the best matches before the limit is applied.
+const SEARCH_BUDGET_MULTIPLIER: usize = 8;
+const SEARCH_BUDGET_MAX: usize = 100_000;
+
+/// Output collector for a scan: either full events (REQ/COUNT) or
+/// `(created_at, id)` records (NIP-77 negentropy, memory-efficient).
+trait ScanCollector {
+    fn len(&self) -> usize;
+    /// Whether the scan must stop: the hard collection cap is reached and
+    /// no created_at boundary is being completed.
+    fn full(&self) -> bool;
+    /// The hard collection cap of this collector.
+    fn cap(&self) -> usize;
+    /// Starts the per-filter limit accounting over (the boundary timestamp
+    /// belongs to one filter's limit, not the next one's).
+    fn reset_boundary(&mut self);
+    /// Pushes a matched event; returns `false` when the per-filter limit is
+    /// reached and the event is strictly older than the boundary timestamp,
+    /// so the scan stops. Events at the boundary timestamp are still
+    /// collected: a page never splits a created_at tie across responses
+    /// (NIP-01 ordering, NIP-67 boundary cursor).
+    fn push(&mut self, event: Event, id: [u8; 32], limit: usize) -> bool;
+    /// Sorts the collected records by the NIP-01 ordering (newest first,
+    /// lowest id first on equal timestamps).
+    fn sort_key(&mut self);
+    /// Sorts by NIP-50 search relevance (most matching terms first), then
+    /// by the NIP-01 ordering.
+    fn sort_relevance(&mut self, terms: &[String]);
+    /// Keeps only the first `take` records.
+    fn truncate_to(&mut self, take: usize);
+}
+
+struct EventCollector {
+    events: Vec<Event>,
+    /// Hard stop for the whole scan.
+    cap: usize,
+    /// Whether the created_at boundary continuation applies (REQ/NEG
+    /// delivery, NIP-67) or the limit must cut exactly (COUNT, NIP-45).
+    boundary_ok: bool,
+    /// created_at of the event that filled a per-filter limit; events at
+    /// the same timestamp keep being collected (see [`ScanCollector::push`]).
+    boundary: Option<u64>,
+}
+
+impl EventCollector {
+    fn new(cap: usize, boundary_ok: bool) -> Self {
+        EventCollector {
+            events: Vec::new(),
+            cap,
+            boundary_ok,
+            boundary: None,
+        }
+    }
+}
+
+/// How many of `terms` appear in the event's content (NIP-50 relevance).
+fn relevance(event: &Event, terms: &[String]) -> usize {
+    let content = event.content.to_lowercase();
+    terms
+        .iter()
+        .filter(|t| content.contains(t.as_str()))
+        .count()
+}
+
+impl ScanCollector for EventCollector {
+    fn len(&self) -> usize {
+        self.events.len()
+    }
+    fn full(&self) -> bool {
+        self.events.len() >= self.cap && self.boundary.is_none()
+    }
+    fn cap(&self) -> usize {
+        self.cap
+    }
+    fn reset_boundary(&mut self) {
+        self.boundary = None;
+    }
+    fn push(&mut self, event: Event, _id: [u8; 32], limit: usize) -> bool {
+        if self.events.len() >= limit {
+            if !self.boundary_ok {
+                return false;
+            }
+            match self.boundary {
+                Some(b) if b == event.created_at => {}
+                _ => return false,
+            }
+        } else if self.events.len() + 1 == limit {
+            self.boundary = Some(event.created_at);
+        }
+        self.events.push(event);
+        true
+    }
+    fn sort_key(&mut self) {
+        self.events.sort_by(|a, b| {
+            b.created_at
+                .cmp(&a.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+    }
+    fn sort_relevance(&mut self, terms: &[String]) {
+        self.events.sort_by(|a, b| {
+            relevance(b, terms)
+                .cmp(&relevance(a, terms))
+                .then_with(|| b.created_at.cmp(&a.created_at))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+    }
+    fn truncate_to(&mut self, take: usize) {
+        self.events.truncate(take);
+    }
+}
+
+struct ItemCollector {
+    items: NegItems,
+    cap: usize,
+    boundary: Option<u64>,
+}
+
+impl ItemCollector {
+    fn new(cap: usize) -> Self {
+        ItemCollector {
+            items: Vec::new(),
+            cap,
+            boundary: None,
+        }
+    }
+}
+
+impl ScanCollector for ItemCollector {
+    fn len(&self) -> usize {
+        self.items.len()
+    }
+    fn full(&self) -> bool {
+        self.items.len() >= self.cap && self.boundary.is_none()
+    }
+    fn cap(&self) -> usize {
+        self.cap
+    }
+    fn reset_boundary(&mut self) {
+        self.boundary = None;
+    }
+    fn push(&mut self, event: Event, id: [u8; 32], limit: usize) -> bool {
+        if self.items.len() >= limit {
+            match self.boundary {
+                Some(b) if b == event.created_at => {}
+                _ => return false,
+            }
+        } else if self.items.len() + 1 == limit {
+            self.boundary = Some(event.created_at);
+        }
+        let protected = crate::nips::nip70::is_protected(&event);
+        let (gid, meta) = match crate::nips::nip29::group_id_any(&event) {
+            Some(gid) => {
+                let meta = (crate::nips::nip29::GROUP_META..=crate::nips::nip29::GROUP_PINS)
+                    .contains(&event.kind);
+                (Some(gid.to_string()), meta)
+            }
+            None => (None, false),
+        };
+        self.items
+            .push((event.created_at, id, protected, gid, meta));
+        true
+    }
+    fn sort_key(&mut self) {
+        self.items
+            .sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    }
+    fn sort_relevance(&mut self, terms: &[String]) {
+        // Negentropy items are re-sorted by the protocol anyway; keep the
+        // relevance path a no-op for the same ordering as sort_key.
+        let _ = terms;
+        self.sort_key();
+    }
+    fn truncate_to(&mut self, take: usize) {
+        self.items.truncate(take);
+    }
+}
+/// What a scan is collecting: full events for REQ, plain counts for
+/// NIP-45 COUNT, or `(created_at, id)` records for NIP-77 negentropy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScanKind {
+    Query,
+    Count,
+    Negentropy,
+}
+
+impl Store {
+    /// Collects events that match the filters, most recent first.
+    pub(crate) fn scan(
+        &self,
+        filters: &[Filter],
+        now: u64,
+        max_limit: usize,
+        count_mode: bool,
+    ) -> Result<(Vec<Event>, bool)> {
+        let has_search = filters.iter().any(Filter::has_search);
+        // NIP-50: relevance ordering needs more candidates than the response
+        // limit, so the scan gathers up to the search budget.
+        let collect_cap = if has_search {
+            max_limit
+                .saturating_mul(SEARCH_BUDGET_MULTIPLIER)
+                .min(SEARCH_BUDGET_MAX)
+        } else {
+            max_limit
+        };
+        let kind = if count_mode {
+            ScanKind::Count
+        } else {
+            ScanKind::Query
+        };
+        let mut out = EventCollector::new(collect_cap, !count_mode);
+        let more = self.scan_collect(filters, now, max_limit, kind, &mut out)?;
+        Ok((out.events, more))
+    }
+
+    /// Collects only `(created_at, id)` records of the matching events
+    /// (NIP-77 negentropy). Keeps the memory footprint small instead of
+    /// materializing every full event.
+    pub(crate) fn scan_neg(
+        &self,
+        filter: &Filter,
+        now: u64,
+        max_items: usize,
+    ) -> Result<(NegItems, bool)> {
+        let collect_cap = if filter.has_search() {
+            max_items
+                .saturating_mul(SEARCH_BUDGET_MULTIPLIER)
+                .min(SEARCH_BUDGET_MAX)
+        } else {
+            max_items
+        };
+        let mut out = ItemCollector::new(collect_cap);
+        let more = self.scan_collect(
+            std::slice::from_ref(filter),
+            now,
+            max_items,
+            ScanKind::Negentropy,
+            &mut out,
+        )?;
+        Ok((out.items, more))
+    }
+
+    /// Shared scan core: applies the filters through the index-selected
+    /// candidate walks and collects into `out`. Returns `true` when the
+    /// scan stopped at a limit instead of exhausting the matches
+    /// (NIP-67 EOSE completeness hint).
+    fn scan_collect<C: ScanCollector>(
+        &self,
+        filters: &[Filter],
+        now: u64,
+        max_limit: usize,
+        kind: ScanKind,
+        out: &mut C,
+    ) -> Result<bool> {
+        let count_mode = matches!(kind, ScanKind::Count);
+        let sort_search = matches!(kind, ScanKind::Query);
+        if max_limit == 0 {
+            return Ok(false);
+        }
+        let rtxn = self.env.read_txn()?;
+        let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        // `more` is true when a scan stopped because of a limit instead of
+        // exhausting the matching records (NIP-67 EOSE completeness hint).
+        let mut more = false;
+        // Union of every search filter's terms, for the relevance ordering,
+        // and the response cap of the search results (min of the search
+        // filters' limits, bounded by the relay's max_limit).
+        let mut all_terms: Vec<String> = Vec::new();
+        let mut search_take = max_limit;
+
+        for filter in filters {
+            if out.full() {
+                more = true;
+                break;
+            }
+            let has_search = filter.has_search();
+            let limit = if count_mode {
+                max_limit
+            } else if has_search {
+                // NIP-50: the limit is applied after the relevance sort, so
+                // candidates are gathered up to the collection budget.
+                out.cap()
+            } else {
+                filter.limit.unwrap_or(max_limit).min(max_limit)
+            };
+            let terms = if has_search {
+                let terms = nip50::terms(filter.search.as_deref().unwrap_or(""));
+                for t in &terms {
+                    if !all_terms.contains(t) {
+                        all_terms.push(t.clone());
+                    }
+                }
+                if let Some(l) = filter.limit {
+                    search_take = search_take.min(l);
+                }
+                terms
+            } else {
+                Vec::new()
+            };
+            out.reset_boundary();
+            let scan = FilterScan {
+                filter,
+                terms: &terms,
+                now,
+                limit,
+            };
+            let mut collect = Collect {
+                seen: &mut seen,
+                out,
+            };
+            let stop = self.scan_filter(&rtxn, &scan, &mut collect, &mut more)?;
+            if stop {
+                break;
+            }
+        }
+        if !count_mode {
+            if sort_search && !all_terms.is_empty() {
+                // NIP-50: results are ordered by search relevance (how many
+                // of the query's terms the content matches), not by
+                // created_at, and the limit is applied after that ordering.
+                out.sort_relevance(&all_terms);
+                let take = search_take.min(max_limit);
+                if out.len() > take {
+                    more = true;
+                    out.truncate_to(take);
+                }
+            } else {
+                // NIP-01: newest events first; on equal created_at the event
+                // with the lowest id comes first.
+                ScanCollector::sort_key(out);
+            }
+        }
+        Ok(more)
+    }
+
+    /// Returns `true` when the global collection cap was reached.
+    fn scan_filter<C: ScanCollector>(
+        &self,
+        rtxn: &RoTxn,
+        scan: &FilterScan<'_>,
+        collect: &mut Collect<'_, C>,
+        more: &mut bool,
+    ) -> Result<bool> {
+        let FilterScan {
+            filter,
+            terms,
+            now,
+            limit,
+        } = *scan;
+        let seen = &mut *collect.seen;
+        let out = &mut *collect.out;
+        let cap = out.cap();
+        let ctx = ScanContext {
+            events: self.events,
+            deleted: self.deleted,
+            banned: self.banned,
+            expiry_enabled: self
+                .expiry_enabled
+                .load(std::sync::atomic::Ordering::Relaxed),
+            rtxn,
+        };
+        let mut consider = |id: &[u8]| -> Result<bool> {
+            consider_event(&ctx, id, filter, terms, now, seen, out, limit)
+        };
+
+        if let Some(ids) = &filter.ids {
+            for id in ids.iter().take(cap) {
+                if let Ok(id) = hex::decode(id)
+                    && !consider(&id)?
+                {
+                    *more = true;
+                    return Ok(false);
+                }
+            }
+            return Ok(out.full());
+        }
+
+        if filter.has_search() {
+            // With the word index available, scan the index of every term
+            // and union the candidates in one merged walk (a note matching
+            // only the second term must still be found, and the limit
+            // applies to the union). Without the index, fall through to the
+            // time-range scans, where the terms are checked per event.
+            if let Some(by_word) = self.by_word {
+                let mut ranges: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(terms.len());
+                for word in terms {
+                    let start = {
+                        let mut v = word.as_bytes().to_vec();
+                        v.push(0x00);
+                        v
+                    };
+                    let end = {
+                        let mut v = word.as_bytes().to_vec();
+                        v.push(0x01);
+                        v
+                    };
+                    ranges.push((start, end));
+                }
+                if !self.walk_merged(rtxn, by_word, &ranges, &mut consider, more)? {
+                    return Ok(false);
+                }
+                return Ok(out.full());
+            }
+        }
+
+        let since = filter.since.unwrap_or(0);
+        let until = filter.until.unwrap_or(u64::MAX);
+
+        if let Some(authors) = &filter.authors {
+            let mut ranges: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(authors.len());
+            for author in authors {
+                let Ok(pk) = hex::decode(author) else {
+                    continue;
+                };
+                if pk.len() != ID_LEN {
+                    continue;
+                }
+                ranges.push((
+                    pubkey_key(&pk, since, &[0u8; ID_LEN]),
+                    pubkey_key(&pk, until, &[0xffu8; ID_LEN]),
+                ));
+            }
+            if !ranges.is_empty()
+                && !self.walk_merged(rtxn, self.by_pubkey, &ranges, &mut consider, more)?
+            {
+                return Ok(false);
+            }
+            return Ok(out.full());
+        }
+
+        if let Some((name, values)) = filter.tags.iter().next() {
+            let tag_name = name.strip_prefix('#').unwrap_or(name);
+            if tag_name.len() == 1 {
+                let name_byte = tag_name.as_bytes()[0];
+                let mut ranges: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+                for value in crate::filter::tag_string_values(values) {
+                    if value.len() > TAG_VALUE_MAX {
+                        continue;
+                    }
+                    ranges.push(tag_range(name_byte, value.as_bytes(), since, until));
+                }
+                if !ranges.is_empty()
+                    && !self.walk_merged(rtxn, self.by_tag, &ranges, &mut consider, more)?
+                {
+                    return Ok(false);
+                }
+                return Ok(out.full());
+            }
+            // Multi-letter tag names are not indexed (NIP-01 only requires
+            // single-letter tags to be indexed): fall through to the
+            // time-range scan, where the final in-memory match enforces the
+            // tag filter.
+        }
+
+        if let Some(kinds) = &filter.kinds {
+            let mut ranges: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(kinds.len());
+            for kind in kinds {
+                ranges.push((
+                    kind_key(*kind, since, &[0u8; ID_LEN]),
+                    kind_key(*kind, until, &[0xffu8; ID_LEN]),
+                ));
+            }
+            if !ranges.is_empty()
+                && !self.walk_merged(rtxn, self.by_kind, &ranges, &mut consider, more)?
+            {
+                return Ok(false);
+            }
+            return Ok(out.full());
+        }
+
+        let start = created_key(since, &[0u8; ID_LEN]);
+        let end = created_key(until, &[0xffu8; ID_LEN]);
+        Ok(!self.walk_created_range(rtxn, self.by_created, &start, &end, &mut consider, more)?)
+    }
+
+    fn walk_created_range(
+        &self,
+        rtxn: &RoTxn,
+        db: Database<Bytes, Bytes>,
+        start: &[u8],
+        end: &[u8],
+        mut consider: impl FnMut(&[u8]) -> Result<bool>,
+        more: &mut bool,
+    ) -> Result<bool> {
+        let range = (
+            std::ops::Bound::Included(start),
+            std::ops::Bound::Excluded(end),
+        );
+        let iter = db.rev_range(rtxn, &range)?;
+        for item in iter {
+            let (key, _) = item?;
+            let id = &key[key.len() - ID_LEN..];
+            if !consider(id)? {
+                *more = true;
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Walks several index ranges in parallel, handing ids to `consider` in
+    /// global `(created_at, id)` descending order. A per-filter limit thus
+    /// applies to the union of every range (NIP-01: "the last n events
+    /// ordered by the created_at"): `{"authors": [A, B], "limit": 100}`
+    /// returns the 100 newest events by either author instead of filling
+    /// the limit from the first author only.
+    fn walk_merged(
+        &self,
+        rtxn: &RoTxn,
+        db: Database<Bytes, Bytes>,
+        ranges: &[(Vec<u8>, Vec<u8>)],
+        consider: &mut impl FnMut(&[u8]) -> Result<bool>,
+        more: &mut bool,
+    ) -> Result<bool> {
+        type RevIter<'a> = Box<dyn Iterator<Item = heed::Result<(&'a [u8], &'a [u8])>> + 'a>;
+        struct Head<'a> {
+            iter: RevIter<'a>,
+            next_key: Option<Vec<u8>>,
+        }
+        let mut heads: Vec<Head<'_>> = Vec::with_capacity(ranges.len());
+        for (start, end) in ranges {
+            let range = (
+                std::ops::Bound::Included(start.as_slice()),
+                std::ops::Bound::Excluded(end.as_slice()),
+            );
+            heads.push(Head {
+                iter: Box::new(db.rev_range(rtxn, &range)?),
+                next_key: None,
+            });
+        }
+        loop {
+            // The index keys are `(prefix..., created_at, id)`, so the
+            // newest head is the one with the largest (created_at, id)
+            // pair, not the largest full key.
+            let mut best: Option<(usize, [u8; 8], [u8; 32])> = None;
+            for (i, head) in heads.iter_mut().enumerate() {
+                if head.next_key.is_none() {
+                    match head.iter.next() {
+                        Some(Ok((key, _))) => head.next_key = Some(key.to_vec()),
+                        Some(Err(e)) => return Err(e.into()),
+                        None => {}
+                    }
+                }
+                if let Some(key) = &head.next_key {
+                    let created: [u8; 8] = key[key.len() - 40..key.len() - 32].try_into().unwrap();
+                    let id: [u8; 32] = key[key.len() - 32..].try_into().unwrap();
+                    if best
+                        .as_ref()
+                        .is_none_or(|(_, bc, bi)| (created, id) > (*bc, *bi))
+                    {
+                        best = Some((i, created, id));
+                    }
+                }
+            }
+            let Some((i, _, _)) = best else {
+                return Ok(true);
+            };
+            let key = heads[i].next_key.as_ref().expect("head was picked");
+            let id = &key[key.len() - ID_LEN..];
+            if !consider(id)? {
+                *more = true;
+                return Ok(false);
+            }
+            heads[i].next_key = None;
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn consider_event<C: ScanCollector>(
+    ctx: &ScanContext<'_>,
+    id: &[u8],
+    filter: &Filter,
+    terms: &[String],
+    now: u64,
+    seen: &mut HashSet<Vec<u8>>,
+    out: &mut C,
+    limit: usize,
+) -> Result<bool> {
+    if out.full() {
+        // The collection cap is reached: stop the scan (and any remaining
+        // ranges of this filter) instead of walking them to completion.
+        return Ok(false);
+    }
+    if seen.contains(id) {
+        return Ok(true);
+    }
+    let Some(raw) = ctx.events.get(ctx.rtxn, id)? else {
+        return Ok(true);
+    };
+    let Ok(event) = serde_json::from_slice::<Event>(raw) else {
+        return Ok(true);
+    };
+    if !is_deliverable(ctx, &event, filter, terms, now)? {
+        return Ok(true);
+    }
+    seen.insert(id.to_vec());
+    let id = id.try_into().unwrap_or([0u8; 32]);
+    Ok(out.push(event, id, limit))
+}
+
+fn is_deliverable(
+    ctx: &ScanContext<'_>,
+    event: &Event,
+    filter: &Filter,
+    terms: &[String],
+    now: u64,
+) -> Result<bool> {
+    let Some(id) = event.id_bytes() else {
+        return Ok(false);
+    };
+    if ctx.deleted.get(ctx.rtxn, &id)?.is_some() {
+        return Ok(false);
+    }
+    if ctx.banned.get(ctx.rtxn, &id)?.is_some() {
+        return Ok(false);
+    }
+    if ctx.expiry_enabled
+        && let Some(exp) = nip40::expiry(event)
+        && exp < now
+    {
+        return Ok(false);
+    }
+    if !terms.is_empty() {
+        // NIP-50: an event matches when at least one query term is present
+        // in its content; the relevance ordering ranks events matching
+        // every term first.
+        let content = event.content.to_lowercase();
+        if !terms.iter().any(|t| content.contains(t.as_str())) {
+            return Ok(false);
+        }
+    }
+    Ok(filter.matches(event))
+}

@@ -56,7 +56,7 @@ pub fn hll(filters: &[Filter], events: &[Event]) -> Option<String> {
 /// (`<kind>:<pubkey>:<d>`, using the pubkey part) or a sha256 hash.
 fn hll_offset(filter: &Filter) -> Option<usize> {
     let (_, value) = filter.tags.iter().next()?;
-    let value = string_values(value).into_iter().next()?;
+    let value = crate::filter::tag_string_values(value).into_iter().next()?;
     let hex_string = if value.len() == 64 && hex::decode(&value).is_ok() {
         value
     } else if let Some((_kind, pubkey, _d)) = split_address(&value) {
@@ -89,17 +89,6 @@ fn hex_nibble(byte: u8) -> Option<u8> {
 fn sha256(data: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     Sha256::digest(data).into()
-}
-
-fn string_values(value: &serde_json::Value) -> Vec<String> {
-    match value {
-        serde_json::Value::String(s) => vec![s.clone()],
-        serde_json::Value::Array(items) => items
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect(),
-        _ => Vec::new(),
-    }
 }
 
 #[cfg(test)]

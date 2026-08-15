@@ -1,3 +1,9 @@
+//! HTTP server: the WebSocket/NIP-11/NIP-86 endpoint, CORS, the
+//! daemon background tasks (stats, expiry purge, signals, config
+//! reload) and the NIP-29 LiveKit integration in [`livekit`].
+
+mod livekit;
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,12 +13,11 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::FromRequestParts;
 use axum::extract::ws::WebSocketUpgrade;
-use axum::extract::{Path as AxPath, Request, State};
+use axum::extract::{Request, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use base64::Engine;
 use log::{error, info};
 use serde_json::json;
 use tokio::net::TcpListener;
@@ -26,9 +31,11 @@ use crate::error::{Error, Result};
 use crate::nips::nip11::{relay_info, stats_handler};
 use crate::nips::nip86;
 use crate::relay::Relay;
-use crate::stats::{Stats, unix_now};
+use crate::stats::Stats;
+use crate::util::unix_now;
 use crate::ws::handle_connection;
 use axum::serve::ListenerExt;
+use livekit::{livekit_supported, livekit_token};
 
 /// Sets an integer socket option on a TCP stream.
 ///
@@ -82,25 +89,45 @@ fn add_cors_headers(headers: &mut HeaderMap) {
     );
 }
 
+/// Binds a TCP listener on `addr` and logs the given label with the
+/// address, turning a bind failure into a configuration error.
+async fn bind_listener(addr: &(String, u16), label: &str) -> Result<TcpListener> {
+    let listener = TcpListener::bind(addr)
+        .await
+        .map_err(|e| Error::Config(format!("cannot bind to {}:{}: {e}", addr.0, addr.1)))?;
+    info!("{label}{}:{}", addr.0, addr.1);
+    Ok(listener)
+}
+
+/// The relay's HTTP router: the WebSocket/NIP-11/NIP-86 endpoint, health
+/// and stats routes, and the NIP-29 LiveKit endpoints when configured.
+async fn build_router(relay: &Arc<Relay>) -> Router {
+    let mut app = Router::new()
+        .route("/", get(ws_handler).post(nip86::rpc_handler))
+        .route("/ws", get(ws_handler).post(nip86::rpc_handler))
+        .route("/ws/", get(ws_handler))
+        .route("/health", get(health_handler))
+        .route("/relay/stats", get(stats_handler));
+    let cfg = relay.config.read().await;
+    if cfg.nip_enabled(29) && !cfg.relay.livekit_url.is_empty() {
+        app = app
+            .route("/.well-known/nip29/livekit", get(livekit_supported))
+            .route("/.well-known/nip29/livekit/{group}", get(livekit_token));
+    }
+    app.layer(axum::middleware::from_fn(cors_middleware))
+        .with_state(relay.clone())
+}
+
 pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> Result<()> {
     let private_key = config.relay.private_key.clone();
-    let live_buffer = config.limits.live_buffer;
-    let live_batch_interval_ms = config.limits.live_batch_interval_ms;
-    let live_batch_size = config.limits.live_batch_size;
+    let live = crate::relay::LiveBusConfig {
+        buffer: config.limits.live_buffer,
+        batch_interval_ms: config.limits.live_batch_interval_ms,
+        batch_size: config.limits.live_batch_size,
+    };
     let config = Arc::new(tokio::sync::RwLock::new(config));
     let stats = Stats::new();
-    let mut relay = Arc::new(
-        Relay::new(
-            config,
-            db,
-            stats,
-            &private_key,
-            live_buffer,
-            live_batch_interval_ms,
-            live_batch_size,
-        )
-        .await,
-    );
+    let mut relay = Arc::new(Relay::new(config, db, stats, &private_key, live).await);
     Arc::get_mut(&mut relay)
         .expect("relay not cloned yet")
         .start_live_bus();
@@ -129,35 +156,13 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    let mut app = Router::new()
-        .route("/", get(ws_handler).post(nip86::rpc_handler))
-        .route("/ws", get(ws_handler).post(nip86::rpc_handler))
-        .route("/ws/", get(ws_handler))
-        .route("/health", get(health_handler))
-        .route("/relay/stats", get(stats_handler));
-    {
-        let cfg = relay.config.read().await;
-        if cfg.nip_enabled(29) && !cfg.relay.livekit_url.is_empty() {
-            app = app
-                .route("/.well-known/nip29/livekit", get(livekit_supported))
-                .route("/.well-known/nip29/livekit/{group}", get(livekit_token));
-        }
-    }
-    let app = app
-        .layer(axum::middleware::from_fn(cors_middleware))
-        .with_state(relay.clone());
+    let app = build_router(&relay).await;
 
     let bind_addr = {
         let cfg = relay.config.read().await;
         (cfg.server.host.clone(), cfg.server.port)
     };
-    let listener = TcpListener::bind(&bind_addr).await.map_err(|e| {
-        Error::Config(format!(
-            "cannot bind to {}:{}: {e}",
-            bind_addr.0, bind_addr.1
-        ))
-    })?;
-    info!("relay listening on ws://{}:{}", bind_addr.0, bind_addr.1);
+    let listener = bind_listener(&bind_addr, "relay listening on ws://").await?;
 
     let mut tasks = Vec::new();
 
@@ -168,16 +173,7 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
                 cfg.server.management_host.clone(),
                 cfg.server.management_port,
             );
-            let listener = TcpListener::bind(&mgmt_addr).await.map_err(|e| {
-                Error::Config(format!(
-                    "cannot bind management on {}:{}: {e}",
-                    mgmt_addr.0, mgmt_addr.1
-                ))
-            })?;
-            info!(
-                "management listening on http://{}:{}",
-                mgmt_addr.0, mgmt_addr.1
-            );
+            let listener = bind_listener(&mgmt_addr, "management listening on http://").await?;
             Some((mgmt_addr, listener))
         } else {
             None
@@ -357,6 +353,10 @@ async fn ws_handler(State(relay): State<Arc<Relay>>, request: Request) -> Respon
             // megabytes each.
             let cfg = relay.config.read().await;
             let max_msg = cfg.limits.max_ws_message_size;
+            // Initial read/write buffer size per connection (grows on
+            // demand); bounded so that hundreds of thousands of idle
+            // connections do not pin megabytes each.
+            let buffer_size = cfg.limits.buffer_size;
             // The outgoing buffer must fit the largest relay-generated
             // message: a NIP-77 NEG-MSG response carries every id of a
             // queried range as hex (up to neg_max_items ids), plus the JSON
@@ -366,8 +366,8 @@ async fn ws_handler(State(relay): State<Arc<Relay>>, request: Request) -> Respon
             let max_write = max_msg.max(neg_max.saturating_mul(80).saturating_add(64 * 1024));
             drop(cfg);
             upgrade
-                .read_buffer_size(2 * 1024)
-                .write_buffer_size(2 * 1024)
+                .read_buffer_size(buffer_size)
+                .write_buffer_size(buffer_size)
                 // Reject oversized frames at the protocol layer: without
                 // this the WebSocket stack buffers frames of up to its own
                 // 64 MiB default into memory before the application check
@@ -384,144 +384,6 @@ async fn ws_handler(State(relay): State<Arc<Relay>>, request: Request) -> Respon
 
 async fn health_handler() -> impl IntoResponse {
     (StatusCode::OK, Json(json!({ "status": "ok" })))
-}
-
-// ----- NIP-29 LiveKit integration -----
-
-/// `GET /.well-known/nip29/livekit` — 204 when LiveKit rooms are supported.
-async fn livekit_supported(State(relay): State<Arc<Relay>>) -> impl IntoResponse {
-    let cfg = relay.config.read().await;
-    if cfg.nip_enabled(29) && !cfg.relay.livekit_url.is_empty() {
-        StatusCode::NO_CONTENT
-    } else {
-        StatusCode::NOT_FOUND
-    }
-}
-
-/// `GET /.well-known/nip29/livekit/<group>` — issues a LiveKit JWT for a
-/// group member, authenticated with a NIP-98 HTTP auth event.
-async fn livekit_token(
-    State(relay): State<Arc<Relay>>,
-    headers: HeaderMap,
-    uri: axum::http::Uri,
-    AxPath(group): AxPath<String>,
-) -> impl IntoResponse {
-    let cfg = relay.config.read().await;
-    if !cfg.nip_enabled(29)
-        || cfg.relay.livekit_api_key.is_empty()
-        || cfg.relay.livekit_api_secret.is_empty()
-    {
-        return (
-            StatusCode::NOT_FOUND,
-            Json(json!({ "error": "livekit not configured" })),
-        );
-    }
-    let expected_path = format!("/.well-known/nip29/livekit/{group}");
-    let encoded = headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Nostr "))
-        .map(str::to_string);
-    let Some(encoded) = encoded else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "unauthorized" })),
-        );
-    };
-    // NIP-29: the auth event's `u` tag must point at this group's livekit
-    // token endpoint (exact path and query), and its `method` tag must
-    // match the GET request.
-    let authed = crate::nips::nip98::verify(&encoded, None, relay.secp(), false, "GET", |url| {
-        crate::nips::nip98::matches_request_url(
-            url,
-            &cfg.server.host,
-            cfg.server.port,
-            &cfg.relay.public_url,
-            &expected_path,
-            uri.query(),
-        )
-    })
-    .await;
-    match authed {
-        Some(pubkey) if group_allows(&relay, &group, &pubkey).await => {
-            match issue_livekit_token(&cfg, &group, &pubkey) {
-                Ok(token) => {
-                    let url = cfg.relay.livekit_url.clone();
-                    (StatusCode::OK, Json(json!({ "token": token, "url": url })))
-                }
-                Err(e) => (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({ "error": e.to_string() })),
-                ),
-            }
-        }
-        _ => (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({ "error": "unauthorized" })),
-        ),
-    }
-}
-
-async fn group_allows(relay: &Relay, group: &str, pubkey: &str) -> bool {
-    let groups = relay.groups.read().await;
-    match groups.group(group) {
-        // Unknown groups are open.
-        None => true,
-        Some(g) => !g.settings.private && !g.settings.restricted || g.is_member(pubkey),
-    }
-}
-
-fn issue_livekit_token(cfg: &Config, group: &str, pubkey: &str) -> Result<String> {
-    let mut suffix = [0u8; 4];
-    getrandom::getrandom(&mut suffix)
-        .map_err(|e| crate::error::Error::Other(format!("rng failure: {e}")))?;
-    let identity = format!("{pubkey}{}", hex::encode(suffix));
-    let now = unix_now();
-    let claims = json!({
-        "iss": cfg.relay.livekit_api_key,
-        "sub": identity,
-        "iat": now,
-        "nbf": now,
-        "exp": now + 3600,
-        "video": {
-            "room": group,
-            "identity": identity,
-            "permissions": { "canPublish": true, "canSubscribe": true, "canPublishData": true }
-        }
-    });
-    jwt_hs256(&cfg.relay.livekit_api_secret, &claims)
-}
-
-/// Minimal HS256 JWT implementation (base64url + HMAC-SHA256).
-fn jwt_hs256(secret: &str, claims: &serde_json::Value) -> Result<String> {
-    fn b64url(data: &[u8]) -> String {
-        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(data)
-    }
-    let header = b64url(br#"{"alg":"HS256","typ":"JWT"}"#);
-    let payload = b64url(serde_json::to_string(claims)?.as_bytes());
-    let signing_input = format!("{header}.{payload}");
-    let mac = hmac_sha256(secret.as_bytes(), signing_input.as_bytes());
-    Ok(format!("{signing_input}.{}", b64url(&mac)))
-}
-
-/// HMAC-SHA256 (RFC 2104), implemented locally to avoid extra dependencies.
-fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    const BLOCK: usize = 64;
-    let mut key = key.to_vec();
-    if key.len() > BLOCK {
-        key = Sha256::digest(&key).to_vec();
-    }
-    key.resize(BLOCK, 0);
-    let mut ipad = [0x36u8; BLOCK];
-    let mut opad = [0x5cu8; BLOCK];
-    for (i, b) in key.iter().enumerate() {
-        ipad[i] ^= b;
-        opad[i] ^= b;
-    }
-    let inner = Sha256::digest([ipad.as_slice(), data].concat());
-    let outer = Sha256::digest([opad.as_slice(), inner.as_slice()].concat());
-    outer.into()
 }
 
 async fn stats_writer(relay: Arc<Relay>, mut shutdown: watch::Receiver<bool>) {

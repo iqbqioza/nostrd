@@ -89,14 +89,19 @@ max_connections = 10000
 max_ws_message_size = 1048576
 max_subscriptions = 20
 max_limit = 500
+count_limit = 2000              # NIP-45 COUNT cap (results beyond it are "approximate")
 new_pubkey_min_age_secs = 0     # spam defense: reject events from accounts younger
                                 # than this many seconds (0 = off)
 db_queue_msgs = 4096            # overload protection: fail fast when the database
 db_queue_events = 262144        # queue holds more than this much pending work
+buffer_size = 2048              # initial WebSocket read/write buffer per connection
+group_late_publish_secs = 604800  # NIP-29 late-publication window
 
 [database]
 path = "./data"
-map_max_size = 1099511627776    # virtual address space ceiling (sparse file)
+map_size = 1073741824           # initial LMDB memory map (virtual address space)
+map_max_size = 1099511627776    # growth ceiling (sparse file: only written pages
+                                # consume physical memory or disk)
 search_index = true             # NIP-50 word index
 purge_interval_secs = 300       # NIP-40 expired-event purge interval
 
@@ -148,13 +153,47 @@ All relay-side NIPs are implemented; client-side NIPs are stored and served as p
 
 ## Performance
 
-Measured on the release build (single connection):
+Measured on the release build (5 concurrent connections, fresh database, fsync per commit):
 
-| Operation | Throughput |
+| Operation | Result |
 | --- | --- |
-| Event publish (signature verification + fsync commit) | ~1,800 events/s |
-| Query (limit 500) | ~26 requests/s (~13k events/s delivered) |
-| Live notification delivery | ~60 ms end-to-end |
+| Event publish (signature verification + fsync commit) | ~1,100–1,400 events/s |
+| Query (limit 100, tag filter) | 50 queries in ~1.4 s |
+| Live notification delivery (publish → subscriber) | median ~6 ms, p95 ~12 ms |
+| COUNT (NIP-45) | 50 counts in ~0.9 s |
+
+Sustained-load stability test (10 connections × 30 s, ~20,000 published events):
+zero database errors, zero panics, zero rejected events. The memory map is a
+virtual address-space reservation: a freshly started relay uses only a few
+tens of MB of physical memory regardless of `map_size`.
+
+## Repository layout
+
+```
+src/
+├── main.rs, cli.rs, config.rs   entry point, CLI, nostrd.toml
+├── util.rs, error.rs, event.rs, filter.rs, stats.rs
+├── db/                          LMDB storage
+│   ├── mod.rs                   DbClient handle and request plumbing
+│   ├── threads.rs               dedicated writer/reader threads
+│   ├── store.rs                 write path and index maintenance
+│   ├── removal.rs               deletions, bans, vanish, expiry purge
+│   └── scan.rs                  query engine (filters, merged walks, collectors)
+├── relay/                       event acceptance and NIP-29/43 state
+│   ├── mod.rs                   accept paths, live fan-out
+│   ├── validate.rs              pre-acceptance checks (shared by both paths)
+│   └── roles.rs                 NIP-43 role administration
+├── server/                      HTTP/WebSocket front end
+│   ├── mod.rs                   router, CORS, background tasks
+│   └── livekit.rs               NIP-29 LiveKit token endpoint
+├── ws/                          connection handling
+│   ├── mod.rs                   connection loop and live delivery
+│   ├── handler.rs               protocol message handlers
+│   └── negentropy.rs            NIP-77 NEG-OPEN/MSG/CLOSE
+└── nips/                        per-NIP modules (some split further, e.g.
+                                nip29/{mod,events,tests}, nip77/{mod,codec},
+                                nip86/{mod,legacy})
+```
 
 ## License
 
