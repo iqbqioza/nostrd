@@ -89,6 +89,16 @@ fn add_cors_headers(headers: &mut HeaderMap) {
     );
 }
 
+/// Binds a TCP listener on `addr` and logs the given label with the
+/// address, turning a bind failure into a configuration error.
+async fn bind_listener(addr: &(String, u16), label: &str) -> Result<TcpListener> {
+    let listener = TcpListener::bind(addr)
+        .await
+        .map_err(|e| Error::Config(format!("cannot bind to {}:{}: {e}", addr.0, addr.1)))?;
+    info!("{label}{}:{}", addr.0, addr.1);
+    Ok(listener)
+}
+
 /// The relay's HTTP router: the WebSocket/NIP-11/NIP-86 endpoint, health
 /// and stats routes, and the NIP-29 LiveKit endpoints when configured.
 async fn build_router(relay: &Arc<Relay>) -> Router {
@@ -152,13 +162,7 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
         let cfg = relay.config.read().await;
         (cfg.server.host.clone(), cfg.server.port)
     };
-    let listener = TcpListener::bind(&bind_addr).await.map_err(|e| {
-        Error::Config(format!(
-            "cannot bind to {}:{}: {e}",
-            bind_addr.0, bind_addr.1
-        ))
-    })?;
-    info!("relay listening on ws://{}:{}", bind_addr.0, bind_addr.1);
+    let listener = bind_listener(&bind_addr, "relay listening on ws://").await?;
 
     let mut tasks = Vec::new();
 
@@ -169,16 +173,7 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
                 cfg.server.management_host.clone(),
                 cfg.server.management_port,
             );
-            let listener = TcpListener::bind(&mgmt_addr).await.map_err(|e| {
-                Error::Config(format!(
-                    "cannot bind management on {}:{}: {e}",
-                    mgmt_addr.0, mgmt_addr.1
-                ))
-            })?;
-            info!(
-                "management listening on http://{}:{}",
-                mgmt_addr.0, mgmt_addr.1
-            );
+            let listener = bind_listener(&mgmt_addr, "management listening on http://").await?;
             Some((mgmt_addr, listener))
         } else {
             None

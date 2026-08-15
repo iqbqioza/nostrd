@@ -35,6 +35,8 @@ fn event(kind: u64, content: &str, created: u64, tags: Vec<Vec<String>>) -> Even
 }
 
 #[test]
+
+// ----- storage and query -----
 fn insert_and_query() {
     let db = DbClient::open(
         &config(),
@@ -109,6 +111,8 @@ fn replaceable_and_deletion() {
 }
 
 #[test]
+
+// ----- expiration (NIP-40) -----
 fn expired_events_are_filtered() {
     let db = DbClient::open(
         &config(),
@@ -133,6 +137,8 @@ fn expired_events_are_filtered() {
 }
 
 #[test]
+
+// ----- deletion (NIP-09) -----
 fn deletion_by_address_and_author() {
     let db = DbClient::open(
         &config(),
@@ -309,6 +315,8 @@ fn equal_timestamp_replaceable_keeps_lowest_id() {
 }
 
 #[test]
+
+// ----- bans (NIP-86) -----
 fn banned_events_are_removed_and_rejected() {
     let db = DbClient::open(
         &config(),
@@ -344,6 +352,8 @@ fn banned_events_are_removed_and_rejected() {
 }
 
 #[test]
+
+// ----- ephemeral and gift wraps (NIP-01/59) -----
 fn ephemeral_events_are_not_stored() {
     // NIP-01: kinds 20000-29999 must not be stored (NIP-59 requires
     // kind 21059 in particular to never be stored).
@@ -424,6 +434,8 @@ fn gift_wraps_to_are_deleted() {
 }
 
 #[test]
+
+// ----- database growth -----
 fn map_grows_beyond_initial_size() {
     // The database must keep accepting writes once it outgrows the
     // initial map size: the map is grown automatically up to
@@ -471,6 +483,8 @@ fn map_grows_beyond_initial_size() {
 }
 
 #[test]
+
+// ----- trust period and expiry toggling -----
 fn first_seen_trust_period() {
     // A pubkey's first event records its arrival; later events within
     // the trust window are rejected by the relay. Here we verify the
@@ -552,6 +566,8 @@ fn expiry_enabled_toggles_at_runtime() {
 }
 
 #[test]
+
+// ----- filters, search and ordering -----
 fn multiletter_tag_filters_match() {
     // NIP-01 only requires single-letter tags to be indexed; filters on
     // longer tag names must still match via the full scan.
@@ -786,6 +802,8 @@ fn expiration_does_not_affect_ephemeral_events() {
 }
 
 #[test]
+
+// ----- negentropy and counting (NIP-77/45) -----
 fn neg_items_carry_visibility_flags() {
     // NIP-70/NIP-29: the negentropy items carry the protected flag and
     // the group id so the connection layer can mirror the REQ path's
@@ -865,6 +883,8 @@ fn count_stops_exactly_at_the_cap() {
 }
 
 #[test]
+
+// ----- replaceable d-tag semantics -----
 fn replaceable_kinds_ignore_the_d_tag() {
     // NIP-01: kind 0/3/10000-19999 are replaced per (pubkey, kind) —
     // a `d` tag must not create a separate slot that keeps old versions
@@ -899,6 +919,8 @@ fn replaceable_kinds_ignore_the_d_tag() {
 }
 
 #[test]
+
+// ----- overload protection -----
 fn request_fails_fast_when_the_queue_is_full() {
     // Overload protection: with a full queue, new requests fail fast
     // instead of accumulating in memory, and the overload is surfaced

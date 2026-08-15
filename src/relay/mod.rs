@@ -218,14 +218,15 @@ impl Relay {
         }
 
         let outcome = self.db.put(event.clone(), now).await;
-        let nip_flags = (cfg.nip_enabled(9), cfg.nip_enabled(43), cfg.nip_enabled(29));
+        let (nip9, nip43, nip29_enabled) =
+            (cfg.nip_enabled(9), cfg.nip_enabled(43), cfg.nip_enabled(29));
         drop(cfg);
         drop(access);
 
         match outcome {
             PutOutcome::Stored | PutOutcome::Replaced | PutOutcome::Ephemeral => {
                 self.stats.bump(&self.stats.events_accepted, 1);
-                self.after_put(&event, now, nip_flags.0, nip_flags.1, nip_flags.2)
+                self.after_put(&event, now, nip9, nip43, nip29_enabled)
                     .await;
                 let arc = Arc::new(event);
                 (outcome, Some(arc))

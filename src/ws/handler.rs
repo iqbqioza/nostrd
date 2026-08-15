@@ -153,15 +153,18 @@ impl super::Conn {
             }
         };
 
-        let (max_sub_id_len, max_filters, max_subscriptions, max_limit) = {
-            let limits = &self.relay.config.read().await.limits;
-            (
-                limits.max_sub_id_len,
-                limits.max_filters,
-                limits.max_subscriptions,
-                limits.max_limit,
-            )
-        };
+        let cfg = self.relay.config.read().await;
+        let (max_sub_id_len, max_filters, max_subscriptions, max_limit) = (
+            cfg.limits.max_sub_id_len,
+            cfg.limits.max_filters,
+            cfg.limits.max_subscriptions,
+            cfg.limits.max_limit,
+        );
+        let search_enabled = cfg.nip_enabled(50);
+        let require_auth = cfg.server.require_auth;
+        let sub_bytes_limit = cfg.limits.max_sub_bytes;
+        let eose_hint = cfg.nip_enabled(67);
+        drop(cfg);
         if sub_id.is_empty() {
             self.send_closed(sub_id, "invalid: subscription id must not be empty");
             return;
@@ -190,10 +193,9 @@ impl super::Conn {
             return;
         }
 
-        let search_disabled = filters.iter().any(|f| f.has_search())
-            && !self.relay.config.read().await.nip_enabled(50);
+        let search_disabled = filters.iter().any(|f| f.has_search()) && !search_enabled;
 
-        if self.relay.config.read().await.server.require_auth && !self.is_authed() {
+        if require_auth && !self.is_authed() {
             self.send_closed(
                 sub_id,
                 "auth-required: please authenticate before subscribing",
@@ -224,7 +226,6 @@ impl super::Conn {
                     .unwrap_or_default()
             })
             .sum();
-        let sub_bytes_limit = self.relay.config.read().await.limits.max_sub_bytes;
         let replacing = self.subs.get(sub_id).map(|(_, bytes)| *bytes);
         let next_total = self
             .sub_bytes
@@ -262,7 +263,7 @@ impl super::Conn {
             self.send_json(json!(["EVENT", sub_id, event]));
         }
         // NIP-67: EOSE completeness hint.
-        if self.relay.config.read().await.nip_enabled(67) {
+        if eose_hint {
             let hint = if more { "more" } else { "finish" };
             self.send_json(json!(["EOSE", sub_id, [hint]]));
         } else {
