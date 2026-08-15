@@ -126,21 +126,28 @@ pub(crate) fn apply_put_batch(
 /// A batch of events to store in one transaction, with its reply.
 pub(crate) type PutBatchMsg = (Vec<(Event, u64)>, oneshot::Sender<Vec<PutOutcome>>);
 
+/// The writer thread's pending write state: the open transaction, the
+/// queued single puts with their reply channels and the queued put
+/// batches.
+#[derive(Default)]
+pub(crate) struct WriteBatch<'tx> {
+    pub(crate) pending: Option<heed::RwTxn<'tx>>,
+    pub(crate) puts: Vec<(Event, u64)>,
+    pub(crate) senders: Vec<oneshot::Sender<PutOutcome>>,
+    pub(crate) pending_batches: Vec<PutBatchMsg>,
+}
+
 /// Commits the pending single-put batch together with every queued
 /// `PutBatch`, merging them all into one write transaction (one commit for
 /// events arriving from many connections). Replies are only sent after a
 /// successful commit, so an OK implies durability.
-#[allow(clippy::too_many_arguments)]
 pub(crate) fn flush_everything(
     store: &Store,
     thread_errors: &Arc<std::sync::atomic::AtomicU64>,
-    pending: &mut Option<heed::RwTxn>,
-    batch_puts: &mut Vec<(Event, u64)>,
-    senders: &mut Vec<oneshot::Sender<PutOutcome>>,
-    pending_batches: &mut Vec<PutBatchMsg>,
+    batch: &mut WriteBatch<'_>,
 ) {
-    if batch_puts.is_empty() && pending_batches.is_empty() {
-        if let Some(wtxn) = pending.take()
+    if batch.puts.is_empty() && batch.pending_batches.is_empty() {
+        if let Some(wtxn) = batch.pending.take()
             && let Err(e) = wtxn.commit()
         {
             db_error(thread_errors, &e.into());
@@ -149,20 +156,21 @@ pub(crate) fn flush_everything(
     }
     // Merge the singles and every queued batch into one list; the split
     // points let the outcomes be distributed back in order.
-    let mut all: Vec<(Event, u64)> = std::mem::take(batch_puts);
+    let mut all: Vec<(Event, u64)> = std::mem::take(&mut batch.puts);
     let mut splits: Vec<usize> = vec![all.len()];
-    for (events, _) in pending_batches.iter_mut() {
+    for (events, _) in batch.pending_batches.iter_mut() {
         all.append(events);
         splits.push(all.len());
     }
-    let outcomes = apply_put_batch(store, thread_errors, pending.take(), &all);
-    for (s, out) in senders
+    let outcomes = apply_put_batch(store, thread_errors, batch.pending.take(), &all);
+    for (s, out) in batch
+        .senders
         .drain(..)
         .zip(outcomes.iter().take(splits[0]).cloned())
     {
         let _ = s.send(out);
     }
-    for (i, (_, reply)) in pending_batches.drain(..).enumerate() {
+    for (i, (_, reply)) in batch.pending_batches.drain(..).enumerate() {
         let range = splits[i]..splits[i + 1];
         let _ = reply.send(outcomes[range].to_vec());
     }

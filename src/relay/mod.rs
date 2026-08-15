@@ -14,9 +14,9 @@ use tokio::sync::{RwLock, broadcast, mpsc};
 use crate::config::{AccessControl, Config};
 use crate::db::{DbClient, PutOutcome};
 use crate::event::Event;
+use crate::nips::nip09;
 use crate::nips::nip29::{self, GroupStore};
 use crate::nips::nip43::{self, RoleStore};
-use crate::nips::{nip09, nip62};
 use crate::stats::Stats;
 use crate::util::unix_now;
 
@@ -42,21 +42,29 @@ pub struct Relay {
     secp: Secp256k1<secp256k1::All>,
 }
 
+/// Tuning of the live fan-out bus.
+#[derive(Debug, Clone, Copy)]
+pub struct LiveBusConfig {
+    /// Bound on the queue of events waiting to be broadcast.
+    pub buffer: usize,
+    /// The bus flushes at least this often (milliseconds).
+    pub batch_interval_ms: u64,
+    /// Maximum events per flushed batch.
+    pub batch_size: usize,
+}
+
 impl Relay {
-    #[allow(clippy::too_many_arguments)]
     pub async fn new(
         config: Arc<RwLock<Config>>,
         db: DbClient,
         stats: Arc<Stats>,
         private_key_hex: &str,
-        live_buffer: usize,
-        live_batch_interval_ms: u64,
-        live_batch_size: usize,
+        live_bus: LiveBusConfig,
     ) -> Relay {
         let (live, _) = broadcast::channel(4096);
-        let (live_tx, live_rx) = mpsc::channel(live_buffer.max(16));
-        let live_batch_interval_ms = live_batch_interval_ms.clamp(1, 1000);
-        let live_batch_size = live_batch_size.max(1);
+        let (live_tx, live_rx) = mpsc::channel(live_bus.buffer.max(16));
+        let live_batch_interval_ms = live_bus.batch_interval_ms.clamp(1, 1000);
+        let live_batch_size = live_bus.batch_size.max(1);
         let secp = Secp256k1::new();
         let key = if private_key_hex.is_empty() {
             None
@@ -163,32 +171,26 @@ impl Relay {
         let cfg = self.config.read().await;
         let access = self.access.read().await;
 
-        if let Err(reason) = self.validate(&cfg, &access, &event, now, authed) {
-            self.stats.bump(&self.stats.events_rejected, 1);
-            return (PutOutcome::Invalid(reason), None);
-        }
-
-        // NIP-62: request to vanish — delete everything by this pubkey and
-        // never accept anything from it again.
-        if cfg.nip_enabled(62)
-            && nip62::is_vanish(&event)
-            && nip62::targets_us(&event, &cfg.relay_identity())
-            && let Some(pubkey) = event.pubkey_bytes()
+        match self
+            .precheck(&cfg, &access, &event, now, authed, known_prefixes)
+            .await
         {
-            let pubkey_hex = hex::encode(pubkey);
-            drop(cfg);
-            drop(access);
-            let removed = self.db.apply_vanish(pubkey).await;
-            self.stats.bump(&self.stats.events_deleted, removed as u64);
-            // Remove the pubkey from every NIP-29 group (its moderation
-            // events were deleted along with everything else).
-            if self.config.read().await.nip_enabled(29) {
-                let mut groups = self.groups.write().await;
-                for group in groups.groups.values_mut() {
-                    group.members.remove(&pubkey_hex);
-                }
+            crate::relay::validate::Precheck::Reject(reason) => {
+                self.stats.bump(&self.stats.events_rejected, 1);
+                return (PutOutcome::Invalid(reason), None);
             }
-            return (PutOutcome::Stored, None);
+            crate::relay::validate::Precheck::Vanish => {
+                // NIP-62: delete everything by this pubkey and never
+                // accept anything from it again.
+                let Some(pubkey) = event.pubkey_bytes() else {
+                    return (PutOutcome::Invalid("invalid: bad pubkey".into()), None);
+                };
+                drop(cfg);
+                drop(access);
+                self.vanish_pubkey(pubkey).await;
+                return (PutOutcome::Stored, None);
+            }
+            crate::relay::validate::Precheck::Accept => {}
         }
 
         // First-seen trust check: a pubkey's first accepted event records
@@ -215,127 +217,16 @@ impl Relay {
             }
         }
 
-        // NIP-43: join requests carry an invite code, which this relay never
-        // issues; every claim therefore fails (NIP-43 mandates an OK reply).
-        if cfg.nip_enabled(43) && event.kind == 28934 {
-            return (
-                PutOutcome::Invalid("restricted: this relay does not issue invite codes".into()),
-                None,
-            );
-        }
-
-        // NIP-29: group action events (moderation 9000-9020, join 9021 and
-        // leave 9022) MUST carry an `h` tag naming the group.
-        if cfg.nip_enabled(29)
-            && nip29::is_group_action(&event)
-            && nip29::group_id(&event).is_none()
-        {
-            return (
-                PutOutcome::Invalid("invalid: group events must carry an h tag".into()),
-                None,
-            );
-        }
-
-        // NIP-29: group write access control.
-        if cfg.nip_enabled(29) {
-            // Group metadata events (39000-39005) MUST be created and signed
-            // by the relay's own key; events signed by anyone else are
-            // rejected.
-            if (nip29::GROUP_META..=nip29::GROUP_PINS).contains(&event.kind)
-                && Some(event.pubkey.as_str()) != self.relay_pubkey().as_deref()
-            {
-                return (
-                    PutOutcome::Invalid(
-                        "blocked: group metadata must be published by the relay".into(),
-                    ),
-                    None,
-                );
-            }
-            if nip29::group_id(&event).is_some() {
-                // Late publication prevention for group events.
-                if cfg.limits.group_late_publish_secs > 0
-                    && event
-                        .created_at
-                        .saturating_add(cfg.limits.group_late_publish_secs)
-                        < now
-                {
-                    return (
-                        PutOutcome::Invalid("invalid: event is too old for this group".into()),
-                        None,
-                    );
-                }
-                let groups = self.groups.read().await;
-                if let Err(reason) = groups.validate_write(&event) {
-                    return (PutOutcome::Invalid(reason), None);
-                }
-                if !nip29::previous_tags(&event).is_empty() {
-                    for prefix in nip29::previous_tags(&event) {
-                        let Ok(prefix) = hex::decode(&prefix) else {
-                            return (
-                                PutOutcome::Invalid("invalid: malformed previous tag".into()),
-                                None,
-                            );
-                        };
-                        if !prefix.is_empty() {
-                            let exists = match known_prefixes {
-                                Some(known) => known.contains(&prefix),
-                                None => self.db.event_id_prefix_exists(&prefix).await,
-                            };
-                            if !exists {
-                                return (
-                                    PutOutcome::Invalid(
-                                        "invalid: unknown previous tag reference".into(),
-                                    ),
-                                    None,
-                                );
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
         let outcome = self.db.put(event.clone(), now).await;
-        let groups_enabled = cfg.nip_enabled(29);
-        let roles_enabled = cfg.nip_enabled(43);
+        let nip_flags = (cfg.nip_enabled(9), cfg.nip_enabled(43), cfg.nip_enabled(29));
         drop(cfg);
         drop(access);
 
         match outcome {
             PutOutcome::Stored | PutOutcome::Replaced | PutOutcome::Ephemeral => {
                 self.stats.bump(&self.stats.events_accepted, 1);
-                if self.config.read().await.nip_enabled(9) && event.kind == nip09::DELETION_KIND {
-                    let removed = self
-                        .db
-                        .apply_deletion(
-                            nip09::deletion_targets(&event),
-                            nip09::deletion_addresses(&event),
-                            Some(event.pubkey.clone()),
-                            event.created_at,
-                        )
-                        .await;
-                    self.stats.bump(&self.stats.events_deleted, removed as u64);
-                    // NIP-59: gift wraps are signed by random keys, so their
-                    // recipient cannot delete them via NIP-09; the relay
-                    // deletes wraps addressed to the deleter instead.
-                    if let Some(pubkey) = event.pubkey_bytes() {
-                        let purged = self.db.delete_gift_wraps_to(pubkey).await;
-                        self.stats.bump(&self.stats.events_deleted, purged as u64);
-                    }
-                }
-                if roles_enabled && event.kind == nip43::LEAVE {
-                    // NIP-43: leave requests (ephemeral kinds) update the
-                    // member list without being stored.
-                    self.apply_leave_request(&event).await;
-                }
-                let is_group_event = groups_enabled
-                    && ((nip29::MOD_MIN..=nip29::MOD_MAX).contains(&event.kind)
-                        || event.kind == nip29::JOIN
-                        || event.kind == nip29::LEAVE);
-                if is_group_event {
-                    self.apply_group_event(&event, now).await;
-                }
-                self.broadcast(event.clone());
+                self.after_put(&event, now, nip_flags.0, nip_flags.1, nip_flags.2)
+                    .await;
                 let arc = Arc::new(event);
                 (outcome, Some(arc))
             }
@@ -409,98 +300,26 @@ impl Relay {
         let mut put_slots: Vec<usize> = Vec::new();
         let mut vanishes: Vec<(String, Event)> = Vec::new();
 
+        // This path only sees events without group involvement: batches
+        // containing group events (an `h` tag or a moderation/join/leave
+        // kind) are routed to the sequential [`Self::accept_event`] path
+        // above. The shared `precheck` still runs for every event.
         for event in events {
             let id = event.id.clone();
-            if let Err(reason) = self.validate(&cfg, &access, &event, now, authed) {
-                self.stats.bump(&self.stats.events_rejected, 1);
-                results.push((id, PutOutcome::Invalid(reason)));
-                continue;
-            }
-            if cfg.nip_enabled(62)
-                && nip62::is_vanish(&event)
-                && nip62::targets_us(&event, &cfg.relay_identity())
+            match self
+                .precheck(&cfg, &access, &event, now, authed, None)
+                .await
             {
-                vanishes.push((id, event));
-                continue;
-            }
-            if cfg.nip_enabled(43) && event.kind == 28934 {
-                self.stats.bump(&self.stats.events_rejected, 1);
-                results.push((
-                    id,
-                    PutOutcome::Invalid(
-                        "restricted: this relay does not issue invite codes".into(),
-                    ),
-                ));
-                continue;
-            }
-            // NIP-29: group action events MUST carry an `h` tag.
-            if cfg.nip_enabled(29)
-                && nip29::is_group_action(&event)
-                && nip29::group_id(&event).is_none()
-            {
-                self.stats.bump(&self.stats.events_rejected, 1);
-                results.push((
-                    id,
-                    PutOutcome::Invalid("invalid: group events must carry an h tag".into()),
-                ));
-                continue;
-            }
-            if cfg.nip_enabled(29) {
-                if (nip29::GROUP_META..=nip29::GROUP_PINS).contains(&event.kind)
-                    && Some(event.pubkey.as_str()) != self.relay_pubkey().as_deref()
-                {
+                crate::relay::validate::Precheck::Reject(reason) => {
                     self.stats.bump(&self.stats.events_rejected, 1);
-                    results.push((
-                        id,
-                        PutOutcome::Invalid(
-                            "blocked: group metadata must be published by the relay".into(),
-                        ),
-                    ));
+                    results.push((id, PutOutcome::Invalid(reason)));
                     continue;
                 }
-                if nip29::group_id(&event).is_some() {
-                    if cfg.limits.group_late_publish_secs > 0
-                        && event
-                            .created_at
-                            .saturating_add(cfg.limits.group_late_publish_secs)
-                            < now
-                    {
-                        self.stats.bump(&self.stats.events_rejected, 1);
-                        results.push((
-                            id,
-                            PutOutcome::Invalid("invalid: event is too old for this group".into()),
-                        ));
-                        continue;
-                    }
-                    let reason = {
-                        let groups = self.groups.read().await;
-                        groups.validate_write(&event).err()
-                    };
-                    if let Some(reason) = reason {
-                        self.stats.bump(&self.stats.events_rejected, 1);
-                        results.push((id, PutOutcome::Invalid(reason)));
-                        continue;
-                    }
-                    let mut previous_ok = true;
-                    for prefix in nip29::previous_tags(&event) {
-                        let Ok(prefix) = hex::decode(&prefix) else {
-                            previous_ok = false;
-                            break;
-                        };
-                        if !prefix.is_empty() && !self.db.event_id_prefix_exists(&prefix).await {
-                            previous_ok = false;
-                            break;
-                        }
-                    }
-                    if !previous_ok {
-                        self.stats.bump(&self.stats.events_rejected, 1);
-                        results.push((
-                            id,
-                            PutOutcome::Invalid("invalid: unknown previous tag reference".into()),
-                        ));
-                        continue;
-                    }
+                crate::relay::validate::Precheck::Vanish => {
+                    vanishes.push((id, event));
+                    continue;
                 }
+                crate::relay::validate::Precheck::Accept => {}
             }
             put_slots.push(results.len());
             results.push((String::new(), PutOutcome::Invalid(String::new())));
@@ -509,6 +328,7 @@ impl Relay {
 
         let groups_enabled = cfg.nip_enabled(29);
         let roles_enabled = cfg.nip_enabled(43);
+        let nip9_enabled = cfg.nip_enabled(9);
         let min_age = cfg.limits.new_pubkey_min_age_secs;
         drop(cfg);
         drop(access);
@@ -575,34 +395,8 @@ impl Relay {
             match outcome {
                 PutOutcome::Stored | PutOutcome::Replaced | PutOutcome::Ephemeral => {
                     self.stats.bump(&self.stats.events_accepted, 1);
-                    if self.config.read().await.nip_enabled(9) && event.kind == nip09::DELETION_KIND
-                    {
-                        let removed = self
-                            .db
-                            .apply_deletion(
-                                nip09::deletion_targets(&event),
-                                nip09::deletion_addresses(&event),
-                                Some(event.pubkey.clone()),
-                                event.created_at,
-                            )
-                            .await;
-                        self.stats.bump(&self.stats.events_deleted, removed as u64);
-                        if let Some(pubkey) = event.pubkey_bytes() {
-                            let purged = self.db.delete_gift_wraps_to(pubkey).await;
-                            self.stats.bump(&self.stats.events_deleted, purged as u64);
-                        }
-                    }
-                    if roles_enabled && event.kind == nip43::LEAVE {
-                        self.apply_leave_request(&event).await;
-                    }
-                    let is_group_event = groups_enabled
-                        && ((nip29::MOD_MIN..=nip29::MOD_MAX).contains(&event.kind)
-                            || event.kind == nip29::JOIN
-                            || event.kind == nip29::LEAVE);
-                    if is_group_event {
-                        self.apply_group_event(&event, now).await;
-                    }
-                    self.broadcast(event);
+                    self.after_put(&event, now, nip9_enabled, roles_enabled, groups_enabled)
+                        .await;
                 }
                 PutOutcome::Duplicate => {
                     self.stats.bump(&self.stats.events_duplicate, 1);
@@ -616,20 +410,71 @@ impl Relay {
 
         for (id, event) in vanishes {
             if let Some(pubkey) = event.pubkey_bytes() {
-                let pubkey_hex = hex::encode(pubkey);
-                let removed = self.db.apply_vanish(pubkey).await;
-                self.stats.bump(&self.stats.events_deleted, removed as u64);
-                if self.config.read().await.nip_enabled(29) {
-                    let mut groups = self.groups.write().await;
-                    for group in groups.groups.values_mut() {
-                        group.members.remove(&pubkey_hex);
-                    }
-                }
+                self.vanish_pubkey(pubkey).await;
             }
             results.push((id, PutOutcome::Stored));
         }
 
         results
+    }
+
+    /// Shared side effects of a stored event: NIP-09 deletion handling,
+    /// NIP-43 leave requests, NIP-29 group state and the live broadcast.
+    async fn after_put(
+        &self,
+        event: &Event,
+        now: u64,
+        nip9: bool,
+        nip43: bool,
+        nip29_enabled: bool,
+    ) {
+        if nip9 && event.kind == nip09::DELETION_KIND {
+            let removed = self
+                .db
+                .apply_deletion(
+                    nip09::deletion_targets(event),
+                    nip09::deletion_addresses(event),
+                    Some(event.pubkey.clone()),
+                    event.created_at,
+                )
+                .await;
+            self.stats.bump(&self.stats.events_deleted, removed as u64);
+            // NIP-59: gift wraps are signed by random keys, so their
+            // recipient cannot delete them via NIP-09; the relay
+            // deletes wraps addressed to the deleter instead.
+            if let Some(pubkey) = event.pubkey_bytes() {
+                let purged = self.db.delete_gift_wraps_to(pubkey).await;
+                self.stats.bump(&self.stats.events_deleted, purged as u64);
+            }
+        }
+        if nip43 && event.kind == nip43::LEAVE {
+            // NIP-43: leave requests (ephemeral kinds) update the member
+            // list without being stored.
+            self.apply_leave_request(event).await;
+        }
+        let is_group_event = nip29_enabled
+            && ((nip29::MOD_MIN..=nip29::MOD_MAX).contains(&event.kind)
+                || event.kind == nip29::JOIN
+                || event.kind == nip29::LEAVE);
+        if is_group_event {
+            self.apply_group_event(event, now).await;
+        }
+        self.broadcast(event.clone());
+    }
+
+    /// NIP-62: deletes every event by `pubkey` and removes the pubkey from
+    /// every NIP-29 group (its moderation events were deleted along with
+    /// everything else).
+    async fn vanish_pubkey(&self, pubkey: [u8; 32]) {
+        let pubkey_hex = hex::encode(pubkey);
+        let removed = self.db.apply_vanish(pubkey).await;
+        self.stats.bump(&self.stats.events_deleted, removed as u64);
+        if self.config.read().await.nip_enabled(29) {
+            let mut groups = self.groups.write().await;
+            for group in groups.groups.values_mut() {
+                group.members.remove(&pubkey_hex);
+            }
+        }
     }
 
     /// Applies a stored NIP-29 event to the group state and publishes the

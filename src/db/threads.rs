@@ -7,14 +7,13 @@
 
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
-use super::store::PutBatchMsg;
+use super::store::WriteBatch;
 use super::store::{Store, flush_everything};
 use super::{Msg, PutOutcome, db_error};
 
 use crate::error::Result;
-use crate::event::Event;
 
 /// The channels, counters and flags handed to the [`super::DbClient`] by
 /// [`spawn`].
@@ -192,25 +191,15 @@ pub(crate) fn spawn(
         // once per batch instead of once per event. Replies are only
         // sent after the commit, so an OK implies durability.
         const BATCH: usize = 64;
-        let mut pending: Option<heed::RwTxn> = None;
-        let mut batch_puts: Vec<(Event, u64)> = Vec::new();
-        let mut senders: Vec<oneshot::Sender<PutOutcome>> = Vec::new();
-        // Put batches received within the current message drain, merged
+        // Put batches received within the current message drain are merged
         // into a single commit at flush time.
-        let mut pending_batches: Vec<PutBatchMsg> = Vec::new();
+        let mut batch = WriteBatch::default();
         'outer: loop {
             let Some(msg) = rx.blocking_recv() else {
                 // The channel is closed (every DbClient was dropped
                 // without a shutdown): flush any pending batch so that
                 // awaiting requests are not left hanging.
-                flush_everything(
-                    &store,
-                    &thread_errors,
-                    &mut pending,
-                    &mut batch_puts,
-                    &mut senders,
-                    &mut pending_batches,
-                );
+                flush_everything(&store, &thread_errors, &mut batch);
                 break;
             };
             // The database thread is the single point of failure for
@@ -238,9 +227,9 @@ pub(crate) fn spawn(
                 for msg in msgs {
                     match msg {
                         Msg::Put { event, now, reply } => {
-                            if pending.is_none() {
+                            if batch.pending.is_none() {
                                 match store.env.write_txn() {
-                                    Ok(txn) => pending = Some(txn),
+                                    Ok(txn) => batch.pending = Some(txn),
                                     Err(e) => {
                                         db_error(&thread_errors, &e.into());
                                         let _ = reply
@@ -249,35 +238,21 @@ pub(crate) fn spawn(
                                     }
                                 }
                             }
-                            batch_puts.push((event, now));
-                            senders.push(reply);
+                            batch.puts.push((event, now));
+                            batch.senders.push(reply);
                         }
                         Msg::PutBatch { events, reply } => {
-                            pending_batches.push((events, reply));
+                            batch.pending_batches.push((events, reply));
                         }
                         Msg::Shutdown => {
-                            flush_everything(
-                                &store,
-                                &thread_errors,
-                                &mut pending,
-                                &mut batch_puts,
-                                &mut senders,
-                                &mut pending_batches,
-                            );
+                            flush_everything(&store, &thread_errors, &mut batch);
                             let _ = store.env.force_sync();
                             return true;
                         }
                         other => {
                             // Work that is not a plain put commits the
                             // batch first so that ordering is preserved.
-                            flush_everything(
-                                &store,
-                                &thread_errors,
-                                &mut pending,
-                                &mut batch_puts,
-                                &mut senders,
-                                &mut pending_batches,
-                            );
+                            flush_everything(&store, &thread_errors, &mut batch);
                             match other {
                                 Msg::Query {
                                     filters,
@@ -496,14 +471,7 @@ pub(crate) fn spawn(
                 // Flush the batch before blocking again: clients await
                 // their replies, so a pending batch must not wait for
                 // the next message or every requestor deadlocks.
-                flush_everything(
-                    &store,
-                    &thread_errors,
-                    &mut pending,
-                    &mut batch_puts,
-                    &mut senders,
-                    &mut pending_batches,
-                );
+                flush_everything(&store, &thread_errors, &mut batch);
                 false
             }));
             match result {
@@ -511,17 +479,19 @@ pub(crate) fn spawn(
                 Ok(true) => break 'outer,
                 Err(_) => {
                     log::error!("database thread recovered from a panic");
-                    pending = None;
-                    for s in senders.drain(..) {
+                    // Reset the batch wholesale: every queued reply is
+                    // revoked because the pending writes were rolled back
+                    // with the aborted transaction.
+                    let mut batch = WriteBatch::default();
+                    for s in batch.senders.drain(..) {
                         let _ = s.send(PutOutcome::Invalid("database error".into()));
                     }
-                    for (events, reply) in pending_batches.drain(..) {
+                    for (events, reply) in batch.pending_batches.drain(..) {
                         let _ = reply.send(vec![
                             PutOutcome::Invalid("database error".into());
                             events.len()
                         ]);
                     }
-                    batch_puts.clear();
                 }
             }
         }

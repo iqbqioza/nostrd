@@ -3,12 +3,110 @@
 
 use crate::config::{AccessControl, Config};
 use crate::event::Event;
-use crate::nips::{nip01, nip13, nip26, nip43, nip70};
+use crate::nips::{nip01, nip13, nip26, nip29, nip43, nip62, nip70};
 
 /// A bech32-encoded nsec secret key is `nsec1` followed by 58 characters
 /// (52 data characters plus a 6-character checksum), 63 characters in total.
 const NSEC_PREFIX: &[u8; 5] = b"nsec1";
 const NSEC_BODY_LEN: usize = 58;
+
+/// Outcome of the shared pre-acceptance checks.
+pub(crate) enum Precheck {
+    Accept,
+    Reject(String),
+    /// NIP-62: the event is a valid request to vanish.
+    Vanish,
+}
+
+impl super::Relay {
+    /// Runs the acceptance checks shared by the single and batched accept
+    /// paths: base validation, NIP-62 vanish detection, NIP-43 join
+    /// rejection and the NIP-29 write-access rules (h tag, relay-signed
+    /// metadata, late publication, membership and `previous` references).
+    /// `known_prefixes` supplies the batch's pre-fetched `previous` tag
+    /// references; `None` falls back to per-reference database lookups.
+    pub(crate) async fn precheck(
+        &self,
+        cfg: &Config,
+        access: &AccessControl,
+        event: &Event,
+        now: u64,
+        authed: &[String],
+        known_prefixes: Option<&std::collections::HashSet<Vec<u8>>>,
+    ) -> Precheck {
+        if let Err(reason) = self.validate(cfg, access, event, now, authed) {
+            return Precheck::Reject(reason);
+        }
+        // NIP-62: request to vanish — delete everything by this pubkey.
+        if cfg.nip_enabled(62)
+            && nip62::is_vanish(event)
+            && nip62::targets_us(event, &cfg.relay_identity())
+        {
+            return Precheck::Vanish;
+        }
+        // NIP-43: join requests carry an invite code, which this relay
+        // never issues; every claim therefore fails (NIP-43 mandates an
+        // OK reply).
+        if cfg.nip_enabled(43) && event.kind == nip43::JOIN {
+            return Precheck::Reject("restricted: this relay does not issue invite codes".into());
+        }
+        // NIP-29: group action events MUST carry an `h` tag.
+        if cfg.nip_enabled(29) && nip29::is_group_action(event) && nip29::group_id(event).is_none()
+        {
+            return Precheck::Reject("invalid: group events must carry an h tag".into());
+        }
+        if cfg.nip_enabled(29) {
+            // Group metadata events MUST be signed by the relay's own key.
+            if (nip29::GROUP_META..=nip29::GROUP_PINS).contains(&event.kind)
+                && Some(event.pubkey.as_str()) != self.relay_pubkey().as_deref()
+            {
+                return Precheck::Reject(
+                    "blocked: group metadata must be published by the relay".into(),
+                );
+            }
+            if nip29::group_id(event).is_some() {
+                // Late publication prevention for group events.
+                if cfg.limits.group_late_publish_secs > 0
+                    && event
+                        .created_at
+                        .saturating_add(cfg.limits.group_late_publish_secs)
+                        < now
+                {
+                    return Precheck::Reject("invalid: event is too old for this group".into());
+                }
+                let reason = {
+                    let groups = self.groups.read().await;
+                    groups.validate_write(event).err()
+                };
+                if let Some(reason) = reason {
+                    return Precheck::Reject(reason);
+                }
+                // NIP-29 `previous` timeline references must exist.
+                let mut unknown: Option<&str> = None;
+                for prefix in nip29::previous_tags(event) {
+                    let Ok(prefix) = hex::decode(&prefix) else {
+                        unknown = Some("invalid: malformed previous tag");
+                        break;
+                    };
+                    if !prefix.is_empty() {
+                        let exists = match known_prefixes {
+                            Some(known) => known.contains(&prefix),
+                            None => self.db.event_id_prefix_exists(&prefix).await,
+                        };
+                        if !exists {
+                            unknown = Some("invalid: unknown previous tag reference");
+                            break;
+                        }
+                    }
+                }
+                if let Some(reason) = unknown {
+                    return Precheck::Reject(reason.into());
+                }
+            }
+        }
+        Precheck::Accept
+    }
+}
 
 impl super::Relay {
     pub(crate) fn validate(

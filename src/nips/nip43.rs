@@ -19,6 +19,7 @@ pub const ROLE_DEFINITION: u64 = 33534;
 pub const MEMBERSHIP_LIST: u64 = 13534;
 pub const ADD_USER: u64 = 8000;
 pub const REMOVE_USER: u64 = 8001;
+pub const JOIN: u64 = 28934;
 pub const LEAVE: u64 = 28936;
 
 #[derive(Debug, Clone, Default)]
