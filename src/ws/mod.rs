@@ -152,6 +152,28 @@ impl Drop for ConnectionGuard {
     }
 }
 
+impl Conn {
+    /// Handles one inbound frame: bounds it against the message size
+    /// limit, counts it and feeds it to the protocol handler. Returns
+    /// `true` when the frame exceeded the limit and the connection must
+    /// close.
+    async fn handle_frame(&mut self, frame: Message, max_msg_size: usize) -> bool {
+        let text = match frame {
+            Message::Text(text) => text.to_string(),
+            Message::Binary(data) => String::from_utf8_lossy(&data).into_owned(),
+            _ => return false,
+        };
+        if text.len() > max_msg_size {
+            self.send_notice("error: message too large");
+            return true;
+        }
+        self.in_msgs += 1;
+        self.in_bytes += text.len() as u64;
+        self.handle_text(&text).await;
+        false
+    }
+}
+
 pub async fn handle_connection(mut socket: WebSocket, relay: Arc<Relay>) {
     let active = relay
         .stats
@@ -233,70 +255,32 @@ pub async fn handle_connection(mut socket: WebSocket, relay: Arc<Relay>) {
         tokio::select! {
             incoming = receiver.next() => {
                 match incoming {
-                    Some(Ok(Message::Text(text))) => {
-                        if text.len() > max_msg_size {
-                            conn.send_notice("error: message too large");
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Err(_)) => break,
+                    Some(Ok(frame)) => {
+                        if conn.handle_frame(frame, max_msg_size).await {
                             break;
                         }
-                        conn.in_msgs += 1;
-                        conn.in_bytes += text.len() as u64;
-                        conn.handle_text(&text).await;
                         // Refresh the cached NIP-40/NIP-42 flags so config
                         // reloads take effect for live delivery.
                         let cfg = conn.relay.config.read().await;
                         conn.expiry_enabled = cfg.nip_enabled(40);
                         conn.giftwrap_restricted = cfg.nip_enabled(42);
                     }
-                    Some(Ok(Message::Binary(data))) => {
-                        if data.len() > max_msg_size {
-                            conn.send_notice("error: message too large");
-                            break;
-                        }
-                        let text = String::from_utf8_lossy(&data).into_owned();
-                        conn.in_msgs += 1;
-                        conn.in_bytes += data.len() as u64;
-                        conn.handle_text(&text).await;
-                        let cfg = conn.relay.config.read().await;
-                        conn.expiry_enabled = cfg.nip_enabled(40);
-                        conn.giftwrap_restricted = cfg.nip_enabled(42);
-                    }
-                    Some(Ok(Message::Close(_))) | None => break,
-                    Some(Ok(_)) => {}
-                    Some(Err(_)) => break,
                 }
                 // Batch window: keep reading for a moment so consecutive
                 // EVENT messages from a busy publisher share one database
                 // commit, then flush the queue when the socket is idle.
+                // Batch window: keep reading for a moment so consecutive
+                // EVENT messages from a busy publisher share one database
+                // commit, then flush the queue when the socket is idle.
                 let mut too_large = false;
-                loop {
-                    match tokio::time::timeout(
-                        std::time::Duration::from_millis(1),
-                        receiver.next(),
-                    )
-                    .await
-                    {
-                        Ok(Some(Ok(Message::Text(text)))) => {
-                            if text.len() > max_msg_size {
-                                conn.send_notice("error: message too large");
-                                too_large = true;
-                                break;
-                            }
-                            conn.in_msgs += 1;
-                            conn.in_bytes += text.len() as u64;
-                            conn.handle_text(&text).await;
-                        }
-                        Ok(Some(Ok(Message::Binary(data)))) => {
-                            if data.len() > max_msg_size {
-                                conn.send_notice("error: message too large");
-                                too_large = true;
-                                break;
-                            }
-                            let text = String::from_utf8_lossy(&data).into_owned();
-                            conn.in_msgs += 1;
-                            conn.in_bytes += data.len() as u64;
-                            conn.handle_text(&text).await;
-                        }
-                        _ => break,
+                while let Ok(Some(Ok(frame))) =
+                    tokio::time::timeout(std::time::Duration::from_millis(1), receiver.next()).await
+                {
+                    if conn.handle_frame(frame, max_msg_size).await {
+                        too_large = true;
+                        break;
                     }
                 }
                 if too_large {

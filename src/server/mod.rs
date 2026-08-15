@@ -89,6 +89,25 @@ fn add_cors_headers(headers: &mut HeaderMap) {
     );
 }
 
+/// The relay's HTTP router: the WebSocket/NIP-11/NIP-86 endpoint, health
+/// and stats routes, and the NIP-29 LiveKit endpoints when configured.
+async fn build_router(relay: &Arc<Relay>) -> Router {
+    let mut app = Router::new()
+        .route("/", get(ws_handler).post(nip86::rpc_handler))
+        .route("/ws", get(ws_handler).post(nip86::rpc_handler))
+        .route("/ws/", get(ws_handler))
+        .route("/health", get(health_handler))
+        .route("/relay/stats", get(stats_handler));
+    let cfg = relay.config.read().await;
+    if cfg.nip_enabled(29) && !cfg.relay.livekit_url.is_empty() {
+        app = app
+            .route("/.well-known/nip29/livekit", get(livekit_supported))
+            .route("/.well-known/nip29/livekit/{group}", get(livekit_token));
+    }
+    app.layer(axum::middleware::from_fn(cors_middleware))
+        .with_state(relay.clone())
+}
+
 pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> Result<()> {
     let private_key = config.relay.private_key.clone();
     let live = crate::relay::LiveBusConfig {
@@ -127,23 +146,7 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    let mut app = Router::new()
-        .route("/", get(ws_handler).post(nip86::rpc_handler))
-        .route("/ws", get(ws_handler).post(nip86::rpc_handler))
-        .route("/ws/", get(ws_handler))
-        .route("/health", get(health_handler))
-        .route("/relay/stats", get(stats_handler));
-    {
-        let cfg = relay.config.read().await;
-        if cfg.nip_enabled(29) && !cfg.relay.livekit_url.is_empty() {
-            app = app
-                .route("/.well-known/nip29/livekit", get(livekit_supported))
-                .route("/.well-known/nip29/livekit/{group}", get(livekit_token));
-        }
-    }
-    let app = app
-        .layer(axum::middleware::from_fn(cors_middleware))
-        .with_state(relay.clone());
+    let app = build_router(&relay).await;
 
     let bind_addr = {
         let cfg = relay.config.read().await;
