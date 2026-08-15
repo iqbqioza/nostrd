@@ -211,6 +211,15 @@ impl ScanCollector for ItemCollector {
         self.items.truncate(take);
     }
 }
+/// What a scan is collecting: full events for REQ, plain counts for
+/// NIP-45 COUNT, or `(created_at, id)` records for NIP-77 negentropy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScanKind {
+    Query,
+    Count,
+    Negentropy,
+}
+
 impl Store {
     /// Collects events that match the filters, most recent first.
     pub(crate) fn scan(
@@ -230,8 +239,13 @@ impl Store {
         } else {
             max_limit
         };
+        let kind = if count_mode {
+            ScanKind::Count
+        } else {
+            ScanKind::Query
+        };
         let mut out = EventCollector::new(collect_cap, !count_mode);
-        let more = self.scan_collect(filters, now, max_limit, count_mode, true, &mut out)?;
+        let more = self.scan_collect(filters, now, max_limit, kind, &mut out)?;
         Ok((out.events, more))
     }
 
@@ -256,8 +270,7 @@ impl Store {
             std::slice::from_ref(filter),
             now,
             max_items,
-            false,
-            false,
+            ScanKind::Negentropy,
             &mut out,
         )?;
         Ok((out.items, more))
@@ -267,16 +280,16 @@ impl Store {
     /// candidate walks and collects into `out`. Returns `true` when the
     /// scan stopped at a limit instead of exhausting the matches
     /// (NIP-67 EOSE completeness hint).
-    #[allow(clippy::too_many_arguments)]
     fn scan_collect<C: ScanCollector>(
         &self,
         filters: &[Filter],
         now: u64,
         max_limit: usize,
-        count_mode: bool,
-        sort_search: bool,
+        kind: ScanKind,
         out: &mut C,
     ) -> Result<bool> {
+        let count_mode = matches!(kind, ScanKind::Count);
+        let sort_search = matches!(kind, ScanKind::Query);
         if max_limit == 0 {
             return Ok(false);
         }

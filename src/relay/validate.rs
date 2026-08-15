@@ -1,5 +1,6 @@
-//! Event validation (NIP-01 signatures, limits, NIP-13/26/42/43/70 and
-//! access control) and the nsec-leak detector.
+//! Event acceptance checks: base validation (NIP-01 signatures, limits,
+//! NIP-13/26/42/43/70 and access control), the shared [`Precheck`] used by
+//! both accept paths, and the nsec-leak detector.
 
 use crate::config::{AccessControl, Config};
 use crate::event::Event;
