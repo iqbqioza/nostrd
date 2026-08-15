@@ -32,6 +32,20 @@ struct ScanContext<'tx> {
     rtxn: &'tx RoTxn<'tx>,
 }
 
+/// The per-filter parameters of one scan pass.
+struct FilterScan<'a> {
+    filter: &'a Filter,
+    terms: &'a [String],
+    now: u64,
+    limit: usize,
+}
+
+/// The mutable collection state shared by the candidates of a scan pass.
+struct Collect<'a, C: ScanCollector> {
+    seen: &'a mut HashSet<Vec<u8>>,
+    out: &'a mut C,
+}
+
 /// NIP-50 search collection budget: the scan gathers up to this many
 /// candidates (instead of the response limit) so that the relevance
 /// ordering can pick the best matches before the limit is applied.
@@ -334,8 +348,17 @@ impl Store {
                 Vec::new()
             };
             out.reset_boundary();
-            let stop =
-                self.scan_filter(&rtxn, filter, &terms, now, limit, &mut seen, out, &mut more)?;
+            let scan = FilterScan {
+                filter,
+                terms: &terms,
+                now,
+                limit,
+            };
+            let mut collect = Collect {
+                seen: &mut seen,
+                out,
+            };
+            let stop = self.scan_filter(&rtxn, &scan, &mut collect, &mut more)?;
             if stop {
                 break;
             }
@@ -361,18 +384,21 @@ impl Store {
     }
 
     /// Returns `true` when the global collection cap was reached.
-    #[allow(clippy::too_many_arguments)]
     fn scan_filter<C: ScanCollector>(
         &self,
         rtxn: &RoTxn,
-        filter: &Filter,
-        terms: &[String],
-        now: u64,
-        limit: usize,
-        seen: &mut HashSet<Vec<u8>>,
-        out: &mut C,
+        scan: &FilterScan<'_>,
+        collect: &mut Collect<'_, C>,
         more: &mut bool,
     ) -> Result<bool> {
+        let FilterScan {
+            filter,
+            terms,
+            now,
+            limit,
+        } = *scan;
+        let seen = &mut *collect.seen;
+        let out = &mut *collect.out;
         let cap = out.cap();
         let ctx = ScanContext {
             events: self.events,

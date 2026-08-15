@@ -15,7 +15,7 @@ use super::{PutOutcome, db_error};
 use crate::config::DatabaseConfig;
 use crate::error::Result;
 use crate::event::Event;
-use crate::nips::{nip09, nip33, nip40, nip50};
+use crate::nips::{nip33, nip40, nip50};
 
 pub(crate) const EVENTS: &str = "events";
 pub(crate) const BY_CREATED: &str = "by_created";
@@ -593,7 +593,7 @@ impl Store {
     }
 
     /// Removes an event and every index entry pointing at it.
-    fn remove_event(&self, wtxn: &mut heed::RwTxn, id: &[u8]) -> Result<()> {
+    pub(crate) fn remove_event(&self, wtxn: &mut heed::RwTxn, id: &[u8]) -> Result<()> {
         let Some(raw) = self.events.get(wtxn, id)? else {
             return Ok(());
         };
@@ -647,213 +647,6 @@ impl Store {
         }
         Ok(())
     }
-
-    /// Applies a deletion request.
-    ///
-    /// `request_pubkey` is the hex pubkey of the deletion event: only events
-    /// authored by the same pubkey are removed (NIP-09). Deletion requests
-    /// themselves are never removed. `request_created` limits how old the
-    /// deleted events may be; `addresses` are NIP-09 `a` tags referencing
-    /// addressable events, whose every version up to `request_created` is
-    /// removed.
-    pub(crate) fn apply_deletion(
-        &self,
-        targets: &[String],
-        addresses: &[nip09::Address],
-        request_pubkey: Option<&str>,
-        request_created: u64,
-    ) -> Result<usize> {
-        let mut wtxn = self.env.write_txn()?;
-        let mut removed = 0usize;
-
-        for target in targets {
-            let Ok(id) = hex::decode(target) else {
-                continue;
-            };
-            if id.len() != ID_LEN {
-                continue;
-            }
-            let Some(raw) = self.events.get(&wtxn, &id)? else {
-                continue;
-            };
-            let Ok(event) = serde_json::from_slice::<Event>(raw) else {
-                continue;
-            };
-            // NIP-09: only events authored by the request's pubkey are
-            // deleted, and deletion requests cannot be deleted. NIP-26:
-            // the delegator may also delete events published by a
-            // delegatee on their behalf.
-            if event.kind == nip09::DELETION_KIND {
-                continue;
-            }
-            if let Some(pubkey) = request_pubkey
-                && event.pubkey != pubkey
-                && !delegated_by(&event, pubkey)
-            {
-                continue;
-            }
-            self.deleted.put(&mut wtxn, &id, b"")?;
-            self.remove_event(&mut wtxn, &id)?;
-            removed += 1;
-        }
-
-        // NIP-09 `a` tags: remove every version of the referenced
-        // addressable events published up to the deletion request.
-        for address in addresses {
-            // Only the author of the addressable event may delete it.
-            if let Some(pubkey) = request_pubkey
-                && address.pubkey != pubkey
-            {
-                continue;
-            }
-            let Ok(pubkey) = hex::decode(&address.pubkey) else {
-                continue;
-            };
-            if pubkey.len() != ID_LEN {
-                continue;
-            }
-            let start = replaceable_key(address.kind, &pubkey, "");
-            let end = replaceable_key(address.kind.saturating_add(1), &pubkey, "");
-            let range = (
-                std::ops::Bound::Included(start.as_slice()),
-                std::ops::Bound::Excluded(end.as_slice()),
-            );
-            let entries: Vec<(Vec<u8>, Vec<u8>)> = self
-                .replaceable
-                .range(&wtxn, &range)?
-                .filter_map(|item| item.ok().map(|(k, v)| (k.to_vec(), v.to_vec())))
-                .collect();
-            for (key, value) in entries {
-                // key = kind(8) + pubkey(32) + dlen(4) + d
-                if key.len() < CREATED_LEN * 2 + ID_LEN {
-                    continue;
-                }
-                if key[CREATED_LEN..CREATED_LEN + ID_LEN] != pubkey {
-                    continue;
-                }
-                let dlen = u32::from_be_bytes(
-                    key[CREATED_LEN + ID_LEN..CREATED_LEN + ID_LEN + 4]
-                        .try_into()
-                        .unwrap(),
-                ) as usize;
-                if key.len() != CREATED_LEN + ID_LEN + 4 + dlen {
-                    continue;
-                }
-                let d = &key[CREATED_LEN + ID_LEN + 4..];
-                if d != address.d.as_bytes() {
-                    continue;
-                }
-                if value.len() < CREATED_LEN + ID_LEN {
-                    continue;
-                }
-                let created = u64::from_be_bytes(value[..CREATED_LEN].try_into().unwrap());
-                if created > request_created {
-                    continue;
-                }
-                let id = &value[CREATED_LEN..CREATED_LEN + ID_LEN];
-                self.deleted.put(&mut wtxn, id, b"")?;
-                self.remove_event(&mut wtxn, id)?;
-                removed += 1;
-            }
-        }
-
-        wtxn.commit()?;
-        Ok(removed)
-    }
-
-    /// NIP-86 banevent: marks the event as banned, removes it from storage
-    /// and rejects future re-publication.
-    pub(crate) fn apply_ban(&self, id: &[u8], reason: &str) -> Result<bool> {
-        let mut wtxn = self.env.write_txn()?;
-        self.banned.put(&mut wtxn, id, reason.as_bytes())?;
-        let removed = if self.events.get(&wtxn, id)?.is_some() {
-            self.remove_event(&mut wtxn, id)?;
-            true
-        } else {
-            false
-        };
-        wtxn.commit()?;
-        Ok(removed)
-    }
-
-    pub(crate) fn apply_unban(&self, id: &[u8]) -> Result<bool> {
-        let mut wtxn = self.env.write_txn()?;
-        let removed = self.banned.delete(&mut wtxn, id)?;
-        wtxn.commit()?;
-        Ok(removed)
-    }
-
-    pub(crate) fn list_banned(&self) -> Result<Vec<(String, String)>> {
-        let rtxn = self.env.read_txn()?;
-        let mut out = Vec::new();
-        for item in self.banned.iter(&rtxn)? {
-            let (id, reason) = item?;
-            out.push((
-                hex::encode(id),
-                String::from_utf8_lossy(reason).into_owned(),
-            ));
-        }
-        Ok(out)
-    }
-
-    /// NIP-62: deletes every event authored by `pubkey` (including NIP-09
-    /// deletion requests and NIP-59 gift wraps that p-tag it) and records the
-    /// pubkey so that no future event from it is accepted.
-    pub(crate) fn apply_vanish(&self, pubkey: &[u8]) -> Result<usize> {
-        let mut wtxn = self.env.write_txn()?;
-        self.vanish.put(&mut wtxn, pubkey, b"")?;
-
-        let mut removed = 0usize;
-        let start = pubkey_key(pubkey, 0, &[0u8; ID_LEN]);
-        let end = pubkey_key(pubkey, u64::MAX, &[0xffu8; ID_LEN]);
-        let range = (
-            std::ops::Bound::Included(start.as_slice()),
-            std::ops::Bound::Excluded(end.as_slice()),
-        );
-        let ids: Vec<Vec<u8>> = self
-            .by_pubkey
-            .range(&wtxn, &range)?
-            .filter_map(|item| item.ok().map(|(k, _)| k[k.len() - ID_LEN..].to_vec()))
-            .collect();
-        for id in ids {
-            if self.events.get(&wtxn, &id)?.is_some() {
-                self.remove_event(&mut wtxn, &id)?;
-                removed += 1;
-            }
-        }
-
-        // NIP-59 gift wraps addressed to the vanished pubkey. The by_tag
-        // index stores the tag value verbatim (the 64-char hex string), not
-        // the decoded bytes.
-        let pubkey_hex = hex::encode(pubkey).into_bytes();
-        let start = tag_key(b'p', &pubkey_hex, 0, &[0u8; ID_LEN]);
-        let end = tag_key(b'p', &pubkey_hex, u64::MAX, &[0xffu8; ID_LEN]);
-        let range = (
-            std::ops::Bound::Included(start.as_slice()),
-            std::ops::Bound::Excluded(end.as_slice()),
-        );
-        let ids: Vec<Vec<u8>> = self
-            .by_tag
-            .range(&wtxn, &range)?
-            .filter_map(|item| item.ok().map(|(k, _)| k[k.len() - ID_LEN..].to_vec()))
-            .collect();
-        for id in ids {
-            let Some(raw) = self.events.get(&wtxn, &id)? else {
-                continue;
-            };
-            let Ok(event) = serde_json::from_slice::<Event>(raw) else {
-                continue;
-            };
-            if event.kind == crate::nips::nip62::GIFT_WRAP_KIND {
-                self.remove_event(&mut wtxn, &id)?;
-                removed += 1;
-            }
-        }
-
-        wtxn.commit()?;
-        Ok(removed)
-    }
-
     /// Records `now` as the first-seen time of `pubkey` when the pubkey is
     /// unknown, and returns `(created, first_seen)`: `created` is true when
     /// the entry was just written (the pubkey's first accepted event).
@@ -873,43 +666,6 @@ impl Store {
                 Ok((true, now))
             }
         }
-    }
-
-    /// NIP-59: relays SHOULD delete `kind:1059` gift wraps addressed to a
-    /// pubkey when that pubkey signs a NIP-09 deletion request. Wraps are
-    /// signed by random keys, so they cannot be deleted by their recipient
-    /// through the normal deletion flow.
-    pub(crate) fn delete_gift_wraps_to(&self, pubkey: &[u8]) -> Result<usize> {
-        let mut wtxn = self.env.write_txn()?;
-        // The by_tag index stores the tag value verbatim (the 64-char hex
-        // string), not the decoded bytes.
-        let pubkey_hex = hex::encode(pubkey).into_bytes();
-        let start = tag_key(b'p', &pubkey_hex, 0, &[0u8; ID_LEN]);
-        let end = tag_key(b'p', &pubkey_hex, u64::MAX, &[0xffu8; ID_LEN]);
-        let range = (
-            std::ops::Bound::Included(start.as_slice()),
-            std::ops::Bound::Excluded(end.as_slice()),
-        );
-        let ids: Vec<Vec<u8>> = self
-            .by_tag
-            .range(&wtxn, &range)?
-            .filter_map(|item| item.ok().map(|(k, _)| k[k.len() - ID_LEN..].to_vec()))
-            .collect();
-        let mut removed = 0usize;
-        for id in ids {
-            let Some(raw) = self.events.get(&wtxn, &id)? else {
-                continue;
-            };
-            let Ok(event) = serde_json::from_slice::<Event>(raw) else {
-                continue;
-            };
-            if event.kind == crate::nips::nip62::GIFT_WRAP_KIND {
-                self.remove_event(&mut wtxn, &id)?;
-                removed += 1;
-            }
-        }
-        wtxn.commit()?;
-        Ok(removed)
     }
 
     pub(crate) fn replaceable_created_at(
@@ -953,30 +709,6 @@ impl Store {
             .map(|(key, _)| key.starts_with(prefix))
             .unwrap_or(false))
     }
-
-    pub(crate) fn purge_expired(&self, now: u64) -> Result<usize> {
-        let mut wtxn = self.env.write_txn()?;
-        let since_key = created_key(0, &[0u8; ID_LEN]);
-        let until_key = created_key(now, &[0xffu8; ID_LEN]);
-        let range = (
-            std::ops::Bound::Included(since_key.as_slice()),
-            std::ops::Bound::Excluded(until_key.as_slice()),
-        );
-        let to_delete: Vec<Vec<u8>> = self
-            .expiry
-            .range(&wtxn, &range)?
-            .filter_map(|item| item.ok().map(|(k, _)| k[k.len() - ID_LEN..].to_vec()))
-            .collect();
-        let mut removed = 0usize;
-        for id in to_delete {
-            if self.events.get(&wtxn, &id)?.is_some() {
-                self.remove_event(&mut wtxn, &id)?;
-                removed += 1;
-            }
-        }
-        wtxn.commit()?;
-        Ok(removed)
-    }
 }
 
 fn indexable_tag(tag: &[String]) -> bool {
@@ -990,9 +722,10 @@ pub(crate) fn is_replaceable(event: &Event) -> bool {
     crate::nips::nip01::is_replaceable_kind(event.kind)
         || nip33::is_param_replaceable_kind(event.kind)
 }
+
 /// Returns `true` when the event was published under a NIP-26 delegation
 /// granted by `delegator`.
-fn delegated_by(event: &Event, delegator: &str) -> bool {
+pub(crate) fn delegated_by(event: &Event, delegator: &str) -> bool {
     event
         .tags
         .iter()

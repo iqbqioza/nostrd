@@ -8,6 +8,7 @@
 //! - [`scan`]: the query engine — filter matching, index-selected range
 //!   walks and the REQ/COUNT/negentropy collectors.
 
+mod removal;
 mod scan;
 mod store;
 #[cfg(test)]
