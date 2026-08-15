@@ -156,8 +156,10 @@ require_pow = 0
 # Maximum number of content words indexed for NIP-50 search per event.
 max_indexed_words = 128
 
-# Reserved (unused).
-buffer_size = 1024
+# Initial size in bytes of each connection's WebSocket read/write buffers
+# (they grow on demand). Keep small so that many idle connections do not
+# pin megabytes each.
+buffer_size = 2048
 
 # NIP-77: maximum number of records a single NEG-OPEN may process; queries
 # exceeding this are rejected with a NEG-ERR carrying the cap.

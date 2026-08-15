@@ -353,6 +353,10 @@ async fn ws_handler(State(relay): State<Arc<Relay>>, request: Request) -> Respon
             // megabytes each.
             let cfg = relay.config.read().await;
             let max_msg = cfg.limits.max_ws_message_size;
+            // Initial read/write buffer size per connection (grows on
+            // demand); bounded so that hundreds of thousands of idle
+            // connections do not pin megabytes each.
+            let buffer_size = cfg.limits.buffer_size;
             // The outgoing buffer must fit the largest relay-generated
             // message: a NIP-77 NEG-MSG response carries every id of a
             // queried range as hex (up to neg_max_items ids), plus the JSON
@@ -362,8 +366,8 @@ async fn ws_handler(State(relay): State<Arc<Relay>>, request: Request) -> Respon
             let max_write = max_msg.max(neg_max.saturating_mul(80).saturating_add(64 * 1024));
             drop(cfg);
             upgrade
-                .read_buffer_size(2 * 1024)
-                .write_buffer_size(2 * 1024)
+                .read_buffer_size(buffer_size)
+                .write_buffer_size(buffer_size)
                 // Reject oversized frames at the protocol layer: without
                 // this the WebSocket stack buffers frames of up to its own
                 // 64 MiB default into memory before the application check

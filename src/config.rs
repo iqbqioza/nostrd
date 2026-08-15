@@ -207,7 +207,7 @@ impl Default for LimitsConfig {
             max_created_at_future: 60 * 60,
             require_pow: 0,
             max_indexed_words: 128,
-            buffer_size: 1_024,
+            buffer_size: 2_048,
             neg_max_items: 100_000,
             db_request_timeout_secs: 30,
             new_pubkey_min_age_secs: 0,
