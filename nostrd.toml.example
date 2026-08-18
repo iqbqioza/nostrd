@@ -110,6 +110,11 @@ send_auth_challenge = true
 # Maximum number of concurrent WebSocket connections.
 max_connections = 10000
 
+# Per-source-IP cap on WebSocket connections: a single host cannot consume
+# the whole connection budget (a socket flood from one IP would otherwise
+# evict legitimate clients). 0 = no per-IP cap.
+max_connections_per_ip = 0
+
 # Maximum size in bytes of a single incoming WebSocket message.
 max_ws_message_size = 1048576
 
@@ -197,6 +202,26 @@ live_batch_size = 64
 # (never stored) when it overflows, remaining available via subscriptions.
 live_buffer = 65536
 
+# REST API (`/api/v1/...`) protection. The API shares the database with the
+# WebSocket server, so these bounds keep a flood of REST traffic from
+# degrading (or crashing) the WebSocket subscribers.
+# Maximum number of concurrent `/api/v1` queries served at once. Requests
+# beyond this limit fail fast with a 503 instead of queuing up behind
+# WebSocket work.
+api_max_concurrent = 32
+
+# Upper bound for the `limit` query parameter (0 = no bound). Larger values
+# are clamped down to this ceiling.
+api_max_limit = 500
+
+# Upper bound for the `offset` query parameter (0 = no bound). Larger values
+# are rejected with a 400.
+api_max_offset = 10000
+
+# Maximum length in bytes of the `search` query parameter (0 = no bound).
+# Longer values are rejected with a 400.
+api_max_search_bytes = 1024
+
 # -----------------------------------------------------------------------------
 # Database (LMDB via heed)
 # -----------------------------------------------------------------------------
@@ -210,14 +235,18 @@ max_dbs = 32
 # Maximum number of concurrent reader threads.
 max_readers = 128
 
-# Initial memory map size in bytes. When the database outgrows it, the map
-# is grown automatically (doubling, up to map_max_size) so reads and writes
-# keep working no matter how large the database becomes.
+# Initial memory map size in bytes. The map is opened at this size and never
+# resized at runtime: resizing would require that no read transactions are
+# active, which cannot be guaranteed while the shared reader and the REST API
+# reader threads hold concurrent read transactions. Physical memory and disk
+# usage grow only with the data actually stored (sparse file).
 map_size = 1073741824
 
-# Upper bound for the automatic map growth. This is a virtual address space
-# reservation backed by a sparse file: physical memory and disk usage grow
-# only with the data actually stored. On 32-bit systems it is capped at 2 GiB.
+# Upper bound for the memory map. This is a virtual address space reservation
+# backed by a sparse file: physical memory and disk usage grow only with the
+# data actually stored. The map is opened at map_max_size on startup (or at
+# map_size, whichever is larger), so this setting is the real ceiling. On
+# 32-bit systems it is capped at 2 GiB.
 map_max_size = 1099511627776
 
 # Interval in seconds between NIP-40 expired-event purge runs.

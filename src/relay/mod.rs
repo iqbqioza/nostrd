@@ -9,7 +9,8 @@ mod validate;
 use std::sync::Arc;
 
 use secp256k1::{Keypair, Secp256k1, XOnlyPublicKey};
-use tokio::sync::{RwLock, broadcast, mpsc};
+use std::collections::HashMap;
+use tokio::sync::{RwLock, Semaphore, broadcast, mpsc};
 
 use crate::config::{AccessControl, Config};
 use crate::db::{DbClient, PutOutcome};
@@ -36,6 +37,12 @@ pub struct Relay {
     pub groups: Arc<RwLock<GroupStore>>,
     /// NIP-43 role definitions and member assignments.
     pub roles: Arc<RwLock<RoleStore>>,
+    /// Limits concurrent `/api/v1` queries so a flood of REST traffic
+    /// fails fast (503) instead of piling up behind WebSocket work.
+    pub api_limit: Arc<Semaphore>,
+    /// Active WebSocket connections per source IP, so a socket flood from
+    /// a single host cannot consume the whole connection budget.
+    per_ip_connections: std::sync::Mutex<HashMap<String, usize>>,
     /// The relay's own keypair (from `relay.private_key`), used to sign
     /// NIP-29 and NIP-43 relay-generated events.
     key: Option<Keypair>,
@@ -77,6 +84,7 @@ impl Relay {
                 }
             }
         };
+        let api_max_concurrent = config.read().await.limits.api_max_concurrent.max(1);
         Relay {
             // Seed the access control from the config so operator bans and
             // allowlists survive restarts.
@@ -91,6 +99,8 @@ impl Relay {
             live_batch_size,
             groups: Arc::new(RwLock::new(GroupStore::default())),
             roles: Arc::new(RwLock::new(RoleStore::default())),
+            api_limit: Arc::new(Semaphore::new(api_max_concurrent)),
+            per_ip_connections: std::sync::Mutex::new(HashMap::new()),
             key,
             secp,
         }
@@ -152,6 +162,40 @@ impl Relay {
 
     pub fn secp(&self) -> &Secp256k1<secp256k1::All> {
         &self.secp
+    }
+
+    /// Registers a new WebSocket connection from `ip` if it does not exceed
+    /// the per-IP cap. Returns `false` (and registers nothing) when the cap
+    /// would be exceeded, so the caller rejects the connection.
+    pub fn try_register_connection(&self, ip: &std::net::IpAddr, max_per_ip: usize) -> bool {
+        if max_per_ip == 0 {
+            return true;
+        }
+        let mut map = self
+            .per_ip_connections
+            .lock()
+            .expect("per-IP connection map poisoned");
+        let count = map.entry(ip.to_string()).or_insert(0);
+        if *count >= max_per_ip {
+            return false;
+        }
+        *count += 1;
+        true
+    }
+
+    /// Releases one connection slot for `ip` (called when the connection
+    /// closes).
+    pub fn release_connection(&self, ip: &std::net::IpAddr) {
+        let mut map = self
+            .per_ip_connections
+            .lock()
+            .expect("per-IP connection map poisoned");
+        if let Some(count) = map.get_mut(&ip.to_string()) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                map.remove(&ip.to_string());
+            }
+        }
     }
 
     pub fn has_relay_key(&self) -> bool {
@@ -263,14 +307,18 @@ impl Relay {
         }) {
             // Check every `previous` tag reference of the whole batch in one
             // database round trip: a single event must not be able to
-            // amplify into thousands of database requests.
+            // amplify into thousands of database requests. Dedup with a set
+            // so that a batch full of distinct `previous` tags (up to
+            // max_tags per event) cannot turn the dedup itself quadratic.
             let mut prefixes: Vec<Vec<u8>> = Vec::new();
+            let mut seen_prefixes: std::collections::HashSet<Vec<u8>> =
+                std::collections::HashSet::new();
             for event in &events {
                 for prefix in nip29::previous_tags(event) {
                     let Ok(prefix) = hex::decode(&prefix) else {
                         continue;
                     };
-                    if !prefix.is_empty() && !prefixes.iter().any(|p| p == &prefix) {
+                    if !prefix.is_empty() && seen_prefixes.insert(prefix.clone()) {
                         prefixes.push(prefix);
                     }
                 }

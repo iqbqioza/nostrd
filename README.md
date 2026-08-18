@@ -10,11 +10,13 @@ nostrd is designed around two goals:
 ## Features
 
 - **All relay-side NIPs implemented** — see the [NIP support](#nip-support) table.
-- **LMDB persistence (via `heed`)** — durable, crash-safe storage that grows automatically (up to a configurable ceiling) and keeps serving no matter how large the database becomes.
+- **REST API** — a read-only HTTP API at `/api/v1/...` for querying events by `npub1`, `nevent1` or `naddr1`, with its own dedicated database reader thread and concurrency limiter so REST traffic can never stall WebSocket subscribers.
+- **LMDB persistence (via `heed`)** — durable, crash-safe storage; the memory map is a sparse virtual-address reservation opened at its configured ceiling, so it never needs a runtime resize (which would be unsafe with concurrent reader threads) and physical memory stays small.
 - **Overload protection** — the database queue is bounded; when it fills up, new requests fail fast instead of accumulating in memory.
-- **Reader/writer thread split** — reads are served by a dedicated thread that never takes the LMDB write lock, so a stalled writer (slow disk, external lock holder) cannot take the relay down for readers.
+- **Reader/writer thread split** — reads are served by dedicated threads that never take the LMDB write lock, so a stalled writer (slow disk, external lock holder) cannot take the relay down for readers. The REST API gets its own reader thread, isolated from WebSocket REQ/COUNT/NEG queries.
+- **Per-IP connection cap** — a single host cannot consume the whole connection budget.
 - **Panic-safe** — task panics are contained and logged, and connection accounting is released on every exit path.
-- **Efficient hot paths** — single-pass event parsing, deduplicated live serialization, batched commits (one fsync per batch), merged multi-range scans and NIP-67 boundary handling.
+- **Efficient hot paths** — single-pass event parsing, deduplicated live serialization, batched commits (one fsync per batch), merged multi-range scans with a per-scan work budget, and NIP-67 boundary handling.
 - **Everything configurable** via `nostrd.toml` — no compile-time options.
 - **Works behind TLS-terminating proxies** (nginx, Caddy, Cloudflare Tunnel): WebSocket upgrades are honored via `X-Forwarded-Proto`.
 
@@ -45,6 +47,36 @@ nostrd stats
 ```
 
 Point your Nostr client at `ws://<host>:8080` (or `wss://<domain>` behind a TLS proxy).
+
+## REST API
+
+nostrd exposes a read-only HTTP API alongside the WebSocket server, on the same port under `/api/v1`. It is served by a dedicated database reader thread with its own concurrency limiter and query-parameter bounds, so heavy REST traffic cannot stall WebSocket subscribers.
+
+| Endpoint | Description |
+| --- | --- |
+| `GET /api/v1/{npub1...}/{kind}` | Events by author pubkey and kind. The `{kind}` path is mandatory for `npub1`. |
+| `GET /api/v1/{nevent1...}` | A single event by its NIP-19 event id. |
+| `GET /api/v1/{naddr1...}` | Addressable/replaceable events by NIP-19 address (`kind` + author + `d` tag). |
+| `GET /api/v1/{note1...}` | A single event by its NIP-19 note id. |
+
+Every endpoint returns `200` with a JSON body, unless the identifier is invalid (`400`) or the server is overloaded (`503`):
+
+```json
+{ "events": [ { ...event objects... } ], "count": 3, "more": false }
+```
+
+Query parameters (all optional):
+
+| Parameter | Description |
+| --- | --- |
+| `limit` | Max results (default 100, capped by `limits.api_max_limit`). |
+| `offset` | Skip this many results (pagination; capped by `limits.api_max_offset`). |
+| `since` / `until` | Unix timestamps bounding `created_at`. |
+| `sort` | `asc` or `ascending` for oldest-first (default is newest-first). |
+| `search` | NIP-50 full-text search on event content (length capped by `limits.api_max_search_bytes`). |
+| `e` / `p` / `t` / `d` | Filter on `#e`, `#p`, `#t` or `#d` tags (for `npub1`/`nevent1`/`note1`; the `d` tag of an `naddr1` is taken from the address itself unless overridden). |
+
+Only `GET` is supported; WebSocket upgrade requests to `/api/v1` are rejected with `403`. The API applies the same visibility rules as an anonymous WebSocket connection: NIP-70 protected events, NIP-59 gift wraps and NIP-29 private/hidden group content are withheld.
 
 ## Commands
 
@@ -86,6 +118,7 @@ admin_pubkey = ""               # or authorize NIP-86 calls with a NIP-98 event
 
 [limits]
 max_connections = 10000
+max_connections_per_ip = 0      # per-source-IP cap on WebSocket connections (0 = off)
 max_ws_message_size = 1048576
 max_subscriptions = 20
 max_limit = 500
@@ -96,12 +129,17 @@ db_queue_msgs = 4096            # overload protection: fail fast when the databa
 db_queue_events = 262144        # queue holds more than this much pending work
 buffer_size = 2048              # initial WebSocket read/write buffer per connection
 group_late_publish_secs = 604800  # NIP-29 late-publication window
+api_max_concurrent = 32         # REST API: max concurrent /api/v1 queries (beyond = 503)
+api_max_limit = 500             # REST API: ceiling for the `limit` parameter (0 = off)
+api_max_offset = 10000          # REST API: ceiling for the `offset` parameter (0 = off)
+api_max_search_bytes = 1024     # REST API: ceiling for the `search` parameter (0 = off)
 
 [database]
 path = "./data"
 map_size = 1073741824           # initial LMDB memory map (virtual address space)
-map_max_size = 1099511627776    # growth ceiling (sparse file: only written pages
-                                # consume physical memory or disk)
+map_max_size = 1099511627776    # map ceiling (sparse file: only written pages
+                                # consume physical memory or disk). The map is
+                                # opened at this size and never resized at runtime
 search_index = true             # NIP-50 word index
 purge_interval_secs = 300       # NIP-40 expired-event purge interval
 
@@ -146,10 +184,12 @@ All relay-side NIPs are implemented; client-side NIPs are stored and served as p
 ## Architecture notes
 
 - **Single database thread for writes**, with puts merged into batches that share one write transaction (one fsync per batch). Replies are sent only after a successful commit, so an `OK` implies durability.
-- **A dedicated reader thread** serves queries/counts/lookups without ever taking the write lock. If a commit is blocked (stalled disk, external lock holder), reads keep working.
-- **Bounded queues everywhere** — the database request queue (fail-fast overload protection), the outgoing message queue (per-connection byte cap), the live fan-out channel and the negentropy item store are all capped.
-- **Scan engine** — multi-range filters (`authors`, `kinds`, `#tag`) are walked with a merged newest-first iterator so a per-filter `limit` applies to the union of all ranges; NIP-67 boundary handling never splits a `created_at` tie across pages.
-- **Panic containment** — the database thread, the reader thread and every connection task are isolated; a fault in any of them is logged and does not take the relay down.
+- **Dedicated reader threads** serve queries/counts/lookups without ever taking the write lock. If a commit is blocked (stalled disk, external lock holder), reads keep working. The REST API runs on its own reader thread with its own bounded queue, so an `/api/v1` flood can neither queue up behind nor delay WebSocket REQ/COUNT/NEG queries.
+- **Bounded queues everywhere** — the database request queue (fail-fast overload protection), the outgoing message queue (per-connection byte cap), the live fan-out channel and the negentropy item store are all capped. The REST API has its own concurrency limiter (`api_max_concurrent`) that fails fast with `503` when saturated.
+- **The LMDB map is opened at its configured ceiling** and never resized at runtime: resizing would require that no read transactions are active, which cannot be guaranteed with concurrent reader threads. The reservation is a sparse virtual-address mapping, so physical memory and disk grow only with the data actually written.
+- **Scan engine** — multi-range filters (`authors`, `kinds`, `#tag`) are walked with a merged newest-first iterator so a per-filter `limit` applies to the union of all ranges; NIP-67 boundary handling never splits a `created_at` tie across pages. A per-scan work budget bounds the candidates examined so a filter matching nothing cannot walk an entire index range.
+- **Panic containment** — the database thread, the reader threads and every connection task are isolated; a fault in any of them is logged and does not take the relay down.
+- **Per-IP connection accounting** — the number of active WebSocket connections per source IP is tracked and capped, so a socket flood from one host cannot evict legitimate clients.
 
 ## Performance
 
@@ -175,7 +215,7 @@ src/
 ├── util.rs, error.rs, event.rs, filter.rs, stats.rs
 ├── db/                          LMDB storage
 │   ├── mod.rs                   DbClient handle and request plumbing
-│   ├── threads.rs               dedicated writer/reader threads
+│   ├── threads.rs               dedicated writer/reader/API-reader threads
 │   ├── store.rs                 write path and index maintenance
 │   ├── removal.rs               deletions, bans, vanish, expiry purge
 │   └── scan.rs                  query engine (filters, merged walks, collectors)
@@ -185,6 +225,7 @@ src/
 │   └── roles.rs                 NIP-43 role administration
 ├── server/                      HTTP/WebSocket front end
 │   ├── mod.rs                   router, CORS, background tasks
+│   ├── api.rs                   read-only REST API (/api/v1)
 │   └── livekit.rs               NIP-29 LiveKit token endpoint
 ├── ws/                          connection handling
 │   ├── mod.rs                   connection loop and live delivery

@@ -38,6 +38,7 @@ struct FilterScan<'a> {
     terms: &'a [String],
     now: u64,
     limit: usize,
+    ascending: bool,
 }
 
 /// The mutable collection state shared by the candidates of a scan pass.
@@ -51,6 +52,13 @@ struct Collect<'a, C: ScanCollector> {
 /// ordering can pick the best matches before the limit is applied.
 const SEARCH_BUDGET_MULTIPLIER: usize = 8;
 const SEARCH_BUDGET_MAX: usize = 100_000;
+
+/// Upper bound on the number of index candidates examined by one scan pass
+/// before it gives up. A filter matching nothing (e.g. a popular `#p` value
+/// combined with an impossible kind) would otherwise walk the whole range
+/// and stall the reader thread for seconds. The cap is large enough that
+/// legitimate subscriptions are never truncated in practice.
+const SCAN_BUDGET: usize = 200_000;
 
 /// Output collector for a scan: either full events (REQ/COUNT) or
 /// `(created_at, id)` records (NIP-77 negentropy, memory-efficient).
@@ -73,6 +81,9 @@ trait ScanCollector {
     /// Sorts the collected records by the NIP-01 ordering (newest first,
     /// lowest id first on equal timestamps).
     fn sort_key(&mut self);
+    /// Sorts the collected records oldest first, lowest id first on equal
+    /// timestamps (ascending variant of the NIP-01 ordering).
+    fn sort_asc(&mut self);
     /// Sorts by NIP-50 search relevance (most matching terms first), then
     /// by the NIP-01 ordering.
     fn sort_relevance(&mut self, terms: &[String]);
@@ -147,6 +158,13 @@ impl ScanCollector for EventCollector {
                 .then_with(|| a.id.cmp(&b.id))
         });
     }
+    fn sort_asc(&mut self) {
+        self.events.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.cmp(&b.id))
+        });
+    }
     fn sort_relevance(&mut self, terms: &[String]) {
         self.events.sort_by(|a, b| {
             relevance(b, terms)
@@ -215,6 +233,10 @@ impl ScanCollector for ItemCollector {
         self.items
             .sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
     }
+    fn sort_asc(&mut self) {
+        self.items
+            .sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    }
     fn sort_relevance(&mut self, terms: &[String]) {
         // Negentropy items are re-sorted by the protocol anyway; keep the
         // relevance path a no-op for the same ordering as sort_key.
@@ -242,6 +264,7 @@ impl Store {
         now: u64,
         max_limit: usize,
         count_mode: bool,
+        ascending: bool,
     ) -> Result<(Vec<Event>, bool)> {
         let has_search = filters.iter().any(Filter::has_search);
         // NIP-50: relevance ordering needs more candidates than the response
@@ -259,7 +282,7 @@ impl Store {
             ScanKind::Query
         };
         let mut out = EventCollector::new(collect_cap, !count_mode);
-        let more = self.scan_collect(filters, now, max_limit, kind, &mut out)?;
+        let more = self.scan_collect(filters, now, max_limit, kind, ascending, &mut out)?;
         Ok((out.events, more))
     }
 
@@ -285,6 +308,7 @@ impl Store {
             now,
             max_items,
             ScanKind::Negentropy,
+            false,
             &mut out,
         )?;
         Ok((out.items, more))
@@ -300,6 +324,7 @@ impl Store {
         now: u64,
         max_limit: usize,
         kind: ScanKind,
+        ascending: bool,
         out: &mut C,
     ) -> Result<bool> {
         let count_mode = matches!(kind, ScanKind::Count);
@@ -353,6 +378,7 @@ impl Store {
                 terms: &terms,
                 now,
                 limit,
+                ascending,
             };
             let mut collect = Collect {
                 seen: &mut seen,
@@ -374,6 +400,10 @@ impl Store {
                     more = true;
                     out.truncate_to(take);
                 }
+            } else if ascending {
+                // NIP-01 ascending: oldest events first; on equal created_at
+                // the event with the lowest id comes first.
+                ScanCollector::sort_asc(out);
             } else {
                 // NIP-01: newest events first; on equal created_at the event
                 // with the lowest id comes first.
@@ -396,10 +426,12 @@ impl Store {
             terms,
             now,
             limit,
+            ascending,
         } = *scan;
         let seen = &mut *collect.seen;
         let out = &mut *collect.out;
         let cap = out.cap();
+        let mut examined = 0usize;
         let ctx = ScanContext {
             events: self.events,
             deleted: self.deleted,
@@ -410,7 +442,17 @@ impl Store {
             rtxn,
         };
         let mut consider = |id: &[u8]| -> Result<bool> {
-            consider_event(&ctx, id, filter, terms, now, seen, out, limit)
+            consider_event(
+                &ctx,
+                id,
+                filter,
+                terms,
+                now,
+                seen,
+                out,
+                limit,
+                &mut examined,
+            )
         };
 
         if let Some(ids) = &filter.ids {
@@ -446,7 +488,7 @@ impl Store {
                     };
                     ranges.push((start, end));
                 }
-                if !self.walk_merged(rtxn, by_word, &ranges, &mut consider, more)? {
+                if !self.walk_merged(rtxn, by_word, &ranges, ascending, &mut consider, more)? {
                     return Ok(false);
                 }
                 return Ok(out.full());
@@ -471,7 +513,14 @@ impl Store {
                 ));
             }
             if !ranges.is_empty()
-                && !self.walk_merged(rtxn, self.by_pubkey, &ranges, &mut consider, more)?
+                && !self.walk_merged(
+                    rtxn,
+                    self.by_pubkey,
+                    &ranges,
+                    ascending,
+                    &mut consider,
+                    more,
+                )?
             {
                 return Ok(false);
             }
@@ -490,7 +539,14 @@ impl Store {
                     ranges.push(tag_range(name_byte, value.as_bytes(), since, until));
                 }
                 if !ranges.is_empty()
-                    && !self.walk_merged(rtxn, self.by_tag, &ranges, &mut consider, more)?
+                    && !self.walk_merged(
+                        rtxn,
+                        self.by_tag,
+                        &ranges,
+                        ascending,
+                        &mut consider,
+                        more,
+                    )?
                 {
                     return Ok(false);
                 }
@@ -511,7 +567,7 @@ impl Store {
                 ));
             }
             if !ranges.is_empty()
-                && !self.walk_merged(rtxn, self.by_kind, &ranges, &mut consider, more)?
+                && !self.walk_merged(rtxn, self.by_kind, &ranges, ascending, &mut consider, more)?
             {
                 return Ok(false);
             }
@@ -520,15 +576,25 @@ impl Store {
 
         let start = created_key(since, &[0u8; ID_LEN]);
         let end = created_key(until, &[0xffu8; ID_LEN]);
-        Ok(!self.walk_created_range(rtxn, self.by_created, &start, &end, &mut consider, more)?)
+        Ok(!self.walk_created_range(
+            rtxn,
+            self.by_created,
+            &start,
+            &end,
+            ascending,
+            &mut consider,
+            more,
+        )?)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn walk_created_range(
         &self,
         rtxn: &RoTxn,
         db: Database<Bytes, Bytes>,
         start: &[u8],
         end: &[u8],
+        ascending: bool,
         mut consider: impl FnMut(&[u8]) -> Result<bool>,
         more: &mut bool,
     ) -> Result<bool> {
@@ -536,7 +602,12 @@ impl Store {
             std::ops::Bound::Included(start),
             std::ops::Bound::Excluded(end),
         );
-        let iter = db.rev_range(rtxn, &range)?;
+        type RangeIter<'a> = Box<dyn Iterator<Item = heed::Result<(&'a [u8], &'a [u8])>> + 'a>;
+        let iter: RangeIter<'_> = if ascending {
+            Box::new(db.range(rtxn, &range)?)
+        } else {
+            Box::new(db.rev_range(rtxn, &range)?)
+        };
         for item in iter {
             let (key, _) = item?;
             let id = &key[key.len() - ID_LEN..];
@@ -559,6 +630,7 @@ impl Store {
         rtxn: &RoTxn,
         db: Database<Bytes, Bytes>,
         ranges: &[(Vec<u8>, Vec<u8>)],
+        ascending: bool,
         consider: &mut impl FnMut(&[u8]) -> Result<bool>,
         more: &mut bool,
     ) -> Result<bool> {
@@ -574,7 +646,11 @@ impl Store {
                 std::ops::Bound::Excluded(end.as_slice()),
             );
             heads.push(Head {
-                iter: Box::new(db.rev_range(rtxn, &range)?),
+                iter: if ascending {
+                    Box::new(db.range(rtxn, &range)?)
+                } else {
+                    Box::new(db.rev_range(rtxn, &range)?)
+                },
                 next_key: None,
             });
         }
@@ -594,10 +670,14 @@ impl Store {
                 if let Some(key) = &head.next_key {
                     let created: [u8; 8] = key[key.len() - 40..key.len() - 32].try_into().unwrap();
                     let id: [u8; 32] = key[key.len() - 32..].try_into().unwrap();
-                    if best
-                        .as_ref()
-                        .is_none_or(|(_, bc, bi)| (created, id) > (*bc, *bi))
-                    {
+                    let better = if ascending {
+                        best.as_ref()
+                            .is_none_or(|(_, bc, bi)| (created, id) < (*bc, *bi))
+                    } else {
+                        best.as_ref()
+                            .is_none_or(|(_, bc, bi)| (created, id) > (*bc, *bi))
+                    };
+                    if better {
                         best = Some((i, created, id));
                     }
                 }
@@ -626,10 +706,18 @@ fn consider_event<C: ScanCollector>(
     seen: &mut HashSet<Vec<u8>>,
     out: &mut C,
     limit: usize,
+    examined: &mut usize,
 ) -> Result<bool> {
     if out.full() {
         // The collection cap is reached: stop the scan (and any remaining
         // ranges of this filter) instead of walking them to completion.
+        return Ok(false);
+    }
+    // Work budget: give up after examining `SCAN_BUDGET` candidates so a
+    // filter matching nothing cannot walk an entire index range and stall
+    // the reader thread (which also serves WebSocket REQ/COUNT/NEG).
+    *examined += 1;
+    if *examined > SCAN_BUDGET {
         return Ok(false);
     }
     if seen.contains(id) {

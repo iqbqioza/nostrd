@@ -1,1 +1,4 @@
 /target
+*.mdb
+nostrd.toml
+nostrd.stats.json

@@ -73,6 +73,7 @@ enum Msg {
         filters: Vec<Filter>,
         limit: usize,
         now: u64,
+        ascending: bool,
         reply: oneshot::Sender<(Vec<Event>, bool)>,
     },
     /// Accepts many events in a single write transaction (one commit).
@@ -166,6 +167,11 @@ pub struct DbClient {
     /// working even when the writer is stalled (a slow disk or an external
     /// lock holder cannot take the relay down for readers).
     read_tx: mpsc::UnboundedSender<Msg>,
+    /// Dedicated channel for REST API queries: served by its own reader
+    /// thread, so a flood of `/api/v1` requests can never queue up behind
+    /// (or in front of) WebSocket REQ/COUNT/NEG queries on the shared
+    /// reader thread.
+    api_read_tx: mpsc::UnboundedSender<Msg>,
     errors: Arc<std::sync::atomic::AtomicU64>,
     expiry: Arc<std::sync::atomic::AtomicBool>,
     /// Seconds a request may wait for the database thread before timing out
@@ -181,9 +187,13 @@ pub struct DbClient {
     /// Events inside the queued `PutBatch`/`Put` messages (the dominant
     /// memory of the queue).
     pending_events: Arc<std::sync::atomic::AtomicUsize>,
+    /// Queued-but-unprocessed REST API queries, counted separately so an API
+    /// flood fails fast without tripping the WebSocket-side caps.
+    api_pending: Arc<std::sync::atomic::AtomicUsize>,
     /// Caps for the counters above.
     max_pending_msgs: usize,
     max_pending_events: usize,
+    max_api_pending: usize,
 }
 
 impl DbClient {
@@ -209,13 +219,16 @@ impl DbClient {
         Ok(DbClient {
             tx: threads.tx,
             read_tx: threads.read_tx,
+            api_read_tx: threads.api_read_tx,
             errors: threads.errors,
             expiry: threads.expiry,
             timeout_secs: threads.timeout_secs,
             pending_msgs: threads.pending_msgs,
             pending_events: threads.pending_events,
+            api_pending: threads.api_pending,
             max_pending_msgs: threads.max_pending_msgs,
             max_pending_events: threads.max_pending_events,
+            max_api_pending: threads.max_api_pending,
         })
     }
 
@@ -263,9 +276,17 @@ impl DbClient {
             self.pending_events
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        if channel.send(msg).is_err() {
+        if let Err(err) = channel.send(msg) {
+            let msg = err.0;
             self.pending_msgs
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            if let Msg::PutBatch { events, .. } = &msg {
+                self.pending_events
+                    .fetch_sub(events.len(), std::sync::atomic::Ordering::Relaxed);
+            } else if let Msg::Put { .. } = &msg {
+                self.pending_events
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
             return R::default();
         }
         if self.timeout_secs == 0 {
@@ -282,13 +303,72 @@ impl DbClient {
     }
 
     pub async fn query(&self, filters: Vec<Filter>, limit: usize, now: u64) -> (Vec<Event>, bool) {
+        self.query_directed(filters, limit, now, false).await
+    }
+
+    /// Like [`Self::query`] but with an explicit scan direction: `false`
+    /// returns newest events first (NIP-01), `true` returns oldest first.
+    pub async fn query_directed(
+        &self,
+        filters: Vec<Filter>,
+        limit: usize,
+        now: u64,
+        ascending: bool,
+    ) -> (Vec<Event>, bool) {
         self.request_read(|reply| Msg::Query {
             filters,
             limit,
             now,
+            ascending,
             reply,
         })
         .await
+    }
+
+    /// REST API query: served by the dedicated API reader thread so that
+    /// `/api/v1` traffic never blocks WebSocket queries. Applies its own
+    /// queue cap: when the API reader's queue is deep, the request fails
+    /// fast with an empty result instead of piling up behind WebSocket
+    /// work.
+    pub async fn api_query(
+        &self,
+        filters: Vec<Filter>,
+        limit: usize,
+        now: u64,
+        ascending: bool,
+    ) -> (Vec<Event>, bool) {
+        if self.api_pending.load(std::sync::atomic::Ordering::Relaxed) >= self.max_api_pending {
+            self.errors
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return (Vec::new(), false);
+        }
+        let (tx, rx) = oneshot::channel();
+        self.api_pending
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let msg = Msg::Query {
+            filters,
+            limit,
+            now,
+            ascending,
+            reply: tx,
+        };
+        if self.api_read_tx.send(msg).is_err() {
+            self.api_pending
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            return (Vec::new(), false);
+        }
+        let out = if self.timeout_secs == 0 {
+            rx.await.unwrap_or_default()
+        } else {
+            tokio::time::timeout(std::time::Duration::from_secs(self.timeout_secs), rx)
+                .await
+                .map(|r| r.unwrap_or_default())
+                .unwrap_or_default()
+        };
+        // The API reader thread decrements `api_pending` once it has
+        // processed the message (including its panic path), so this path
+        // must not decrement again.
+        out
     }
 
     /// Records the first-seen time of each pubkey when unknown; returns
@@ -431,5 +511,6 @@ impl DbClient {
     pub fn shutdown(&self) {
         let _ = self.tx.send(Msg::Shutdown);
         let _ = self.read_tx.send(Msg::Shutdown);
+        let _ = self.api_read_tx.send(Msg::Shutdown);
     }
 }
