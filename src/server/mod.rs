@@ -2,6 +2,7 @@
 //! daemon background tasks (stats, expiry purge, signals, config
 //! reload) and the NIP-29 LiveKit integration in [`livekit`].
 
+mod api;
 mod livekit;
 
 use std::path::PathBuf;
@@ -34,6 +35,7 @@ use crate::relay::Relay;
 use crate::stats::Stats;
 use crate::util::unix_now;
 use crate::ws::handle_connection;
+use api::{api_handler, api_kind_handler};
 use axum::serve::ListenerExt;
 use livekit::{livekit_supported, livekit_token};
 
@@ -102,12 +104,17 @@ async fn bind_listener(addr: &(String, u16), label: &str) -> Result<TcpListener>
 /// The relay's HTTP router: the WebSocket/NIP-11/NIP-86 endpoint, health
 /// and stats routes, and the NIP-29 LiveKit endpoints when configured.
 async fn build_router(relay: &Arc<Relay>) -> Router {
+    let api_routes = Router::new()
+        .route("/{identifier}", get(api_handler))
+        .route("/{identifier}/{kind}", get(api_kind_handler))
+        .layer(axum::middleware::from_fn(reject_ws_upgrade));
     let mut app = Router::new()
         .route("/", get(ws_handler).post(nip86::rpc_handler))
         .route("/ws", get(ws_handler).post(nip86::rpc_handler))
         .route("/ws/", get(ws_handler))
         .route("/health", get(health_handler))
-        .route("/relay/stats", get(stats_handler));
+        .route("/relay/stats", get(stats_handler))
+        .nest("/api/v1", api_routes);
     let cfg = relay.config.read().await;
     if cfg.nip_enabled(29) && !cfg.relay.livekit_url.is_empty() {
         app = app
@@ -301,6 +308,16 @@ fn is_websocket_request(headers: &HeaderMap) -> bool {
     }
 }
 
+/// Rejects WebSocket upgrade requests, returning 403 Forbidden.
+/// Applied as a layer to `/api/v1` routes so that they are only
+/// accessible over plain HTTP/HTTPS.
+async fn reject_ws_upgrade(request: Request, next: Next) -> Response {
+    if is_websocket_request(request.headers()) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    next.run(request).await
+}
+
 /// Serves the WebSocket endpoint and the NIP-11 document on the same URI:
 /// valid WebSocket handshakes are upgraded, plain HTTP requests (GET with
 /// no upgrade headers) receive the relay information document, per NIP-11
@@ -346,6 +363,10 @@ async fn ws_handler(State(relay): State<Arc<Relay>>, request: Request) -> Respon
         return response;
     }
     let (mut parts, _) = request.into_parts();
+    let peer_ip = parts
+        .extensions
+        .get::<axum::extract::connect_info::ConnectInfo<std::net::SocketAddr>>()
+        .map(|info| info.0.ip());
     match WebSocketUpgrade::from_request_parts(&mut parts, &()).await {
         Ok(upgrade) => {
             // Start with small read/write buffers (they grow on demand) so
@@ -375,7 +396,13 @@ async fn ws_handler(State(relay): State<Arc<Relay>>, request: Request) -> Respon
                 .max_message_size(max_msg)
                 .max_frame_size(max_msg)
                 .max_write_buffer_size(max_write)
-                .on_upgrade(move |socket| handle_connection(socket, relay))
+                .on_upgrade(move |socket| {
+                    handle_connection(
+                        socket,
+                        relay,
+                        peer_ip.unwrap_or_else(|| "0.0.0.0".parse().unwrap()),
+                    )
+                })
                 .into_response()
         }
         Err(rejection) => rejection.into_response(),

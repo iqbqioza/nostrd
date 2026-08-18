@@ -997,3 +997,87 @@ fn search_works_without_word_index() {
         assert_eq!(res.len(), 1);
     });
 }
+
+#[test]
+fn query_directed_ascending() {
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let e1 = event(1, "first", now - 200, vec![]);
+        let e2 = event(1, "second", now - 100, vec![]);
+        let e3 = event(1, "third", now, vec![]);
+        for e in [&e1, &e2, &e3] {
+            assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
+        }
+
+        let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap();
+        let (desc, _) = db.query_directed(vec![f.clone()], 500, now, false).await;
+        let ids: Vec<_> = desc.iter().map(|e| e.created_at).collect();
+        assert_eq!(ids, vec![now, now - 100, now - 200]);
+
+        let (asc, _) = db.query_directed(vec![f], 500, now, true).await;
+        let ids: Vec<_> = asc.iter().map(|e| e.created_at).collect();
+        assert_eq!(ids, vec![now - 200, now - 100, now]);
+
+        // Ascending limit keeps the oldest events.
+        let (asc2, more) = db
+            .query_directed(
+                vec![serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap()],
+                2,
+                now,
+                true,
+            )
+            .await;
+        let ids: Vec<_> = asc2.iter().map(|e| e.created_at).collect();
+        assert_eq!(ids, vec![now - 200, now - 100]);
+        assert!(more);
+    });
+}
+
+#[test]
+fn api_query_uses_dedicated_reader_and_stays_healthy() {
+    // The REST API queries must be served by their own reader thread and
+    // keep working across many calls: `api_pending` must not leak or wrap
+    // (a double-decrement bug would break every subsequent call).
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        for i in 0..64 {
+            let ev = event(1, &format!("api-{i}"), now - i, vec![]);
+            assert_eq!(db.put(ev, now).await, PutOutcome::Stored);
+        }
+
+        // Repeated queries must all succeed (regression: the counter was
+        // decremented twice, breaking the API after the first request).
+        for i in 0..16 {
+            let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap();
+            let (res, _) = db.api_query(vec![f], 500, now, false).await;
+            assert_eq!(res.len(), 64, "api query {i} must return all events");
+        }
+
+        // The WebSocket query path is unaffected by API traffic.
+        let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 64);
+    });
+}

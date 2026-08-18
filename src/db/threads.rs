@@ -20,13 +20,132 @@ use crate::error::Result;
 pub(crate) struct DbThreads {
     pub(crate) tx: mpsc::UnboundedSender<Msg>,
     pub(crate) read_tx: mpsc::UnboundedSender<Msg>,
+    pub(crate) api_read_tx: mpsc::UnboundedSender<Msg>,
     pub(crate) errors: Arc<std::sync::atomic::AtomicU64>,
     pub(crate) expiry: Arc<std::sync::atomic::AtomicBool>,
     pub(crate) timeout_secs: u64,
     pub(crate) pending_msgs: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) pending_events: Arc<std::sync::atomic::AtomicUsize>,
+    pub(crate) api_pending: Arc<std::sync::atomic::AtomicUsize>,
     pub(crate) max_pending_msgs: usize,
     pub(crate) max_pending_events: usize,
+    pub(crate) max_api_pending: usize,
+}
+
+/// Serves one read-only message on a dedicated reader thread. Returns
+/// `true` when the thread must shut down.
+fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, msg: Msg) -> bool {
+    match msg {
+        Msg::Query {
+            filters,
+            limit,
+            now,
+            ascending,
+            reply,
+        } => {
+            let out = match store.scan(&filters, now, limit, false, ascending) {
+                Ok(out) => out,
+                Err(e) => {
+                    db_error(errors, &e);
+                    (Vec::new(), false)
+                }
+            };
+            let _ = reply.send(out);
+            false
+        }
+        Msg::NegQuery {
+            filter,
+            limit,
+            now,
+            reply,
+        } => {
+            let out = match store.scan_neg(&filter, now, limit) {
+                Ok(out) => out,
+                Err(e) => {
+                    db_error(errors, &e);
+                    (Vec::new(), false)
+                }
+            };
+            let _ = reply.send(out);
+            false
+        }
+        Msg::Count {
+            filters,
+            limit,
+            now,
+            reply,
+        } => {
+            let out = match store.scan(&filters, now, limit, true, false) {
+                Ok(out) => out,
+                Err(e) => {
+                    db_error(errors, &e);
+                    (Vec::new(), false)
+                }
+            };
+            let _ = reply.send(out);
+            false
+        }
+        Msg::PrefixExists { prefix, reply } => {
+            let exists = match store.event_id_prefix_exists(&prefix) {
+                Ok(exists) => exists,
+                Err(e) => {
+                    db_error(errors, &e);
+                    false
+                }
+            };
+            let _ = reply.send(exists);
+            false
+        }
+        Msg::PrefixesExist { prefixes, reply } => {
+            let out = match store.prefixes_exist(&prefixes) {
+                Ok(out) => out,
+                Err(e) => {
+                    db_error(errors, &e);
+                    vec![false; prefixes.len()]
+                }
+            };
+            let _ = reply.send(out);
+            false
+        }
+        Msg::ReplaceableCreatedAt {
+            kind,
+            pubkey,
+            d,
+            reply,
+        } => {
+            let created = match store.replaceable_created_at(kind, &pubkey, &d) {
+                Ok(created) => created,
+                Err(e) => {
+                    db_error(errors, &e);
+                    None
+                }
+            };
+            let _ = reply.send(created);
+            false
+        }
+        Msg::ListBanned { reply } => {
+            let banned = match store.list_banned() {
+                Ok(banned) => banned,
+                Err(e) => {
+                    db_error(errors, &e);
+                    Vec::new()
+                }
+            };
+            let _ = reply.send(banned);
+            false
+        }
+        Msg::DatabaseSize { reply } => {
+            let _ = reply.send(store.size_on_disk());
+            false
+        }
+        #[cfg(test)]
+        Msg::MapSize { reply } => {
+            let _ = reply.send(store.env.info().map_size as u64);
+            false
+        }
+        Msg::Shutdown => true,
+        _ => unreachable!("read channel received a write message"),
+    }
 }
 
 pub(crate) fn spawn(
@@ -39,12 +158,15 @@ pub(crate) fn spawn(
 ) -> Result<DbThreads> {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (read_tx, mut read_rx) = mpsc::unbounded_channel();
+    let (api_read_tx, mut api_read_rx) = mpsc::unbounded_channel();
     let thread_errors = Arc::clone(&errors);
     let pending_msgs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let pending_events = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let thread_pending_msgs = Arc::clone(&pending_msgs);
     let thread_pending_events = Arc::clone(&pending_events);
     let read_pending = Arc::clone(&pending_msgs);
+    let api_pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let api_thread_pending = Arc::clone(&api_pending);
     // Dedicated reader thread: serves Query/Count/NEG and the small
     // lookups without ever taking the LMDB write lock.
     {
@@ -56,121 +178,7 @@ pub(crate) fn spawn(
                     break;
                 };
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let shutdown = match msg {
-                        Msg::Query {
-                            filters,
-                            limit,
-                            now,
-                            reply,
-                        } => {
-                            let out = match read_store.scan(&filters, now, limit, false) {
-                                Ok(out) => out,
-                                Err(e) => {
-                                    db_error(&read_errors, &e);
-                                    (Vec::new(), false)
-                                }
-                            };
-                            let _ = reply.send(out);
-                            false
-                        }
-                        Msg::NegQuery {
-                            filter,
-                            limit,
-                            now,
-                            reply,
-                        } => {
-                            let out = match read_store.scan_neg(&filter, now, limit) {
-                                Ok(out) => out,
-                                Err(e) => {
-                                    db_error(&read_errors, &e);
-                                    (Vec::new(), false)
-                                }
-                            };
-                            let _ = reply.send(out);
-                            false
-                        }
-                        Msg::Count {
-                            filters,
-                            limit,
-                            now,
-                            reply,
-                        } => {
-                            let out = match read_store.scan(&filters, now, limit, true) {
-                                Ok(out) => out,
-                                Err(e) => {
-                                    db_error(&read_errors, &e);
-                                    (Vec::new(), false)
-                                }
-                            };
-                            let _ = reply.send(out);
-                            false
-                        }
-                        Msg::PrefixExists { prefix, reply } => {
-                            let exists = match read_store.event_id_prefix_exists(&prefix) {
-                                Ok(exists) => exists,
-                                Err(e) => {
-                                    db_error(&read_errors, &e);
-                                    false
-                                }
-                            };
-                            let _ = reply.send(exists);
-                            false
-                        }
-                        Msg::PrefixesExist { prefixes, reply } => {
-                            let mut out = Vec::with_capacity(prefixes.len());
-                            for prefix in &prefixes {
-                                let exists = match read_store.event_id_prefix_exists(prefix) {
-                                    Ok(exists) => exists,
-                                    Err(e) => {
-                                        db_error(&read_errors, &e);
-                                        false
-                                    }
-                                };
-                                out.push(exists);
-                            }
-                            let _ = reply.send(out);
-                            false
-                        }
-                        Msg::ReplaceableCreatedAt {
-                            kind,
-                            pubkey,
-                            d,
-                            reply,
-                        } => {
-                            let created = match read_store.replaceable_created_at(kind, &pubkey, &d)
-                            {
-                                Ok(created) => created,
-                                Err(e) => {
-                                    db_error(&read_errors, &e);
-                                    None
-                                }
-                            };
-                            let _ = reply.send(created);
-                            false
-                        }
-                        Msg::ListBanned { reply } => {
-                            let banned = match read_store.list_banned() {
-                                Ok(banned) => banned,
-                                Err(e) => {
-                                    db_error(&read_errors, &e);
-                                    Vec::new()
-                                }
-                            };
-                            let _ = reply.send(banned);
-                            false
-                        }
-                        Msg::DatabaseSize { reply } => {
-                            let _ = reply.send(read_store.size_on_disk());
-                            false
-                        }
-                        #[cfg(test)]
-                        Msg::MapSize { reply } => {
-                            let _ = reply.send(read_store.env.info().map_size as u64);
-                            false
-                        }
-                        Msg::Shutdown => true,
-                        _ => unreachable!("read channel received a write message"),
-                    };
+                    let shutdown = handle_read_msg(&read_store, &read_errors, msg);
                     read_pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                     shutdown
                 }));
@@ -180,6 +188,34 @@ pub(crate) fn spawn(
                     Err(_) => {
                         log::error!("reader thread recovered from a panic");
                         read_pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            }
+        });
+    }
+    // Dedicated REST API reader thread: serves `/api/v1` queries on its own
+    // queue so an API flood can never queue behind (or in front of)
+    // WebSocket queries on the shared reader thread. LMDB allows many
+    // concurrent readers, so both threads read the same data safely.
+    {
+        let api_store = store.clone_for_reader();
+        let api_errors = Arc::clone(&errors);
+        std::thread::spawn(move || {
+            'api_reader: loop {
+                let Some(msg) = api_read_rx.blocking_recv() else {
+                    break;
+                };
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let shutdown = handle_read_msg(&api_store, &api_errors, msg);
+                    api_thread_pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    shutdown
+                }));
+                match result {
+                    Ok(true) => break 'api_reader,
+                    Ok(false) => {}
+                    Err(_) => {
+                        log::error!("api reader thread recovered from a panic");
+                        api_thread_pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
             }
@@ -258,15 +294,17 @@ pub(crate) fn spawn(
                                     filters,
                                     limit,
                                     now,
+                                    ascending,
                                     reply,
                                 } => {
-                                    let out = match store.scan(&filters, now, limit, false) {
-                                        Ok(out) => out,
-                                        Err(e) => {
-                                            db_error(&thread_errors, &e);
-                                            (Vec::new(), false)
-                                        }
-                                    };
+                                    let out =
+                                        match store.scan(&filters, now, limit, false, ascending) {
+                                            Ok(out) => out,
+                                            Err(e) => {
+                                                db_error(&thread_errors, &e);
+                                                (Vec::new(), false)
+                                            }
+                                        };
                                     let _ = reply.send(out);
                                 }
                                 Msg::NegQuery {
@@ -290,7 +328,7 @@ pub(crate) fn spawn(
                                     now,
                                     reply,
                                 } => {
-                                    let out = match store.scan(&filters, now, limit, true) {
+                                    let out = match store.scan(&filters, now, limit, true, false) {
                                         Ok(out) => out,
                                         Err(e) => {
                                             db_error(&thread_errors, &e);
@@ -499,12 +537,15 @@ pub(crate) fn spawn(
     Ok(DbThreads {
         tx,
         read_tx,
+        api_read_tx,
         errors,
         expiry,
         timeout_secs: request_timeout_secs,
         pending_msgs,
         pending_events,
+        api_pending,
         max_pending_msgs: max_pending_msgs.max(1),
         max_pending_events: max_pending_events.max(1),
+        max_api_pending: max_pending_msgs.max(1),
     })
 }

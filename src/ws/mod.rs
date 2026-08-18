@@ -142,13 +142,18 @@ fn message_size(msg: &Message) -> usize {
 /// matter how it ends. A panic anywhere in the connection handling would
 /// otherwise skip the disconnect cleanup and leak the `connections_active`
 /// counter, slowly refusing every new connection.
-struct ConnectionGuard(Arc<Stats>);
+struct ConnectionGuard {
+    relay: Arc<Relay>,
+    stats: Arc<Stats>,
+    peer_ip: std::net::IpAddr,
+}
 
 impl Drop for ConnectionGuard {
     fn drop(&mut self) {
-        self.0
+        self.stats
             .connections_active
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.relay.release_connection(&self.peer_ip);
     }
 }
 
@@ -174,7 +179,11 @@ impl Conn {
     }
 }
 
-pub async fn handle_connection(mut socket: WebSocket, relay: Arc<Relay>) {
+pub async fn handle_connection(
+    mut socket: WebSocket,
+    relay: Arc<Relay>,
+    peer_ip: std::net::IpAddr,
+) {
     let active = relay
         .stats
         .connections_active
@@ -183,7 +192,8 @@ pub async fn handle_connection(mut socket: WebSocket, relay: Arc<Relay>) {
     relay.stats.bump(&relay.stats.connections_total, 1);
 
     let max_connections = relay.config.read().await.limits.max_connections;
-    if active > max_connections as u64 {
+    let max_per_ip = relay.config.read().await.limits.max_connections_per_ip;
+    if active > max_connections as u64 || !relay.try_register_connection(&peer_ip, max_per_ip) {
         relay
             .stats
             .connections_active
@@ -191,7 +201,11 @@ pub async fn handle_connection(mut socket: WebSocket, relay: Arc<Relay>) {
         let _ = socket.close().await;
         return;
     }
-    let _guard = ConnectionGuard(relay.stats.clone());
+    let _guard = ConnectionGuard {
+        relay: relay.clone(),
+        stats: relay.stats.clone(),
+        peer_ip,
+    };
 
     let (mut sender, mut receiver) = socket.split();
     let (max_msg_size, out_queue_bytes, expiry_enabled, giftwrap_restricted) = {

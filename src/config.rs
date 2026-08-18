@@ -75,6 +75,10 @@ pub struct ServerConfig {
 #[serde(default)]
 pub struct LimitsConfig {
     pub max_connections: usize,
+    /// Per-source-IP cap on WebSocket connections: a single host cannot
+    /// consume the whole connection budget (a socket flood from one IP
+    /// would otherwise evict legitimate clients). 0 = no per-IP cap.
+    pub max_connections_per_ip: usize,
     pub max_ws_message_size: usize,
     pub max_filters: usize,
     pub max_subscriptions: usize,
@@ -114,6 +118,18 @@ pub struct LimitsConfig {
     /// NIP-29: reject group events whose created_at is older than this many
     /// seconds (late publication prevention); 0 disables the check.
     pub group_late_publish_secs: u64,
+    /// REST API: maximum number of concurrent `/api/v1` requests being
+    /// served at once. Requests beyond this limit fail fast with `503`
+    /// instead of queuing, so a flood of API traffic cannot stall the
+    /// WebSocket subscribers (which share the same database).
+    pub api_max_concurrent: usize,
+    /// REST API: upper bound for the `limit` query parameter (0 = no bound).
+    pub api_max_limit: usize,
+    /// REST API: upper bound for the `offset` query parameter (0 = no bound).
+    pub api_max_offset: usize,
+    /// REST API: maximum length of the `search` query parameter in bytes
+    /// (0 = no bound).
+    pub api_max_search_bytes: usize,
     /// Live fan-out: events are accumulated and broadcast in batches of at
     /// most `live_batch_size` events every `live_batch_interval_ms`, so that
     /// idle connections wake up once per batch instead of once per event.
@@ -191,6 +207,7 @@ impl Default for LimitsConfig {
     fn default() -> Self {
         LimitsConfig {
             max_connections: 10_000,
+            max_connections_per_ip: 0,
             max_ws_message_size: 1 << 20,
             max_filters: 20,
             max_subscriptions: 20,
@@ -215,6 +232,10 @@ impl Default for LimitsConfig {
             live_batch_size: 64,
             live_buffer: 65_536,
             group_late_publish_secs: 7 * 24 * 60 * 60,
+            api_max_concurrent: 32,
+            api_max_limit: 500,
+            api_max_offset: 10_000,
+            api_max_search_bytes: 1_024,
         }
     }
 }

@@ -104,7 +104,6 @@ pub(crate) fn apply_put_batch(
         }
         match txn.commit() {
             Ok(()) => {
-                store.grow_map_if_needed();
                 return outcomes;
             }
             Err(heed::Error::Mdb(heed::MdbError::MapFull)) => {
@@ -196,10 +195,9 @@ pub(crate) struct Store {
     pub(crate) expiry_enabled: Arc<std::sync::atomic::AtomicBool>,
     /// NIP-50 word index: maximum number of words indexed per event.
     pub(crate) max_indexed_words: usize,
-    /// Ceiling for the automatic map growth (bytes).
+    /// Ceiling for the memory map (bytes): the map is opened at this size
+    /// and never resized at runtime.
     pub(crate) map_max_size: u64,
-    /// System page size in bytes (LMDB uses it for its pages).
-    pub(crate) page_size: usize,
 }
 
 /// `(created_at, id, protected, group_id, is_meta)` records returned by the
@@ -216,20 +214,27 @@ impl Store {
         // transaction created from it within this process.
         // The map is virtual address space: on 64-bit systems the growth
         // ceiling can be huge; on 32-bit systems LMDB is limited to ~2 GiB.
-        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
-        let page_size = page_size.max(4096);
-        let mut map_size = (cfg.map_size as u64).max(16 * 1024 * 1024);
-        let mut map_max_size = (cfg.map_max_size as u64).max(map_size);
+        let mut map_max_size = (cfg.map_max_size as u64)
+            .max(cfg.map_size as u64)
+            .max(16 * 1024 * 1024);
         if usize::BITS < 64 {
             let cap = 2u64 * 1024 * 1024 * 1024;
-            map_size = map_size.min(cap);
             map_max_size = map_max_size.min(cap);
         }
+        // The map is opened at `map_max_size` from the start (a sparse
+        // virtual reservation: physical memory is only consumed by the
+        // pages actually touched) and never resized at runtime. Runtime
+        // growth would call `mdb_env_set_mapsize`, which requires that no
+        // transactions are active — impossible while the shared reader and
+        // the dedicated API reader threads hold concurrent read
+        // transactions — and would risk unmapping memory the readers are
+        // still using.
+        let map_size = map_max_size as usize;
         let env = unsafe {
             EnvOpenOptions::new()
                 .max_dbs(cfg.max_dbs.max(16))
                 .max_readers(cfg.max_readers.max(8))
-                .map_size(map_size as usize)
+                .map_size(map_size)
                 .open(&cfg.path)?
         };
 
@@ -269,58 +274,21 @@ impl Store {
             expiry_enabled,
             max_indexed_words: max_indexed_words.max(1),
             map_max_size,
-            page_size,
         })
     }
 
-    /// Grows the memory map (doubling it, at least covering the current
-    /// usage) up to `map_max_size`. Returns `false` when the map cannot
-    /// grow further, meaning the database is full for good.
-    ///
-    /// Must be called with no transactions active: the DB thread is the only
-    /// user of the environment and calls this between messages, after a
-    /// failed commit has consumed its transaction.
+    /// The map is opened at its maximum size and never resized at runtime:
+    /// LMDB's `mdb_env_set_mapsize` requires that no transactions are
+    /// active, which cannot be guaranteed now that the shared reader and
+    /// the dedicated API reader threads hold concurrent read transactions.
+    /// Returns `false` (the map cannot grow), so a commit that fills the
+    /// map fails with `MapFull` and the caller revokes the batch.
     pub(crate) fn grow_map(&self) -> bool {
-        let info = self.env.info();
-        let current = info.map_size as u64;
-        let used = info.last_page_number as u64 * self.page_size as u64;
-        let target = current
-            .saturating_mul(2)
-            .max(used.saturating_mul(2))
-            .min(self.map_max_size);
-        if target <= current {
-            log::error!(
-                "database map is full and cannot grow beyond {} bytes (map_max_size)",
-                self.map_max_size
-            );
-            return false;
-        }
-        let target = target.div_ceil(self.page_size as u64) * self.page_size as u64;
-        // SAFETY: the environment is only used by this thread and no
-        // transaction is active at this point.
-        match unsafe { self.env.resize(target as usize) } {
-            Ok(()) => {
-                log::info!("database map resized to {target} bytes");
-                true
-            }
-            Err(e) => {
-                // A failed resize must be reported so the caller does not
-                // retry into an infinite loop.
-                log::error!("database map resize to {target} bytes failed: {e}");
-                false
-            }
-        }
-    }
-
-    /// Grows the map proactively when it is more than 90% used, so that
-    /// subsequent commits do not pay the grow-and-retry cost.
-    pub(crate) fn grow_map_if_needed(&self) {
-        let info = self.env.info();
-        let used = info.last_page_number as u64 * self.page_size as u64;
-        let current = info.map_size as u64;
-        if used > current.saturating_mul(9) / 10 {
-            self.grow_map();
-        }
+        log::error!(
+            "database map is full ({} bytes, map_max_size)",
+            self.map_max_size
+        );
+        false
     }
 
     /// Free bytes on the filesystem hosting the data directory, when
@@ -369,7 +337,6 @@ impl Store {
             expiry_enabled: Arc::clone(&self.expiry_enabled),
             max_indexed_words: self.max_indexed_words,
             map_max_size: self.map_max_size,
-            page_size: self.page_size,
         }
     }
 }
@@ -708,6 +675,30 @@ impl Store {
             .transpose()?
             .map(|(key, _)| key.starts_with(prefix))
             .unwrap_or(false))
+    }
+
+    /// Batched variant of [`Self::event_id_prefix_exists`]: answers many
+    /// prefix lookups in a single read transaction instead of opening one
+    /// transaction per prefix (a batch of NIP-29 `previous` tags can reach
+    /// tens of thousands of entries).
+    pub fn prefixes_exist(&self, prefixes: &[Vec<u8>]) -> Result<Vec<bool>> {
+        let rtxn = self.env.read_txn()?;
+        let mut out = Vec::with_capacity(prefixes.len());
+        for prefix in prefixes {
+            let range = (
+                std::ops::Bound::Included(prefix.as_slice()),
+                std::ops::Bound::Unbounded,
+            );
+            let exists = self
+                .events
+                .range(&rtxn, &range)?
+                .next()
+                .transpose()?
+                .map(|(key, _)| key.starts_with(prefix))
+                .unwrap_or(false);
+            out.push(exists);
+        }
+        Ok(out)
     }
 }
 
