@@ -488,7 +488,7 @@ impl super::Conn {
             out.push(',');
             out.push_str(&event_json);
             out.push(']');
-            self.send(Message::Text(out.clone().into()));
+            self.send(Message::Text(std::mem::take(&mut out).into()));
         }
     }
 }

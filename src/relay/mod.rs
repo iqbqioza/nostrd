@@ -387,7 +387,7 @@ impl Relay {
                     }
                 }
             }
-            let known: std::collections::HashSet<Vec<u8>> = if prefixes.is_empty() {
+            let mut known: std::collections::HashSet<Vec<u8>> = if prefixes.is_empty() {
                 std::collections::HashSet::new()
             } else {
                 let existing = self.db.prefixes_exist(prefixes.clone()).await;
@@ -397,6 +397,17 @@ impl Relay {
                     .filter_map(|(p, exists)| exists.then_some(p))
                     .collect()
             };
+            // References to sibling events of the same batch are valid: the
+            // group state changes are applied sequentially, so an earlier
+            // event of the batch is a legitimate `previous` target even
+            // though it is not committed to the database yet.
+            for event in &events {
+                if let Ok(id_bytes) = hex::decode(&event.id) {
+                    for len in 1..=id_bytes.len() {
+                        known.insert(id_bytes[..len].to_vec());
+                    }
+                }
+            }
             let mut out = Vec::with_capacity(events.len());
             for event in events {
                 let id = event.id.clone();

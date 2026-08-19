@@ -490,8 +490,10 @@ impl GroupStore {
             serde_json::from_value(json!({ "kinds": kinds })).expect("static filter");
         let (mut events, _) = db.query_full(vec![filter], 1_000_000, unix_now()).await;
         // Chronological order (the scan is per-kind, not globally ordered) so
-        // that later events win.
-        events.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+        // that later events win. Within the same second the kind is used as a
+        // tie-breaker so that the group exists (9007) before member operations
+        // (9000/9001/9002) and joins/leaves (9021/9022) are applied to it.
+        events.sort_by(|a, b| (a.created_at, a.kind, &a.id).cmp(&(b.created_at, b.kind, &b.id)));
         for event in events {
             self.apply(&event, "", unix_now(), false);
         }

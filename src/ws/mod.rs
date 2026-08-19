@@ -285,9 +285,6 @@ pub async fn handle_connection(
                 // Batch window: keep reading for a moment so consecutive
                 // EVENT messages from a busy publisher share one database
                 // commit, then flush the queue when the socket is idle.
-                // Batch window: keep reading for a moment so consecutive
-                // EVENT messages from a busy publisher share one database
-                // commit, then flush the queue when the socket is idle.
                 let mut too_large = false;
                 while let Ok(Some(Ok(frame))) =
                     tokio::time::timeout(std::time::Duration::from_millis(1), receiver.next()).await

@@ -83,6 +83,8 @@ pub(crate) fn authority_of(identity: &RelayIdentity<'_>) -> String {
         .public_url
         .strip_prefix("wss://")
         .or_else(|| identity.public_url.strip_prefix("ws://"))
+        .or_else(|| identity.public_url.strip_prefix("https://"))
+        .or_else(|| identity.public_url.strip_prefix("http://"))
     {
         let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
         return authority.to_string();
