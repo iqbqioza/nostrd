@@ -521,10 +521,10 @@ impl Relay {
                 .await
         };
         if outcomes.len() != puts.len() {
-            // A timed-out (or failed) request returns no outcomes: every
-            // pending event is reported as failed instead of being replied
-            // with an empty id.
-            outcomes = vec![PutOutcome::Invalid("error: database timeout".into()); puts.len()];
+            // The write was rejected before it was queued (overload
+            // fail-fast): nothing will commit, so every pending event is
+            // reported as failed instead of being replied with an empty id.
+            outcomes = vec![PutOutcome::Invalid("error: database overloaded".into()); puts.len()];
         }
 
         for ((event, outcome), slot) in puts.into_iter().zip(outcomes).zip(put_slots) {

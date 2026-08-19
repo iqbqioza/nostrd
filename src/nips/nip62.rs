@@ -89,16 +89,35 @@ pub(crate) fn authority_of(identity: &RelayIdentity<'_>) -> String {
         let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
         return authority.to_string();
     }
-    format!("{}:{}", identity.host, identity.port)
+    // IPv6 literals must be bracketed to form a valid authority.
+    if identity.host.contains(':') {
+        format!("[{}]:{}", identity.host, identity.port)
+    } else {
+        format!("{}:{}", identity.host, identity.port)
+    }
 }
 
+/// Splits an authority into its host (brackets stripped) and optional port.
+/// Handles IPv6 literals (`[::1]`, `[::1]:8080`), DNS names and IPv4.
 pub(crate) fn split_host_port(authority: &str) -> (&str, Option<u16>) {
-    if let Some((host, port)) = authority.rsplit_once(':')
+    if let Some(rest) = authority.strip_prefix('[') {
+        // IPv6 literal: the host ends at the closing bracket, optionally
+        // followed by a `:port`.
+        match rest.split_once(']') {
+            Some((host, "")) => (host, None),
+            Some((host, tail)) => {
+                let port = tail.strip_prefix(':').and_then(|p| p.parse::<u16>().ok());
+                (host, port)
+            }
+            None => (rest, None),
+        }
+    } else if let Some((host, port)) = authority.rsplit_once(':')
         && let Ok(port) = port.parse::<u16>()
     {
-        return (host, Some(port));
+        (host, Some(port))
+    } else {
+        (authority, None)
     }
-    (authority, None)
 }
 
 #[cfg(test)]
@@ -148,5 +167,28 @@ mod tests {
         // public_url overrides the configured host/port.
         let public = RelayIdentity::new("127.0.0.1", 8080, "wss://public.example.net");
         assert!(targets_us(&event("wss://public.example.net"), &public));
+    }
+
+    #[test]
+    fn ipv6_authorities_are_bracketed() {
+        let identity = RelayIdentity::new("::1", 80, "");
+        assert_eq!(authority_of(&identity), "[::1]:80");
+        let ipv6 = RelayIdentity::new("fe80::1%eth0", 443, "");
+        assert_eq!(authority_of(&ipv6), "[fe80::1%eth0]:443");
+    }
+
+    #[test]
+    fn split_host_port_handles_ipv6() {
+        assert_eq!(split_host_port("[::1]:8080"), ("::1", Some(8080)));
+        assert_eq!(split_host_port("[::1]"), ("::1", None));
+        assert_eq!(
+            split_host_port("relay.example.com:8080"),
+            ("relay.example.com", Some(8080))
+        );
+        assert_eq!(
+            split_host_port("relay.example.com"),
+            ("relay.example.com", None)
+        );
+        assert_eq!(split_host_port("192.0.2.1:80"), ("192.0.2.1", Some(80)));
     }
 }

@@ -260,14 +260,29 @@ impl DbClient {
         self.request_with(make, &self.read_tx).await
     }
 
-    async fn request_with<R: Default>(
+    /// Sends a write request to the writer thread and waits for the reply
+    /// *without* a response timeout. A write that reached the writer queue is
+    /// guaranteed to be processed (the writer always replies, on commit,
+    /// abort or shutdown), so waiting for the true outcome is preferable to a
+    /// false "database timeout": an event that later commits while the caller
+    /// already reported failure would skip its side-effects (live broadcast,
+    /// NIP-09 deletion, NIP-29 group state, NIP-43 leave). The overload
+    /// fail-fast still rejects new writes while the queue is deep.
+    async fn request_write<R: Default>(&self, make: impl FnOnce(oneshot::Sender<R>) -> Msg) -> R {
+        let Some(rx) = self.send_request(make, &self.tx) else {
+            return R::default();
+        };
+        rx.await.unwrap_or_default()
+    }
+
+    /// Overload check, queued-work accounting and send. Returns the reply
+    /// receiver, or `None` when the request failed fast (queue full) or could
+    /// not be sent (in which case nothing was queued and nothing will commit).
+    fn send_request<R>(
         &self,
         make: impl FnOnce(oneshot::Sender<R>) -> Msg,
         channel: &mpsc::UnboundedSender<Msg>,
-    ) -> R {
-        // Overload protection: when the database thread's queue is already
-        // deep, new requests fail fast instead of accumulating in memory.
-        // Callers degrade gracefully (empty replies, error outcomes).
+    ) -> Option<oneshot::Receiver<R>> {
         if self.pending_msgs.load(std::sync::atomic::Ordering::Relaxed) >= self.max_pending_msgs
             || self
                 .pending_events
@@ -277,7 +292,7 @@ impl DbClient {
             // Surface the overload in the stats (db_errors).
             self.errors
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return R::default();
+            return None;
         }
         let (tx, rx) = oneshot::channel();
         let msg = make(tx);
@@ -301,8 +316,19 @@ impl DbClient {
                 self.pending_events
                     .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             }
-            return R::default();
+            return None;
         }
+        Some(rx)
+    }
+
+    async fn request_with<R: Default>(
+        &self,
+        make: impl FnOnce(oneshot::Sender<R>) -> Msg,
+        channel: &mpsc::UnboundedSender<Msg>,
+    ) -> R {
+        let Some(rx) = self.send_request(make, channel) else {
+            return R::default();
+        };
         if self.timeout_secs == 0 {
             return rx.await.unwrap_or_default();
         }
@@ -313,7 +339,8 @@ impl DbClient {
     }
 
     pub async fn put(&self, event: Event, now: u64) -> PutOutcome {
-        self.request(|reply| Msg::Put { event, now, reply }).await
+        self.request_write(|reply| Msg::Put { event, now, reply })
+            .await
     }
 
     pub async fn query(&self, filters: Vec<Filter>, limit: usize, now: u64) -> (Vec<Event>, bool) {
@@ -417,7 +444,8 @@ impl DbClient {
 
     /// Stores a batch of events in a single write transaction.
     pub async fn put_batch(&self, events: Vec<(Event, u64)>) -> Vec<PutOutcome> {
-        self.request(|reply| Msg::PutBatch { events, reply }).await
+        self.request_write(|reply| Msg::PutBatch { events, reply })
+            .await
     }
 
     /// NIP-77: returns only `(created_at, id)` records of the matching

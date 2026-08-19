@@ -61,16 +61,20 @@ async fn check_auth(
     let relay = &state.relay;
     let cfg = relay.config.read().await;
 
+    // Bearer token, when configured. A wrong token falls through to the
+    // NIP-98 check (matching the JSON-RPC path) so both methods can be
+    // configured at once instead of one silently disabling the other.
+    let mut token_configured = false;
     if !cfg.server.management_token.is_empty() {
-        let token = headers
+        token_configured = true;
+        if let Some(token) = headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
-            .ok_or_else(|| unauthorized("missing bearer token"))?;
-        if super::ct_eq(token, &cfg.server.management_token) {
+            && super::ct_eq(token, &cfg.server.management_token)
+        {
             return Ok(());
         }
-        return Err(unauthorized("invalid bearer token"));
     }
 
     if !cfg.server.admin_pubkey.is_empty() {
@@ -107,9 +111,11 @@ async fn check_auth(
         return Err(unauthorized("invalid NIP-98 auth"));
     }
 
-    Err(unauthorized(
-        "management API disabled: set server.management_token or server.admin_pubkey",
-    ))
+    Err(unauthorized(if token_configured {
+        "invalid bearer token"
+    } else {
+        "management API disabled: set server.management_token or server.admin_pubkey"
+    }))
 }
 
 fn unauthorized(msg: &str) -> Response {
