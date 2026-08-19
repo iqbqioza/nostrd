@@ -7,6 +7,7 @@ mod negentropy;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
@@ -210,15 +211,31 @@ pub async fn handle_connection(
     };
 
     let (mut sender, mut receiver) = socket.split();
-    let (max_msg_size, out_queue_bytes, expiry_enabled, giftwrap_restricted) = {
+    let (max_msg_size, out_queue_bytes, expiry_enabled, giftwrap_restricted, idle_timeout) = {
         let cfg = relay.config.read().await;
         (
             cfg.limits.max_ws_message_size,
             cfg.limits.max_out_queue_bytes,
             cfg.nip_enabled(40),
             cfg.nip_enabled(42),
+            cfg.limits.ws_idle_timeout_secs,
         )
     };
+    // Idle connections (no inbound frames) hold their slot forever; when the
+    // operator enables the idle timeout the relay closes them, sending a
+    // periodic PING so an alive-but-silent subscriber (which auto-responds
+    // with a PONG, itself an inbound frame) stays connected while dead peers
+    // are reaped.
+    let idle: Option<Duration> = if idle_timeout > 0 {
+        Some(Duration::from_secs(idle_timeout))
+    } else {
+        None
+    };
+    let mut ping: Option<tokio::time::Interval> = idle.map(|d| {
+        let mut interval = tokio::time::interval(Duration::from_secs((d.as_secs() / 3).max(5)));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval
+    });
 
     let challenge = nip42::generate_challenge();
 
@@ -268,12 +285,30 @@ pub async fn handle_connection(
                 None => std::future::pending().await,
             }
         };
+        // Periodic keep-alive PING (when the idle timeout is enabled).
+        let ping_fut = async {
+            match ping.as_mut() {
+                Some(interval) => interval.tick().await,
+                None => std::future::pending().await,
+            }
+        };
+        let incoming_fut = async {
+            match idle {
+                Some(d) => match tokio::time::timeout(d, receiver.next()).await {
+                    Ok(x) => Ok(x),
+                    Err(_) => Err(()),
+                },
+                None => Ok(receiver.next().await),
+            }
+        };
         tokio::select! {
-            incoming = receiver.next() => {
+            incoming = incoming_fut => {
                 match incoming {
-                    Some(Ok(Message::Close(_))) | None => break,
-                    Some(Err(_)) => break,
-                    Some(Ok(frame)) => {
+                    // Idle timeout (ws_idle_timeout_secs): no inbound frames.
+                    Err(_) => break,
+                    Ok(Some(Ok(Message::Close(_)))) | Ok(None) => break,
+                    Ok(Some(Err(_))) => break,
+                    Ok(Some(Ok(frame))) => {
                         if conn.handle_frame(frame, max_msg_size).await {
                             break;
                         }
@@ -318,6 +353,12 @@ pub async fn handle_connection(
                 } else if live.is_some() && conn.subs.is_empty() {
                     live = None;
                 }
+            }
+            _ = ping_fut => {
+                // Keep-alive: a healthy client answers with a PONG (an
+                // inbound frame, which resets the idle timeout), so an idle
+                // subscriber stays connected while a dead peer is reaped.
+                let _ = sender.send(Message::Ping(vec![].into())).await;
             }
             live_batch = live_fut => {
                 match live_batch {

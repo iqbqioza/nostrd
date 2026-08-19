@@ -499,12 +499,24 @@ impl GroupStore {
             let mut filter: Filter =
                 serde_json::from_value(json!({ "kinds": kinds })).expect("static filter");
             filter.until = until;
-            let (page, _) = db.query(vec![filter], PAGE, unix_now()).await;
+            // `query_full` gives each page the full-scan work budget (not the
+            // smaller per-query one), so a single second holding more events
+            // than the small budget cannot be silently cut mid-boundary.
+            let (page, more) = db.query_full(vec![filter], PAGE, unix_now()).await;
             if page.is_empty() {
                 break;
             }
             let min_created = page.iter().map(|e| e.created_at).min().unwrap_or(0);
             let full = page.len() >= PAGE;
+            if !full && more {
+                log::warn!(
+                    "group state rebuild ended early (scan budget exhausted with {} events in \
+                     the page): the in-memory group store may be incomplete after this restart",
+                    page.len()
+                );
+                events.extend(page);
+                break;
+            }
             events.extend(page);
             if !full {
                 // Fewer than a page: every remaining event was collected.

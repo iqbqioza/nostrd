@@ -34,7 +34,10 @@ pub fn relay_info(config: &Config, stats: &Stats, self_pubkey: Option<&str>) -> 
             "max_subid_length": limits.max_sub_id_len,
             "max_event_tags": limits.max_tags,
             "max_content_length": limits.max_content_bytes,
-            "min_pow_difficulty": limits.require_pow,
+            // Only advertise the PoW floor when NIP-13 is enabled and it is
+            // actually enforced; otherwise reporting `require_pow` would
+            // claim a difficulty the relay never checks.
+            "min_pow_difficulty": if config.nip_enabled(13) { limits.require_pow } else { 0 },
             "auth_required": config.server.require_auth,
             "payment_required": false,
             "restricted_writes": false,

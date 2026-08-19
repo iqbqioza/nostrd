@@ -118,6 +118,11 @@ pub struct LimitsConfig {
     /// Maximum bytes of outgoing messages queued for a single connection
     /// before new ones are dropped (protects memory against slow readers).
     pub max_out_queue_bytes: usize,
+    /// Seconds a connection may stay idle (no inbound frames) before it is
+    /// closed. When non-zero the relay also sends periodic WebSocket PINGs so
+    /// an alive-but-silent subscriber keeps its slot and dead peers are
+    /// detected and reaped; 0 disables the idle timeout entirely.
+    pub ws_idle_timeout_secs: u64,
     /// Overload protection: when the database thread's queue holds more than
     /// this many pending messages (or `db_queue_events` events), new
     /// database requests fail fast instead of accumulating in memory.
@@ -246,6 +251,7 @@ impl Default for LimitsConfig {
             db_request_timeout_secs: 30,
             new_pubkey_min_age_secs: 0,
             max_out_queue_bytes: 256 * 1024,
+            ws_idle_timeout_secs: 0,
             db_queue_msgs: 4_096,
             db_queue_events: 262_144,
             max_sub_bytes: 512 * 1024,

@@ -15,6 +15,7 @@ nostrd is designed around two goals:
 - **Overload protection** — the database queue is bounded; when it fills up, new requests fail fast instead of accumulating in memory. Writes that reach the queue always wait for their true outcome, so a queued event can never silently commit after the relay reported a false failure (which would skip its side-effects).
 - **Reader/writer thread split** — reads are served by dedicated threads that never take the LMDB write lock, so a stalled writer (slow disk, external lock holder) cannot take the relay down for readers. The REST API gets its own reader thread, isolated from WebSocket REQ/COUNT/NEG queries.
 - **Per-IP connection cap** — a single host cannot consume the whole connection budget.
+- **Optional WS idle timeout** — close connections that stay silent for a configured period (sending periodic PINGs so alive-but-idle subscribers keep their slot while dead peers are reaped), preventing a socket flood from exhausting the connection budget.
 - **Panic-safe** — task panics are contained and logged, and connection accounting is released on every exit path.
 - **Efficient hot paths** — single-pass event parsing, deduplicated live serialization, batched commits (one fsync per batch), merged multi-range scans with a per-scan work budget, and NIP-67 boundary handling.
 - **Everything configurable** via `nostrd.toml` — no compile-time options.
@@ -94,7 +95,7 @@ Only `GET` is supported; WebSocket upgrade requests to `/api/v1` are rejected wi
 
 All commands accept `--config <path>` (default `./nostrd.toml`).
 
-Sending `SIGHUP` to the daemon reloads the configuration at runtime: most limits, server auth settings, the NIP toggles (including the NIP-40 toggle, applied live) and the REST API concurrency ceiling apply immediately. A few settings are captured at startup and require a full restart: `live_buffer`/`live_batch_size`/`live_batch_interval_ms`, `server.api_host`, `server.management_port`, `server.metrics_enabled`, the database request timeouts/queue caps, `purge_interval_secs`, `stats_interval_secs` and `max_indexed_words`. An invalid reloaded file is rejected (the old configuration stays in force). The access control lists are runtime-managed (NIP-86) and are **not** overwritten by a reload.
+Sending `SIGHUP` to the daemon reloads the configuration at runtime: most limits, server auth settings, the NIP toggles (including the NIP-40 toggle, applied live) and the REST API concurrency ceiling apply immediately. A few settings are captured at startup and require a full restart: `live_buffer`/`live_batch_size`/`live_batch_interval_ms`, `server.api_host`, `server.management_port`, `server.metrics_enabled`, `relay.private_key` (a reload warns that it is ignored), `relay.livekit_url`, `daemon.log_max_size_bytes`/`log_max_files`, the database request timeouts/queue caps, `purge_interval_secs`, `stats_interval_secs` and `max_indexed_words`. An invalid reloaded file is rejected (the old configuration stays in force). The access control lists are runtime-managed (NIP-86) and are **not** overwritten by a reload.
 
 ## Configuration
 
@@ -137,6 +138,8 @@ new_pubkey_min_age_secs = 0     # spam defense: reject events from accounts youn
 db_queue_msgs = 4096            # overload protection: fail fast when the database
 db_queue_events = 262144        # queue holds more than this much pending work
 buffer_size = 2048              # initial WebSocket read/write buffer per connection
+ws_idle_timeout_secs = 0        # close connections idle this many seconds (0 = off);
+                                # sends periodic PINGs so silent subscribers stay alive
 group_late_publish_secs = 604800  # NIP-29 late-publication window
 api_max_concurrent = 32         # REST API: max concurrent /api/v1 queries (beyond = 503)
 api_max_limit = 500             # REST API: ceiling for the `limit` parameter (0 = off)

@@ -21,8 +21,10 @@
 # live) and the REST API concurrency ceiling apply immediately. A few settings
 # are captured at startup and require a full restart: live_buffer /
 # live_batch_size / live_batch_interval_ms, server.api_host, server.
-# management_port, server.metrics_enabled, the database request timeouts and
-# queue caps, purge_interval_secs, stats_interval_secs and max_indexed_words.
+# management_port, server.metrics_enabled, relay.private_key (a reload warns
+# that it is ignored), relay.livekit_url, daemon.log_max_size_bytes /
+# log_max_files, the database request timeouts and queue caps,
+# purge_interval_secs, stats_interval_secs and max_indexed_words.
 # An invalid reloaded file is rejected (the old configuration stays in force).
 # =============================================================================
 
@@ -211,6 +213,13 @@ new_pubkey_min_age_secs = 0
 # Maximum bytes of outgoing messages queued per connection before new ones
 # are dropped (protects memory against slow readers).
 max_out_queue_bytes = 262144
+
+# Seconds a connection may stay idle (no inbound frames) before it is closed.
+# When non-zero the relay also sends periodic WebSocket PINGs, so an
+# alive-but-silent subscriber (which auto-answers with a PONG) keeps its slot
+# while dead peers are detected and reaped — otherwise a flood of idle
+# connections can exhaust max_connections. 0 disables the idle timeout.
+ws_idle_timeout_secs = 0
 
 # Overload protection: when the database thread's queue holds more than this
 # many pending messages (or db_queue_events pending events), new database

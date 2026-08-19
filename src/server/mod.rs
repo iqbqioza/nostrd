@@ -19,7 +19,7 @@ use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use log::{error, info};
+use log::{error, info, warn};
 use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
@@ -596,6 +596,19 @@ async fn reload_handler(
                         }
                         db.set_expiry_enabled(new_config.nip_enabled(40));
                         api_limit.set_max(new_config.limits.api_max_concurrent);
+                        // The relay's signing key is fixed at startup: a
+                        // reloaded private_key is not applied (NIP-29/NIP-43
+                        // keep signing and NIP-11 `self` keeps advertising
+                        // the old key). Warn so the operator knows a restart
+                        // is required for it to take effect.
+                        let old = config.read().await;
+                        if old.relay.private_key != new_config.relay.private_key {
+                            warn!(
+                                "relay.private_key changed in the reloaded config but is fixed \
+                                 at startup; a restart is required to apply it"
+                            );
+                        }
+                        drop(old);
                         *config.write().await = new_config;
                         info!("configuration reloaded from {}", config_path.display());
                     }
