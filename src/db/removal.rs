@@ -100,7 +100,7 @@ impl Store {
                 .collect();
             for (key, value) in entries {
                 // key = kind(8) + pubkey(32) + dlen(4) + d
-                if key.len() < CREATED_LEN * 2 + ID_LEN {
+                if key.len() < CREATED_LEN + ID_LEN + 4 {
                     continue;
                 }
                 if key[CREATED_LEN..CREATED_LEN + ID_LEN] != pubkey {
@@ -192,11 +192,23 @@ impl Store {
             .range(&wtxn, &range)?
             .filter_map(|item| item.ok().map(|(k, _)| k[k.len() - ID_LEN..].to_vec()))
             .collect();
+        let pubkey_hex = hex::encode(pubkey);
         for id in ids {
-            if self.events.get(&wtxn, &id)?.is_some() {
-                self.remove_event(&mut wtxn, &id)?;
-                removed += 1;
+            let Some(raw) = self.events.get(&wtxn, &id)? else {
+                continue;
+            };
+            let Ok(event) = serde_json::from_slice::<Event>(raw) else {
+                continue;
+            };
+            // NIP-62: only events *authored* by the vanished pubkey are
+            // removed. NIP-26 delegatee events are indexed under the
+            // delegator's pubkey too, but they belong to the delegatee and
+            // must survive a delegator's request to vanish.
+            if event.pubkey != pubkey_hex {
+                continue;
             }
+            self.remove_event(&mut wtxn, &id)?;
+            removed += 1;
         }
 
         // NIP-59 gift wraps addressed to the vanished pubkey. The by_tag

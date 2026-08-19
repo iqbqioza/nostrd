@@ -178,10 +178,10 @@ pub async fn api_handler(
         } => {
             let hex_pk = hex::encode(pubkey);
             let limit = params.limit.unwrap_or(100).min(500);
+            // No per-filter `limit`: see the Pubkey handler.
             let mut filter = Filter {
                 authors: Some(vec![hex_pk]),
                 kinds: Some(vec![kind]),
-                limit: Some(limit),
                 ..Default::default()
             };
             // d_tag from naddr1 is primary; user ?d= overrides if present
@@ -223,11 +223,13 @@ pub async fn api_kind_handler(
         Nip19Entity::Pubkey(pk) => {
             let hex_pk = hex::encode(pk);
             let limit = params.limit.unwrap_or(100).min(500);
+            // No per-filter `limit`: query_and_respond fetches `limit+offset+1`
+            // pre-filter rows (via the max_limit parameter) so pagination over
+            // the visible sequence works even when hidden events are present.
             let filter = apply_params(
                 Filter {
                     authors: Some(vec![hex_pk]),
                     kinds: Some(vec![kind]),
-                    limit: Some(limit),
                     ..Default::default()
                 },
                 &params,

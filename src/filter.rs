@@ -7,6 +7,14 @@ use serde_json::Value;
 
 use crate::event::Event;
 
+/// Maximum number of `ids`/`authors` entries a filter may carry. The
+/// in-memory per-candidate match is linear in these arrays, so an
+/// unauthenticated REQ listing thousands of real ids or pubkeys could force
+/// quadratic work on the shared reader thread; filters beyond this bound are
+/// rejected with a clear error. No legitimate client lists this many ids or
+/// authors in a single filter.
+pub const MAX_FILTER_MEMBERS: usize = 512;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Filter {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -28,6 +36,18 @@ pub struct Filter {
 }
 
 impl Filter {
+    /// Whether the filter exceeds the [`MAX_FILTER_MEMBERS`] bound on `ids`
+    /// or `authors`, which would make the in-memory match quadratic.
+    pub fn too_many_members(&self) -> bool {
+        self.ids
+            .as_ref()
+            .is_some_and(|v| v.len() > MAX_FILTER_MEMBERS)
+            || self
+                .authors
+                .as_ref()
+                .is_some_and(|v| v.len() > MAX_FILTER_MEMBERS)
+    }
+
     /// Performs an in-memory match (used for live events and final checks).
     pub fn matches(&self, ev: &Event) -> bool {
         if let Some(ids) = &self.ids {
@@ -197,5 +217,18 @@ mod tests {
         assert!(!f.matches(&e));
         let f: Filter = serde_json::from_value(serde_json::json!({"ids": ["bb"]})).unwrap();
         assert!(!f.matches(&e));
+    }
+
+    #[test]
+    fn too_many_members_flagged() {
+        let mut f = Filter::default();
+        assert!(!f.too_many_members());
+        f.ids = Some(vec!["a".repeat(64); MAX_FILTER_MEMBERS]);
+        assert!(!f.too_many_members(), "exactly at the bound is allowed");
+        f.ids = Some(vec!["a".repeat(64); MAX_FILTER_MEMBERS + 1]);
+        assert!(f.too_many_members());
+        f.ids = None;
+        f.authors = Some(vec!["a".repeat(64); MAX_FILTER_MEMBERS + 1]);
+        assert!(f.too_many_members());
     }
 }

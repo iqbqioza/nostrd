@@ -50,6 +50,11 @@ impl super::Conn {
                 return;
             }
         };
+        let max_sub_id_len = self.relay.config.read().await.limits.max_sub_id_len;
+        if sub_id.len() > max_sub_id_len {
+            self.send_notice("error: NEG-OPEN subscription id too long");
+            return;
+        }
         let filter: Filter = match serde_json::from_value::<Filter>(rest[1].clone()) {
             Ok(mut filter) => {
                 // Negentropy needs every matching record, not a capped page.
@@ -61,6 +66,10 @@ impl super::Conn {
                 return;
             }
         };
+        if filter.too_many_members() {
+            self.send_neg_err(&sub_id, "error: too many ids or authors in the filter");
+            return;
+        }
         let Some(initial) = rest[2].as_str() else {
             self.send_notice("error: NEG-OPEN message must be hex");
             return;

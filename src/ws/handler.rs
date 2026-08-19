@@ -192,6 +192,10 @@ impl super::Conn {
             self.send_closed(sub_id, "invalid: too many filters");
             return;
         }
+        if filters.iter().any(|f| f.too_many_members()) {
+            self.send_closed(sub_id, "invalid: too many ids or authors in a filter");
+            return;
+        }
 
         let search_disabled = filters.iter().any(|f| f.has_search()) && !search_enabled;
 
@@ -354,6 +358,10 @@ impl super::Conn {
                     return;
                 }
             }
+        }
+        if filters.iter().any(|f| f.too_many_members()) {
+            self.send_closed(sub_id, "invalid: too many ids or authors in a filter");
+            return;
         }
         let count_limit = self.relay.config.read().await.limits.count_limit;
         let (events, more) = self

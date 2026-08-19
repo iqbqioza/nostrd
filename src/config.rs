@@ -524,6 +524,17 @@ impl Config {
                 l.require_pow
             );
         }
+
+        // `require_auth` with `send_auth_challenge = false` is a total
+        // lockout: the challenge is only ever sent on connect, so nobody can
+        // authenticate and every REQ/EVENT/COUNT is refused.
+        if self.server.require_auth && !self.server.send_auth_challenge {
+            log::warn!(
+                "server.require_auth is true but server.send_auth_challenge is false: the \
+                 AUTH challenge is never sent, so no client can authenticate and all \
+                 REQ/EVENT/COUNT messages will be refused"
+            );
+        }
         Ok(())
     }
 }

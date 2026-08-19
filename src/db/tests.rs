@@ -207,6 +207,51 @@ fn deletion_by_address_and_author() {
 }
 
 #[test]
+fn deletion_by_address_with_empty_d() {
+    // NIP-09 `a`-tag deletion of a *replaceable* event (kind 0/3, empty `d`)
+    // must work: the replaceable slot key is kind(8)+pubkey(32)+dlen(4)+d(0)
+    // = 44 bytes, and the deletion walk used to skip keys < 48 bytes.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // A replaceable profile event (kind 0) with an empty `d` tag.
+        let e1 = event(0, "profile", now, vec![]);
+        assert_eq!(db.put(e1.clone(), now).await, PutOutcome::Stored);
+
+        let address = crate::nips::nip09::Address {
+            kind: 0,
+            pubkey: "0000000000000000000000000000000000000000000000000000000000000000".into(),
+            d: String::new(),
+        };
+        let removed = db
+            .apply_deletion(
+                vec![],
+                vec![address],
+                Some("0000000000000000000000000000000000000000000000000000000000000000".into()),
+                u64::MAX,
+            )
+            .await;
+        assert_eq!(
+            removed, 1,
+            "kind 0 with empty d must be deletable by address"
+        );
+        let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [0]})).unwrap();
+        let (res, _) = db.query(vec![f], 10, now).await;
+        assert!(res.is_empty());
+    });
+}
+
+#[test]
 fn deletion_requests_are_never_deleted() {
     let db = DbClient::open(
         &config(),
