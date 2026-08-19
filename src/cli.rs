@@ -23,6 +23,9 @@ pub struct Cli {
     pub config: PathBuf,
     #[command(subcommand)]
     pub command: Command,
+    /// Set when the process is the daemon child (after daemonization).
+    #[arg(skip)]
+    pub daemonized: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -54,6 +57,7 @@ impl Cli {
             Command::Init => return init_config(&self.config),
             Command::Check => {
                 let cfg = self.load_config()?;
+                cfg.validate()?;
                 print_line(&format!("configuration OK: {}", cfg.relay.name));
                 return Ok(());
             }
@@ -88,6 +92,7 @@ impl Cli {
                     info!("created default configuration at {}", self.config.display());
                 }
                 let cfg = self.load_config()?;
+                cfg.validate()?;
                 let db = open_db(&cfg)?;
                 run_server(self.config.clone(), cfg, db).await
             }
@@ -101,32 +106,47 @@ impl Cli {
         Ok(cfg)
     }
 
-    fn daemonize(&self, cfg: &Config) -> Result<()> {
-        let log_file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&cfg.daemon.log_file)
-            .map_err(|e| {
+    fn daemonize(&mut self, cfg: &Config) -> Result<()> {
+        // All logging goes through the custom logger to the log file (with
+        // rotation); the daemon's stdio is pointed at /dev/null so the
+        // inherited descriptors do not keep the file open across rotations.
+        if let Some(dir) = cfg.daemon.log_file.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| {
                 Error::Config(format!(
-                    "cannot open {}: {e}",
-                    cfg.daemon.log_file.display()
+                    "cannot create log directory {}: {e}",
+                    dir.display()
                 ))
             })?;
-        let err_file = log_file
-            .try_clone()
-            .map_err(|e| Error::Config(format!("cannot clone log file: {e}")))?;
+        }
+        crate::logging::install_file_logger(
+            cfg.daemon.log_file.clone(),
+            cfg.daemon.log_max_size_bytes,
+            cfg.daemon.log_max_files,
+        )
+        .map_err(|e| {
+            Error::Config(format!(
+                "cannot open {}: {e}",
+                cfg.daemon.log_file.display()
+            ))
+        })?;
+        let devnull = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .map_err(|e| Error::Config(format!("cannot open /dev/null: {e}")))?;
 
         let daemon = Daemonize::new()
             .pid_file(&cfg.daemon.pid_file)
             .working_directory("/")
-            .stdout(log_file)
-            .stderr(err_file);
+            .stdout(devnull.try_clone()?)
+            .stderr(devnull);
 
         daemon
             .start()
             .map_err(|e| Error::Config(format!("failed to daemonize: {e}")))?;
 
         // Only the daemon child reaches this point.
+        self.daemonized = true;
         info!(
             "daemon started (pid {}), log: {}",
             std::process::id(),

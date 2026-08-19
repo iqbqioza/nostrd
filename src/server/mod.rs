@@ -116,6 +116,9 @@ async fn build_router(relay: &Arc<Relay>) -> Router {
         .route("/relay/stats", get(stats_handler))
         .nest("/api/v1", api_routes);
     let cfg = relay.config.read().await;
+    if cfg.server.metrics_enabled {
+        app = app.route("/metrics", get(metrics_handler));
+    }
     if cfg.nip_enabled(29) && !cfg.relay.livekit_url.is_empty() {
         app = app
             .route("/.well-known/nip29/livekit", get(livekit_supported))
@@ -137,16 +140,35 @@ async fn build_router(relay: &Arc<Relay>) -> Router {
         .with_state(relay.clone())
 }
 
+/// The host part of an HTTP Host header value: strips an IPv6 literal's
+/// brackets (`[::1]:8080` -> `::1`) or splits a DNS/IPv4 host from its
+/// optional `:port` suffix (`relay.example.com:8080` -> `relay.example.com`).
+fn host_header_host(header: &str) -> &str {
+    let h = header.trim();
+    if let Some(rest) = h.strip_prefix('[') {
+        // IPv6 literal: the host ends at the closing bracket.
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        // DNS name or IPv4 address: everything before the first ':'.
+        h.split(':').next().unwrap_or(h)
+    }
+}
+
 /// Returns `true` when the request's Host header names `api_host`
-/// (ignoring case and any `:port` suffix).
+/// (ignoring case, any `:port` suffix and IPv6 literal brackets).
 fn host_is_api(api_host: &str, request: &Request) -> bool {
     request
         .headers()
         .get(axum::http::header::HOST)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|h| {
-            let host = h.split(':').next().unwrap_or(h).trim().to_ascii_lowercase();
-            host == api_host
+            let host = host_header_host(h).to_ascii_lowercase();
+            let expected = api_host
+                .trim()
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_ascii_lowercase();
+            host == expected
         })
 }
 
@@ -158,7 +180,8 @@ async fn host_split(api_host: &str, request: Request, next: Next) -> Response {
     let is_api_host = host_is_api(api_host, &request);
     let is_api_path = request.uri().path().starts_with("/api/v1");
     let is_health = request.uri().path() == "/health";
-    match (is_api_host, is_api_path || is_health) {
+    let is_metrics = request.uri().path() == "/metrics";
+    match (is_api_host, is_api_path || is_health || is_metrics) {
         (true, true) | (false, false) => next.run(request).await,
         _ => StatusCode::NOT_FOUND.into_response(),
     }
@@ -453,6 +476,17 @@ async fn health_handler() -> impl IntoResponse {
     (StatusCode::OK, Json(json!({ "status": "ok" })))
 }
 
+/// Prometheus metrics endpoint: the counters in text exposition format.
+async fn metrics_handler(State(relay): State<Arc<Relay>>) -> impl IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        relay.stats.as_prometheus(),
+    )
+}
+
 async fn stats_writer(relay: Arc<Relay>, mut shutdown: watch::Receiver<bool>) {
     let secs = relay.config.read().await.daemon.stats_interval_secs.max(1);
     let mut ticker = interval(Duration::from_secs(secs));
@@ -605,5 +639,34 @@ mod tests {
     fn host_is_api_rejects_missing_host() {
         let bare = Request::builder().uri("/").body(Body::empty()).unwrap();
         assert!(!host_is_api("api.example.com", &bare));
+    }
+
+    #[test]
+    fn host_is_api_handles_ipv6_literals() {
+        // Bracket form with and without a port.
+        assert!(host_is_api("::1", &req("[::1]:8080", "/")));
+        assert!(host_is_api("[::1]", &req("[::1]:8080", "/")));
+        assert!(host_is_api("::1", &req("[::1]", "/")));
+        // A different IPv6 address does not match.
+        assert!(!host_is_api("::1", &req("[::2]:8080", "/")));
+        // IPv4-mapped IPv6 literals work too.
+        assert!(host_is_api(
+            "::ffff:192.0.2.1",
+            &req("[::ffff:192.0.2.1]:8080", "/")
+        ));
+        // IPv6 with a zone identifier (link-local) still matches.
+        assert!(host_is_api(
+            "fe80::1%eth0",
+            &req("[fe80::1%eth0]:8080", "/")
+        ));
+    }
+
+    #[test]
+    fn host_header_host_extracts_host() {
+        assert_eq!(host_header_host("api.example.com"), "api.example.com");
+        assert_eq!(host_header_host("api.example.com:8080"), "api.example.com");
+        assert_eq!(host_header_host("[::1]"), "::1");
+        assert_eq!(host_header_host("[::1]:8080"), "::1");
+        assert_eq!(host_header_host("192.0.2.1:80"), "192.0.2.1");
     }
 }

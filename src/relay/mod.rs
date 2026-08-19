@@ -149,11 +149,16 @@ impl Relay {
             }
         };
         let api_max_concurrent = config.read().await.limits.api_max_concurrent;
+        // Seed the access control: the persisted runtime state wins, so NIP-86
+        // bans/allowlists survive restarts; the config `access` section seeds
+        // the very first run only (when no runtime state exists yet).
+        let access = match db.load_access().await {
+            Some(access) => access,
+            None => config.read().await.access.clone(),
+        };
         Relay {
-            // Seed the access control from the config so operator bans and
-            // allowlists survive restarts.
             config: Arc::clone(&config),
-            access: Arc::new(RwLock::new(config.read().await.access.clone())),
+            access: Arc::new(RwLock::new(access)),
             db,
             stats,
             live,
@@ -226,6 +231,14 @@ impl Relay {
 
     pub fn secp(&self) -> &Secp256k1<secp256k1::All> {
         &self.secp
+    }
+
+    /// Persists the current access control lists to the database so NIP-86
+    /// runtime bans/allowlists survive restarts. Callers must release the
+    /// `access` write lock before awaiting this.
+    pub async fn persist_access(&self) {
+        let access = self.access.read().await.clone();
+        self.db.save_access(access).await;
     }
 
     /// Registers a new WebSocket connection from `ip` if it does not exceed

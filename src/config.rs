@@ -16,7 +16,7 @@ pub const DEFAULT_CONFIG: &str = "nostrd.toml";
 /// project rules. NIP-33 was merged into NIP-01 but remains advertised for
 /// clients that check it.
 pub const RELAY_NIPS: &[u16] = &[
-    1, 9, 11, 13, 26, 29, 33, 40, 42, 43, 45, 50, 62, 67, 70, 77, 86, 98,
+    1, 9, 11, 13, 26, 28, 29, 33, 40, 42, 43, 45, 50, 62, 67, 70, 77, 86, 98,
 ];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -76,6 +76,10 @@ pub struct ServerConfig {
     pub admin_pubkey: String,
     pub require_auth: bool,
     pub send_auth_challenge: bool,
+    /// Expose Prometheus metrics on `GET /metrics` (text format). Served on
+    /// the API host when one is configured; without `api_host` the metrics
+    /// are public on every host.
+    pub metrics_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -174,6 +178,13 @@ pub struct DaemonConfig {
     pub log_file: PathBuf,
     pub stats_file: PathBuf,
     pub stats_interval_secs: u64,
+    /// Rotate the log file when it grows past this many bytes (0 disables
+    /// rotation). The old file is renamed to `.1` and older backups shift up
+    /// to `log_max_files` backups.
+    pub log_max_size_bytes: u64,
+    /// Number of rotated log backups to keep (each is the previous generation
+    /// of the log file).
+    pub log_max_files: u32,
 }
 
 impl Default for RelayConfig {
@@ -208,6 +219,7 @@ impl Default for ServerConfig {
             admin_pubkey: String::new(),
             require_auth: false,
             send_auth_challenge: true,
+            metrics_enabled: true,
         }
     }
 }
@@ -272,6 +284,8 @@ impl Default for DaemonConfig {
             log_file: PathBuf::from("./nostrd.log"),
             stats_file: PathBuf::from("./nostrd.stats.json"),
             stats_interval_secs: 5,
+            log_max_size_bytes: 50 * 1024 * 1024,
+            log_max_files: 5,
         }
     }
 }
@@ -353,6 +367,107 @@ impl Config {
             return self.relay.enabled_nips.contains(&num);
         }
         !self.relay.disabled_nips.contains(&num)
+    }
+
+    /// Validates the configuration values. Returns a clear error message for
+    /// the first problem found, so `nostrd check` and startup fail fast
+    /// instead of misbehaving at runtime with a typo'd key or an impossible
+    /// database layout.
+    pub fn validate(&self) -> Result<()> {
+        // Hex key format checks.
+        let hex32 = |value: &str, what: &str| -> Result<()> {
+            if value.is_empty() {
+                return Ok(());
+            }
+            match hex::decode(value) {
+                Ok(b) if b.len() == 32 => Ok(()),
+                _ => Err(Error::Config(format!(
+                    "{what} must be 64 hex characters (32 bytes), got {value:?}"
+                ))),
+            }
+        };
+        hex32(&self.relay.pubkey, "relay.pubkey")?;
+        hex32(&self.server.admin_pubkey, "server.admin_pubkey")?;
+        for pk in &self.access.blocked_pubkeys {
+            hex32(pk, "access.blocked_pubkeys")?;
+        }
+        for pk in &self.access.allowed_pubkeys {
+            hex32(pk, "access.allowed_pubkeys")?;
+        }
+
+        // Secret key: must be a valid secp256k1 secret key when set.
+        if !self.relay.private_key.is_empty() {
+            let bytes = hex::decode(&self.relay.private_key)
+                .map_err(|_| Error::Config("relay.private_key must be 64 hex characters".into()))?;
+            if bytes.len() != 32 {
+                return Err(Error::Config("relay.private_key must be 32 bytes".into()));
+            }
+            secp256k1::SecretKey::from_slice(&bytes).map_err(|_| {
+                Error::Config("relay.private_key is not a valid secp256k1 secret key".into())
+            })?;
+        }
+
+        // Ports.
+        if self.server.port == 0 {
+            return Err(Error::Config(
+                "server.port must be between 1 and 65535".into(),
+            ));
+        }
+        if self.server.management_port > 0 && self.server.management_port == self.server.port {
+            return Err(Error::Config(
+                "server.management_port must differ from server.port".into(),
+            ));
+        }
+
+        // Blocked IPs must parse as IP addresses.
+        for ip in &self.access.blocked_ips {
+            ip.parse::<std::net::IpAddr>().map_err(|_| {
+                Error::Config(format!(
+                    "access.blocked_ips contains an invalid IP address: {ip:?}"
+                ))
+            })?;
+        }
+
+        // Database layout.
+        if self.database.map_size > self.database.map_max_size {
+            return Err(Error::Config(
+                "database.map_size must not exceed database.map_max_size".into(),
+            ));
+        }
+
+        // NIP toggles: `enabled_nips` wins silently; surface the ambiguity.
+        if !self.relay.enabled_nips.is_empty() && !self.relay.disabled_nips.is_empty() {
+            log::warn!(
+                "relay.enabled_nips and relay.disabled_nips are both set; enabled_nips wins"
+            );
+        }
+
+        // Limits must be usable (zero would disable core functionality or
+        // make the queue fail fast on the first request).
+        let l = &self.limits;
+        let nonzero = [
+            ("limits.max_connections", l.max_connections),
+            ("limits.max_ws_message_size", l.max_ws_message_size),
+            ("limits.max_filters", l.max_filters),
+            ("limits.max_subscriptions", l.max_subscriptions),
+            ("limits.max_limit", l.max_limit),
+            ("limits.count_limit", l.count_limit),
+            ("limits.neg_max_items", l.neg_max_items),
+            ("limits.buffer_size", l.buffer_size),
+            ("limits.max_sub_bytes", l.max_sub_bytes),
+            ("limits.db_queue_msgs", l.db_queue_msgs),
+            ("limits.db_queue_events", l.db_queue_events),
+            ("limits.api_max_concurrent", l.api_max_concurrent),
+            ("limits.live_buffer", l.live_buffer),
+            ("limits.max_out_queue_bytes", l.max_out_queue_bytes),
+            ("limits.max_indexed_words", l.max_indexed_words),
+        ];
+        for (name, value) in nonzero {
+            if value == 0 {
+                return Err(Error::Config(format!("{name} must be at least 1 (got 0)")));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -441,5 +556,65 @@ mod tests {
         ac.blocked_kinds.push(5);
         assert!(!ac.allows_kind(5));
         assert!(ac.allows_kind(1));
+    }
+
+    #[test]
+    fn validation_accepts_defaults() {
+        assert!(Config::default().validate().is_ok());
+    }
+
+    #[test]
+    fn validation_rejects_bad_keys() {
+        let mut cfg = Config::default();
+        cfg.relay.pubkey = "zz".repeat(32);
+        assert!(cfg.validate().is_err(), "pubkey must be hex");
+        cfg.relay.pubkey = "aa".repeat(31); // 62 chars
+        assert!(cfg.validate().is_err(), "pubkey must be 32 bytes");
+        cfg.relay.private_key = "gg".repeat(32);
+        assert!(cfg.validate().is_err(), "secret key must be valid hex");
+        cfg.relay.private_key = "00".repeat(32); // 0 is not on the curve
+        assert!(
+            cfg.validate().is_err(),
+            "secret key must be on the secp256k1 curve"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_port_collision_and_map_layout() {
+        let mut cfg = Config::default();
+        cfg.server.port = 8080;
+        cfg.server.management_port = 8080;
+        assert!(
+            cfg.validate().is_err(),
+            "management_port must differ from port"
+        );
+        cfg.server.management_port = 0;
+
+        cfg.database.map_size = 1024 * 1024;
+        cfg.database.map_max_size = 512 * 1024;
+        assert!(
+            cfg.validate().is_err(),
+            "map_size must not exceed map_max_size"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_bad_access_entries() {
+        let mut cfg = Config::default();
+        cfg.access.blocked_pubkeys = vec!["not-hex".into()];
+        assert!(cfg.validate().is_err(), "blocked pubkeys must be hex");
+        cfg.access.blocked_pubkeys.clear();
+        cfg.access.blocked_ips = vec!["not-an-ip".into()];
+        assert!(cfg.validate().is_err(), "blocked IPs must parse");
+    }
+
+    #[test]
+    fn validation_rejects_zero_limits() {
+        let mut cfg = Config::default();
+        cfg.limits.max_connections = 0;
+        assert!(
+            cfg.validate().is_err(),
+            "max_connections must be at least 1"
+        );
     }
 }

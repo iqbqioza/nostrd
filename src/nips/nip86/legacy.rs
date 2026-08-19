@@ -145,6 +145,8 @@ async fn block_pubkey(
     if !access.blocked_pubkeys.iter().any(|p| p == &body.pubkey) {
         access.blocked_pubkeys.push(body.pubkey.clone());
     }
+    drop(access);
+    state.relay.persist_access().await;
     Json(json!({ "ok": true, "blocked_pubkey": body.pubkey })).into_response()
 }
 
@@ -158,6 +160,8 @@ async fn allow_pubkey(
     }
     let mut access = state.relay.access.write().await;
     access.blocked_pubkeys.retain(|p| p != &body.pubkey);
+    drop(access);
+    state.relay.persist_access().await;
     Json(json!({ "ok": true, "allowed_pubkey": body.pubkey })).into_response()
 }
 
@@ -173,6 +177,8 @@ async fn block_kind(
     if !access.blocked_kinds.contains(&body.kind) {
         access.blocked_kinds.push(body.kind);
     }
+    drop(access);
+    state.relay.persist_access().await;
     Json(json!({ "ok": true, "blocked_kind": body.kind })).into_response()
 }
 
@@ -186,6 +192,8 @@ async fn allow_kind(
     }
     let mut access = state.relay.access.write().await;
     access.blocked_kinds.retain(|k| k != &body.kind);
+    drop(access);
+    state.relay.persist_access().await;
     Json(json!({ "ok": true, "allowed_kind": body.kind })).into_response()
 }
 

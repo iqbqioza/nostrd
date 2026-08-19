@@ -109,22 +109,24 @@ pub async fn rpc_handler(
             if !is_pubkey(pubkey) {
                 return rpc_err("invalid pubkey");
             }
-            let mut access = relay.access.write().await;
-            if !access.blocked_pubkeys.iter().any(|p| p == pubkey) {
-                access.blocked_pubkeys.push(pubkey.to_string());
+            {
+                let mut access = relay.access.write().await;
+                if !access.blocked_pubkeys.iter().any(|p| p == pubkey) {
+                    access.blocked_pubkeys.push(pubkey.to_string());
+                }
             }
+            relay.persist_access().await;
             rpc_ok(json!(true))
         }
         "unbanpubkey" => {
             let Some(pubkey) = params.first().and_then(Value::as_str) else {
                 return rpc_err("invalid params");
             };
-            relay
-                .access
-                .write()
-                .await
-                .blocked_pubkeys
-                .retain(|p| p != pubkey);
+            {
+                let mut access = relay.access.write().await;
+                access.blocked_pubkeys.retain(|p| p != pubkey);
+            }
+            relay.persist_access().await;
             rpc_ok(json!(true))
         }
         "listbannedpubkeys" => {
@@ -143,22 +145,24 @@ pub async fn rpc_handler(
             if !is_pubkey(pubkey) {
                 return rpc_err("invalid pubkey");
             }
-            let mut access = relay.access.write().await;
-            if !access.allowed_pubkeys.iter().any(|p| p == pubkey) {
-                access.allowed_pubkeys.push(pubkey.to_string());
+            {
+                let mut access = relay.access.write().await;
+                if !access.allowed_pubkeys.iter().any(|p| p == pubkey) {
+                    access.allowed_pubkeys.push(pubkey.to_string());
+                }
             }
+            relay.persist_access().await;
             rpc_ok(json!(true))
         }
         "unallowpubkey" => {
             let Some(pubkey) = params.first().and_then(Value::as_str) else {
                 return rpc_err("invalid params");
             };
-            relay
-                .access
-                .write()
-                .await
-                .allowed_pubkeys
-                .retain(|p| p != pubkey);
+            {
+                let mut access = relay.access.write().await;
+                access.allowed_pubkeys.retain(|p| p != pubkey);
+            }
+            relay.persist_access().await;
             rpc_ok(json!(true))
         }
         "listallowedpubkeys" => {
@@ -174,20 +178,26 @@ pub async fn rpc_handler(
             let Some(kind) = params.first().and_then(Value::as_u64) else {
                 return rpc_err("invalid params");
             };
-            let mut access = relay.access.write().await;
-            if !access.allowed_kinds.contains(&kind) {
-                access.allowed_kinds.push(kind);
+            {
+                let mut access = relay.access.write().await;
+                if !access.allowed_kinds.contains(&kind) {
+                    access.allowed_kinds.push(kind);
+                }
             }
+            relay.persist_access().await;
             rpc_ok(json!(true))
         }
         "disallowkind" => {
             let Some(kind) = params.first().and_then(Value::as_u64) else {
                 return rpc_err("invalid params");
             };
-            let mut access = relay.access.write().await;
-            if !access.blocked_kinds.contains(&kind) {
-                access.blocked_kinds.push(kind);
+            {
+                let mut access = relay.access.write().await;
+                if !access.blocked_kinds.contains(&kind) {
+                    access.blocked_kinds.push(kind);
+                }
             }
+            relay.persist_access().await;
             rpc_ok(json!(true))
         }
         "listallowedkinds" => {
@@ -286,17 +296,24 @@ pub async fn rpc_handler(
             if ip.parse::<std::net::IpAddr>().is_err() {
                 return rpc_err("invalid ip address");
             }
-            let mut access = relay.access.write().await;
-            if !access.blocked_ips.iter().any(|i| i == ip) {
-                access.blocked_ips.push(ip.to_string());
+            {
+                let mut access = relay.access.write().await;
+                if !access.blocked_ips.iter().any(|i| i == ip) {
+                    access.blocked_ips.push(ip.to_string());
+                }
             }
+            relay.persist_access().await;
             rpc_ok(json!(true))
         }
         "unblockip" => {
             let Some(ip) = params.first().and_then(Value::as_str) else {
                 return rpc_err("invalid params");
             };
-            relay.access.write().await.blocked_ips.retain(|i| i != ip);
+            {
+                let mut access = relay.access.write().await;
+                access.blocked_ips.retain(|i| i != ip);
+            }
+            relay.persist_access().await;
             rpc_ok(json!(true))
         }
         "listblockedips" => {

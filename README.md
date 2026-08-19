@@ -93,7 +93,7 @@ Only `GET` is supported; WebSocket upgrade requests to `/api/v1` are rejected wi
 
 All commands accept `--config <path>` (default `./nostrd.toml`).
 
-Sending `SIGHUP` to the daemon reloads the configuration at runtime (limits and server settings apply immediately — including the REST API concurrency ceiling — and the NIP-40 toggle is applied live too).
+Sending `SIGHUP` to the daemon reloads the configuration at runtime (limits and server settings apply immediately — including the REST API concurrency ceiling — and the NIP-40 toggle is applied live too). The access control lists are runtime-managed (NIP-86) and are **not** overwritten by a reload.
 
 ## Configuration
 
@@ -119,6 +119,7 @@ api_host = ""                   # hostname dedicated to the REST API; empty =
                                 # API served on every host, next to WebSocket
 management_token = ""           # bearer token for the NIP-86 management API
 admin_pubkey = ""               # or authorize NIP-86 calls with a NIP-98 event
+metrics_enabled = true          # serve Prometheus metrics on GET /metrics
 
 [limits]
 max_connections = 10000
@@ -154,11 +155,13 @@ pid_file = "./nostrd.pid"
 log_file = "./nostrd.log"
 stats_file = "./nostrd.stats.json"
 stats_interval_secs = 5         # interval between stats file writes
+log_max_size_bytes = 52428800   # rotate the log file when it grows past this size (0 = never)
+log_max_files = 5               # rotated log backups to keep
 
 [access]
-blocked_pubkeys = []
-allowed_pubkeys = []            # non-empty = allowlist
-blocked_kinds = []
+blocked_pubkeys = []            # NIP-86 runtime bans/allowlists are persisted in
+allowed_pubkeys = []            # the database and survive restarts; this section
+blocked_kinds = []              # seeds them on the very first run only
 blocked_ips = []
 ```
 
@@ -173,6 +176,7 @@ All relay-side NIPs are implemented; client-side NIPs are stored and served as p
 | [11](https://github.com/nostr-protocol/nips/blob/master/11.md) | Relay information document |
 | [13](https://github.com/nostr-protocol/nips/blob/master/13.md) | Proof of work |
 | [26](https://github.com/nostr-protocol/nips/blob/master/26.md) | Delegated event signing |
+| [28](https://github.com/nostr-protocol/nips/blob/master/28.md) | Public chat (channel messages are served via the `#e` index) |
 | [29](https://github.com/nostr-protocol/nips/blob/master/29.md) | Relay-based groups (moderation events, relay-signed metadata, subgroups, invite codes, LiveKit rooms) |
 | [33](https://github.com/nostr-protocol/nips/blob/master/33.md) | Parameterized replaceable events |
 | [40](https://github.com/nostr-protocol/nips/blob/master/40.md) | Expiration timestamp |

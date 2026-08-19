@@ -155,6 +155,17 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             let _ = reply.send(banned);
             false
         }
+        Msg::LoadAccess { reply } => {
+            let access = match store.load_access() {
+                Ok(access) => access,
+                Err(e) => {
+                    db_error(errors, &e);
+                    None
+                }
+            };
+            let _ = reply.send(access);
+            false
+        }
         Msg::DatabaseSize { reply } => {
             let _ = reply.send(store.size_on_disk());
             false
@@ -489,6 +500,12 @@ pub(crate) fn spawn(
                                     };
                                     let _ = reply.send(banned);
                                 }
+                                Msg::SaveAccess { access, reply } => {
+                                    if let Err(e) = store.save_access(&access) {
+                                        db_error(&thread_errors, &e);
+                                    }
+                                    let _ = reply.send(());
+                                }
                                 Msg::PurgeExpired { now, reply } => {
                                     let n = match store.purge_expired(now) {
                                         Ok(n) => n,
@@ -534,7 +551,10 @@ pub(crate) fn spawn(
                                     }
                                     let _ = reply.send(out);
                                 }
-                                Msg::PutBatch { .. } | Msg::Put { .. } | Msg::Shutdown => {
+                                Msg::PutBatch { .. }
+                                | Msg::Put { .. }
+                                | Msg::Shutdown
+                                | Msg::LoadAccess { .. } => {
                                     unreachable!()
                                 }
                             }

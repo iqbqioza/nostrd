@@ -29,6 +29,7 @@ pub(crate) const REPLACEABLE: &str = "replaceable";
 pub(crate) const VANISH: &str = "vanish";
 pub(crate) const BANNED: &str = "banned";
 pub(crate) const FIRST_SEEN: &str = "first_seen";
+pub(crate) const ACCESS: &str = "access";
 pub(crate) const CREATED_LEN: usize = 8;
 pub(crate) const ID_LEN: usize = 32;
 pub(crate) const TAG_VALUE_MAX: usize = 1024;
@@ -190,6 +191,9 @@ pub(crate) struct Store {
     pub(crate) banned: Database<Bytes, Bytes>,
     /// pubkey (32 bytes) -> unix timestamp of the first accepted event.
     pub(crate) first_seen: Database<Bytes, Bytes>,
+    /// Serialized access control lists (NIP-86 runtime bans/allowlists), kept
+    /// under a single fixed key so they survive restarts.
+    pub(crate) access: Database<Bytes, Bytes>,
     /// NIP-40 expiration handling is only active when the NIP is enabled.
     /// Shared with the relay so that a config reload can toggle it at runtime.
     pub(crate) expiry_enabled: Arc<std::sync::atomic::AtomicBool>,
@@ -255,6 +259,7 @@ impl Store {
         let vanish = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(VANISH))?;
         let banned = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(BANNED))?;
         let first_seen = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(FIRST_SEEN))?;
+        let access = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(ACCESS))?;
         wtxn.commit()?;
 
         Ok(Store {
@@ -271,6 +276,7 @@ impl Store {
             vanish,
             banned,
             first_seen,
+            access,
             expiry_enabled,
             max_indexed_words: max_indexed_words.max(1),
             map_max_size,
@@ -334,10 +340,31 @@ impl Store {
             vanish: self.vanish,
             banned: self.banned,
             first_seen: self.first_seen,
+            access: self.access,
             expiry_enabled: Arc::clone(&self.expiry_enabled),
             max_indexed_words: self.max_indexed_words,
             map_max_size: self.map_max_size,
         }
+    }
+
+    /// Persists the access control lists under a single fixed key. The
+    /// whole `AccessControl` is serialized as JSON so NIP-86 mutations
+    /// survive restarts.
+    pub(crate) fn save_access(&self, access: &crate::config::AccessControl) -> Result<()> {
+        let data = serde_json::to_vec(access)?;
+        let mut wtxn = self.env.write_txn()?;
+        self.access.put(&mut wtxn, b"access", &data)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Loads the persisted access control lists, if any.
+    pub(crate) fn load_access(&self) -> Result<Option<crate::config::AccessControl>> {
+        let rtxn = self.env.read_txn()?;
+        let Some(raw) = self.access.get(&rtxn, b"access")? else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_slice(raw)?))
     }
 }
 

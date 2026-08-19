@@ -9,6 +9,7 @@ mod db;
 mod error;
 mod event;
 mod filter;
+mod logging;
 mod nips;
 mod relay;
 mod server;
@@ -26,7 +27,7 @@ fn main() {
     std::panic::set_hook(Box::new(|info| {
         log::error!("panic: {info}");
     }));
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    crate::logging::init();
 
     let mut cli = Cli::parse();
     if let Err(e) = cli.prepare() {

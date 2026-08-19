@@ -149,6 +149,15 @@ enum Msg {
     ListBanned {
         reply: oneshot::Sender<Vec<(String, String)>>,
     },
+    /// Persists the access control lists (NIP-86 runtime bans/allowlists).
+    SaveAccess {
+        access: crate::config::AccessControl,
+        reply: oneshot::Sender<()>,
+    },
+    /// Loads the persisted access control lists.
+    LoadAccess {
+        reply: oneshot::Sender<Option<crate::config::AccessControl>>,
+    },
     PurgeExpired {
         now: u64,
         reply: oneshot::Sender<usize>,
@@ -505,6 +514,18 @@ impl DbClient {
 
     pub async fn list_banned_events(&self) -> Vec<(String, String)> {
         self.request_read(|reply| Msg::ListBanned { reply }).await
+    }
+
+    /// Persists the access control lists (NIP-86 runtime bans/allowlists).
+    pub async fn save_access(&self, access: crate::config::AccessControl) {
+        let _ = self
+            .request(|reply| Msg::SaveAccess { access, reply })
+            .await;
+    }
+
+    /// Loads the persisted access control lists, if any.
+    pub async fn load_access(&self) -> Option<crate::config::AccessControl> {
+        self.request_read(|reply| Msg::LoadAccess { reply }).await
     }
 
     /// The created_at of the stored version of a replaceable/addressable

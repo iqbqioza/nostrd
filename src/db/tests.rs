@@ -521,6 +521,98 @@ fn ids_filter_checks_every_id_regardless_of_limit() {
 }
 
 #[test]
+fn nip28_channel_queries_use_e_tag_index() {
+    // NIP-28 channel messages reference their channel with an `e` tag; the
+    // generic tag index must serve `{"#e": [channel_id]}` queries.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // The channel itself (kind 40) and its messages (kind 42).
+        let channel = event(
+            40,
+            "channel about",
+            now,
+            vec![vec!["name".into(), "nostrd".into()]],
+        );
+        assert_eq!(db.put(channel.clone(), now).await, PutOutcome::Stored);
+        for i in 0..3 {
+            let msg = event(
+                42,
+                &format!("message {i}"),
+                now - i as u64,
+                vec![vec!["e".into(), channel.id.clone()]],
+            );
+            assert_eq!(db.put(msg.clone(), now).await, PutOutcome::Stored);
+        }
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"kinds": [42], "#e": [channel.id]})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 3, "channel messages must be served via #e");
+        // Messages referencing another channel are not returned.
+        let other: Filter =
+            serde_json::from_value(serde_json::json!({"#e": ["ff".repeat(32)]})).unwrap();
+        let (res, _) = db.query(vec![other], 500, now).await;
+        assert!(res.is_empty());
+    });
+}
+
+#[test]
+fn access_control_persists_across_reopen() {
+    // NIP-86 runtime bans/allowlists survive restarts: the access control is
+    // stored in the database and restored when the database is reopened.
+    let cfg = config();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        {
+            let db = DbClient::open(
+                &cfg,
+                true,
+                Arc::new(Default::default()),
+                0,
+                128,
+                4096,
+                262144,
+            )
+            .unwrap();
+            let mut access = crate::config::AccessControl::default();
+            access.blocked_pubkeys.push("aa".repeat(32));
+            access.allowed_kinds.push(5);
+            access.blocked_ips.push("203.0.113.9".into());
+            db.save_access(access.clone()).await;
+            let loaded = db.load_access().await.expect("persisted access loads");
+            assert_eq!(loaded.blocked_pubkeys, access.blocked_pubkeys);
+            assert_eq!(loaded.allowed_kinds, access.allowed_kinds);
+            assert_eq!(loaded.blocked_ips, access.blocked_ips);
+        }
+        // Reopen the same database: the state is restored.
+        let db = DbClient::open(
+            &cfg,
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
+        let loaded = db.load_access().await.expect("persisted access loads");
+        assert_eq!(loaded.blocked_pubkeys, vec!["aa".repeat(32)]);
+        assert_eq!(loaded.allowed_kinds, vec![5]);
+        assert_eq!(loaded.blocked_ips, vec![String::from("203.0.113.9")]);
+    });
+}
+
+#[test]
 
 // ----- trust period and expiry toggling -----
 fn first_seen_trust_period() {

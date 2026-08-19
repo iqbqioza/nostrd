@@ -114,6 +114,11 @@ require_auth = false
 # Send the NIP-42 AUTH challenge to every new connection.
 send_auth_challenge = true
 
+# Expose Prometheus metrics on GET /metrics (text format). Served on the API
+# host when one is configured; without api_host the metrics are public on
+# every host (point a monitoring system at it, or set this to false).
+metrics_enabled = true
+
 # -----------------------------------------------------------------------------
 # Limits (anti-abuse and resource bounds)
 # -----------------------------------------------------------------------------
@@ -282,11 +287,19 @@ stats_file = "./nostrd.stats.json"
 # Interval in seconds between statistics file writes.
 stats_interval_secs = 5
 
+# Rotate the log file when it grows past this many bytes (0 disables
+# rotation). The current file is renamed to .1 and older backups shift up.
+log_max_size_bytes = 52428800
+
+# Number of rotated log backups to keep.
+log_max_files = 5
+
 # -----------------------------------------------------------------------------
-# Access control (seeded from this file at startup). NIP-86 management calls
-# (banpubkey, allowkind, blockip, ...) mutate these lists at runtime, but the
-# runtime changes are in-memory only and are lost on restart: put persistent
-# rules here.
+# Access control (seeded from this file on the very first run). NIP-86
+# management calls (banpubkey, allowkind, blockip, ...) mutate these lists at
+# runtime, and the runtime state is persisted in the database so it survives
+# restarts; this section only seeds the initial state when no runtime state
+# exists yet. A SIGHUP reload does not overwrite the runtime lists.
 # -----------------------------------------------------------------------------
 [access]
 # Pubkeys whose events are rejected ("blocked: pubkey not allowed").
