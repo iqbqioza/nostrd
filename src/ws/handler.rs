@@ -363,6 +363,14 @@ impl super::Conn {
             self.send_closed(sub_id, "invalid: too many ids or authors in a filter");
             return;
         }
+        // Cap the filter count like REQ: without it each filter would get its
+        // own full scan budget, so a single 1 MiB COUNT frame could drive
+        // ~28k filters × 200k candidate examinations on the shared reader
+        // thread (~1400x the full-scan budget).
+        if filters.len() > self.relay.config.read().await.limits.max_filters {
+            self.send_closed(sub_id, "invalid: too many filters");
+            return;
+        }
         let count_limit = self.relay.config.read().await.limits.count_limit;
         let (events, more) = self
             .relay

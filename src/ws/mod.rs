@@ -225,12 +225,15 @@ pub async fn handle_connection(
     // operator enables the idle timeout the relay closes them, sending a
     // periodic PING so an alive-but-silent subscriber (which auto-responds
     // with a PONG, itself an inbound frame) stays connected while dead peers
-    // are reaped.
+    // are reaped. The deadline is measured from the *last inbound frame*, not
+    // from the loop restart, so the keep-alive PING and live deliveries never
+    // reset it (otherwise dead peers would never be reaped).
     let idle: Option<Duration> = if idle_timeout > 0 {
         Some(Duration::from_secs(idle_timeout))
     } else {
         None
     };
+    let mut last_activity = std::time::Instant::now();
     let mut ping: Option<tokio::time::Interval> = idle.map(|d| {
         let mut interval = tokio::time::interval(Duration::from_secs((d.as_secs() / 3).max(5)));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -294,10 +297,17 @@ pub async fn handle_connection(
         };
         let incoming_fut = async {
             match idle {
-                Some(d) => match tokio::time::timeout(d, receiver.next()).await {
-                    Ok(x) => Ok(x),
-                    Err(_) => Err(()),
-                },
+                Some(d) => {
+                    // Remaining time until the idle deadline, measured from the
+                    // last inbound frame (only the incoming branch updates
+                    // `last_activity`, so pings/live batches cannot mask a dead
+                    // peer).
+                    let remaining = d.saturating_sub(last_activity.elapsed());
+                    match tokio::time::timeout(remaining, receiver.next()).await {
+                        Ok(x) => Ok(x),
+                        Err(_) => Err(()),
+                    }
+                }
                 None => Ok(receiver.next().await),
             }
         };
@@ -309,6 +319,7 @@ pub async fn handle_connection(
                     Ok(Some(Ok(Message::Close(_)))) | Ok(None) => break,
                     Ok(Some(Err(_))) => break,
                     Ok(Some(Ok(frame))) => {
+                        last_activity = std::time::Instant::now();
                         if conn.handle_frame(frame, max_msg_size).await {
                             break;
                         }
@@ -335,6 +346,7 @@ pub async fn handle_connection(
                     else {
                         break;
                     };
+                    last_activity = std::time::Instant::now();
                     if conn.handle_frame(frame, max_msg_size).await {
                         too_large = true;
                         break;
