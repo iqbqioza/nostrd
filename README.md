@@ -93,7 +93,7 @@ Only `GET` is supported; WebSocket upgrade requests to `/api/v1` are rejected wi
 
 All commands accept `--config <path>` (default `./nostrd.toml`).
 
-Sending `SIGHUP` to the daemon reloads the configuration at runtime (limits and server settings apply immediately; the NIP-40 toggle is applied live too).
+Sending `SIGHUP` to the daemon reloads the configuration at runtime (limits and server settings apply immediately — including the REST API concurrency ceiling — and the NIP-40 toggle is applied live too).
 
 ## Configuration
 
@@ -140,10 +140,12 @@ api_max_search_bytes = 1024     # REST API: ceiling for the `search` parameter (
 
 [database]
 path = "./data"
-map_size = 1073741824           # initial LMDB memory map (virtual address space)
-map_max_size = 1099511627776    # map ceiling (sparse file: only written pages
-                                # consume physical memory or disk). The map is
-                                # opened at this size and never resized at runtime
+map_size = 1073741824           # memory map floor (bytes). The map is a sparse
+                                # virtual-address reservation opened at the
+                                # ceiling (map_max_size), so physical memory and
+                                # disk grow only with the data actually stored
+map_max_size = 1099511627776    # map ceiling (bytes); the map is opened at this
+                                # size once and never resized at runtime
 search_index = true             # NIP-50 word index
 purge_interval_secs = 300       # NIP-40 expired-event purge interval
 
@@ -151,6 +153,7 @@ purge_interval_secs = 300       # NIP-40 expired-event purge interval
 pid_file = "./nostrd.pid"
 log_file = "./nostrd.log"
 stats_file = "./nostrd.stats.json"
+stats_interval_secs = 5         # interval between stats file writes
 
 [access]
 blocked_pubkeys = []
@@ -176,7 +179,7 @@ All relay-side NIPs are implemented; client-side NIPs are stored and served as p
 | [42](https://github.com/nostr-protocol/nips/blob/master/42.md) | Client authentication (AUTH) |
 | [43](https://github.com/nostr-protocol/nips/blob/master/43.md) | Relay access metadata and requests (roles, membership lists, join/leave) |
 | [45](https://github.com/nostr-protocol/nips/blob/master/45.md) | Counting results (COUNT, with HyperLogLog registers) |
-| [50](https://github.com/nostr-protocol/nips/blob/master/50.md) | Search capability (relevance-ordered) |
+| [50](https://github.com/nostr-protocol/nips/blob/master/50.md) | Search capability (relevance-ordered by IDF-weighted terms) |
 | [59](https://github.com/nostr-protocol/nips/blob/master/59.md) | Gift wrap (recipient-only serving, NIP-09/62 linked deletion) |
 | [62](https://github.com/nostr-protocol/nips/blob/master/62.md) | Request to vanish |
 | [67](https://github.com/nostr-protocol/nips/blob/master/67.md) | EOSE completeness hint (`finish`/`more`) |

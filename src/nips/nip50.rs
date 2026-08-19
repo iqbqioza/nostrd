@@ -2,8 +2,12 @@
 //!
 //! Filters may carry a `search` string. The relay maintains a word index of
 //! event content: an event matches when at least one query term appears in
-//! its content, and the results are ordered by how many terms match
-//! (relevance), with the `limit` applied after that ordering.
+//! its content, and the results are ordered by relevance — each term is
+//! weighted by its inverse document frequency (`1 / (1 + ln df)`, estimated
+//! from the word index), so rarer terms dominate the ranking — with the
+//! `limit` applied after that ordering. The number of query terms used is
+//! capped (see `SEARCH_MAX_TERMS` in the scan engine) so a pathological
+//! search string cannot fan out into hundreds of index ranges.
 
 /// Tokenizes text into lowercase alphanumeric words of length >= 2.
 pub fn tokenize(text: &str) -> Vec<String> {

@@ -66,6 +66,17 @@ struct Collect<'a, C: ScanCollector> {
 const SEARCH_BUDGET_MULTIPLIER: usize = 8;
 const SEARCH_BUDGET_MAX: usize = 100_000;
 
+/// Upper bound on the number of query terms used for a search: the word
+/// index walk and the relevance ranking both stop here, so a pathological
+/// query (e.g. a 1000-byte search string) cannot fan out into hundreds of
+/// index ranges.
+const SEARCH_MAX_TERMS: usize = 32;
+
+/// How many word-index keys are counted per term to estimate its document
+/// frequency for the IDF weight: beyond this the term is "common" and its
+/// weight is negligible, so the count stops early to keep search instant.
+const DF_SAMPLE: u64 = 4096;
+
 /// Upper bound on the number of index candidates examined by one scan pass
 /// before it gives up. A filter matching nothing (e.g. a popular `#p` value
 /// combined with an impossible kind) would otherwise walk the whole range
@@ -102,9 +113,10 @@ trait ScanCollector {
     /// Sorts the collected records oldest first, lowest id first on equal
     /// timestamps (ascending variant of the NIP-01 ordering).
     fn sort_asc(&mut self);
-    /// Sorts by NIP-50 search relevance (most matching terms first), then
-    /// by the NIP-01 ordering.
-    fn sort_relevance(&mut self, terms: &[String]);
+    /// Sorts by NIP-50 search relevance (most matching terms first, weighted
+    /// by the inverse document frequency of each term), then by the NIP-01
+    /// ordering.
+    fn sort_relevance(&mut self, terms: &[String], weights: &[f64]);
     /// Keeps only the first `take` records.
     fn truncate_to(&mut self, take: usize);
 }
@@ -132,13 +144,17 @@ impl EventCollector {
     }
 }
 
-/// How many of `terms` appear in the event's content (NIP-50 relevance).
-fn relevance(event: &Event, terms: &[String]) -> usize {
+/// The NIP-50 relevance score of an event: the sum of the weights of the
+/// query terms present in its content. Weights are the inverse document
+/// frequency of each term (`1 / (1 + ln df)`), so rarer terms dominate.
+fn score(event: &Event, terms: &[String], weights: &[f64]) -> f64 {
     let content = event.content.to_lowercase();
     terms
         .iter()
-        .filter(|t| content.contains(t.as_str()))
-        .count()
+        .zip(weights)
+        .filter(|(t, _)| content.contains(t.as_str()))
+        .map(|(_, w)| w)
+        .sum()
 }
 
 impl ScanCollector for EventCollector {
@@ -183,10 +199,11 @@ impl ScanCollector for EventCollector {
                 .then_with(|| a.id.cmp(&b.id))
         });
     }
-    fn sort_relevance(&mut self, terms: &[String]) {
+    fn sort_relevance(&mut self, terms: &[String], weights: &[f64]) {
         self.events.sort_by(|a, b| {
-            relevance(b, terms)
-                .cmp(&relevance(a, terms))
+            score(b, terms, weights)
+                .partial_cmp(&score(a, terms, weights))
+                .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| b.created_at.cmp(&a.created_at))
                 .then_with(|| a.id.cmp(&b.id))
         });
@@ -273,10 +290,10 @@ impl ScanCollector for ItemCollector {
         self.items
             .sort_by(|a, b| a.created.cmp(&b.created).then_with(|| a.id.cmp(&b.id)));
     }
-    fn sort_relevance(&mut self, terms: &[String]) {
+    fn sort_relevance(&mut self, terms: &[String], weights: &[f64]) {
         // Negentropy items are re-sorted by the protocol anyway; keep the
         // relevance path a no-op for the same ordering as sort_key.
-        let _ = terms;
+        let _ = (terms, weights);
         self.sort_key();
     }
     fn truncate_to(&mut self, take: usize) {
@@ -293,6 +310,48 @@ pub(crate) enum ScanKind {
 }
 
 impl Store {
+    /// Estimates the inverse document frequency weight of each search term
+    /// from the word index: a term's document frequency is the number of
+    /// keys in its index range (each event contributes exactly one key per
+    /// unique word), counted up to [`DF_SAMPLE`]. Rarer terms get a higher
+    /// weight, so a query like "nostr bitcoin" ranks an event about both
+    /// topics above one that merely mentions the common word "nostr".
+    /// Without the word index every term is weighted equally.
+    fn term_weights(&self, rtxn: &RoTxn, terms: &[String]) -> Vec<f64> {
+        let Some(by_word) = self.by_word else {
+            return vec![1.0; terms.len()];
+        };
+        terms
+            .iter()
+            .map(|term| {
+                let mut start = term.as_bytes().to_vec();
+                start.push(0x00);
+                let mut end = term.as_bytes().to_vec();
+                end.push(0x01);
+                let range = (
+                    std::ops::Bound::Included(start.as_slice()),
+                    std::ops::Bound::Excluded(end.as_slice()),
+                );
+                let mut df = 0u64;
+                if let Ok(iter) = by_word.range(rtxn, &range) {
+                    for item in iter {
+                        match item {
+                            Ok(_) => {
+                                df += 1;
+                                if df >= DF_SAMPLE {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+                let df = df.max(1) as f64;
+                1.0 / (1.0 + df.ln())
+            })
+            .collect()
+    }
+
     /// Collects events that match the filters, most recent first.
     pub(crate) fn scan(
         &self,
@@ -401,9 +460,18 @@ impl Store {
             };
             let terms = if has_search {
                 let terms = nip50::terms(filter.search.as_deref().unwrap_or(""));
+                // Cap the terms used for the index walk and the ranking: a
+                // pathological search string must not fan out into hundreds
+                // of index ranges. Events matching only the truncated terms
+                // are not candidates; the most common terms (last, in
+                // token order) are dropped first.
+                let terms: Vec<String> = terms.into_iter().take(SEARCH_MAX_TERMS).collect();
                 for t in &terms {
                     if !all_terms.contains(t) {
                         all_terms.push(t.clone());
+                        if all_terms.len() >= SEARCH_MAX_TERMS {
+                            break;
+                        }
                     }
                 }
                 if let Some(l) = filter.limit {
@@ -432,10 +500,11 @@ impl Store {
         }
         if !count_mode {
             if sort_search && !all_terms.is_empty() {
-                // NIP-50: results are ordered by search relevance (how many
-                // of the query's terms the content matches), not by
+                // NIP-50: results are ordered by search relevance (weighted
+                // by each term's inverse document frequency), not by
                 // created_at, and the limit is applied after that ordering.
-                out.sort_relevance(&all_terms);
+                let weights = self.term_weights(&rtxn, &all_terms);
+                out.sort_relevance(&all_terms, &weights);
                 let take = search_take.min(max_limit);
                 if out.len() > take {
                     more = true;
@@ -472,7 +541,6 @@ impl Store {
         } = *scan;
         let seen = &mut *collect.seen;
         let out = &mut *collect.out;
-        let cap = out.cap();
         let mut examined = 0usize;
         let ctx = ScanContext {
             events: self.events,
@@ -499,7 +567,11 @@ impl Store {
         };
 
         if let Some(ids) = &filter.ids {
-            for id in ids.iter().take(cap) {
+            // Every id is checked (each maps to at most one event): the
+            // collection limit only bounds the results, not the number of
+            // ids examined, so `{"ids": [A, B], "limit": 1}` must still find
+            // B when A does not exist. The work budget bounds the walk.
+            for id in ids {
                 if let Ok(id) = hex::decode(id)
                     && !consider(&id)?
                 {

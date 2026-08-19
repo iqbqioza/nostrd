@@ -483,6 +483,44 @@ fn map_grows_beyond_initial_size() {
 }
 
 #[test]
+fn ids_filter_checks_every_id_regardless_of_limit() {
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let e1 = event(1, "first", now, vec![]);
+        let e2 = event(1, "second", now - 1, vec![]);
+        assert_eq!(db.put(e1.clone(), now).await, PutOutcome::Stored);
+        assert_eq!(db.put(e2.clone(), now).await, PutOutcome::Stored);
+        // With `limit: 1` the scan must still look past the first id: if
+        // the first id does not exist but a later one does, it is found.
+        let missing = "00".repeat(32);
+        let f: Filter = serde_json::from_value(serde_json::json!({
+            "ids": [missing, e2.id],
+            "limit": 1
+        }))
+        .unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 1, "the existing id must be found");
+        assert_eq!(res[0].id, e2.id);
+        // Without a limit every id is checked too.
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({ "ids": [e1.id, e2.id] })).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 2);
+    });
+}
+
+#[test]
 
 // ----- trust period and expiry toggling -----
 fn first_seen_trust_period() {
@@ -688,6 +726,40 @@ fn search_results_are_relevance_ordered() {
         assert_eq!(res[1].id, one.id, "partial matches rank below");
         assert!(!more, "both matches were delivered");
         assert!(!res.iter().any(|e| e.id == none.id));
+    });
+}
+
+#[test]
+fn search_ranks_rare_terms_higher() {
+    // NIP-50 with IDF weighting: a note matching the rarer term ranks above
+    // a newer note matching only the common term.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // "zebra" is rare (only the first note has it); "meetup" is common.
+        let rare = event(1, "zebra meetup notes", now - 50, vec![]);
+        let common = event(1, "meetup reminder", now, vec![]);
+        assert_eq!(db.put(rare.clone(), now).await, PutOutcome::Stored);
+        assert_eq!(db.put(common.clone(), now).await, PutOutcome::Stored);
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"search": "zebra meetup"})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 2);
+        assert_eq!(
+            res[0].id, rare.id,
+            "the rare-term match ranks first despite being older"
+        );
+        assert_eq!(res[1].id, common.id);
     });
 }
 
