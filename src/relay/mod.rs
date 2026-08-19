@@ -629,12 +629,17 @@ impl Relay {
         );
 
         if event.kind == 9005 {
-            // Group moderation delete-event: admins may delete any event.
-            let removed = self
-                .db
-                .apply_deletion(nip29::delete_targets(event), vec![], None, u64::MAX)
-                .await;
-            self.stats.bump(&self.stats.events_deleted, removed as u64);
+            // Group moderation delete-event: admins may delete events, but
+            // only within their own group — an admin of one group must not
+            // be able to delete another group's content (or the relay's
+            // metadata) by referencing its id.
+            if let Some(gid) = nip29::group_id(event) {
+                let removed = self
+                    .db
+                    .apply_group_deletion(nip29::delete_targets(event), gid.to_string())
+                    .await;
+                self.stats.bump(&self.stats.events_deleted, removed as u64);
+            }
         }
 
         for mut ev in generated {

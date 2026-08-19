@@ -491,12 +491,31 @@ impl GroupStore {
         let (mut events, _) = db.query_full(vec![filter], 1_000_000, unix_now()).await;
         // Chronological order (the scan is per-kind, not globally ordered) so
         // that later events win. Within the same second the kind is used as a
-        // tie-breaker so that the group exists (9007) before member operations
-        // (9000/9001/9002) and joins/leaves (9021/9022) are applied to it.
-        events.sort_by(|a, b| (a.created_at, a.kind, &a.id).cmp(&(b.created_at, b.kind, &b.id)));
+        // tie-breaker: the group-establishing events apply first (9007 create,
+        // 9008 delete), then the member/settings operations (9000-9006,
+        // 9009-9010) which need the group to exist, and joins/leaves last.
+        events.sort_by(|a, b| {
+            (a.created_at, group_rank(a.kind), a.kind, &a.id).cmp(&(
+                b.created_at,
+                group_rank(b.kind),
+                b.kind,
+                &b.id,
+            ))
+        });
         for event in events {
             self.apply(&event, "", unix_now(), false);
         }
+    }
+}
+
+/// Replay order of group events within the same second: the create/delete
+/// establish the group before the member/settings operations, joins and
+/// leaves come last.
+fn group_rank(kind: u64) -> u8 {
+    match kind {
+        9007 | 9008 => 0,
+        9021 | 9022 => 2,
+        _ => 1,
     }
 }
 

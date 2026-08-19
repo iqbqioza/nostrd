@@ -17,12 +17,14 @@ impl Store {
     /// deleted events may be; `addresses` are NIP-09 `a` tags referencing
     /// addressable events, whose every version up to `request_created` is
     /// removed.
-    pub(crate) fn apply_deletion(
+    /// Like [`Self::apply_deletion_group`] with no group scope (NIP-09).
+    pub(crate) fn apply_deletion_group(
         &self,
         targets: &[String],
         addresses: &[nip09::Address],
         request_pubkey: Option<&str>,
         request_created: u64,
+        group: Option<&str>,
     ) -> Result<usize> {
         let mut wtxn = self.env.write_txn()?;
         let mut removed = 0usize;
@@ -50,6 +52,17 @@ impl Store {
             if let Some(pubkey) = request_pubkey
                 && event.pubkey != pubkey
                 && !delegated_by(&event, pubkey)
+            {
+                continue;
+            }
+            // NIP-29 9005 moderation: restrict to events of the admin's own
+            // group, so a group admin cannot delete another group's content
+            // (or the relay's metadata) by referencing its id.
+            if let Some(gid) = group
+                && crate::nips::nip29::group_id_any(&event)
+                    .map(str::to_string)
+                    .as_deref()
+                    != Some(gid)
             {
                 continue;
             }

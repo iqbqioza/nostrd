@@ -95,9 +95,11 @@ fn bech32_decode(input: &str) -> Result<(String, Vec<u8>, bool), Bech32Error> {
         return Err(Bech32Error::EmptyData);
     }
 
-    // Validate characters.
+    // Validate characters. BIP-173 requires ASCII only: a non-ASCII char
+    // must not be silently truncated to its low byte (which could pass the
+    // charset check as a look-alike).
     for ch in data_part.chars() {
-        if !CHARSET.contains(&(ch as u8)) {
+        if !ch.is_ascii() || !CHARSET.contains(&(ch as u8)) {
             return Err(Bech32Error::InvalidChar(ch));
         }
     }
@@ -430,6 +432,16 @@ mod tests {
     fn invalid_checksum() {
         let result = parse_nip19("npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkws3w8kt");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn rejects_non_ascii_lookalikes() {
+        let base = "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkws3w8ktc";
+        assert!(parse_nip19(base).is_ok());
+        // U+0138 (ĸ) has low byte 0x38 = '8': a truncating cast used to let
+        // it pass the charset check as a look-alike. BIP-173 requires ASCII.
+        let lookalike = base.replace('8', "\u{0138}");
+        assert!(parse_nip19(&lookalike).is_err());
     }
 
     #[test]

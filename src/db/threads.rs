@@ -408,13 +408,15 @@ pub(crate) fn spawn(
                                     addresses,
                                     request_pubkey,
                                     request_created,
+                                    group,
                                     reply,
                                 } => {
-                                    let n = match store.apply_deletion(
+                                    let n = match store.apply_deletion_group(
                                         &targets,
                                         &addresses,
                                         request_pubkey.as_deref(),
                                         request_created,
+                                        group.as_deref(),
                                     ) {
                                         Ok(n) => n,
                                         Err(e) => {

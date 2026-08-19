@@ -31,10 +31,15 @@ impl Filter {
     /// Performs an in-memory match (used for live events and final checks).
     pub fn matches(&self, ev: &Event) -> bool {
         if let Some(ids) = &self.ids {
-            // NIP-01: `ids` entries may be full ids or prefixes.
-            let matches = ids
-                .iter()
-                .any(|id| id == &ev.id || (id.len() < ev.id.len() && ev.id.starts_with(id)));
+            // NIP-01: `ids` entries may be full ids or prefixes. Only
+            // even-length, non-empty prefixes are matched, mirroring the
+            // historical scan (which decodes hex) so live and stored results
+            // agree; an empty or odd-length entry matches nothing.
+            let matches = ids.iter().any(|id| {
+                !id.is_empty()
+                    && id.len() % 2 == 0
+                    && (id == &ev.id || (id.len() < ev.id.len() && ev.id.starts_with(id)))
+            });
             if !matches {
                 return false;
             }
@@ -173,5 +178,24 @@ mod tests {
         // Empty search strings are ignored.
         let f: Filter = serde_json::from_value(serde_json::json!({"search": "  "})).unwrap();
         assert!(f.matches(&hit));
+    }
+
+    #[test]
+    fn ids_match_full_and_prefix() {
+        let e = ev(1, vec![]);
+        // Full id matches.
+        let f: Filter = serde_json::from_value(serde_json::json!({"ids": [e.id]})).unwrap();
+        assert!(f.matches(&e));
+        // Even-length prefix matches.
+        let f: Filter = serde_json::from_value(serde_json::json!({"ids": ["aa"]})).unwrap();
+        assert!(f.matches(&e));
+        // Odd-length and empty entries match nothing (consistent with the
+        // historical scan, which decodes hex).
+        let f: Filter = serde_json::from_value(serde_json::json!({"ids": ["a"]})).unwrap();
+        assert!(!f.matches(&e));
+        let f: Filter = serde_json::from_value(serde_json::json!({"ids": [""]})).unwrap();
+        assert!(!f.matches(&e));
+        let f: Filter = serde_json::from_value(serde_json::json!({"ids": ["bb"]})).unwrap();
+        assert!(!f.matches(&e));
     }
 }

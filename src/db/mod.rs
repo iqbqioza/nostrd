@@ -109,6 +109,8 @@ enum Msg {
         addresses: Vec<nip09::Address>,
         request_pubkey: Option<String>,
         request_created: u64,
+        /// NIP-29 9005 moderation: restrict deletion to events of this group.
+        group: Option<String>,
         reply: oneshot::Sender<usize>,
     },
     Vanish {
@@ -452,6 +454,22 @@ impl DbClient {
             addresses,
             request_pubkey,
             request_created,
+            group: None,
+            reply,
+        })
+        .await
+    }
+
+    /// NIP-29 `kind:9005`: deletes the `e`-tag targets but only when they
+    /// belong to `group`, so a group admin cannot delete another group's
+    /// events.
+    pub async fn apply_group_deletion(&self, targets: Vec<String>, group: String) -> usize {
+        self.request(|reply| Msg::Delete {
+            targets,
+            addresses: Vec::new(),
+            request_pubkey: None,
+            request_created: u64::MAX,
+            group: Some(group),
             reply,
         })
         .await

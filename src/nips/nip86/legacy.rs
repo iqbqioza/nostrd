@@ -80,10 +80,17 @@ async fn check_auth(
             .and_then(|v| v.strip_prefix("Nostr "))
             .ok_or_else(|| unauthorized("missing NIP-98 auth"))?;
         // NIP-98: the `u` tag must be the absolute request URL (host, path
-        // and query all match), matching the JSON-RPC path.
-        let url_ok = |tag: &str| {
-            nip98::matches_request_url(tag, &cfg.relay_identity(), uri.path(), uri.query())
-        };
+        // and query all match), matching the JSON-RPC path. The legacy
+        // management API is served on the *management* host:port, not the
+        // relay's main endpoint, so the authority is the management
+        // host:port (the relay `public_url` does not apply here).
+        let mgmt_identity = crate::nips::nip62::RelayIdentity::new(
+            &cfg.server.management_host,
+            cfg.server.management_port,
+            "",
+        );
+        let url_ok =
+            |tag: &str| nip98::matches_request_url(tag, &mgmt_identity, uri.path(), uri.query());
         if nip98::verify(
             auth,
             Some(&cfg.server.admin_pubkey),

@@ -682,6 +682,51 @@ fn ids_filter_supports_prefixes() {
 }
 
 #[test]
+fn group_deletion_is_scoped_to_the_group() {
+    // NIP-29 kind:9005 moderation deletion must only delete events of the
+    // admin's own group: an admin of one group cannot remove another
+    // group's events by referencing their ids.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let e1 = event(
+            9000,
+            "in group a",
+            now,
+            vec![vec!["h".into(), "group-a".into()]],
+        );
+        let e2 = event(
+            9000,
+            "in group b",
+            now,
+            vec![vec!["h".into(), "group-b".into()]],
+        );
+        assert_eq!(db.put(e1.clone(), now).await, PutOutcome::Stored);
+        assert_eq!(db.put(e2.clone(), now).await, PutOutcome::Stored);
+        let removed = db
+            .apply_group_deletion(vec![e1.id.clone(), e2.id.clone()], "group-a".into())
+            .await;
+        assert_eq!(removed, 1, "only the group-a event may be deleted");
+        let f: Filter = serde_json::from_value(serde_json::json!({"ids": [e1.id]})).unwrap();
+        let (res, _) = db.query(vec![f], 10, now).await;
+        assert!(res.is_empty(), "group-a event deleted");
+        let f: Filter = serde_json::from_value(serde_json::json!({"ids": [e2.id]})).unwrap();
+        let (res, _) = db.query(vec![f], 10, now).await;
+        assert_eq!(res.len(), 1, "group-b event must survive");
+    });
+}
+
+#[test]
 fn access_control_persists_across_reopen() {
     // NIP-86 runtime bans/allowlists survive restarts: the access control is
     // stored in the database and restored when the database is reopened.

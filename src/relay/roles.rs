@@ -120,6 +120,15 @@ impl super::Relay {
         }
         let removed = self.roles.write().await.delete(id);
         if removed {
+            // Publish a tombstone `kind:33534` so the deletion survives the
+            // restart rebuild (the rebuild skips `["deleted"]` tombstones);
+            // then republish the membership list without the deleted role.
+            let relay_pubkey = self.relay_pubkey().unwrap_or_default();
+            let event = {
+                let roles = self.roles.read().await;
+                roles.role_deletion_event(id, &relay_pubkey, unix_now())
+            };
+            self.publish_relay_event(event).await;
             self.publish_membership(None).await;
         }
         removed

@@ -276,3 +276,40 @@ fn private_groups_hide_from_non_members() {
         assert!(!store.visible_to(m, Some(&outsider)));
     }
 }
+
+#[test]
+fn rebuild_order_applies_create_before_member_ops() {
+    // Within the same second the create (9007) must be applied before member
+    // operations (9000) and joins (9021), or the member/join ops are dropped
+    // for a not-yet-existing group.
+    assert!(group_rank(9007) < group_rank(9000));
+    assert!(group_rank(9000) < group_rank(9021));
+    assert!(group_rank(9008) < group_rank(9022));
+
+    let mut events = vec![
+        event(9000, ADMIN, Some("g1"), vec![vec![P.into(), OTHER.into()]]),
+        event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        event(JOIN, OTHER, Some("g1"), vec![]),
+    ];
+    for e in &mut events {
+        e.created_at = 1_700_000_000;
+    }
+    events.sort_by(|a, b| {
+        (a.created_at, group_rank(a.kind), a.kind, &a.id).cmp(&(
+            b.created_at,
+            group_rank(b.kind),
+            b.kind,
+            &b.id,
+        ))
+    });
+    assert_eq!(events[0].kind, CREATE_GROUP, "create applies first");
+    assert_eq!(events[1].kind, 9000, "member op applies second");
+    assert_eq!(events[2].kind, JOIN, "join applies last");
+
+    let mut store = GroupStore::default();
+    for e in &events {
+        store.apply(e, "", 1, false);
+    }
+    let g = store.group("g1").unwrap();
+    assert!(g.is_member(OTHER), "the member op and join must both apply");
+}
