@@ -467,6 +467,63 @@ impl Config {
                 return Err(Error::Config(format!("{name} must be at least 1 (got 0)")));
             }
         }
+
+        // NIP-42 AUTH relay-tag, NIP-62 vanish and NIP-86 NIP-98 admin auth
+        // all compare client URLs against `relay_identity()`. With an empty
+        // `public_url` that identity is `server.host:server.port`; a
+        // wildcard or loopback bind (0.0.0.0, ::, 127.0.0.1) never matches a
+        // client's real hostname, silently breaking all three. Warn loudly.
+        if self.relay.public_url.trim().is_empty() {
+            let host = self.server.host.trim();
+            if matches!(host, "0.0.0.0" | "::" | "127.0.0.1" | "::1" | "localhost") {
+                log::warn!(
+                    "relay.public_url is empty and server.host is {host:?}: NIP-42 AUTH, \
+                     NIP-62 vanish and NIP-86 NIP-98 auth will not match client URLs; \
+                     set relay.public_url to the public wss:// address"
+                );
+            }
+        } else if !self.relay.public_url.contains("://") {
+            log::warn!(
+                "relay.public_url {0:?} has no scheme (wss:///ws://); set it to the public \
+                 wss:// address or NIP-42/62/98 URL matching may fail",
+                self.relay.public_url
+            );
+        }
+
+        // Paths must be non-empty: an empty database path would silently open
+        // the LMDB environment inside the config file's directory.
+        if self.database.path.as_os_str().is_empty() {
+            return Err(Error::Config("database.path must not be empty".into()));
+        }
+        if self.daemon.pid_file.as_os_str().is_empty()
+            || self.daemon.log_file.as_os_str().is_empty()
+            || self.daemon.stats_file.as_os_str().is_empty()
+        {
+            return Err(Error::Config(
+                "daemon.pid_file, daemon.log_file and daemon.stats_file must not be empty".into(),
+            ));
+        }
+
+        // LiveKit configuration must be complete when enabled.
+        if !self.relay.livekit_url.trim().is_empty()
+            && (self.relay.livekit_api_key.trim().is_empty()
+                || self.relay.livekit_api_secret.trim().is_empty())
+        {
+            log::warn!(
+                "relay.livekit_url is set but livekit_api_key/livekit_api_secret are empty: \
+                 tokens will be signed with an empty secret and rejected by LiveKit"
+            );
+        }
+
+        // A very high PoW requirement makes every event infeasible to mine;
+        // warn instead of silently disabling writes.
+        if l.require_pow >= 64 {
+            log::warn!(
+                "limits.require_pow = {} is practically unmineable; new events will be \
+                 rejected with 'pow: difficulty requirement not reached'",
+                l.require_pow
+            );
+        }
         Ok(())
     }
 }

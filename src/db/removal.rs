@@ -2,7 +2,8 @@
 //! vanish and the NIP-40 expiration purge.
 
 use super::store::{
-    CREATED_LEN, ID_LEN, Store, created_key, delegated_by, pubkey_key, replaceable_key, tag_key,
+    CREATED_LEN, ID_LEN, Store, created_key, delegated_by, dtag_key_safe, pubkey_key,
+    replaceable_key, tag_key,
 };
 use crate::error::Result;
 use crate::event::Event;
@@ -114,7 +115,9 @@ impl Store {
                     continue;
                 }
                 let d = &key[CREATED_LEN + ID_LEN + 4..];
-                if d != address.d.as_bytes() {
+                // The stored slot key truncates over-long `d` tags (see
+                // `dtag_key_safe`), so compare against the truncated form.
+                if d != dtag_key_safe(&address.d).as_bytes() {
                     continue;
                 }
                 if value.len() < CREATED_LEN + ID_LEN {

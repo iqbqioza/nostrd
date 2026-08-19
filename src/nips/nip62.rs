@@ -98,7 +98,9 @@ pub(crate) fn authority_of(identity: &RelayIdentity<'_>) -> String {
 }
 
 /// Splits an authority into its host (brackets stripped) and optional port.
-/// Handles IPv6 literals (`[::1]`, `[::1]:8080`), DNS names and IPv4.
+/// Handles IPv6 literals (`[::1]`, `[::1]:8080`), DNS names and IPv4. An
+/// unparseable port suffix leaves the whole authority as the host (so a
+/// garbage tail never degrades to "no port", which would match any port).
 pub(crate) fn split_host_port(authority: &str) -> (&str, Option<u16>) {
     if let Some(rest) = authority.strip_prefix('[') {
         // IPv6 literal: the host ends at the closing bracket, optionally
@@ -107,7 +109,11 @@ pub(crate) fn split_host_port(authority: &str) -> (&str, Option<u16>) {
             Some((host, "")) => (host, None),
             Some((host, tail)) => {
                 let port = tail.strip_prefix(':').and_then(|p| p.parse::<u16>().ok());
-                (host, port)
+                match port {
+                    Some(port) => (host, Some(port)),
+                    // `[::1]:garbage` or `[::1]junk`: unparseable tail.
+                    None => (authority, None),
+                }
             }
             None => (rest, None),
         }

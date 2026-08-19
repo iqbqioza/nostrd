@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::config::Config;
+use crate::event::Event;
 use crate::filter::Filter;
 use crate::nips::nip19::{self, Nip19Entity};
 use crate::nips::{nip29, nip62, nip70};
@@ -265,12 +266,19 @@ async fn query_and_respond(
         );
     };
     let now = unix_now();
-    // Pagination: fetch `limit + offset` so skipping `offset` still leaves
-    // `limit` events to return.
+    // Pagination: fetch `limit + offset + 1` so `more` can be decided from
+    // the *visible* sequence (events hidden between pages — protected, gift
+    // wraps, private groups — must not make a client skip a page or stop
+    // early, e.g. `[V1, H, V2]` with offset=0 must still deliver V1 and V2).
     let skip = offset.unwrap_or(0);
-    let (events, more) = relay
+    let (events, db_more) = relay
         .db
-        .api_query(filters, max_limit.saturating_add(skip), now, ascending)
+        .api_query(
+            filters,
+            max_limit.saturating_add(skip).saturating_add(1),
+            now,
+            ascending,
+        )
         .await;
     drop(_permit);
 
@@ -285,13 +293,23 @@ async fn query_and_respond(
     } else {
         None
     };
-    let event_values: Vec<Value> = events
+    let visible: Vec<Event> = events
         .into_iter()
         .filter(|e| {
             !nip70::is_protected(e)
                 && (e.kind != nip62::GIFT_WRAP_KIND)
                 && groups.as_deref().is_none_or(|g| g.visible_to(e, None))
         })
+        .collect();
+    drop(groups);
+
+    // `more` reflects the visible sequence: a further page exists when more
+    // than `skip + limit` visible events were fetched, or when the database
+    // hint says the pre-filter scan was cut short (best-effort, so a page
+    // that is under-filled because of hidden rows still advertises more).
+    let has_more = visible.len() > skip.saturating_add(max_limit) || db_more;
+    let event_values: Vec<Value> = visible
+        .into_iter()
         .skip(skip)
         .take(max_limit)
         .filter_map(|e| serde_json::to_value(e).ok())
@@ -304,7 +322,121 @@ async fn query_and_respond(
         Json(json!(ApiResponse {
             events: event_values,
             count,
-            more,
+            more: has_more,
         })),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use secp256k1::{Keypair, Secp256k1, XOnlyPublicKey};
+    use tokio::sync::RwLock;
+
+    use crate::db::DbClient;
+    use crate::nips::nip01::sign;
+    use crate::relay::LiveBusConfig;
+    use crate::stats::Stats;
+
+    fn signed_note(
+        secp: &Secp256k1<secp256k1::All>,
+        content: &str,
+        created: u64,
+        tags: Vec<Vec<String>>,
+    ) -> Event {
+        let keypair = Keypair::from_seckey_slice(secp, &[1u8; 32]).unwrap();
+        let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
+        let mut ev = Event {
+            id: String::new(),
+            pubkey,
+            created_at: created,
+            kind: 1,
+            tags,
+            content: content.into(),
+            sig: String::new(),
+        };
+        sign(&mut ev, &keypair, secp).unwrap();
+        ev
+    }
+
+    async fn build_relay() -> Arc<Relay> {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir()
+            .join("nostrd-api-test")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        let mut cfg = Config::default();
+        cfg.database.path = path;
+        let db = DbClient::open(
+            &cfg.database,
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
+        let config = Arc::new(RwLock::new(cfg));
+        let stats = Stats::new();
+        let mut relay = Relay::new(
+            config,
+            db,
+            stats,
+            "",
+            LiveBusConfig {
+                buffer: 1024,
+                batch_interval_ms: 10,
+                batch_size: 64,
+            },
+        )
+        .await;
+        relay.start_live_bus();
+        Arc::new(relay)
+    }
+
+    #[test]
+    fn pagination_skips_hidden_events_without_losing_pages() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay().await;
+            let now = unix_now();
+            let v1 = signed_note(relay.secp(), "v1", now, vec![]);
+            let hidden = signed_note(relay.secp(), "hidden", now - 1, vec![vec!["-".into()]]);
+            let v2 = signed_note(relay.secp(), "v2", now - 2, vec![]);
+            let v3 = signed_note(relay.secp(), "v3", now - 3, vec![]);
+            for e in [&v1, &hidden, &v2, &v3] {
+                assert_eq!(
+                    relay.db.put(e.clone(), now).await,
+                    crate::db::PutOutcome::Stored
+                );
+            }
+            let filters: Vec<Filter> =
+                serde_json::from_value(serde_json::json!([{"kinds": [1]}])).unwrap();
+
+            // Page 1: the hidden event must not consume a slot; V1 and V2 both
+            // arrive, and more pages exist.
+            let (code, Json(resp)) =
+                query_and_respond(&relay, filters.clone(), 2, Some(0), false).await;
+            assert_eq!(code, StatusCode::OK);
+            let events = resp["events"].as_array().unwrap();
+            assert_eq!(events.len(), 2, "hidden event must not consume the page");
+            assert_eq!(events[0]["content"], "v1");
+            assert_eq!(events[1]["content"], "v2");
+            assert_eq!(resp["more"], true);
+
+            // Page 2 (offset 2 over visible): V3, and no more pages.
+            let (_, Json(resp)) = query_and_respond(&relay, filters, 2, Some(2), false).await;
+            let events = resp["events"].as_array().unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(
+                events[0]["content"], "v3",
+                "V2 must not be lost or repeated"
+            );
+            assert_eq!(resp["more"], false);
+
+            relay.db.shutdown();
+        });
+    }
 }

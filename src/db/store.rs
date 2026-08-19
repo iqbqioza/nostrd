@@ -635,15 +635,19 @@ impl Store {
             .delete(wtxn, &created_key(event.created_at, id))?;
         // NIP-01/33: clear the replaceable/addressable slot so a later
         // re-publication (e.g. after the event was expired or deleted) is
-        // judged against the current state instead of a stale entry.
+        // judged against the current state instead of a stale entry. The
+        // key must match the one written by `put_event_in` (which truncates
+        // over-long `d` tags via `dtag_key_safe`).
         if is_replaceable(&event) {
             let dtag = if nip33::is_param_replaceable_kind(event.kind) {
                 nip33::dtag(&event)
             } else {
                 String::new()
             };
-            self.replaceable
-                .delete(wtxn, &replaceable_key(event.kind, &pubkey, &dtag))?;
+            self.replaceable.delete(
+                wtxn,
+                &replaceable_key(event.kind, &pubkey, dtag_key_safe(&dtag)),
+            )?;
         }
         self.by_pubkey
             .delete(wtxn, &pubkey_key(&pubkey, event.created_at, id))?;
@@ -721,7 +725,9 @@ impl Store {
             return Ok(None);
         }
         let rtxn = self.env.read_txn()?;
-        let key = replaceable_key(kind, &pubkey, d);
+        // The stored slot key truncates over-long `d` tags (see
+        // `put_event_in` / `dtag_key_safe`), so the lookup must too.
+        let key = replaceable_key(kind, &pubkey, dtag_key_safe(d));
         let Some(value) = self.replaceable.get(&rtxn, &key)? else {
             return Ok(None);
         };

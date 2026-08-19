@@ -73,6 +73,10 @@ impl Cli {
 
         self.config = absolutize(&self.config);
         let cfg = self.load_config()?;
+        // Validate before daemonizing: an invalid config must fail loudly in
+        // the foreground (the parent), not silently in the daemon child
+        // whose stderr is already pointed at /dev/null.
+        cfg.validate()?;
         if let Some(pid) = running_pid(&cfg.daemon.pid_file) {
             return Err(Error::Config(format!(
                 "already running (pid {pid}); use 'nostrd stop' or 'nostrd restart'"
@@ -249,11 +253,26 @@ fn running_pid(pid_file: &Path) -> Option<u32> {
     if process_alive(pid) { Some(pid) } else { None }
 }
 
-/// Checks whether a process is alive with `kill(pid, 0)`.
+/// Checks whether a process is alive with `kill(pid, 0)`. On Linux the
+/// process name is cross-checked against `/proc/<pid>/comm` so that a stale
+/// pid file whose pid was reused by an unrelated process is not mistaken for
+/// a running relay (which would make `start` refuse and `stop` signal an
+/// innocent process).
 fn process_alive(pid: u32) -> bool {
     // SAFETY: signal 0 only probes for the existence of the process.
-    let ret = unsafe { libc::kill(pid as i32, 0) };
-    ret == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    let alive = {
+        let ret = unsafe { libc::kill(pid as i32, 0) };
+        ret == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    };
+    if !alive {
+        return false;
+    }
+    // Best-effort name check (Linux only): a reused pid running a different
+    // program is not our daemon.
+    if let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) {
+        return comm.trim() == "nostrd";
+    }
+    true
 }
 
 /// Waits up to 10 seconds for the daemon to exit (the pid file to disappear).
