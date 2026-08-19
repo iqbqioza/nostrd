@@ -90,6 +90,11 @@ enum Msg {
         entries: Vec<([u8; 32], u64)>,
         reply: oneshot::Sender<Vec<(bool, u64)>>,
     },
+    /// Read-only first-seen lookup (does not record anything).
+    FirstSeenStatus {
+        pubkeys: Vec<[u8; 32]>,
+        reply: oneshot::Sender<Vec<(bool, u64)>>,
+    },
     /// NIP-77: query returning only `(created_at, id)` records so that large
     /// negentropy ranges do not materialize every full event in memory.
     NegQuery {
@@ -439,6 +444,14 @@ impl DbClient {
     /// `(created, first_seen)` per entry, aligned with the input.
     pub async fn touch_first_seen_batch(&self, entries: Vec<([u8; 32], u64)>) -> Vec<(bool, u64)> {
         self.request(|reply| Msg::TouchFirstSeen { entries, reply })
+            .await
+    }
+
+    /// Read-only first-seen lookup (no write): returns `(created, first_seen)`
+    /// per pubkey. Used by the pre-store age check so that a failed first
+    /// event (expired/duplicate/invalid) does not start the account-age clock.
+    pub async fn first_seen_batch(&self, pubkeys: Vec<[u8; 32]>) -> Vec<(bool, u64)> {
+        self.request_read(|reply| Msg::FirstSeenStatus { pubkeys, reply })
             .await
     }
 

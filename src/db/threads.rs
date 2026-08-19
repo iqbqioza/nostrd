@@ -166,6 +166,29 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             let _ = reply.send(access);
             false
         }
+        Msg::FirstSeenStatus { pubkeys, reply } => {
+            let rtxn = match store.env.read_txn() {
+                Ok(rtxn) => rtxn,
+                Err(e) => {
+                    db_error(errors, &e.into());
+                    let _ = reply.send(vec![(false, u64::MAX); pubkeys.len()]);
+                    return false;
+                }
+            };
+            let mut out = Vec::with_capacity(pubkeys.len());
+            for pk in pubkeys {
+                match store.first_seen_status(&rtxn, &pk) {
+                    Ok(status) => out.push(status),
+                    Err(e) => {
+                        db_error(errors, &e);
+                        // Fail closed: treat the pubkey as too young.
+                        out.push((false, u64::MAX));
+                    }
+                }
+            }
+            let _ = reply.send(out);
+            false
+        }
         Msg::DatabaseSize { reply } => {
             let _ = reply.send(store.size_on_disk());
             false
@@ -570,7 +593,8 @@ pub(crate) fn spawn(
                                 Msg::PutBatch { .. }
                                 | Msg::Put { .. }
                                 | Msg::Shutdown
-                                | Msg::LoadAccess { .. } => {
+                                | Msg::LoadAccess { .. }
+                                | Msg::FirstSeenStatus { .. } => {
                                     unreachable!()
                                 }
                             }

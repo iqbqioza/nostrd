@@ -316,11 +316,15 @@ impl Relay {
 
         // First-seen trust check: a pubkey's first accepted event records
         // its arrival; events from pubkeys first seen within the configured
-        // window are rejected (spam from freshly created accounts).
+        // window are rejected (spam from freshly created accounts). The
+        // lookup is read-only here — the first-seen timestamp is only
+        // persisted once an event actually stores, so a rejected first event
+        // (expired/duplicate/invalid) cannot pre-warm the account-age clock.
+        let mut persist_first_seen = false;
         if cfg.limits.new_pubkey_min_age_secs > 0
             && let Some(pubkey) = event.pubkey_bytes()
         {
-            let first_seens = self.db.touch_first_seen_batch(vec![(pubkey, now)]).await;
+            let first_seens = self.db.first_seen_batch(vec![pubkey]).await;
             let Some(&(created, first_seen)) = first_seens.first() else {
                 // The database is unavailable or overloaded: fail closed.
                 self.stats.bump(&self.stats.events_rejected, 1);
@@ -329,6 +333,7 @@ impl Relay {
                     None,
                 );
             };
+            persist_first_seen = created;
             if !created && now.saturating_sub(first_seen) < cfg.limits.new_pubkey_min_age_secs {
                 self.stats.bump(&self.stats.events_rejected, 1);
                 return (
@@ -339,6 +344,15 @@ impl Relay {
         }
 
         let outcome = self.db.put(event.clone(), now).await;
+        if persist_first_seen
+            && matches!(
+                outcome,
+                PutOutcome::Stored | PutOutcome::Replaced | PutOutcome::Ephemeral
+            )
+            && let Some(pubkey) = event.pubkey_bytes()
+        {
+            self.db.touch_first_seen_batch(vec![(pubkey, now)]).await;
+        }
         let (nip9, nip43, nip29_enabled) =
             (cfg.nip_enabled(9), cfg.nip_enabled(43), cfg.nip_enabled(29));
         drop(cfg);
@@ -472,13 +486,16 @@ impl Relay {
 
         // First-seen trust check: pubkeys first seen within the configured
         // window may not publish (their first event established the
-        // account). Performed in one database round trip for the batch.
+        // account). Performed in one database round trip for the batch. The
+        // lookup is read-only; first-seen is only persisted for events that
+        // actually store, so a failed first event cannot pre-warm the clock.
+        let mut new_pubkeys: Vec<bool> = Vec::new();
         if min_age > 0 && !puts.is_empty() {
-            let entries: Vec<([u8; 32], u64)> = puts
+            let pubkeys: Vec<[u8; 32]> = puts
                 .iter()
-                .map(|e| (e.pubkey_bytes().unwrap_or([0u8; 32]), now))
+                .map(|e| e.pubkey_bytes().unwrap_or([0u8; 32]))
                 .collect();
-            let first_seens = self.db.touch_first_seen_batch(entries).await;
+            let first_seens = self.db.first_seen_batch(pubkeys).await;
             if first_seens.len() != puts.len() {
                 // The database is unavailable or overloaded: every pending
                 // event of the batch fails closed.
@@ -494,6 +511,7 @@ impl Relay {
             } else {
                 let mut kept = Vec::with_capacity(puts.len());
                 let mut kept_slots = Vec::with_capacity(put_slots.len());
+                let mut kept_new = Vec::with_capacity(puts.len());
                 for ((event, slot), (created, first_seen)) in
                     puts.into_iter().zip(put_slots).zip(first_seens)
                 {
@@ -504,12 +522,14 @@ impl Relay {
                             PutOutcome::Invalid("restricted: your account is too new".into()),
                         );
                     } else {
+                        kept_new.push(created);
                         kept.push(event);
                         kept_slots.push(slot);
                     }
                 }
                 puts = kept;
                 put_slots = kept_slots;
+                new_pubkeys = kept_new;
             }
         }
 
@@ -527,11 +547,28 @@ impl Relay {
             outcomes = vec![PutOutcome::Invalid("error: database overloaded".into()); puts.len()];
         }
 
-        for ((event, outcome), slot) in puts.into_iter().zip(outcomes).zip(put_slots) {
+        // Record the first-seen timestamp only for accounts whose first
+        // event actually stored: a failed first event must not pre-warm the
+        // account-age clock.
+        let is_new_vec = if new_pubkeys.is_empty() {
+            vec![false; puts.len()]
+        } else {
+            new_pubkeys
+        };
+        let mut persist_first_seen: Vec<[u8; 32]> = Vec::new();
+        for (((event, outcome), slot), is_new) in puts
+            .into_iter()
+            .zip(outcomes)
+            .zip(put_slots)
+            .zip(is_new_vec)
+        {
             let id = event.id.clone();
             match outcome {
                 PutOutcome::Stored | PutOutcome::Replaced | PutOutcome::Ephemeral => {
                     self.stats.bump(&self.stats.events_accepted, 1);
+                    if is_new && let Some(pk) = event.pubkey_bytes() {
+                        persist_first_seen.push(pk);
+                    }
                     self.after_put(&event, now, nip9_enabled, roles_enabled, groups_enabled)
                         .await;
                 }
@@ -543,6 +580,13 @@ impl Relay {
                 }
             }
             results[slot] = (id, outcome);
+        }
+        if !persist_first_seen.is_empty() {
+            self.db
+                .touch_first_seen_batch(
+                    persist_first_seen.into_iter().map(|pk| (pk, now)).collect(),
+                )
+                .await;
         }
 
         for (id, event) in vanishes {

@@ -548,6 +548,43 @@ mod tests {
     }
 
     #[test]
+    fn nevent_with_author_hint_parses_id_and_author_separately() {
+        // A standard nevent carrying both the id (type 0) and the optional
+        // author pubkey (type 2) must not confuse the author for the id.
+        let id = [0x42u8; 32];
+        let author = [0x77u8; 32];
+        let mut data = Vec::new();
+        data.push(TLV_SPECIAL);
+        data.extend_from_slice(&(32u16).to_be_bytes());
+        data.extend_from_slice(&id);
+        data.push(TLV_AUTHOR);
+        data.extend_from_slice(&(32u16).to_be_bytes());
+        data.extend_from_slice(&author);
+        data.push(TLV_KIND);
+        data.extend_from_slice(&(4u16).to_be_bytes());
+        data.extend_from_slice(&7u32.to_be_bytes());
+
+        let encoded = bech32m_encode("nevent", &data).unwrap();
+        match parse_nip19(&encoded).unwrap() {
+            Nip19Entity::Event {
+                id: got_id,
+                author: got_author,
+                kind,
+                ..
+            } => {
+                assert_eq!(got_id, id, "id must come from the type-0 TLV");
+                assert_eq!(
+                    got_author,
+                    Some(author),
+                    "author must come from the type-2 TLV"
+                );
+                assert_eq!(kind, Some(7));
+            }
+            _ => panic!("expected event"),
+        }
+    }
+
+    #[test]
     fn decodes_standard_vectors() {
         // The npub from the NIP-19 spec.
         let npub =

@@ -49,10 +49,11 @@ pub(crate) const MAX_INDEX_KEY: usize = 511;
 pub(crate) const DISK_FREE_MARGIN: u64 = 32 * 1024 * 1024;
 
 /// Applies `puts` in one write transaction and commits. When the commit
-/// fails because the memory map is full, the map is grown (up to
-/// `map_max_size`) and the whole batch is re-applied in a fresh
-/// transaction. Returns one outcome per put; all outcomes are
-/// `Invalid("...")` when the batch cannot be committed.
+/// fails because the memory map is full, the whole batch is re-applied in a
+/// fresh transaction if the map can grow (it cannot at runtime: the map is
+/// opened once at its ceiling and never resized, so `MapFull` fails the
+/// batch). Returns one outcome per put; all outcomes are `Invalid("...")`
+/// when the batch cannot be committed.
 pub(crate) fn apply_put_batch(
     store: &Store,
     thread_errors: &Arc<std::sync::atomic::AtomicU64>,
@@ -709,6 +710,23 @@ impl Store {
                 self.first_seen.put(wtxn, pubkey, &now.to_be_bytes())?;
                 Ok((true, now))
             }
+        }
+    }
+
+    /// Read-only first-seen lookup: returns `(created, first_seen)` without
+    /// recording anything. `created` is `true` when the pubkey has never been
+    /// seen (so its first stored event may establish the account).
+    pub(crate) fn first_seen_status(
+        &self,
+        rtxn: &heed::RoTxn,
+        pubkey: &[u8],
+    ) -> Result<(bool, u64)> {
+        match self.first_seen.get(rtxn, pubkey)? {
+            Some(raw) if raw.len() >= 8 => {
+                let ts = u64::from_be_bytes(raw[..8].try_into().unwrap());
+                Ok((false, ts))
+            }
+            _ => Ok((true, 0)),
         }
     }
 

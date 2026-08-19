@@ -372,10 +372,20 @@ impl super::Conn {
             return;
         }
         let count_limit = self.relay.config.read().await.limits.count_limit;
+        let mut count_filters = filters.clone();
+        // NIP-50: when the search capability is disabled, strip `search` like
+        // REQ does — otherwise COUNT would filter by terms a REQ would ignore
+        // (count/REQ divergence) and drive search walks for a feature the
+        // relay claims not to offer.
+        if !self.relay.config.read().await.nip_enabled(50) {
+            for f in &mut count_filters {
+                f.search = None;
+            }
+        }
         let (events, more) = self
             .relay
             .db
-            .count(filters.clone(), count_limit, unix_now())
+            .count(count_filters, count_limit, unix_now())
             .await;
         // NIP-70/59/29: COUNT applies the same visibility rules as REQ, so
         // an unauthenticated peer cannot learn the size of a private group,

@@ -482,9 +482,9 @@ fn gift_wraps_to_are_deleted() {
 
 // ----- database growth -----
 fn map_grows_beyond_initial_size() {
-    // The database must keep accepting writes once it outgrows the
-    // initial map size: the map is grown automatically up to
-    // map_max_size, without degrading reads or writes.
+    // The database must keep accepting writes beyond a small configured map
+    // size: the map is opened at the ceiling (map_max_size) up front as a
+    // sparse virtual reservation, so `map_size` only acts as a floor.
     let cfg = DatabaseConfig {
         map_size: 256 * 1024,
         map_max_size: 32 * 1024 * 1024,
@@ -910,6 +910,39 @@ fn first_seen_trust_period() {
         // A different pubkey is created independently.
         let (created, _) = db.touch_first_seen_batch(vec![([8u8; 32], now)]).await[0];
         assert!(created);
+    });
+}
+
+#[test]
+fn read_only_first_seen_does_not_record() {
+    // The pre-store age check must not write first-seen: a rejected first
+    // event (expired/duplicate/invalid) must not start the account-age clock.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let pubkey = [9u8; 32];
+        let (created, _) = db.first_seen_batch(vec![pubkey]).await[0];
+        assert!(created, "never seen before");
+        // Repeated read-only lookups still report "created": nothing written.
+        let (created, _) = db.first_seen_batch(vec![pubkey]).await[0];
+        assert!(created, "read-only lookup must not record first-seen");
+        // Recording happens explicitly on a successful store.
+        let (created, ts) = db.touch_first_seen_batch(vec![(pubkey, 1234)]).await[0];
+        assert!(created);
+        assert_eq!(ts, 1234);
+        // Now the read-only lookup reports "not created" with the recorded time.
+        let (created, ts) = db.first_seen_batch(vec![pubkey]).await[0];
+        assert!(!created);
+        assert_eq!(ts, 1234);
     });
 }
 
