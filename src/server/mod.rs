@@ -121,8 +121,90 @@ async fn build_router(relay: &Arc<Relay>) -> Router {
             .route("/.well-known/nip29/livekit", get(livekit_supported))
             .route("/.well-known/nip29/livekit/{group}", get(livekit_token));
     }
+    // When `server.api_host` is set, the REST API and the WebSocket relay
+    // are split by Host header on the same port: the API host serves only
+    // `/api/v1` (and the health check), everything else is served only on
+    // every other host. Without it the API stays on all hosts.
+    let api_host = cfg.server.api_host.trim().to_ascii_lowercase();
+    drop(cfg);
+    if !api_host.is_empty() {
+        app = app.layer(axum::middleware::from_fn(move |req, next| {
+            let api_host = api_host.clone();
+            async move { host_split(&api_host, req, next).await }
+        }));
+    }
     app.layer(axum::middleware::from_fn(cors_middleware))
         .with_state(relay.clone())
+}
+
+/// Returns `true` when the request's Host header names `api_host`
+/// (ignoring case and any `:port` suffix).
+fn host_is_api(api_host: &str, request: &Request) -> bool {
+    request
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|h| {
+            let host = h.split(':').next().unwrap_or(h).trim().to_ascii_lowercase();
+            host == api_host
+        })
+}
+
+/// Splits the API from the relay by Host header: the configured API host
+/// only serves `/api/v1` and `/health`; every other host never serves
+/// `/api/v1`. Anything else gets a 404, so a wrong hostname cannot reach
+/// the other side.
+async fn host_split(api_host: &str, request: Request, next: Next) -> Response {
+    let is_api_host = host_is_api(api_host, &request);
+    let is_api_path = request.uri().path().starts_with("/api/v1");
+    let is_health = request.uri().path() == "/health";
+    match (is_api_host, is_api_path || is_health) {
+        (true, true) | (false, false) => next.run(request).await,
+        _ => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, header};
+
+    fn req(host: &str, path: &str) -> Request<Body> {
+        Request::builder()
+            .uri(path)
+            .header(header::HOST, host)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[test]
+    fn host_is_api_matches_exact_host() {
+        assert!(host_is_api("api.example.com", &req("api.example.com", "/")));
+        assert!(!host_is_api(
+            "api.example.com",
+            &req("relay.example.com", "/")
+        ));
+    }
+
+    #[test]
+    fn host_is_api_ignores_port_and_case() {
+        assert!(host_is_api(
+            "api.example.com",
+            &req("api.example.com:8080", "/")
+        ));
+        assert!(host_is_api("api.example.com", &req("API.EXAMPLE.COM", "/")));
+        assert!(!host_is_api(
+            "api.example.com",
+            &req("notapi.example.com", "/")
+        ));
+    }
+
+    #[test]
+    fn host_is_api_rejects_missing_host() {
+        let bare = Request::builder().uri("/").body(Body::empty()).unwrap();
+        assert!(!host_is_api("api.example.com", &bare));
+    }
 }
 
 pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> Result<()> {

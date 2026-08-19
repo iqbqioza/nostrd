@@ -77,6 +77,17 @@ disabled_nips = []
 host = "127.0.0.1"
 port = 8080
 
+# Hostname dedicated to the REST API, e.g. "api.example.com". When set, the
+# API and the WebSocket relay are split by Host header on the same port:
+#   - requests whose Host header matches this value serve ONLY /api/v1
+#     (and /health);
+#   - every other host serves ONLY the WebSocket/NIP-11/NIP-86 routes, and
+#     /api/v1 is never reachable on them.
+# Point the API's DNS name and the relay's DNS name at the same server
+# (e.g. via Cloudflare) and the two never bleed into each other. Empty =
+# the API is served on every host, next to the WebSocket endpoint.
+api_host = ""
+
 # WebSocket upgrades are also accepted when a TLS-terminating proxy announces
 # the client scheme via `X-Forwarded-Proto` (ws/wss/http/https are all
 # accepted), so Cloudflare Tunnel and similar setups work out of the box.

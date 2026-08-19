@@ -61,6 +61,13 @@ pub struct RelayConfig {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+    /// Hostname (Host header) dedicated to the REST API. When set, requests
+    /// whose Host header matches this value are served only the `/api/v1`
+    /// routes, and requests for any other host never reach them: the API
+    /// and the WebSocket relay are split by hostname on the same port
+    /// (e.g. `api.example.com` vs `relay.example.com`). Empty = the API is
+    /// served on every host, next to the WebSocket endpoint.
+    pub api_host: String,
     /// Separate local management port for NIP-86; 0 disables it.
     pub management_port: u16,
     pub management_host: String,
@@ -193,6 +200,7 @@ impl Default for ServerConfig {
         ServerConfig {
             host: "127.0.0.1".into(),
             port: 8080,
+            api_host: String::new(),
             management_port: 0,
             management_host: "127.0.0.1".into(),
             management_token: String::new(),

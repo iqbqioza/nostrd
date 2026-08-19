@@ -52,6 +52,8 @@ Point your Nostr client at `ws://<host>:8080` (or `wss://<domain>` behind a TLS 
 
 nostrd exposes a read-only HTTP API alongside the WebSocket server, on the same port under `/api/v1`. It is served by a dedicated database reader thread with its own concurrency limiter and query-parameter bounds, so heavy REST traffic cannot stall WebSocket subscribers.
 
+By default the API is served on every host, next to the WebSocket endpoint. Set `server.api_host` (e.g. `api_host = "api.example.com"`) to split the two by Host header on the same port: that hostname then serves only `/api/v1` and `/health`, while every other hostname (your relay's DNS name) serves only the WebSocket/NIP-11/NIP-86 routes and never exposes `/api/v1`. Point both DNS names at the same server and the API and the relay are fully separated.
+
 | Endpoint | Description |
 | --- | --- |
 | `GET /api/v1/{npub1...}/{kind}` | Events by author pubkey and kind. The `{kind}` path is mandatory for `npub1`. |
@@ -113,6 +115,8 @@ disabled_nips = []              # NIPs to disable
 host = "0.0.0.0"                # bind address; "127.0.0.1" = local only,
                                 # "0.0.0.0" = all interfaces
 port = 8080
+api_host = ""                   # hostname dedicated to the REST API; empty =
+                                # API served on every host, next to WebSocket
 management_token = ""           # bearer token for the NIP-86 management API
 admin_pubkey = ""               # or authorize NIP-86 calls with a NIP-98 event
 
