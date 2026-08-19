@@ -16,7 +16,7 @@ pub const DEFAULT_CONFIG: &str = "nostrd.toml";
 /// project rules. NIP-33 was merged into NIP-01 but remains advertised for
 /// clients that check it.
 pub const RELAY_NIPS: &[u16] = &[
-    1, 9, 11, 13, 26, 29, 33, 40, 42, 43, 45, 50, 62, 67, 70, 77, 86, 98,
+    1, 9, 11, 13, 26, 28, 29, 33, 40, 42, 43, 45, 50, 62, 67, 70, 77, 86, 98,
 ];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -76,6 +76,10 @@ pub struct ServerConfig {
     pub admin_pubkey: String,
     pub require_auth: bool,
     pub send_auth_challenge: bool,
+    /// Expose Prometheus metrics on `GET /metrics` (text format). Served on
+    /// the API host when one is configured; without `api_host` the metrics
+    /// are public on every host.
+    pub metrics_enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,6 +118,11 @@ pub struct LimitsConfig {
     /// Maximum bytes of outgoing messages queued for a single connection
     /// before new ones are dropped (protects memory against slow readers).
     pub max_out_queue_bytes: usize,
+    /// Seconds a connection may stay idle (no inbound frames) before it is
+    /// closed. When non-zero the relay also sends periodic WebSocket PINGs so
+    /// an alive-but-silent subscriber keeps its slot and dead peers are
+    /// detected and reaped; 0 disables the idle timeout entirely.
+    pub ws_idle_timeout_secs: u64,
     /// Overload protection: when the database thread's queue holds more than
     /// this many pending messages (or `db_queue_events` events), new
     /// database requests fail fast instead of accumulating in memory.
@@ -153,13 +162,14 @@ pub struct DatabaseConfig {
     pub path: PathBuf,
     pub max_dbs: u32,
     pub max_readers: u32,
-    /// Initial memory map size in bytes. The map grows automatically (up to
-    /// `map_max_size`) when the database outgrows it, so reads and writes
-    /// keep working no matter how large the database becomes.
+    /// Memory map size in bytes. The map is opened at `map_max_size` (a
+    /// sparse virtual-address reservation), so this value only acts as a
+    /// floor: the actual map is never smaller than this or `map_max_size`.
     pub map_size: usize,
-    /// Upper bound for the automatic map growth. The reservation is virtual
-    /// address space (sparse file): physical memory is only consumed by the
-    /// pages actually touched.
+    /// Memory map ceiling in bytes. The map is opened at this size once and
+    /// never resized at runtime: the reservation is virtual address space
+    /// (sparse file), so physical memory and disk grow only with the data
+    /// actually written.
     pub map_max_size: usize,
     pub purge_interval_secs: u64,
     /// Enable the NIP-50 full-text word index.
@@ -173,6 +183,13 @@ pub struct DaemonConfig {
     pub log_file: PathBuf,
     pub stats_file: PathBuf,
     pub stats_interval_secs: u64,
+    /// Rotate the log file when it grows past this many bytes (0 disables
+    /// rotation). The old file is renamed to `.1` and older backups shift up
+    /// to `log_max_files` backups.
+    pub log_max_size_bytes: u64,
+    /// Number of rotated log backups to keep (each is the previous generation
+    /// of the log file).
+    pub log_max_files: u32,
 }
 
 impl Default for RelayConfig {
@@ -207,6 +224,7 @@ impl Default for ServerConfig {
             admin_pubkey: String::new(),
             require_auth: false,
             send_auth_challenge: true,
+            metrics_enabled: true,
         }
     }
 }
@@ -233,6 +251,7 @@ impl Default for LimitsConfig {
             db_request_timeout_secs: 30,
             new_pubkey_min_age_secs: 0,
             max_out_queue_bytes: 256 * 1024,
+            ws_idle_timeout_secs: 0,
             db_queue_msgs: 4_096,
             db_queue_events: 262_144,
             max_sub_bytes: 512 * 1024,
@@ -271,6 +290,8 @@ impl Default for DaemonConfig {
             log_file: PathBuf::from("./nostrd.log"),
             stats_file: PathBuf::from("./nostrd.stats.json"),
             stats_interval_secs: 5,
+            log_max_size_bytes: 50 * 1024 * 1024,
+            log_max_files: 5,
         }
     }
 }
@@ -352,6 +373,175 @@ impl Config {
             return self.relay.enabled_nips.contains(&num);
         }
         !self.relay.disabled_nips.contains(&num)
+    }
+
+    /// Validates the configuration values. Returns a clear error message for
+    /// the first problem found, so `nostrd check` and startup fail fast
+    /// instead of misbehaving at runtime with a typo'd key or an impossible
+    /// database layout.
+    pub fn validate(&self) -> Result<()> {
+        // Hex key format checks.
+        let hex32 = |value: &str, what: &str| -> Result<()> {
+            if value.is_empty() {
+                return Ok(());
+            }
+            match hex::decode(value) {
+                Ok(b) if b.len() == 32 => Ok(()),
+                _ => Err(Error::Config(format!(
+                    "{what} must be 64 hex characters (32 bytes), got {value:?}"
+                ))),
+            }
+        };
+        hex32(&self.relay.pubkey, "relay.pubkey")?;
+        hex32(&self.server.admin_pubkey, "server.admin_pubkey")?;
+        for pk in &self.access.blocked_pubkeys {
+            hex32(pk, "access.blocked_pubkeys")?;
+        }
+        for pk in &self.access.allowed_pubkeys {
+            hex32(pk, "access.allowed_pubkeys")?;
+        }
+
+        // Secret key: must be a valid secp256k1 secret key when set.
+        if !self.relay.private_key.is_empty() {
+            let bytes = hex::decode(&self.relay.private_key)
+                .map_err(|_| Error::Config("relay.private_key must be 64 hex characters".into()))?;
+            if bytes.len() != 32 {
+                return Err(Error::Config("relay.private_key must be 32 bytes".into()));
+            }
+            secp256k1::SecretKey::from_slice(&bytes).map_err(|_| {
+                Error::Config("relay.private_key is not a valid secp256k1 secret key".into())
+            })?;
+        }
+
+        // Ports.
+        if self.server.port == 0 {
+            return Err(Error::Config(
+                "server.port must be between 1 and 65535".into(),
+            ));
+        }
+        if self.server.management_port > 0 && self.server.management_port == self.server.port {
+            return Err(Error::Config(
+                "server.management_port must differ from server.port".into(),
+            ));
+        }
+
+        // Blocked IPs must parse as IP addresses.
+        for ip in &self.access.blocked_ips {
+            ip.parse::<std::net::IpAddr>().map_err(|_| {
+                Error::Config(format!(
+                    "access.blocked_ips contains an invalid IP address: {ip:?}"
+                ))
+            })?;
+        }
+
+        // Database layout.
+        if self.database.map_size > self.database.map_max_size {
+            return Err(Error::Config(
+                "database.map_size must not exceed database.map_max_size".into(),
+            ));
+        }
+
+        // NIP toggles: `enabled_nips` wins silently; surface the ambiguity.
+        if !self.relay.enabled_nips.is_empty() && !self.relay.disabled_nips.is_empty() {
+            log::warn!(
+                "relay.enabled_nips and relay.disabled_nips are both set; enabled_nips wins"
+            );
+        }
+
+        // Limits must be usable (zero would disable core functionality or
+        // make the queue fail fast on the first request).
+        let l = &self.limits;
+        let nonzero = [
+            ("limits.max_connections", l.max_connections),
+            ("limits.max_ws_message_size", l.max_ws_message_size),
+            ("limits.max_filters", l.max_filters),
+            ("limits.max_subscriptions", l.max_subscriptions),
+            ("limits.max_limit", l.max_limit),
+            ("limits.count_limit", l.count_limit),
+            ("limits.neg_max_items", l.neg_max_items),
+            ("limits.buffer_size", l.buffer_size),
+            ("limits.max_sub_bytes", l.max_sub_bytes),
+            ("limits.db_queue_msgs", l.db_queue_msgs),
+            ("limits.db_queue_events", l.db_queue_events),
+            ("limits.api_max_concurrent", l.api_max_concurrent),
+            ("limits.live_buffer", l.live_buffer),
+            ("limits.max_out_queue_bytes", l.max_out_queue_bytes),
+            ("limits.max_indexed_words", l.max_indexed_words),
+        ];
+        for (name, value) in nonzero {
+            if value == 0 {
+                return Err(Error::Config(format!("{name} must be at least 1 (got 0)")));
+            }
+        }
+
+        // NIP-42 AUTH relay-tag, NIP-62 vanish and NIP-86 NIP-98 admin auth
+        // all compare client URLs against `relay_identity()`. With an empty
+        // `public_url` that identity is `server.host:server.port`; a
+        // wildcard or loopback bind (0.0.0.0, ::, 127.0.0.1) never matches a
+        // client's real hostname, silently breaking all three. Warn loudly.
+        if self.relay.public_url.trim().is_empty() {
+            let host = self.server.host.trim();
+            if matches!(host, "0.0.0.0" | "::" | "127.0.0.1" | "::1" | "localhost") {
+                log::warn!(
+                    "relay.public_url is empty and server.host is {host:?}: NIP-42 AUTH, \
+                     NIP-62 vanish and NIP-86 NIP-98 auth will not match client URLs; \
+                     set relay.public_url to the public wss:// address"
+                );
+            }
+        } else if !self.relay.public_url.contains("://") {
+            log::warn!(
+                "relay.public_url {0:?} has no scheme (wss:///ws://); set it to the public \
+                 wss:// address or NIP-42/62/98 URL matching may fail",
+                self.relay.public_url
+            );
+        }
+
+        // Paths must be non-empty: an empty database path would silently open
+        // the LMDB environment inside the config file's directory.
+        if self.database.path.as_os_str().is_empty() {
+            return Err(Error::Config("database.path must not be empty".into()));
+        }
+        if self.daemon.pid_file.as_os_str().is_empty()
+            || self.daemon.log_file.as_os_str().is_empty()
+            || self.daemon.stats_file.as_os_str().is_empty()
+        {
+            return Err(Error::Config(
+                "daemon.pid_file, daemon.log_file and daemon.stats_file must not be empty".into(),
+            ));
+        }
+
+        // LiveKit configuration must be complete when enabled.
+        if !self.relay.livekit_url.trim().is_empty()
+            && (self.relay.livekit_api_key.trim().is_empty()
+                || self.relay.livekit_api_secret.trim().is_empty())
+        {
+            log::warn!(
+                "relay.livekit_url is set but livekit_api_key/livekit_api_secret are empty: \
+                 tokens will be signed with an empty secret and rejected by LiveKit"
+            );
+        }
+
+        // A very high PoW requirement makes every event infeasible to mine;
+        // warn instead of silently disabling writes.
+        if l.require_pow >= 64 {
+            log::warn!(
+                "limits.require_pow = {} is practically unmineable; new events will be \
+                 rejected with 'pow: difficulty requirement not reached'",
+                l.require_pow
+            );
+        }
+
+        // `require_auth` with `send_auth_challenge = false` is a total
+        // lockout: the challenge is only ever sent on connect, so nobody can
+        // authenticate and every REQ/EVENT/COUNT is refused.
+        if self.server.require_auth && !self.server.send_auth_challenge {
+            log::warn!(
+                "server.require_auth is true but server.send_auth_challenge is false: the \
+                 AUTH challenge is never sent, so no client can authenticate and all \
+                 REQ/EVENT/COUNT messages will be refused"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -440,5 +630,65 @@ mod tests {
         ac.blocked_kinds.push(5);
         assert!(!ac.allows_kind(5));
         assert!(ac.allows_kind(1));
+    }
+
+    #[test]
+    fn validation_accepts_defaults() {
+        assert!(Config::default().validate().is_ok());
+    }
+
+    #[test]
+    fn validation_rejects_bad_keys() {
+        let mut cfg = Config::default();
+        cfg.relay.pubkey = "zz".repeat(32);
+        assert!(cfg.validate().is_err(), "pubkey must be hex");
+        cfg.relay.pubkey = "aa".repeat(31); // 62 chars
+        assert!(cfg.validate().is_err(), "pubkey must be 32 bytes");
+        cfg.relay.private_key = "gg".repeat(32);
+        assert!(cfg.validate().is_err(), "secret key must be valid hex");
+        cfg.relay.private_key = "00".repeat(32); // 0 is not on the curve
+        assert!(
+            cfg.validate().is_err(),
+            "secret key must be on the secp256k1 curve"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_port_collision_and_map_layout() {
+        let mut cfg = Config::default();
+        cfg.server.port = 8080;
+        cfg.server.management_port = 8080;
+        assert!(
+            cfg.validate().is_err(),
+            "management_port must differ from port"
+        );
+        cfg.server.management_port = 0;
+
+        cfg.database.map_size = 1024 * 1024;
+        cfg.database.map_max_size = 512 * 1024;
+        assert!(
+            cfg.validate().is_err(),
+            "map_size must not exceed map_max_size"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_bad_access_entries() {
+        let mut cfg = Config::default();
+        cfg.access.blocked_pubkeys = vec!["not-hex".into()];
+        assert!(cfg.validate().is_err(), "blocked pubkeys must be hex");
+        cfg.access.blocked_pubkeys.clear();
+        cfg.access.blocked_ips = vec!["not-an-ip".into()];
+        assert!(cfg.validate().is_err(), "blocked IPs must parse");
+    }
+
+    #[test]
+    fn validation_rejects_zero_limits() {
+        let mut cfg = Config::default();
+        cfg.limits.max_connections = 0;
+        assert!(
+            cfg.validate().is_err(),
+            "max_connections must be at least 1"
+        );
     }
 }

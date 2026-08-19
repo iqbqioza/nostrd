@@ -16,11 +16,24 @@ use crate::event::Event;
 use crate::filter::Filter;
 use crate::nips::{nip40, nip50};
 
-/// `(created_at, id, protected, group_id, is_meta)` records returned by the
-/// NIP-77 negentropy query. The visibility flags let the connection layer
-/// withhold NIP-70 protected events from unauthenticated peers and NIP-29
-/// private/hidden group content from non-members, mirroring the REQ path.
-pub(crate) type NegItems = Vec<(u64, [u8; 32], bool, Option<String>, bool)>;
+/// A single NIP-77 negentropy record returned by a negentropy query. The
+/// visibility flags let the connection layer withhold NIP-70 protected
+/// events from unauthenticated peers, NIP-29 private/hidden group content
+/// from non-members and NIP-59 gift wraps from anyone but their
+/// recipients, mirroring the REQ path.
+pub(crate) struct NegItem {
+    pub created: u64,
+    pub id: [u8; 32],
+    pub protected: bool,
+    pub gid: Option<String>,
+    pub meta: bool,
+    /// p-tag recipients of a NIP-59 gift wrap (kind 1059), `None` for every
+    /// other kind. Kept so the connection layer can serve wraps only to
+    /// their recipients without loading the full events back.
+    pub wrap_recipients: Option<Vec<String>>,
+}
+
+pub(crate) type NegItems = Vec<NegItem>;
 
 /// The database handles and transaction of one scan, bundled so the
 /// per-candidate checks stay readable.
@@ -53,12 +66,28 @@ struct Collect<'a, C: ScanCollector> {
 const SEARCH_BUDGET_MULTIPLIER: usize = 8;
 const SEARCH_BUDGET_MAX: usize = 100_000;
 
+/// Upper bound on the number of query terms used for a search: the word
+/// index walk and the relevance ranking both stop here, so a pathological
+/// query (e.g. a 1000-byte search string) cannot fan out into hundreds of
+/// index ranges.
+const SEARCH_MAX_TERMS: usize = 32;
+
+/// How many word-index keys are counted per term to estimate its document
+/// frequency for the IDF weight: beyond this the term is "common" and its
+/// weight is negligible, so the count stops early to keep search instant.
+const DF_SAMPLE: u64 = 4096;
+
 /// Upper bound on the number of index candidates examined by one scan pass
 /// before it gives up. A filter matching nothing (e.g. a popular `#p` value
 /// combined with an impossible kind) would otherwise walk the whole range
 /// and stall the reader thread for seconds. The cap is large enough that
 /// legitimate subscriptions are never truncated in practice.
-const SCAN_BUDGET: usize = 200_000;
+pub(crate) const SCAN_BUDGET: usize = 200_000;
+
+/// Budget used by the startup rebuilds (NIP-29 group state, NIP-43 role
+/// store): they must read the whole history, so they may walk far more
+/// candidates than a client-driven subscription.
+pub(crate) const FULL_SCAN_BUDGET: usize = 4_000_000;
 
 /// Output collector for a scan: either full events (REQ/COUNT) or
 /// `(created_at, id)` records (NIP-77 negentropy, memory-efficient).
@@ -84,9 +113,10 @@ trait ScanCollector {
     /// Sorts the collected records oldest first, lowest id first on equal
     /// timestamps (ascending variant of the NIP-01 ordering).
     fn sort_asc(&mut self);
-    /// Sorts by NIP-50 search relevance (most matching terms first), then
-    /// by the NIP-01 ordering.
-    fn sort_relevance(&mut self, terms: &[String]);
+    /// Sorts by NIP-50 search relevance (most matching terms first, weighted
+    /// by the inverse document frequency of each term), then by the NIP-01
+    /// ordering.
+    fn sort_relevance(&mut self, terms: &[String], weights: &[f64]);
     /// Keeps only the first `take` records.
     fn truncate_to(&mut self, take: usize);
 }
@@ -114,13 +144,17 @@ impl EventCollector {
     }
 }
 
-/// How many of `terms` appear in the event's content (NIP-50 relevance).
-fn relevance(event: &Event, terms: &[String]) -> usize {
+/// The NIP-50 relevance score of an event: the sum of the weights of the
+/// query terms present in its content. Weights are the inverse document
+/// frequency of each term (`1 / (1 + ln df)`), so rarer terms dominate.
+fn score(event: &Event, terms: &[String], weights: &[f64]) -> f64 {
     let content = event.content.to_lowercase();
     terms
         .iter()
-        .filter(|t| content.contains(t.as_str()))
-        .count()
+        .zip(weights)
+        .filter(|(t, _)| content.contains(t.as_str()))
+        .map(|(_, w)| w)
+        .sum()
 }
 
 impl ScanCollector for EventCollector {
@@ -165,10 +199,11 @@ impl ScanCollector for EventCollector {
                 .then_with(|| a.id.cmp(&b.id))
         });
     }
-    fn sort_relevance(&mut self, terms: &[String]) {
+    fn sort_relevance(&mut self, terms: &[String], weights: &[f64]) {
         self.events.sort_by(|a, b| {
-            relevance(b, terms)
-                .cmp(&relevance(a, terms))
+            score(b, terms, weights)
+                .partial_cmp(&score(a, terms, weights))
+                .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| b.created_at.cmp(&a.created_at))
                 .then_with(|| a.id.cmp(&b.id))
         });
@@ -225,22 +260,40 @@ impl ScanCollector for ItemCollector {
             }
             None => (None, false),
         };
-        self.items
-            .push((event.created_at, id, protected, gid, meta));
+        let wrap_recipients = if event.kind == crate::nips::nip62::GIFT_WRAP_KIND {
+            Some(
+                event
+                    .tags
+                    .iter()
+                    .filter(|t| t.len() >= 2 && t[0] == "p")
+                    .map(|t| t[1].clone())
+                    .collect(),
+            )
+        } else {
+            None
+        };
+        self.items.push(NegItem {
+            created: event.created_at,
+            id,
+            protected,
+            gid,
+            meta,
+            wrap_recipients,
+        });
         true
     }
     fn sort_key(&mut self) {
         self.items
-            .sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            .sort_by(|a, b| b.created.cmp(&a.created).then_with(|| a.id.cmp(&b.id)));
     }
     fn sort_asc(&mut self) {
         self.items
-            .sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            .sort_by(|a, b| a.created.cmp(&b.created).then_with(|| a.id.cmp(&b.id)));
     }
-    fn sort_relevance(&mut self, terms: &[String]) {
+    fn sort_relevance(&mut self, terms: &[String], weights: &[f64]) {
         // Negentropy items are re-sorted by the protocol anyway; keep the
         // relevance path a no-op for the same ordering as sort_key.
-        let _ = terms;
+        let _ = (terms, weights);
         self.sort_key();
     }
     fn truncate_to(&mut self, take: usize) {
@@ -257,6 +310,48 @@ pub(crate) enum ScanKind {
 }
 
 impl Store {
+    /// Estimates the inverse document frequency weight of each search term
+    /// from the word index: a term's document frequency is the number of
+    /// keys in its index range (each event contributes exactly one key per
+    /// unique word), counted up to [`DF_SAMPLE`]. Rarer terms get a higher
+    /// weight, so a query like "nostr bitcoin" ranks an event about both
+    /// topics above one that merely mentions the common word "nostr".
+    /// Without the word index every term is weighted equally.
+    fn term_weights(&self, rtxn: &RoTxn, terms: &[String]) -> Vec<f64> {
+        let Some(by_word) = self.by_word else {
+            return vec![1.0; terms.len()];
+        };
+        terms
+            .iter()
+            .map(|term| {
+                let mut start = term.as_bytes().to_vec();
+                start.push(0x00);
+                let mut end = term.as_bytes().to_vec();
+                end.push(0x01);
+                let range = (
+                    std::ops::Bound::Included(start.as_slice()),
+                    std::ops::Bound::Excluded(end.as_slice()),
+                );
+                let mut df = 0u64;
+                if let Ok(iter) = by_word.range(rtxn, &range) {
+                    for item in iter {
+                        match item {
+                            Ok(_) => {
+                                df += 1;
+                                if df >= DF_SAMPLE {
+                                    break;
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                }
+                let df = df.max(1) as f64;
+                1.0 / (1.0 + df.ln())
+            })
+            .collect()
+    }
+
     /// Collects events that match the filters, most recent first.
     pub(crate) fn scan(
         &self,
@@ -265,6 +360,7 @@ impl Store {
         max_limit: usize,
         count_mode: bool,
         ascending: bool,
+        budget: usize,
     ) -> Result<(Vec<Event>, bool)> {
         let has_search = filters.iter().any(Filter::has_search);
         // NIP-50: relevance ordering needs more candidates than the response
@@ -282,7 +378,7 @@ impl Store {
             ScanKind::Query
         };
         let mut out = EventCollector::new(collect_cap, !count_mode);
-        let more = self.scan_collect(filters, now, max_limit, kind, ascending, &mut out)?;
+        let more = self.scan_collect(filters, now, max_limit, kind, ascending, budget, &mut out)?;
         Ok((out.events, more))
     }
 
@@ -294,6 +390,7 @@ impl Store {
         filter: &Filter,
         now: u64,
         max_items: usize,
+        budget: usize,
     ) -> Result<(NegItems, bool)> {
         let collect_cap = if filter.has_search() {
             max_items
@@ -309,6 +406,7 @@ impl Store {
             max_items,
             ScanKind::Negentropy,
             false,
+            budget,
             &mut out,
         )?;
         Ok((out.items, more))
@@ -318,6 +416,7 @@ impl Store {
     /// candidate walks and collects into `out`. Returns `true` when the
     /// scan stopped at a limit instead of exhausting the matches
     /// (NIP-67 EOSE completeness hint).
+    #[allow(clippy::too_many_arguments)]
     fn scan_collect<C: ScanCollector>(
         &self,
         filters: &[Filter],
@@ -325,6 +424,7 @@ impl Store {
         max_limit: usize,
         kind: ScanKind,
         ascending: bool,
+        budget: usize,
         out: &mut C,
     ) -> Result<bool> {
         let count_mode = matches!(kind, ScanKind::Count);
@@ -360,9 +460,18 @@ impl Store {
             };
             let terms = if has_search {
                 let terms = nip50::terms(filter.search.as_deref().unwrap_or(""));
+                // Cap the terms used for the index walk and the ranking: a
+                // pathological search string must not fan out into hundreds
+                // of index ranges. Events matching only the truncated terms
+                // are not candidates; the most common terms (last, in
+                // token order) are dropped first.
+                let terms: Vec<String> = terms.into_iter().take(SEARCH_MAX_TERMS).collect();
                 for t in &terms {
                     if !all_terms.contains(t) {
                         all_terms.push(t.clone());
+                        if all_terms.len() >= SEARCH_MAX_TERMS {
+                            break;
+                        }
                     }
                 }
                 if let Some(l) = filter.limit {
@@ -384,17 +493,18 @@ impl Store {
                 seen: &mut seen,
                 out,
             };
-            let stop = self.scan_filter(&rtxn, &scan, &mut collect, &mut more)?;
+            let stop = self.scan_filter(&rtxn, &scan, &mut collect, budget, &mut more)?;
             if stop {
                 break;
             }
         }
         if !count_mode {
             if sort_search && !all_terms.is_empty() {
-                // NIP-50: results are ordered by search relevance (how many
-                // of the query's terms the content matches), not by
+                // NIP-50: results are ordered by search relevance (weighted
+                // by each term's inverse document frequency), not by
                 // created_at, and the limit is applied after that ordering.
-                out.sort_relevance(&all_terms);
+                let weights = self.term_weights(&rtxn, &all_terms);
+                out.sort_relevance(&all_terms, &weights);
                 let take = search_take.min(max_limit);
                 if out.len() > take {
                     more = true;
@@ -419,6 +529,7 @@ impl Store {
         rtxn: &RoTxn,
         scan: &FilterScan<'_>,
         collect: &mut Collect<'_, C>,
+        budget: usize,
         more: &mut bool,
     ) -> Result<bool> {
         let FilterScan {
@@ -430,7 +541,6 @@ impl Store {
         } = *scan;
         let seen = &mut *collect.seen;
         let out = &mut *collect.out;
-        let cap = out.cap();
         let mut examined = 0usize;
         let ctx = ScanContext {
             events: self.events,
@@ -451,17 +561,34 @@ impl Store {
                 seen,
                 out,
                 limit,
+                budget,
                 &mut examined,
             )
         };
 
         if let Some(ids) = &filter.ids {
-            for id in ids.iter().take(cap) {
-                if let Ok(id) = hex::decode(id)
-                    && !consider(&id)?
-                {
-                    *more = true;
-                    return Ok(false);
+            // Every id is checked (each maps to at most one event): the
+            // collection limit only bounds the results, not the number of
+            // ids examined, so `{"ids": [A, B], "limit": 1}` must still find
+            // B when A does not exist. The work budget bounds the walk.
+            for id in ids {
+                if let Ok(id) = hex::decode(id) {
+                    if id.len() == ID_LEN {
+                        if !consider(&id)? {
+                            *more = true;
+                            return Ok(false);
+                        }
+                    } else if !id.is_empty() {
+                        // NIP-01: `ids` entries may be event-id *prefixes*.
+                        // Walk the events range of that prefix (bounded by
+                        // the work budget); the collection limit and the
+                        // final created_at sort apply as usual.
+                        let start = prefix_start(&id);
+                        let end = prefix_end(&id);
+                        if !self.walk_events_prefix(rtxn, &start, &end, &mut consider, more)? {
+                            return Ok(false);
+                        }
+                    }
                 }
             }
             return Ok(out.full());
@@ -576,7 +703,12 @@ impl Store {
 
         let start = created_key(since, &[0u8; ID_LEN]);
         let end = created_key(until, &[0xffu8; ID_LEN]);
-        Ok(!self.walk_created_range(
+        // A per-filter limit/budget stop only ends this filter's walk, like
+        // every other index path: the remaining filters still contribute
+        // results. (Returning `true` here used to drop the rest of a
+        // multi-filter REQ whenever the first filter hit its limit, e.g. a
+        // `{"limit": 0}` filter killed the whole query.)
+        if !self.walk_created_range(
             rtxn,
             self.by_created,
             &start,
@@ -584,7 +716,10 @@ impl Store {
             ascending,
             &mut consider,
             more,
-        )?)
+        )? {
+            return Ok(false);
+        }
+        Ok(out.full())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -612,6 +747,33 @@ impl Store {
             let (key, _) = item?;
             let id = &key[key.len() - ID_LEN..];
             if !consider(id)? {
+                *more = true;
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Walks the `events` database over the id range `[start, end]` (an
+    /// id-prefix range from NIP-01 `ids` filters), handing every full id key
+    /// to `consider`. The range is inclusive on both ends so the maximum id
+    /// with the prefix is covered.
+    fn walk_events_prefix(
+        &self,
+        rtxn: &RoTxn,
+        start: &[u8],
+        end: &[u8],
+        mut consider: impl FnMut(&[u8]) -> Result<bool>,
+        more: &mut bool,
+    ) -> Result<bool> {
+        let range = (
+            std::ops::Bound::Included(start),
+            std::ops::Bound::Included(end),
+        );
+        let iter = self.events.range(rtxn, &range)?;
+        for item in iter {
+            let (key, _) = item?;
+            if !consider(key)? {
                 *more = true;
                 return Ok(false);
             }
@@ -696,6 +858,20 @@ impl Store {
     }
 }
 
+/// The smallest 32-byte id sharing `prefix` (for NIP-01 id-prefix ranges).
+fn prefix_start(prefix: &[u8]) -> Vec<u8> {
+    let mut v = prefix.to_vec();
+    v.resize(ID_LEN, 0);
+    v
+}
+
+/// The largest 32-byte id sharing `prefix`.
+fn prefix_end(prefix: &[u8]) -> Vec<u8> {
+    let mut v = prefix.to_vec();
+    v.resize(ID_LEN, 0xff);
+    v
+}
+
 #[allow(clippy::too_many_arguments)]
 fn consider_event<C: ScanCollector>(
     ctx: &ScanContext<'_>,
@@ -706,6 +882,7 @@ fn consider_event<C: ScanCollector>(
     seen: &mut HashSet<Vec<u8>>,
     out: &mut C,
     limit: usize,
+    budget: usize,
     examined: &mut usize,
 ) -> Result<bool> {
     if out.full() {
@@ -713,11 +890,11 @@ fn consider_event<C: ScanCollector>(
         // ranges of this filter) instead of walking them to completion.
         return Ok(false);
     }
-    // Work budget: give up after examining `SCAN_BUDGET` candidates so a
+    // Work budget: give up after examining `budget` candidates so a
     // filter matching nothing cannot walk an entire index range and stall
     // the reader thread (which also serves WebSocket REQ/COUNT/NEG).
     *examined += 1;
-    if *examined > SCAN_BUDGET {
+    if *examined > budget {
         return Ok(false);
     }
     if seen.contains(id) {
@@ -732,9 +909,16 @@ fn consider_event<C: ScanCollector>(
     if !is_deliverable(ctx, &event, filter, terms, now)? {
         return Ok(true);
     }
-    seen.insert(id.to_vec());
     let id = id.try_into().unwrap_or([0u8; 32]);
-    Ok(out.push(event, id, limit))
+    // Only record the event as seen when it was actually collected: an event
+    // that hit this filter's limit (push failed) must still be available to
+    // a later filter of the same REQ, e.g. `[{"limit":0},{"kinds":[1]}]`.
+    if out.push(event, id, limit) {
+        seen.insert(id.to_vec());
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }
 
 fn is_deliverable(

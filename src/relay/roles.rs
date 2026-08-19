@@ -94,12 +94,41 @@ impl super::Relay {
         true
     }
 
+    /// NIP-86 `editrole`: updates an *existing* role. A typo'd or missing id
+    /// must not silently create a brand-new role, so the role must already
+    /// exist (unlike `create_role`).
+    pub async fn edit_role(
+        &self,
+        id: &str,
+        label: &str,
+        description: &str,
+        color: &str,
+        order: Option<i64>,
+    ) -> bool {
+        if !self.config.read().await.nip_enabled(43) || self.key.is_none() {
+            return false;
+        }
+        if !self.roles.read().await.roles.contains_key(id) {
+            return false;
+        }
+        self.create_role(id, label, description, color, order).await
+    }
+
     pub async fn delete_role(&self, id: &str) -> bool {
         if !self.config.read().await.nip_enabled(43) || self.key.is_none() {
             return false;
         }
         let removed = self.roles.write().await.delete(id);
         if removed {
+            // Publish a tombstone `kind:33534` so the deletion survives the
+            // restart rebuild (the rebuild skips `["deleted"]` tombstones);
+            // then republish the membership list without the deleted role.
+            let relay_pubkey = self.relay_pubkey().unwrap_or_default();
+            let event = {
+                let roles = self.roles.read().await;
+                roles.role_deletion_event(id, &relay_pubkey, unix_now())
+            };
+            self.publish_relay_event(event).await;
             self.publish_membership(None).await;
         }
         removed

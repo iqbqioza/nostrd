@@ -12,8 +12,28 @@ use tokio::sync::mpsc;
 use super::store::WriteBatch;
 use super::store::{Store, flush_everything};
 use super::{Msg, PutOutcome, db_error};
-
+use crate::db::scan::SCAN_BUDGET;
 use crate::error::Result;
+
+/// Releases the writer thread's queued-work accounting for one drain. The
+/// counters are decremented when the guard drops, so a panic anywhere in
+/// the drain cannot leave the overload-protection counters elevated
+/// (which would reject every new request afterwards).
+struct PendingGuard {
+    msgs: usize,
+    events: usize,
+    msgs_counter: Arc<std::sync::atomic::AtomicUsize>,
+    events_counter: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        self.msgs_counter
+            .fetch_sub(self.msgs, std::sync::atomic::Ordering::Relaxed);
+        self.events_counter
+            .fetch_sub(self.events, std::sync::atomic::Ordering::Relaxed);
+    }
+}
 
 /// The channels, counters and flags handed to the [`super::DbClient`] by
 /// [`spawn`].
@@ -41,9 +61,10 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             limit,
             now,
             ascending,
+            budget,
             reply,
         } => {
-            let out = match store.scan(&filters, now, limit, false, ascending) {
+            let out = match store.scan(&filters, now, limit, false, ascending, budget) {
                 Ok(out) => out,
                 Err(e) => {
                     db_error(errors, &e);
@@ -59,7 +80,7 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             now,
             reply,
         } => {
-            let out = match store.scan_neg(&filter, now, limit) {
+            let out = match store.scan_neg(&filter, now, limit, SCAN_BUDGET) {
                 Ok(out) => out,
                 Err(e) => {
                     db_error(errors, &e);
@@ -75,7 +96,7 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             now,
             reply,
         } => {
-            let out = match store.scan(&filters, now, limit, true, false) {
+            let out = match store.scan(&filters, now, limit, true, false, SCAN_BUDGET) {
                 Ok(out) => out,
                 Err(e) => {
                     db_error(errors, &e);
@@ -134,6 +155,40 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             let _ = reply.send(banned);
             false
         }
+        Msg::LoadAccess { reply } => {
+            let access = match store.load_access() {
+                Ok(access) => access,
+                Err(e) => {
+                    db_error(errors, &e);
+                    None
+                }
+            };
+            let _ = reply.send(access);
+            false
+        }
+        Msg::FirstSeenStatus { pubkeys, reply } => {
+            let rtxn = match store.env.read_txn() {
+                Ok(rtxn) => rtxn,
+                Err(e) => {
+                    db_error(errors, &e.into());
+                    let _ = reply.send(vec![(false, u64::MAX); pubkeys.len()]);
+                    return false;
+                }
+            };
+            let mut out = Vec::with_capacity(pubkeys.len());
+            for pk in pubkeys {
+                match store.first_seen_status(&rtxn, &pk) {
+                    Ok(status) => out.push(status),
+                    Err(e) => {
+                        db_error(errors, &e);
+                        // Fail closed: treat the pubkey as too young.
+                        out.push((false, u64::MAX));
+                    }
+                }
+            }
+            let _ = reply.send(out);
+            false
+        }
         Msg::DatabaseSize { reply } => {
             let _ = reply.send(store.size_on_disk());
             false
@@ -179,7 +234,12 @@ pub(crate) fn spawn(
                 };
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let shutdown = handle_read_msg(&read_store, &read_errors, msg);
-                    read_pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    // `Msg::Shutdown` is sent directly (never through
+                    // `request_read`), so it was not counted; decrementing
+                    // for it would underflow the pending counter.
+                    if !shutdown {
+                        read_pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     shutdown
                 }));
                 match result {
@@ -207,7 +267,10 @@ pub(crate) fn spawn(
                 };
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let shutdown = handle_read_msg(&api_store, &api_errors, msg);
-                    api_thread_pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    // `Msg::Shutdown` is not counted (see the reader thread).
+                    if !shutdown {
+                        api_thread_pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     shutdown
                 }));
                 match result {
@@ -251,7 +314,13 @@ pub(crate) fn spawn(
                         Err(_) => break,
                     }
                 }
-                let drained_msgs = msgs.len();
+                let drained_msgs: usize = msgs
+                    .iter()
+                    // `Msg::Shutdown` is sent directly (never through
+                    // `request`), so it was not counted in `pending_msgs`;
+                    // counting it here would underflow the counter.
+                    .filter(|m| !matches!(m, Msg::Shutdown))
+                    .count();
                 let drained_events: usize = msgs
                     .iter()
                     .map(|m| match m {
@@ -260,6 +329,16 @@ pub(crate) fn spawn(
                         _ => 0,
                     })
                     .sum();
+                // Release the queued-work accounting of everything the
+                // drain processed. The guard drops on every exit path of
+                // the drain (including a panic mid-drain), so the
+                // overload-protection counters can never be left elevated.
+                let _pending = PendingGuard {
+                    msgs: drained_msgs,
+                    events: drained_events,
+                    msgs_counter: Arc::clone(&thread_pending_msgs),
+                    events_counter: Arc::clone(&thread_pending_events),
+                };
                 for msg in msgs {
                     match msg {
                         Msg::Put { event, now, reply } => {
@@ -295,16 +374,18 @@ pub(crate) fn spawn(
                                     limit,
                                     now,
                                     ascending,
+                                    budget,
                                     reply,
                                 } => {
-                                    let out =
-                                        match store.scan(&filters, now, limit, false, ascending) {
-                                            Ok(out) => out,
-                                            Err(e) => {
-                                                db_error(&thread_errors, &e);
-                                                (Vec::new(), false)
-                                            }
-                                        };
+                                    let out = match store
+                                        .scan(&filters, now, limit, false, ascending, budget)
+                                    {
+                                        Ok(out) => out,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            (Vec::new(), false)
+                                        }
+                                    };
                                     let _ = reply.send(out);
                                 }
                                 Msg::NegQuery {
@@ -313,7 +394,8 @@ pub(crate) fn spawn(
                                     now,
                                     reply,
                                 } => {
-                                    let out = match store.scan_neg(&filter, now, limit) {
+                                    let out = match store.scan_neg(&filter, now, limit, SCAN_BUDGET)
+                                    {
                                         Ok(out) => out,
                                         Err(e) => {
                                             db_error(&thread_errors, &e);
@@ -328,7 +410,14 @@ pub(crate) fn spawn(
                                     now,
                                     reply,
                                 } => {
-                                    let out = match store.scan(&filters, now, limit, true, false) {
+                                    let out = match store.scan(
+                                        &filters,
+                                        now,
+                                        limit,
+                                        true,
+                                        false,
+                                        SCAN_BUDGET,
+                                    ) {
                                         Ok(out) => out,
                                         Err(e) => {
                                             db_error(&thread_errors, &e);
@@ -342,13 +431,15 @@ pub(crate) fn spawn(
                                     addresses,
                                     request_pubkey,
                                     request_created,
+                                    group,
                                     reply,
                                 } => {
-                                    let n = match store.apply_deletion(
+                                    let n = match store.apply_deletion_group(
                                         &targets,
                                         &addresses,
                                         request_pubkey.as_deref(),
                                         request_created,
+                                        group.as_deref(),
                                     ) {
                                         Ok(n) => n,
                                         Err(e) => {
@@ -448,6 +539,12 @@ pub(crate) fn spawn(
                                     };
                                     let _ = reply.send(banned);
                                 }
+                                Msg::SaveAccess { access, reply } => {
+                                    if let Err(e) = store.save_access(&access) {
+                                        db_error(&thread_errors, &e);
+                                    }
+                                    let _ = reply.send(());
+                                }
                                 Msg::PurgeExpired { now, reply } => {
                                     let n = match store.purge_expired(now) {
                                         Ok(n) => n,
@@ -493,22 +590,22 @@ pub(crate) fn spawn(
                                     }
                                     let _ = reply.send(out);
                                 }
-                                Msg::PutBatch { .. } | Msg::Put { .. } | Msg::Shutdown => {
+                                Msg::PutBatch { .. }
+                                | Msg::Put { .. }
+                                | Msg::Shutdown
+                                | Msg::LoadAccess { .. }
+                                | Msg::FirstSeenStatus { .. } => {
                                     unreachable!()
                                 }
                             }
                         }
                     }
                 }
-                // Release the queued-work accounting of everything the
-                // drain processed (the batch counters are approximate:
-                // messages in the middle of the drain still count).
-                thread_pending_msgs.fetch_sub(drained_msgs, std::sync::atomic::Ordering::Relaxed);
-                thread_pending_events
-                    .fetch_sub(drained_events, std::sync::atomic::Ordering::Relaxed);
                 // Flush the batch before blocking again: clients await
-                // their replies, so a pending batch must not wait for
-                // the next message or every requestor deadlocks.
+                // their replies, so a pending batch must not wait for the
+                // next message or every requestor deadlocks. The queued-work
+                // accounting is released by the `PendingGuard` when this
+                // closure returns.
                 flush_everything(&store, &thread_errors, &mut batch);
                 false
             }));
@@ -517,10 +614,10 @@ pub(crate) fn spawn(
                 Ok(true) => break 'outer,
                 Err(_) => {
                     log::error!("database thread recovered from a panic");
-                    // Reset the batch wholesale: every queued reply is
-                    // revoked because the pending writes were rolled back
-                    // with the aborted transaction.
-                    let mut batch = WriteBatch::default();
+                    // Revoke every reply queued for the rolled-back batch:
+                    // the pending writes were aborted with the transaction,
+                    // so their OK would be a lie. Drain the OLD batch before
+                    // resetting it (a fresh batch has nothing to drain).
                     for s in batch.senders.drain(..) {
                         let _ = s.send(PutOutcome::Invalid("database error".into()));
                     }
@@ -530,6 +627,7 @@ pub(crate) fn spawn(
                             events.len()
                         ]);
                     }
+                    batch = WriteBatch::default();
                 }
             }
         }

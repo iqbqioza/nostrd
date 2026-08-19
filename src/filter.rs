@@ -7,6 +7,14 @@ use serde_json::Value;
 
 use crate::event::Event;
 
+/// Maximum number of `ids`/`authors` entries a filter may carry. The
+/// in-memory per-candidate match is linear in these arrays, so an
+/// unauthenticated REQ listing thousands of real ids or pubkeys could force
+/// quadratic work on the shared reader thread; filters beyond this bound are
+/// rejected with a clear error. No legitimate client lists this many ids or
+/// authors in a single filter.
+pub const MAX_FILTER_MEMBERS: usize = 512;
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Filter {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -28,12 +36,33 @@ pub struct Filter {
 }
 
 impl Filter {
+    /// Whether the filter exceeds the [`MAX_FILTER_MEMBERS`] bound on `ids`
+    /// or `authors`, which would make the in-memory match quadratic.
+    pub fn too_many_members(&self) -> bool {
+        self.ids
+            .as_ref()
+            .is_some_and(|v| v.len() > MAX_FILTER_MEMBERS)
+            || self
+                .authors
+                .as_ref()
+                .is_some_and(|v| v.len() > MAX_FILTER_MEMBERS)
+    }
+
     /// Performs an in-memory match (used for live events and final checks).
     pub fn matches(&self, ev: &Event) -> bool {
-        if let Some(ids) = &self.ids
-            && !ids.iter().any(|id| id == &ev.id)
-        {
-            return false;
+        if let Some(ids) = &self.ids {
+            // NIP-01: `ids` entries may be full ids or prefixes. Only
+            // even-length, non-empty prefixes are matched, mirroring the
+            // historical scan (which decodes hex) so live and stored results
+            // agree; an empty or odd-length entry matches nothing.
+            let matches = ids.iter().any(|id| {
+                !id.is_empty()
+                    && id.len() % 2 == 0
+                    && (id == &ev.id || (id.len() < ev.id.len() && ev.id.starts_with(id)))
+            });
+            if !matches {
+                return false;
+            }
         }
         // NIP-26: events published under a delegation tag match filters on
         // the delegator's pubkey as well as on the event's own author.
@@ -169,5 +198,37 @@ mod tests {
         // Empty search strings are ignored.
         let f: Filter = serde_json::from_value(serde_json::json!({"search": "  "})).unwrap();
         assert!(f.matches(&hit));
+    }
+
+    #[test]
+    fn ids_match_full_and_prefix() {
+        let e = ev(1, vec![]);
+        // Full id matches.
+        let f: Filter = serde_json::from_value(serde_json::json!({"ids": [e.id]})).unwrap();
+        assert!(f.matches(&e));
+        // Even-length prefix matches.
+        let f: Filter = serde_json::from_value(serde_json::json!({"ids": ["aa"]})).unwrap();
+        assert!(f.matches(&e));
+        // Odd-length and empty entries match nothing (consistent with the
+        // historical scan, which decodes hex).
+        let f: Filter = serde_json::from_value(serde_json::json!({"ids": ["a"]})).unwrap();
+        assert!(!f.matches(&e));
+        let f: Filter = serde_json::from_value(serde_json::json!({"ids": [""]})).unwrap();
+        assert!(!f.matches(&e));
+        let f: Filter = serde_json::from_value(serde_json::json!({"ids": ["bb"]})).unwrap();
+        assert!(!f.matches(&e));
+    }
+
+    #[test]
+    fn too_many_members_flagged() {
+        let mut f = Filter::default();
+        assert!(!f.too_many_members());
+        f.ids = Some(vec!["a".repeat(64); MAX_FILTER_MEMBERS]);
+        assert!(!f.too_many_members(), "exactly at the bound is allowed");
+        f.ids = Some(vec!["a".repeat(64); MAX_FILTER_MEMBERS + 1]);
+        assert!(f.too_many_members());
+        f.ids = None;
+        f.authors = Some(vec!["a".repeat(64); MAX_FILTER_MEMBERS + 1]);
+        assert!(f.too_many_members());
     }
 }

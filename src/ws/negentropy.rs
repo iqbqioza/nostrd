@@ -10,6 +10,21 @@ use crate::util::unix_now;
 
 use super::value_string;
 
+/// NIP-77 negentropy state for one open subscription.
+pub(crate) struct NegState {
+    pub(crate) items: Vec<nip77::Item>,
+    /// Remaining NEG-MSG rounds for this subscription. The reconciliation
+    /// protocol completes in a bounded number of rounds proportional to the
+    /// number of divergent ranges; a peer that keeps sending NEG-MSG with
+    /// bogus fingerprints would otherwise force an unbounded, CPU-bounded
+    /// bisection over the held items on every message.
+    pub(crate) rounds_left: u32,
+}
+
+/// Cap on the number of NEG-MSG rounds a single subscription may consume
+/// before it is closed (generous for legitimate syncs).
+pub(crate) const MAX_NEG_MSG_ROUNDS: u32 = 128;
+
 impl super::Conn {
     pub(crate) fn send_neg_err(&mut self, sub_id: &str, reason: &str) {
         self.send_json(json!(["NEG-ERR", sub_id, reason]));
@@ -35,6 +50,11 @@ impl super::Conn {
                 return;
             }
         };
+        let max_sub_id_len = self.relay.config.read().await.limits.max_sub_id_len;
+        if sub_id.len() > max_sub_id_len {
+            self.send_notice("error: NEG-OPEN subscription id too long");
+            return;
+        }
         let filter: Filter = match serde_json::from_value::<Filter>(rest[1].clone()) {
             Ok(mut filter) => {
                 // Negentropy needs every matching record, not a capped page.
@@ -46,6 +66,10 @@ impl super::Conn {
                 return;
             }
         };
+        if filter.too_many_members() {
+            self.send_neg_err(&sub_id, "error: too many ids or authors in the filter");
+            return;
+        }
         let Some(initial) = rest[2].as_str() else {
             self.send_notice("error: NEG-OPEN message must be hex");
             return;
@@ -82,30 +106,40 @@ impl super::Conn {
             ]));
             return;
         }
-        // NIP-70/NIP-29: withhold protected events from unauthenticated
-        // peers and private/hidden group content from non-members, exactly
-        // like the REQ path.
+        // NIP-70/NIP-59/NIP-29: withhold protected events from
+        // unauthenticated peers, gift wraps from anyone but their
+        // recipients, and private/hidden group content from non-members,
+        // exactly like the REQ path.
         let items: Vec<nip77::Item> = {
             let groups = self.relay.groups.read().await;
             items
                 .into_iter()
-                .filter(|(_, _, protected, gid, meta)| {
-                    if *protected && !self.is_authed() {
+                .filter(|item| {
+                    if item.protected && !self.is_authed() {
                         return false;
                     }
-                    if let Some(gid) = gid {
+                    if item.wrap_recipients.is_some()
+                        && !self.authed_pubkeys.iter().any(|pk| {
+                            item.wrap_recipients
+                                .as_ref()
+                                .is_some_and(|recips| recips.iter().any(|r| r == pk))
+                        })
+                    {
+                        return false;
+                    }
+                    if let Some(gid) = &item.gid {
                         if self.authed_pubkeys.is_empty() {
-                            groups.visible_gid(gid, *meta, None)
+                            groups.visible_gid(gid, item.meta, None)
                         } else {
                             self.authed_pubkeys
                                 .iter()
-                                .any(|pk| groups.visible_gid(gid, *meta, Some(pk)))
+                                .any(|pk| groups.visible_gid(gid, item.meta, Some(pk)))
                         }
                     } else {
                         true
                     }
                 })
-                .map(|(created, id, _, _, _)| (created, id))
+                .map(|item| (item.created, item.id))
                 .collect()
         };
         let items = nip77::sort_items(items);
@@ -118,7 +152,7 @@ impl super::Conn {
         // existing one (NIP-77): release the old items from the accounting
         // first so the total does not drift upward.
         if let Some(old) = self.neg.remove(&sub_id) {
-            self.neg_total = self.neg_total.saturating_sub(old.len());
+            self.neg_total = self.neg_total.saturating_sub(old.items.len());
         }
         if self.neg_total.saturating_add(items.len()) > total_cap {
             self.send_json(json!([
@@ -133,7 +167,13 @@ impl super::Conn {
         match nip77::respond(&items, &initial) {
             Ok(response) => {
                 self.neg_total += items.len();
-                self.neg.insert(sub_id.clone(), items);
+                self.neg.insert(
+                    sub_id.clone(),
+                    NegState {
+                        items,
+                        rounds_left: MAX_NEG_MSG_ROUNDS,
+                    },
+                );
                 self.send_neg_msg(&sub_id, &response);
             }
             Err(reason) => {
@@ -159,17 +199,25 @@ impl super::Conn {
             self.send_notice("error: NEG-MSG message must be hex");
             return;
         };
-        let Some(items) = self.neg.get(&sub_id) else {
+        let Some(state) = self.neg.get_mut(&sub_id) else {
             self.send_neg_err(&sub_id, "closed: unknown subscription");
             return;
         };
-        match nip77::respond(items, &message) {
+        // NIP-77: "After a NEG-ERR is issued, the subscription is considered
+        // to be closed." Exhausting the round budget closes it too.
+        if state.rounds_left == 0 {
+            if let Some(state) = self.neg.remove(&sub_id) {
+                self.neg_total = self.neg_total.saturating_sub(state.items.len());
+            }
+            self.send_neg_err(&sub_id, "error: too many negentropy messages");
+            return;
+        }
+        state.rounds_left -= 1;
+        match nip77::respond(&state.items, &message) {
             Ok(response) => self.send_neg_msg(&sub_id, &response),
             Err(reason) => {
-                // NIP-77: "After a NEG-ERR is issued, the subscription is
-                // considered to be closed."
-                if let Some(items) = self.neg.remove(&sub_id) {
-                    self.neg_total = self.neg_total.saturating_sub(items.len());
+                if let Some(state) = self.neg.remove(&sub_id) {
+                    self.neg_total = self.neg_total.saturating_sub(state.items.len());
                 }
                 self.send_neg_err(&sub_id, &format!("error: {reason}"));
             }
@@ -181,8 +229,8 @@ impl super::Conn {
             self.send_notice("error: NEG-CLOSE requires a subscription id");
             return;
         };
-        if let Some(items) = self.neg.remove(&sub_id) {
-            self.neg_total = self.neg_total.saturating_sub(items.len());
+        if let Some(state) = self.neg.remove(&sub_id) {
+            self.neg_total = self.neg_total.saturating_sub(state.items.len());
         }
     }
 }

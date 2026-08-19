@@ -7,6 +7,7 @@ mod negentropy;
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{SinkExt, StreamExt};
@@ -14,7 +15,7 @@ use serde_json::{Value, json};
 
 use crate::event::Event;
 use crate::filter::Filter;
-use crate::nips::{nip29, nip42, nip77};
+use crate::nips::{nip29, nip42};
 use crate::relay::Relay;
 use crate::stats::Stats;
 
@@ -40,8 +41,10 @@ pub struct Conn {
     subs: HashMap<String, (Vec<Filter>, usize)>,
     /// Bytes held by the filters of all active subscriptions.
     pub(crate) sub_bytes: usize,
-    /// NIP-77 negentropy state per subscription id.
-    neg: HashMap<String, Vec<nip77::Item>>,
+    /// NIP-77 negentropy state per subscription id: the held items plus the
+    /// remaining number of NEG-MSG rounds (a budget so a peer cannot drive
+    /// unbounded CPU-bounded reconciliation work with tiny messages).
+    neg: HashMap<String, negentropy::NegState>,
     /// Total number of negentropy items held across all open NEG-OPEN
     /// subscriptions, so that a connection cannot pin more than twice the
     /// configured per-query maximum in memory.
@@ -208,15 +211,34 @@ pub async fn handle_connection(
     };
 
     let (mut sender, mut receiver) = socket.split();
-    let (max_msg_size, out_queue_bytes, expiry_enabled, giftwrap_restricted) = {
+    let (max_msg_size, out_queue_bytes, expiry_enabled, giftwrap_restricted, idle_timeout) = {
         let cfg = relay.config.read().await;
         (
             cfg.limits.max_ws_message_size,
             cfg.limits.max_out_queue_bytes,
             cfg.nip_enabled(40),
             cfg.nip_enabled(42),
+            cfg.limits.ws_idle_timeout_secs,
         )
     };
+    // Idle connections (no inbound frames) hold their slot forever; when the
+    // operator enables the idle timeout the relay closes them, sending a
+    // periodic PING so an alive-but-silent subscriber (which auto-responds
+    // with a PONG, itself an inbound frame) stays connected while dead peers
+    // are reaped. The deadline is measured from the *last inbound frame*, not
+    // from the loop restart, so the keep-alive PING and live deliveries never
+    // reset it (otherwise dead peers would never be reaped).
+    let idle: Option<Duration> = if idle_timeout > 0 {
+        Some(Duration::from_secs(idle_timeout))
+    } else {
+        None
+    };
+    let mut last_activity = std::time::Instant::now();
+    let mut ping: Option<tokio::time::Interval> = idle.map(|d| {
+        let mut interval = tokio::time::interval(Duration::from_secs((d.as_secs() / 3).max(5)));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval
+    });
 
     let challenge = nip42::generate_challenge();
 
@@ -266,12 +288,38 @@ pub async fn handle_connection(
                 None => std::future::pending().await,
             }
         };
+        // Periodic keep-alive PING (when the idle timeout is enabled).
+        let ping_fut = async {
+            match ping.as_mut() {
+                Some(interval) => interval.tick().await,
+                None => std::future::pending().await,
+            }
+        };
+        let incoming_fut = async {
+            match idle {
+                Some(d) => {
+                    // Remaining time until the idle deadline, measured from the
+                    // last inbound frame (only the incoming branch updates
+                    // `last_activity`, so pings/live batches cannot mask a dead
+                    // peer).
+                    let remaining = d.saturating_sub(last_activity.elapsed());
+                    match tokio::time::timeout(remaining, receiver.next()).await {
+                        Ok(x) => Ok(x),
+                        Err(_) => Err(()),
+                    }
+                }
+                None => Ok(receiver.next().await),
+            }
+        };
         tokio::select! {
-            incoming = receiver.next() => {
+            incoming = incoming_fut => {
                 match incoming {
-                    Some(Ok(Message::Close(_))) | None => break,
-                    Some(Err(_)) => break,
-                    Some(Ok(frame)) => {
+                    // Idle timeout (ws_idle_timeout_secs): no inbound frames.
+                    Err(_) => break,
+                    Ok(Some(Ok(Message::Close(_)))) | Ok(None) => break,
+                    Ok(Some(Err(_))) => break,
+                    Ok(Some(Ok(frame))) => {
+                        last_activity = std::time::Instant::now();
                         if conn.handle_frame(frame, max_msg_size).await {
                             break;
                         }
@@ -284,14 +332,21 @@ pub async fn handle_connection(
                 }
                 // Batch window: keep reading for a moment so consecutive
                 // EVENT messages from a busy publisher share one database
-                // commit, then flush the queue when the socket is idle.
-                // Batch window: keep reading for a moment so consecutive
-                // EVENT messages from a busy publisher share one database
-                // commit, then flush the queue when the socket is idle.
+                // commit, then flush the queue when the socket is idle. The
+                // iteration cap bounds the window so a client flooding
+                // frames cannot starve this connection's live delivery and
+                // outgoing flush (which only run in the outer select).
                 let mut too_large = false;
-                while let Ok(Some(Ok(frame))) =
-                    tokio::time::timeout(std::time::Duration::from_millis(1), receiver.next()).await
-                {
+                for _ in 0..EVENT_BATCH * 4 {
+                    let Ok(Some(Ok(frame))) = tokio::time::timeout(
+                        std::time::Duration::from_millis(1),
+                        receiver.next(),
+                    )
+                    .await
+                    else {
+                        break;
+                    };
+                    last_activity = std::time::Instant::now();
                     if conn.handle_frame(frame, max_msg_size).await {
                         too_large = true;
                         break;
@@ -311,9 +366,23 @@ pub async fn handle_connection(
                     live = None;
                 }
             }
+            _ = ping_fut => {
+                // Keep-alive: a healthy client answers with a PONG (an
+                // inbound frame, which resets the idle timeout), so an idle
+                // subscriber stays connected while a dead peer is reaped.
+                let _ = sender.send(Message::Ping(vec![].into())).await;
+            }
             live_batch = live_fut => {
                 match live_batch {
                     Ok(batch) => {
+                        // Refresh the cached NIP-40/NIP-42 flags so a config
+                        // reload (e.g. re-enabling NIP-40 expiry) takes effect
+                        // even for idle connections that only receive live
+                        // events and never send another frame.
+                        let cfg = conn.relay.config.read().await;
+                        conn.expiry_enabled = cfg.nip_enabled(40);
+                        conn.giftwrap_restricted = cfg.nip_enabled(42);
+                        drop(cfg);
                         // The group store lock is only taken when the batch
                         // actually contains group events (rare); ordinary
                         // traffic skips the shared lock entirely.
@@ -376,4 +445,293 @@ pub async fn handle_connection(
         .stats
         .subscriptions_active
         .fetch_sub(conn.subs.len() as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use secp256k1::{Keypair, Secp256k1, XOnlyPublicKey};
+    use serde_json::Value;
+    use tokio::sync::RwLock;
+
+    use crate::config::Config;
+    use crate::nips::nip01::{compute_id, sign};
+    use crate::relay::LiveBusConfig;
+    use crate::util::unix_now;
+
+    fn temp_db_path() -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir()
+            .join("nostrd-ws-test")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        path
+    }
+
+    fn signed_note(
+        secp: &Secp256k1<secp256k1::All>,
+        content: &str,
+        created: u64,
+        tags: Vec<Vec<String>>,
+    ) -> Event {
+        let keypair = Keypair::from_seckey_slice(secp, &[1u8; 32]).unwrap();
+        let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
+        let mut ev = Event {
+            id: String::new(),
+            pubkey,
+            created_at: created,
+            kind: 1,
+            tags,
+            content: content.into(),
+            sig: String::new(),
+        };
+        sign(&mut ev, &keypair, secp).unwrap();
+        ev
+    }
+
+    fn signed_auth(secp: &Secp256k1<secp256k1::All>, challenge: &str, created: u64) -> Event {
+        let keypair = Keypair::from_seckey_slice(secp, &[2u8; 32]).unwrap();
+        let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
+        let mut ev = Event {
+            id: String::new(),
+            pubkey,
+            created_at: created,
+            kind: 22242,
+            tags: vec![
+                vec!["challenge".into(), challenge.into()],
+                vec!["relay".into(), "127.0.0.1:8080".into()],
+            ],
+            content: String::new(),
+            sig: String::new(),
+        };
+        ev.id = compute_id(&ev);
+        let id = ev.id_bytes().unwrap();
+        ev.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+        ev
+    }
+
+    async fn build_conn() -> Conn {
+        let mut cfg = Config::default();
+        cfg.database.path = temp_db_path();
+        let db = crate::db::DbClient::open(
+            &cfg.database,
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
+        let config = Arc::new(RwLock::new(cfg));
+        let stats = Stats::new();
+        let mut relay = Relay::new(
+            config,
+            db,
+            stats,
+            "",
+            LiveBusConfig {
+                buffer: 1024,
+                batch_interval_ms: 10,
+                batch_size: 64,
+            },
+        )
+        .await;
+        relay.start_live_bus();
+        let relay = Arc::new(relay);
+        let (out_queue_bytes, expiry_enabled, giftwrap_restricted) = {
+            let cfg = relay.config.read().await;
+            (
+                cfg.limits.max_out_queue_bytes,
+                cfg.nip_enabled(40),
+                cfg.nip_enabled(42),
+            )
+        };
+        Conn {
+            relay,
+            outgoing: std::collections::VecDeque::new(),
+            out_bytes: 0,
+            out_queue_bytes,
+            subs: HashMap::new(),
+            sub_bytes: 0,
+            neg: HashMap::new(),
+            neg_total: 0,
+            challenge: "test-challenge".into(),
+            authed_pubkeys: Vec::new(),
+            pending_events: Vec::new(),
+            expiry_enabled,
+            giftwrap_restricted,
+            dropped: 0,
+            in_msgs: 0,
+            in_bytes: 0,
+            out_msgs: 0,
+            out_bytes_total: 0,
+        }
+    }
+
+    /// Every queued outgoing text message parsed as JSON.
+    fn outgoing_json(conn: &Conn) -> Vec<Value> {
+        conn.outgoing
+            .iter()
+            .filter_map(|m| match m {
+                Message::Text(t) => serde_json::from_str(t).ok(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn req_delivers_matching_events_then_eose() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            let e1 = signed_note(conn.relay.secp(), "hello", now, vec![]);
+            let e2 = signed_note(conn.relay.secp(), "world", now - 1, vec![]);
+            conn.relay.db.put(e1.clone(), now).await;
+            conn.relay.db.put(e2.clone(), now).await;
+            conn.handle_req(&[json!("sub"), json!({"kinds": [1]})])
+                .await;
+            let msgs = outgoing_json(&conn);
+            let events: Vec<&Value> = msgs.iter().filter(|m| m[0] == "EVENT").collect();
+            assert_eq!(events.len(), 2);
+            let ids: Vec<String> = events
+                .iter()
+                .map(|m| m[2]["id"].as_str().unwrap().to_string())
+                .collect();
+            assert!(ids.contains(&e1.id) && ids.contains(&e2.id));
+            assert!(msgs.iter().any(|m| m[0] == "EOSE" && m[1] == "sub"));
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn req_hides_protected_events_from_anonymous() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            let normal = signed_note(conn.relay.secp(), "public", now, vec![]);
+            let protected = signed_note(conn.relay.secp(), "secret", now, vec![vec!["-".into()]]);
+            conn.relay.db.put(normal.clone(), now).await;
+            conn.relay.db.put(protected.clone(), now).await;
+            conn.handle_req(&[json!("sub"), json!({"kinds": [1]})])
+                .await;
+            let ids: Vec<String> = outgoing_json(&conn)
+                .iter()
+                .filter(|m| m[0] == "EVENT")
+                .map(|m| m[2]["id"].as_str().unwrap().to_string())
+                .collect();
+            assert!(ids.contains(&normal.id));
+            assert!(
+                !ids.contains(&protected.id),
+                "protected event must be hidden from anonymous"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn auth_grants_protected_event_visibility() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            let protected = signed_note(conn.relay.secp(), "secret", now, vec![vec!["-".into()]]);
+            conn.relay.db.put(protected.clone(), now).await;
+            // AUTH with a valid event for this connection's challenge.
+            let auth = signed_auth(conn.relay.secp(), "test-challenge", now);
+            conn.handle_auth(&[serde_json::to_value(&auth).unwrap()])
+                .await;
+            assert!(conn.is_authed());
+            conn.handle_req(&[json!("sub"), json!({"kinds": [1]})])
+                .await;
+            let ids: Vec<String> = outgoing_json(&conn)
+                .iter()
+                .filter(|m| m[0] == "EVENT")
+                .map(|m| m[2]["id"].as_str().unwrap().to_string())
+                .collect();
+            assert!(
+                ids.contains(&protected.id),
+                "authed client sees protected events"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn count_applies_visibility_to_protected_events() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            conn.relay
+                .db
+                .put(signed_note(conn.relay.secp(), "public", now, vec![]), now)
+                .await;
+            conn.relay
+                .db
+                .put(
+                    signed_note(conn.relay.secp(), "secret", now, vec![vec!["-".into()]]),
+                    now,
+                )
+                .await;
+            conn.handle_count(&[json!("c"), json!({"kinds": [1]})])
+                .await;
+            let msgs = outgoing_json(&conn);
+            let count = msgs
+                .iter()
+                .find(|m| m[0] == "COUNT")
+                .expect("a COUNT response is sent");
+            assert_eq!(
+                count[2]["count"].as_u64(),
+                Some(1),
+                "protected events are not counted for anonymous"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn flush_pending_events_acks_each_outcome() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            let valid = signed_note(conn.relay.secp(), "ok", now, vec![]);
+            let mut invalid = signed_note(conn.relay.secp(), "bad", now, vec![]);
+            invalid.sig = "00".repeat(64);
+            conn.queue_event_value(valid.clone()).await;
+            conn.queue_event_value(invalid.clone()).await;
+            conn.flush_pending_events().await;
+            let msgs = outgoing_json(&conn);
+            let oks: Vec<&Value> = msgs.iter().filter(|m| m[0] == "OK").collect();
+            assert_eq!(oks.len(), 2);
+            let by_id = |id: &str| oks.iter().find(|m| m[1] == id).copied().unwrap();
+            assert_eq!(by_id(&valid.id)[2], true);
+            assert_eq!(by_id(&invalid.id)[2], false);
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn req_rejects_too_many_filters() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let mut args = vec![json!("sub")];
+            for _ in 0..25 {
+                args.push(json!({"kinds": [1]}));
+            }
+            conn.handle_req(&args).await;
+            let msgs = outgoing_json(&conn);
+            assert!(
+                msgs.iter().any(|m| m[0] == "CLOSED"
+                    && m[2].as_str().unwrap_or("").contains("too many filters")),
+                "too many filters must be refused with CLOSED"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
 }

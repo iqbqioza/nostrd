@@ -111,10 +111,14 @@ fn issue_livekit_token(cfg: &Config, group: &str, pubkey: &str) -> Result<String
         "iat": now,
         "nbf": now,
         "exp": now + 3600,
+        // LiveKit VideoGrant: the permission fields are direct keys of the
+        // `video` claim (a nested `permissions` object would be ignored).
         "video": {
             "room": group,
-            "identity": identity,
-            "permissions": { "canPublish": true, "canSubscribe": true, "canPublishData": true }
+            "roomJoin": true,
+            "canPublish": true,
+            "canSubscribe": true,
+            "canPublishData": true
         }
     });
     jwt_hs256(&cfg.relay.livekit_api_secret, &claims)

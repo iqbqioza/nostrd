@@ -23,12 +23,19 @@ pub struct Cli {
     pub config: PathBuf,
     #[command(subcommand)]
     pub command: Command,
+    /// Set when the process is the daemon child (after daemonization).
+    #[arg(skip)]
+    pub daemonized: bool,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Write a default nostrd.toml and exit.
     Init,
+    /// Generate a relay secret key for NIP-29 and write it into nostrd.toml
+    /// (asks for confirmation when relay.private_key is already set).
+    #[command(name = "genkey")]
+    GenKey,
     /// Start the relay as a daemon (or in the foreground with --foreground).
     Start {
         #[arg(long)]
@@ -52,8 +59,10 @@ impl Cli {
     pub fn prepare(&mut self) -> Result<()> {
         match self.command {
             Command::Init => return init_config(&self.config),
+            Command::GenKey => return self.genkey(),
             Command::Check => {
                 let cfg = self.load_config()?;
+                cfg.validate()?;
                 print_line(&format!("configuration OK: {}", cfg.relay.name));
                 return Ok(());
             }
@@ -69,6 +78,10 @@ impl Cli {
 
         self.config = absolutize(&self.config);
         let cfg = self.load_config()?;
+        // Validate before daemonizing: an invalid config must fail loudly in
+        // the foreground (the parent), not silently in the daemon child
+        // whose stderr is already pointed at /dev/null.
+        cfg.validate()?;
         if let Some(pid) = running_pid(&cfg.daemon.pid_file) {
             return Err(Error::Config(format!(
                 "already running (pid {pid}); use 'nostrd stop' or 'nostrd restart'"
@@ -88,6 +101,7 @@ impl Cli {
                     info!("created default configuration at {}", self.config.display());
                 }
                 let cfg = self.load_config()?;
+                cfg.validate()?;
                 let db = open_db(&cfg)?;
                 run_server(self.config.clone(), cfg, db).await
             }
@@ -101,38 +115,68 @@ impl Cli {
         Ok(cfg)
     }
 
-    fn daemonize(&self, cfg: &Config) -> Result<()> {
-        let log_file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&cfg.daemon.log_file)
-            .map_err(|e| {
+    fn daemonize(&mut self, cfg: &Config) -> Result<()> {
+        // All logging goes through the custom logger to the log file (with
+        // rotation); the daemon's stdio is pointed at /dev/null so the
+        // inherited descriptors do not keep the file open across rotations.
+        if let Some(dir) = cfg.daemon.log_file.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| {
                 Error::Config(format!(
-                    "cannot open {}: {e}",
-                    cfg.daemon.log_file.display()
+                    "cannot create log directory {}: {e}",
+                    dir.display()
                 ))
             })?;
-        let err_file = log_file
-            .try_clone()
-            .map_err(|e| Error::Config(format!("cannot clone log file: {e}")))?;
+        }
+        crate::logging::install_file_logger(
+            cfg.daemon.log_file.clone(),
+            cfg.daemon.log_max_size_bytes,
+            cfg.daemon.log_max_files,
+        )
+        .map_err(|e| {
+            Error::Config(format!(
+                "cannot open {}: {e}",
+                cfg.daemon.log_file.display()
+            ))
+        })?;
+        let devnull = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/null")
+            .map_err(|e| Error::Config(format!("cannot open /dev/null: {e}")))?;
 
         let daemon = Daemonize::new()
             .pid_file(&cfg.daemon.pid_file)
             .working_directory("/")
-            .stdout(log_file)
-            .stderr(err_file);
+            .stdout(devnull.try_clone()?)
+            .stderr(devnull);
 
-        daemon
-            .start()
-            .map_err(|e| Error::Config(format!("failed to daemonize: {e}")))?;
-
-        // Only the daemon child reaches this point.
-        info!(
-            "daemon started (pid {}), log: {}",
-            std::process::id(),
-            cfg.daemon.log_file.display()
-        );
-        Ok(())
+        match daemon.execute() {
+            // Parent: the daemon has forked and the first child exited.
+            // Report the pid (read from the pid file, which the daemon
+            // writes just after the first child exits) and terminate, so the
+            // foreground `nostrd start`/`restart` returns with a clear
+            // message instead of silently.
+            daemonize::Outcome::Parent(result) => {
+                result.map_err(|e| Error::Config(format!("failed to daemonize: {e}")))?;
+                match wait_for_pid_file(&cfg.daemon.pid_file) {
+                    Some(pid) => print_line(&format!("nostrd started (pid {pid})")),
+                    None => print_line("nostrd started"),
+                }
+                flush_stdout();
+                std::process::exit(0);
+            }
+            // Only the daemon child reaches this point.
+            daemonize::Outcome::Child(result) => {
+                result.map_err(|e| Error::Config(format!("failed to daemonize: {e}")))?;
+                self.daemonized = true;
+                info!(
+                    "daemon started (pid {}), log: {}",
+                    std::process::id(),
+                    cfg.daemon.log_file.display()
+                );
+                Ok(())
+            }
+        }
     }
 
     fn stop(&self) -> Result<()> {
@@ -143,7 +187,7 @@ impl Cli {
                 return Ok(());
             }
         };
-        info!("stopping nostrd (pid {pid})");
+        print_line(&format!("stopping nostrd (pid {pid})"));
         // SAFETY: `kill` only touches the targeted process id.
         let ret = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
         if ret != 0 {
@@ -152,7 +196,12 @@ impl Cli {
                 std::io::Error::last_os_error()
             )));
         }
-        wait_for_stop(&self.load_config()?.daemon.pid_file);
+        if !wait_for_stop(&self.load_config()?.daemon.pid_file) {
+            return Err(Error::Other(format!(
+                "daemon (pid {pid}) did not stop in time"
+            )));
+        }
+        print_line("nostrd stopped");
         Ok(())
     }
 
@@ -166,6 +215,59 @@ impl Cli {
         let raw = std::fs::read_to_string(&cfg.daemon.stats_file)?;
         let value: serde_json::Value = serde_json::from_str(&raw)?;
         print_line(&serde_json::to_string_pretty(&value)?);
+        Ok(())
+    }
+
+    /// `nostrd genkey`: generates a relay secret key (for NIP-29 group
+    /// metadata and NIP-43 membership events) and writes it into
+    /// `relay.private_key` of the config file, preserving the rest of the
+    /// file. When `relay.private_key` is already set, the operator is asked
+    /// to confirm the overwrite (y/N).
+    fn genkey(&self) -> Result<()> {
+        if !self.config.exists() {
+            return Err(Error::Config(format!(
+                "{} not found; run 'nostrd init' first",
+                self.config.display()
+            )));
+        }
+        let existing = Config::load(&self.config)?.relay.private_key.clone();
+        let key = generate_secret_key_hex()?;
+
+        if !existing.is_empty() {
+            let prefix: String = existing.chars().take(8).collect();
+            print_line(&format!(
+                "relay.private_key is already set ({}...). Overwrite it? [y/N]",
+                prefix
+            ));
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer).map_err(Error::Io)?;
+            if !answer.trim().eq_ignore_ascii_case("y") {
+                print_line("aborted: relay.private_key unchanged");
+                return Ok(());
+            }
+        }
+
+        let text = std::fs::read_to_string(&self.config)?;
+        std::fs::write(&self.config, set_private_key_in_text(&text, &key))?;
+
+        // Print the relay's pubkey too: it is safe to share and useful for
+        // advertising the relay's `self` identity (NIP-11).
+        let pubkey = match secp256k1::SecretKey::from_slice(&hex::decode(&key).unwrap()) {
+            Ok(secret) => {
+                let secp = secp256k1::Secp256k1::new();
+                let keypair = secp256k1::Keypair::from_seckey_slice(&secp, &secret.secret_bytes())
+                    .map(|k| secp256k1::XOnlyPublicKey::from_keypair(&k).0.to_string());
+                keypair.unwrap_or_default()
+            }
+            Err(_) => String::new(),
+        };
+        print_line(&format!(
+            "wrote relay.private_key to {}",
+            self.config.display()
+        ));
+        if !pubkey.is_empty() {
+            print_line(&format!("relay pubkey (NIP-11 \"self\"): {pubkey}"));
+        }
         Ok(())
     }
 }
@@ -189,6 +291,26 @@ fn print_line(text: &str) {
     let _ = writeln!(std::io::stdout(), "{text}");
 }
 
+/// Flushes stdout so a completion message survives a `process::exit` (which
+/// runs no destructors and would otherwise drop a buffered write).
+fn flush_stdout() {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+}
+
+/// Waits up to one second for the daemon's pid file to appear (the daemon
+/// writes it just after the first child exits, so the parent can read it a
+/// moment early) and returns the pid when the daemon is alive.
+fn wait_for_pid_file(path: &Path) -> Option<u32> {
+    for _ in 0..100 {
+        if let Some(pid) = running_pid(path) {
+            return Some(pid);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    None
+}
+
 fn init_config(path: &Path) -> Result<()> {
     match Config::write_default(path) {
         Ok(()) => print_line(&format!("wrote {}", path.display())),
@@ -199,6 +321,109 @@ fn init_config(path: &Path) -> Result<()> {
         Err(e) => return Err(e),
     }
     Ok(())
+}
+
+/// Generates a random secp256k1 secret key as lowercase hex (64 chars),
+/// retrying if the random bytes happen to be out of the valid range.
+fn generate_secret_key_hex() -> Result<String> {
+    for _ in 0..8 {
+        let mut bytes = [0u8; 32];
+        getrandom::getrandom(&mut bytes)
+            .map_err(|e| Error::Other(format!("cannot read random bytes: {e}")))?;
+        if let Ok(secret) = secp256k1::SecretKey::from_slice(&bytes) {
+            return Ok(hex::encode(secret.secret_bytes()));
+        }
+    }
+    Err(Error::Other("failed to generate a valid secret key".into()))
+}
+
+/// Replaces (or inserts) the `relay.private_key` value in a config file's
+/// text, preserving every other line, comment and section. Handles three
+/// cases: a `private_key` line already present in the `[relay]` section, no
+/// `private_key` line in `[relay]` (inserted right after the header), and no
+/// `[relay]` section at all (appended).
+fn set_private_key_in_text(text: &str, key: &str) -> String {
+    let line = format!("private_key = \"{key}\"");
+
+    // Locate a real `[relay]` section header: a line whose trimmed text
+    // starts with `[relay]` followed by `]`. A `[relay]` inside a comment or
+    // a string value is not a section header and must not match.
+    let mut header_start = None;
+    let mut offset = 0;
+    for l in text.split_inclusive('\n') {
+        let t = l.trim();
+        // `[relay]` header line: exactly `[relay]`, or `[relay]` followed by
+        // whitespace (a trailing comment). A `[relay]` inside a comment or a
+        // string value does not start with `[relay]` as a header.
+        if t == "[relay]" || t.starts_with("[relay] ") || t.starts_with("[relay]\t") {
+            header_start = Some(offset);
+            break;
+        }
+        offset += l.len();
+    }
+    let Some(header_start) = header_start else {
+        // No [relay] section: append one at the end.
+        let mut s = text.to_string();
+        if !s.ends_with('\n') {
+            s.push('\n');
+        }
+        s.push_str(&format!("[relay]\n{line}\n"));
+        return s;
+    };
+
+    // The header line ends at the first newline after its start (or EOF when
+    // it is the last line without a trailing newline).
+    let header_end = text[header_start..]
+        .find('\n')
+        .map(|i| header_start + i + 1)
+        .unwrap_or(text.len());
+
+    // Bound the section at the next `[section]` header line.
+    let mut section_end = text.len();
+    let mut cursor = header_end;
+    for l in text[header_end..].split_inclusive('\n') {
+        let t = l.trim();
+        if t.starts_with('[') && t.ends_with(']') {
+            section_end = cursor;
+            break;
+        }
+        cursor += l.len();
+    }
+    let section = &text[header_end..section_end];
+
+    // Case 1: a `private_key` line already exists in the section — replace it.
+    if let Some(offset) = section
+        .lines()
+        .position(|l| l.trim_start().starts_with("private_key"))
+    {
+        let mut new_section = String::new();
+        for (i, l) in section.lines().enumerate() {
+            if i == offset {
+                let indent: String = l.chars().take_while(|c| c.is_whitespace()).collect();
+                new_section.push_str(&format!("{indent}{line}\n"));
+            } else {
+                new_section.push_str(l);
+                new_section.push('\n');
+            }
+        }
+        let mut s = text.to_string();
+        s.replace_range(header_end..section_end, &new_section);
+        return s;
+    }
+
+    // Case 2: no `private_key` line — insert it right after the `[relay]`
+    // header line, keeping the header on its own line even when the header
+    // is the last line of the file without a trailing newline.
+    let mut s = text.to_string();
+    if header_end >= s.len() {
+        // Header is the last line without a trailing newline.
+        s.push('\n');
+        s.push_str(&line);
+        s.push('\n');
+    } else {
+        s.insert_str(header_end, &format!("{line}\n"));
+    }
+    s
 }
 
 /// Resolves a possibly relative path against the current directory so that it
@@ -225,14 +450,31 @@ fn running_pid(pid_file: &Path) -> Option<u32> {
     if process_alive(pid) { Some(pid) } else { None }
 }
 
-/// Checks whether a process is alive with `kill(pid, 0)`.
+/// Checks whether a process is alive with `kill(pid, 0)`. On Linux the
+/// process name is cross-checked against `/proc/<pid>/comm` so that a stale
+/// pid file whose pid was reused by an unrelated process is not mistaken for
+/// a running relay (which would make `start` refuse and `stop` signal an
+/// innocent process).
 fn process_alive(pid: u32) -> bool {
     // SAFETY: signal 0 only probes for the existence of the process.
-    let ret = unsafe { libc::kill(pid as i32, 0) };
-    ret == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    let alive = {
+        let ret = unsafe { libc::kill(pid as i32, 0) };
+        ret == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    };
+    if !alive {
+        return false;
+    }
+    // Best-effort name check (Linux only): a reused pid running a different
+    // program is not our daemon.
+    if let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) {
+        return comm.trim() == "nostrd";
+    }
+    true
 }
 
-fn wait_for_stop(pid_file: &Path) {
+/// Waits up to 10 seconds for the daemon to exit (the pid file to disappear).
+/// Returns `true` when the daemon stopped, `false` when it is still running.
+fn wait_for_stop(pid_file: &Path) -> bool {
     for _ in 0..100 {
         let gone = std::fs::read_to_string(pid_file)
             .ok()
@@ -241,7 +483,7 @@ fn wait_for_stop(pid_file: &Path) {
             .unwrap_or(true);
         if gone {
             let _ = std::fs::remove_file(pid_file);
-            return;
+            return true;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -249,4 +491,74 @@ fn wait_for_stop(pid_file: &Path) {
         "daemon did not stop in time; pid file {} still exists",
         pid_file.display()
     );
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KEY: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+    #[test]
+    fn replaces_existing_private_key_preserving_comments() {
+        let text = "# comment\n[relay]\nname = \"nostrd\"\n# my key\nprivate_key = \"\"\npublic_url = \"wss://x\"\n";
+        let out = set_private_key_in_text(text, KEY);
+        assert!(out.contains(&format!("private_key = \"{KEY}\"")));
+        assert!(!out.contains("private_key = \"\""));
+        // Comments and unrelated lines survive.
+        assert!(out.contains("# comment"));
+        assert!(out.contains("# my key"));
+        assert!(out.contains("name = \"nostrd\""));
+        assert!(out.contains("public_url = \"wss://x\""));
+    }
+
+    #[test]
+    fn inserts_private_key_after_relay_header() {
+        let text = "[relay]\nname = \"nostrd\"\n\n[server]\nport = 8080\n";
+        let out = set_private_key_in_text(text, KEY);
+        assert!(out.contains(&format!(
+            "[relay]\nprivate_key = \"{KEY}\"\nname = \"nostrd\""
+        )));
+        assert!(out.contains("[server]\nport = 8080"));
+    }
+
+    #[test]
+    fn appends_relay_section_when_missing() {
+        let text = "[server]\nport = 8080\n";
+        let out = set_private_key_in_text(text, KEY);
+        assert!(out.ends_with(&format!("[relay]\nprivate_key = \"{KEY}\"\n")));
+        assert!(out.starts_with("[server]\nport = 8080\n"));
+    }
+
+    #[test]
+    fn relay_header_at_eof_without_newline_stays_valid_toml() {
+        // [relay] as the last line with no trailing newline: the key must be
+        // inserted on a new line, not glued to the header.
+        let text = "[server]\nport = 8080\n[relay]";
+        let out = set_private_key_in_text(text, KEY);
+        assert!(out.contains(&format!("[relay]\nprivate_key = \"{KEY}\"\n")));
+        // The result must parse as valid TOML.
+        assert!(toml::from_str::<toml::Value>(&out).is_ok());
+    }
+
+    #[test]
+    fn relay_in_comment_or_string_is_not_a_header() {
+        // A `[relay]` mention inside a comment or a string value must not be
+        // treated as the section header.
+        let text =
+            "# [relay] mentioned in a comment\nname = \"x [relay] y\"\n[server]\nport = 8080\n";
+        let out = set_private_key_in_text(text, KEY);
+        assert!(out.ends_with(&format!("[relay]\nprivate_key = \"{KEY}\"\n")));
+        assert!(out.starts_with("# [relay] mentioned in a comment\n"));
+        assert!(toml::from_str::<toml::Value>(&out).is_ok());
+    }
+
+    #[test]
+    fn generated_key_is_valid_hex() {
+        let key = generate_secret_key_hex().unwrap();
+        assert_eq!(key.len(), 64);
+        assert!(hex::decode(&key).is_ok());
+        assert!(secp256k1::SecretKey::from_slice(&hex::decode(&key).unwrap()).is_ok());
+    }
 }

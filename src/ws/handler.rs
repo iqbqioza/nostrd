@@ -192,6 +192,10 @@ impl super::Conn {
             self.send_closed(sub_id, "invalid: too many filters");
             return;
         }
+        if filters.iter().any(|f| f.too_many_members()) {
+            self.send_closed(sub_id, "invalid: too many ids or authors in a filter");
+            return;
+        }
 
         let search_disabled = filters.iter().any(|f| f.has_search()) && !search_enabled;
 
@@ -355,18 +359,61 @@ impl super::Conn {
                 }
             }
         }
+        if filters.iter().any(|f| f.too_many_members()) {
+            self.send_closed(sub_id, "invalid: too many ids or authors in a filter");
+            return;
+        }
+        // Cap the filter count like REQ: without it each filter would get its
+        // own full scan budget, so a single 1 MiB COUNT frame could drive
+        // ~28k filters × 200k candidate examinations on the shared reader
+        // thread (~1400x the full-scan budget).
+        if filters.len() > self.relay.config.read().await.limits.max_filters {
+            self.send_closed(sub_id, "invalid: too many filters");
+            return;
+        }
         let count_limit = self.relay.config.read().await.limits.count_limit;
+        let mut count_filters = filters.clone();
+        // NIP-50: when the search capability is disabled, strip `search` like
+        // REQ does — otherwise COUNT would filter by terms a REQ would ignore
+        // (count/REQ divergence) and drive search walks for a feature the
+        // relay claims not to offer.
+        if !self.relay.config.read().await.nip_enabled(50) {
+            for f in &mut count_filters {
+                f.search = None;
+            }
+        }
         let (events, more) = self
             .relay
             .db
-            .count(filters.clone(), count_limit, unix_now())
+            .count(count_filters, count_limit, unix_now())
             .await;
-        // NIP-70: protected events are only counted for authenticated
-        // clients, so COUNT never leaks them to unauthenticated peers.
-        let events: Vec<Event> = events
-            .into_iter()
-            .filter(|e| self.is_authed() || !nip70::is_protected(e))
-            .collect();
+        // NIP-70/59/29: COUNT applies the same visibility rules as REQ, so
+        // an unauthenticated peer cannot learn the size of a private group,
+        // the existence of gift wraps or the count of protected events.
+        let events: Vec<Event> = {
+            let has_group_events = events.iter().any(nip29::is_group_event);
+            let groups = if has_group_events {
+                Some(self.relay.groups.read().await)
+            } else {
+                None
+            };
+            events
+                .into_iter()
+                .filter(|e| {
+                    (self.is_authed() || !nip70::is_protected(e))
+                        && self.gift_wrap_visible(e)
+                        && groups.as_deref().is_none_or(|g| {
+                            if self.authed_pubkeys.is_empty() {
+                                g.visible_to(e, None)
+                            } else {
+                                self.authed_pubkeys
+                                    .iter()
+                                    .any(|pk| g.visible_to(e, Some(pk)))
+                            }
+                        })
+                })
+                .collect()
+        };
         self.send_json(nip45::count_response(sub_id, &filters, &events, more));
     }
 
@@ -467,7 +514,7 @@ impl super::Conn {
             out.push(',');
             out.push_str(&event_json);
             out.push(']');
-            self.send(Message::Text(out.clone().into()));
+            self.send(Message::Text(std::mem::take(&mut out).into()));
         }
     }
 }

@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path as AxPath, State};
+use axum::extract::{OriginalUri, Path as AxPath, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -56,20 +56,25 @@ async fn check_auth(
     headers: &HeaderMap,
     state: &AdminState,
     method: &str,
+    uri: &axum::http::Uri,
 ) -> std::result::Result<(), Response> {
     let relay = &state.relay;
     let cfg = relay.config.read().await;
 
+    // Bearer token, when configured. A wrong token falls through to the
+    // NIP-98 check (matching the JSON-RPC path) so both methods can be
+    // configured at once instead of one silently disabling the other.
+    let mut token_configured = false;
     if !cfg.server.management_token.is_empty() {
-        let token = headers
+        token_configured = true;
+        if let Some(token) = headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
-            .ok_or_else(|| unauthorized("missing bearer token"))?;
-        if super::ct_eq(token, &cfg.server.management_token) {
+            && super::ct_eq(token, &cfg.server.management_token)
+        {
             return Ok(());
         }
-        return Err(unauthorized("invalid bearer token"));
     }
 
     if !cfg.server.admin_pubkey.is_empty() {
@@ -78,13 +83,25 @@ async fn check_auth(
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Nostr "))
             .ok_or_else(|| unauthorized("missing NIP-98 auth"))?;
+        // NIP-98: the `u` tag must be the absolute request URL (host, path
+        // and query all match), matching the JSON-RPC path. The legacy
+        // management API is served on the *management* host:port, not the
+        // relay's main endpoint, so the authority is the management
+        // host:port (the relay `public_url` does not apply here).
+        let mgmt_identity = crate::nips::nip62::RelayIdentity::new(
+            &cfg.server.management_host,
+            cfg.server.management_port,
+            "",
+        );
+        let url_ok =
+            |tag: &str| nip98::matches_request_url(tag, &mgmt_identity, uri.path(), uri.query());
         if nip98::verify(
             auth,
             Some(&cfg.server.admin_pubkey),
             relay.secp(),
             true,
             method,
-            |_| true,
+            url_ok,
         )
         .await
         .is_some()
@@ -94,9 +111,11 @@ async fn check_auth(
         return Err(unauthorized("invalid NIP-98 auth"));
     }
 
-    Err(unauthorized(
-        "management API disabled: set server.management_token or server.admin_pubkey",
-    ))
+    Err(unauthorized(if token_configured {
+        "invalid bearer token"
+    } else {
+        "management API disabled: set server.management_token or server.admin_pubkey"
+    }))
 }
 
 fn unauthorized(msg: &str) -> Response {
@@ -107,8 +126,12 @@ fn bad_request(msg: &str) -> Response {
     (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response()
 }
 
-async fn admin_info(State(state): State<Arc<AdminState>>, headers: HeaderMap) -> Response {
-    if let Err(resp) = check_auth(&headers, &state, "GET").await {
+async fn admin_info(
+    uri: OriginalUri,
+    State(state): State<Arc<AdminState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(resp) = check_auth(&headers, &state, "GET", &uri).await {
         return resp;
     }
     let cfg = state.relay.config.read().await;
@@ -120,19 +143,24 @@ async fn admin_info(State(state): State<Arc<AdminState>>, headers: HeaderMap) ->
     .into_response()
 }
 
-async fn admin_stats(State(state): State<Arc<AdminState>>, headers: HeaderMap) -> Response {
-    if let Err(resp) = check_auth(&headers, &state, "GET").await {
+async fn admin_stats(
+    uri: OriginalUri,
+    State(state): State<Arc<AdminState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(resp) = check_auth(&headers, &state, "GET", &uri).await {
         return resp;
     }
     Json(state.relay.stats.as_json()).into_response()
 }
 
 async fn block_pubkey(
+    uri: OriginalUri,
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
     Json(body): Json<PubkeyBody>,
 ) -> Response {
-    if let Err(resp) = check_auth(&headers, &state, "POST").await {
+    if let Err(resp) = check_auth(&headers, &state, "POST", &uri).await {
         return resp;
     }
     if hex::decode(&body.pubkey)
@@ -145,56 +173,68 @@ async fn block_pubkey(
     if !access.blocked_pubkeys.iter().any(|p| p == &body.pubkey) {
         access.blocked_pubkeys.push(body.pubkey.clone());
     }
+    drop(access);
+    state.relay.persist_access().await;
     Json(json!({ "ok": true, "blocked_pubkey": body.pubkey })).into_response()
 }
 
 async fn allow_pubkey(
+    uri: OriginalUri,
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
     Json(body): Json<PubkeyBody>,
 ) -> Response {
-    if let Err(resp) = check_auth(&headers, &state, "POST").await {
+    if let Err(resp) = check_auth(&headers, &state, "POST", &uri).await {
         return resp;
     }
     let mut access = state.relay.access.write().await;
     access.blocked_pubkeys.retain(|p| p != &body.pubkey);
+    drop(access);
+    state.relay.persist_access().await;
     Json(json!({ "ok": true, "allowed_pubkey": body.pubkey })).into_response()
 }
 
 async fn block_kind(
+    uri: OriginalUri,
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
     Json(body): Json<KindBody>,
 ) -> Response {
-    if let Err(resp) = check_auth(&headers, &state, "POST").await {
+    if let Err(resp) = check_auth(&headers, &state, "POST", &uri).await {
         return resp;
     }
     let mut access = state.relay.access.write().await;
     if !access.blocked_kinds.contains(&body.kind) {
         access.blocked_kinds.push(body.kind);
     }
+    drop(access);
+    state.relay.persist_access().await;
     Json(json!({ "ok": true, "blocked_kind": body.kind })).into_response()
 }
 
 async fn allow_kind(
+    uri: OriginalUri,
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
     Json(body): Json<KindBody>,
 ) -> Response {
-    if let Err(resp) = check_auth(&headers, &state, "POST").await {
+    if let Err(resp) = check_auth(&headers, &state, "POST", &uri).await {
         return resp;
     }
     let mut access = state.relay.access.write().await;
     access.blocked_kinds.retain(|k| k != &body.kind);
+    drop(access);
+    state.relay.persist_access().await;
     Json(json!({ "ok": true, "allowed_kind": body.kind })).into_response()
 }
 
 async fn event_status(
+    uri: OriginalUri,
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
     AxPath(id): AxPath<String>,
 ) -> Response {
-    if let Err(resp) = check_auth(&headers, &state, "GET").await {
+    if let Err(resp) = check_auth(&headers, &state, "GET", &uri).await {
         return resp;
     }
     let filter: Value = json!({ "ids": [id] });
@@ -209,8 +249,12 @@ async fn event_status(
     Json(json!({ "ok": true, "found": true, "event": event[0] })).into_response()
 }
 
-async fn shutdown(State(state): State<Arc<AdminState>>, headers: HeaderMap) -> Response {
-    if let Err(resp) = check_auth(&headers, &state, "POST").await {
+async fn shutdown(
+    uri: OriginalUri,
+    State(state): State<Arc<AdminState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(resp) = check_auth(&headers, &state, "POST", &uri).await {
         return resp;
     }
     let _ = state.shutdown.send(true);

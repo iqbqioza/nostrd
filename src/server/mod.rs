@@ -5,7 +5,7 @@
 mod api;
 mod livekit;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,7 +19,7 @@ use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
-use log::{error, info};
+use log::{error, info, warn};
 use serde_json::json;
 use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
@@ -116,6 +116,9 @@ async fn build_router(relay: &Arc<Relay>) -> Router {
         .route("/relay/stats", get(stats_handler))
         .nest("/api/v1", api_routes);
     let cfg = relay.config.read().await;
+    if cfg.server.metrics_enabled {
+        app = app.route("/metrics", get(metrics_handler));
+    }
     if cfg.nip_enabled(29) && !cfg.relay.livekit_url.is_empty() {
         app = app
             .route("/.well-known/nip29/livekit", get(livekit_supported))
@@ -137,16 +140,35 @@ async fn build_router(relay: &Arc<Relay>) -> Router {
         .with_state(relay.clone())
 }
 
+/// The host part of an HTTP Host header value: strips an IPv6 literal's
+/// brackets (`[::1]:8080` -> `::1`) or splits a DNS/IPv4 host from its
+/// optional `:port` suffix (`relay.example.com:8080` -> `relay.example.com`).
+fn host_header_host(header: &str) -> &str {
+    let h = header.trim();
+    if let Some(rest) = h.strip_prefix('[') {
+        // IPv6 literal: the host ends at the closing bracket.
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        // DNS name or IPv4 address: everything before the first ':'.
+        h.split(':').next().unwrap_or(h)
+    }
+}
+
 /// Returns `true` when the request's Host header names `api_host`
-/// (ignoring case and any `:port` suffix).
+/// (ignoring case, any `:port` suffix and IPv6 literal brackets).
 fn host_is_api(api_host: &str, request: &Request) -> bool {
     request
         .headers()
         .get(axum::http::header::HOST)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|h| {
-            let host = h.split(':').next().unwrap_or(h).trim().to_ascii_lowercase();
-            host == api_host
+            let host = host_header_host(h).to_ascii_lowercase();
+            let expected = api_host
+                .trim()
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_ascii_lowercase();
+            host == expected
         })
 }
 
@@ -158,52 +180,10 @@ async fn host_split(api_host: &str, request: Request, next: Next) -> Response {
     let is_api_host = host_is_api(api_host, &request);
     let is_api_path = request.uri().path().starts_with("/api/v1");
     let is_health = request.uri().path() == "/health";
-    match (is_api_host, is_api_path || is_health) {
+    let is_metrics = request.uri().path() == "/metrics";
+    match (is_api_host, is_api_path || is_health || is_metrics) {
         (true, true) | (false, false) => next.run(request).await,
         _ => StatusCode::NOT_FOUND.into_response(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::body::Body;
-    use axum::http::{Request, header};
-
-    fn req(host: &str, path: &str) -> Request<Body> {
-        Request::builder()
-            .uri(path)
-            .header(header::HOST, host)
-            .body(Body::empty())
-            .unwrap()
-    }
-
-    #[test]
-    fn host_is_api_matches_exact_host() {
-        assert!(host_is_api("api.example.com", &req("api.example.com", "/")));
-        assert!(!host_is_api(
-            "api.example.com",
-            &req("relay.example.com", "/")
-        ));
-    }
-
-    #[test]
-    fn host_is_api_ignores_port_and_case() {
-        assert!(host_is_api(
-            "api.example.com",
-            &req("api.example.com:8080", "/")
-        ));
-        assert!(host_is_api("api.example.com", &req("API.EXAMPLE.COM", "/")));
-        assert!(!host_is_api(
-            "api.example.com",
-            &req("notapi.example.com", "/")
-        ));
-    }
-
-    #[test]
-    fn host_is_api_rejects_missing_host() {
-        let bare = Request::builder().uri("/").body(Body::empty()).unwrap();
-        assert!(!host_is_api("api.example.com", &bare));
     }
 }
 
@@ -298,6 +278,7 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
         config_path,
         relay.config.clone(),
         relay.db.clone(),
+        relay.api_limit.clone(),
         shutdown_rx.clone(),
     )));
 
@@ -495,6 +476,17 @@ async fn health_handler() -> impl IntoResponse {
     (StatusCode::OK, Json(json!({ "status": "ok" })))
 }
 
+/// Prometheus metrics endpoint: the counters in text exposition format.
+async fn metrics_handler(State(relay): State<Arc<Relay>>) -> impl IntoResponse {
+    (
+        [(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )],
+        relay.stats.as_prometheus(),
+    )
+}
+
 async fn stats_writer(relay: Arc<Relay>, mut shutdown: watch::Receiver<bool>) {
     let secs = relay.config.read().await.daemon.stats_interval_secs.max(1);
     let mut ticker = interval(Duration::from_secs(secs));
@@ -508,14 +500,23 @@ async fn stats_writer(relay: Arc<Relay>, mut shutdown: watch::Receiver<bool>) {
                     .db_size_bytes
                     .store(relay.db.size_on_disk().await, std::sync::atomic::Ordering::Relaxed);
                 relay.stats.bump(&relay.stats.db_errors, relay.db.take_errors());
-                if let Ok(json) = serde_json::to_string_pretty(&relay.stats.as_json())
-                    && std::fs::write(&path, json).is_err()
-                {
-                    error!("cannot write stats file {}", path.display());
+                if let Ok(json) = serde_json::to_string_pretty(&relay.stats.as_json()) {
+                    write_atomic(&path, json.as_bytes());
                 }
             }
             _ = shutdown.changed() => break,
         }
+    }
+}
+
+/// Writes `data` to `path` atomically (temp file + rename) so a crash in
+/// the middle of a write never leaves a truncated stats file behind.
+fn write_atomic(path: &Path, data: &[u8]) {
+    let tmp = path.with_extension("tmp");
+    let result = std::fs::write(&tmp, data).and_then(|()| std::fs::rename(&tmp, path));
+    if let Err(e) = result {
+        error!("cannot write {}: {e}", path.display());
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -569,6 +570,7 @@ async fn reload_handler(
     config_path: PathBuf,
     config: Arc<tokio::sync::RwLock<Config>>,
     db: DbClient,
+    api_limit: Arc<crate::relay::ApiLimiter>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut hangup = match signal(SignalKind::hangup()) {
@@ -584,7 +586,29 @@ async fn reload_handler(
                 match Config::load(&config_path) {
                     Ok(mut new_config) => {
                         new_config.absolutize_paths(&config_path);
+                        // Validate before applying: a parseable-but-invalid
+                        // file (zero limits, bad keys, map layout) must not
+                        // silently disable the relay at runtime. The old
+                        // configuration stays in force on failure.
+                        if let Err(e) = new_config.validate() {
+                            error!("config reload rejected: {e}");
+                            continue;
+                        }
                         db.set_expiry_enabled(new_config.nip_enabled(40));
+                        api_limit.set_max(new_config.limits.api_max_concurrent);
+                        // The relay's signing key is fixed at startup: a
+                        // reloaded private_key is not applied (NIP-29/NIP-43
+                        // keep signing and NIP-11 `self` keeps advertising
+                        // the old key). Warn so the operator knows a restart
+                        // is required for it to take effect.
+                        let old = config.read().await;
+                        if old.relay.private_key != new_config.relay.private_key {
+                            warn!(
+                                "relay.private_key changed in the reloaded config but is fixed \
+                                 at startup; a restart is required to apply it"
+                            );
+                        }
+                        drop(old);
                         *config.write().await = new_config;
                         info!("configuration reloaded from {}", config_path.display());
                     }
@@ -593,5 +617,77 @@ async fn reload_handler(
             }
             _ = shutdown.changed() => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, header};
+
+    fn req(host: &str, path: &str) -> Request<Body> {
+        Request::builder()
+            .uri(path)
+            .header(header::HOST, host)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[test]
+    fn host_is_api_matches_exact_host() {
+        assert!(host_is_api("api.example.com", &req("api.example.com", "/")));
+        assert!(!host_is_api(
+            "api.example.com",
+            &req("relay.example.com", "/")
+        ));
+    }
+
+    #[test]
+    fn host_is_api_ignores_port_and_case() {
+        assert!(host_is_api(
+            "api.example.com",
+            &req("api.example.com:8080", "/")
+        ));
+        assert!(host_is_api("api.example.com", &req("API.EXAMPLE.COM", "/")));
+        assert!(!host_is_api(
+            "api.example.com",
+            &req("notapi.example.com", "/")
+        ));
+    }
+
+    #[test]
+    fn host_is_api_rejects_missing_host() {
+        let bare = Request::builder().uri("/").body(Body::empty()).unwrap();
+        assert!(!host_is_api("api.example.com", &bare));
+    }
+
+    #[test]
+    fn host_is_api_handles_ipv6_literals() {
+        // Bracket form with and without a port.
+        assert!(host_is_api("::1", &req("[::1]:8080", "/")));
+        assert!(host_is_api("[::1]", &req("[::1]:8080", "/")));
+        assert!(host_is_api("::1", &req("[::1]", "/")));
+        // A different IPv6 address does not match.
+        assert!(!host_is_api("::1", &req("[::2]:8080", "/")));
+        // IPv4-mapped IPv6 literals work too.
+        assert!(host_is_api(
+            "::ffff:192.0.2.1",
+            &req("[::ffff:192.0.2.1]:8080", "/")
+        ));
+        // IPv6 with a zone identifier (link-local) still matches.
+        assert!(host_is_api(
+            "fe80::1%eth0",
+            &req("[fe80::1%eth0]:8080", "/")
+        ));
+    }
+
+    #[test]
+    fn host_header_host_extracts_host() {
+        assert_eq!(host_header_host("api.example.com"), "api.example.com");
+        assert_eq!(host_header_host("api.example.com:8080"), "api.example.com");
+        assert_eq!(host_header_host("[::1]"), "::1");
+        assert_eq!(host_header_host("[::1]:8080"), "::1");
+        assert_eq!(host_header_host("192.0.2.1:80"), "192.0.2.1");
     }
 }

@@ -58,6 +58,34 @@ fn verify_checksum(hrp: &[u8], data: &[u8]) -> Option<bool> {
     }
 }
 
+/// Whether `s` is a complete `hrp`-prefixed bech32/bech32m string with a
+/// valid checksum (BIP-173). Case-insensitive (BIP-173 permits all-lowercase
+/// or all-uppercase). Used by the nsec-leak detector so that strings merely
+/// *resembling* a key (`nsec1` + charset chars but a bad checksum) are not
+/// mistaken for real secret keys.
+pub(crate) fn bech32_checksum_valid(hrp: &str, s: &str) -> bool {
+    let s = s.to_lowercase();
+    let Some(body) = s.strip_prefix(hrp).and_then(|r| r.strip_prefix('1')) else {
+        return false;
+    };
+    if body.len() < 6 {
+        return false;
+    }
+    let data: Option<Vec<u8>> = body
+        .chars()
+        .map(|ch| {
+            if !ch.is_ascii() {
+                return None;
+            }
+            CHARSET.iter().position(|&c| c == ch as u8).map(|p| p as u8)
+        })
+        .collect();
+    let Some(data) = data else {
+        return false;
+    };
+    verify_checksum(hrp.as_bytes(), &data).is_some()
+}
+
 /// Create a bech32m checksum for `data` (without checksum).
 fn create_checksum(hrp: &[u8], data: &[u8]) -> Vec<u8> {
     let mut values = hrp_expand(hrp);
@@ -95,9 +123,11 @@ fn bech32_decode(input: &str) -> Result<(String, Vec<u8>, bool), Bech32Error> {
         return Err(Bech32Error::EmptyData);
     }
 
-    // Validate characters.
+    // Validate characters. BIP-173 requires ASCII only: a non-ASCII char
+    // must not be silently truncated to its low byte (which could pass the
+    // charset check as a look-alike).
     for ch in data_part.chars() {
-        if !CHARSET.contains(&(ch as u8)) {
+        if !ch.is_ascii() || !CHARSET.contains(&(ch as u8)) {
             return Err(Bech32Error::InvalidChar(ch));
         }
     }
@@ -218,12 +248,14 @@ impl std::error::Error for Bech32Error {}
 // NIP-19 TLV parsing
 // ---------------------------------------------------------------------------
 
-const TLV_PUBKEY: u8 = 1;
-const TLV_EVENT: u8 = 2;
+/// NIP-19 TLV types (19.md): `0` = special (nprofile pubkey / nevent id /
+/// naddr `d` tag), `1` = relay, `2` = author (pubkey), `3` = kind (32-bit
+/// big-endian). Earlier revisions used non-standard numbers here, which made
+/// every standard `nevent1`/`naddr1` undecodable.
+const TLV_SPECIAL: u8 = 0;
+const TLV_RELAY: u8 = 1;
+const TLV_AUTHOR: u8 = 2;
 const TLV_KIND: u8 = 3;
-const TLV_RELAY: u8 = 4;
-const TLV_DTAG: u8 = 5;
-const TLV_AUTHOR: u8 = 6;
 
 fn parse_tlv(data: &[u8]) -> Result<Vec<(u8, Vec<u8>)>, Bech32Error> {
     let mut items = Vec::new();
@@ -280,7 +312,7 @@ pub fn parse_nip19(input: &str) -> Result<Nip19Entity, Bech32Error> {
             let mut kind = None;
             for (tlv_type, value) in &tlv {
                 match *tlv_type {
-                    TLV_EVENT if value.len() == 32 => {
+                    TLV_SPECIAL if value.len() == 32 => {
                         let mut buf = [0u8; 32];
                         buf.copy_from_slice(value);
                         id = Some(buf);
@@ -322,12 +354,12 @@ pub fn parse_nip19(input: &str) -> Result<Nip19Entity, Bech32Error> {
                         let k = u32::from_be_bytes([value[0], value[1], value[2], value[3]]);
                         kind = Some(k as u64);
                     }
-                    TLV_PUBKEY if value.len() == 32 => {
+                    TLV_AUTHOR if value.len() == 32 => {
                         let mut buf = [0u8; 32];
                         buf.copy_from_slice(value);
                         pubkey = Some(buf);
                     }
-                    TLV_DTAG => {
+                    TLV_SPECIAL => {
                         if let Ok(s) = std::str::from_utf8(value) {
                             d_tag = Some(s.to_string());
                         }
@@ -356,7 +388,7 @@ pub fn parse_nip19(input: &str) -> Result<Nip19Entity, Bech32Error> {
 
 /// Encode 8-bit bytes into bech32m with the given HRP.
 #[allow(dead_code)]
-fn bech32m_encode(hrp: &str, data: &[u8]) -> Result<String, Bech32Error> {
+pub(crate) fn bech32m_encode(hrp: &str, data: &[u8]) -> Result<String, Bech32Error> {
     let data_5bit = convert_bits(data, 8, 5, true)?;
     let checksum = create_checksum(hrp.as_bytes(), &data_5bit);
     let mut combined = data_5bit;
@@ -433,6 +465,16 @@ mod tests {
     }
 
     #[test]
+    fn rejects_non_ascii_lookalikes() {
+        let base = "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkws3w8ktc";
+        assert!(parse_nip19(base).is_ok());
+        // U+0138 (ĸ) has low byte 0x38 = '8': a truncating cast used to let
+        // it pass the charset check as a look-alike. BIP-173 requires ASCII.
+        let lookalike = base.replace('8', "\u{0138}");
+        assert!(parse_nip19(&lookalike).is_err());
+    }
+
+    #[test]
     fn unknown_prefix() {
         // nsec1 has a valid bech32m checksum but is not a known NIP-19 prefix.
         // Encode a valid nsec1 string to ensure it decodes.
@@ -456,9 +498,10 @@ mod tests {
             author: None,
             kind: None,
         };
-        // Encode via TLV manually for the test
+        // Encode with the standard TLV types: 0 = special (event id),
+        // 1 = relay.
         let mut data = Vec::new();
-        data.push(TLV_EVENT);
+        data.push(TLV_SPECIAL);
         data.extend_from_slice(&(32u16).to_be_bytes());
         data.extend_from_slice(&id);
         let relay = b"wss://relay.example.com";
@@ -469,5 +512,134 @@ mod tests {
         let encoded = bech32m_encode("nevent", &data).unwrap();
         let parsed = parse_nip19(&encoded).unwrap();
         assert_eq!(parsed, entity);
+    }
+
+    #[test]
+    fn naddr_roundtrip_with_standard_types() {
+        // A standard naddr: d-tag at 0, relay at 1, author pubkey at 2, kind
+        // at 3.
+        let mut data = Vec::new();
+        let d = b"post-1";
+        data.push(TLV_SPECIAL);
+        data.extend_from_slice(&(d.len() as u16).to_be_bytes());
+        data.extend_from_slice(d);
+        let relay = b"wss://relay.example.com";
+        data.push(TLV_RELAY);
+        data.extend_from_slice(&(relay.len() as u16).to_be_bytes());
+        data.extend_from_slice(relay);
+        data.push(TLV_AUTHOR);
+        data.extend_from_slice(&(32u16).to_be_bytes());
+        data.extend_from_slice(&[0x11u8; 32]);
+        data.push(TLV_KIND);
+        data.extend_from_slice(&(4u16).to_be_bytes());
+        data.extend_from_slice(&30023u32.to_be_bytes());
+
+        let encoded = bech32m_encode("naddr", &data).unwrap();
+        let parsed = parse_nip19(&encoded).unwrap();
+        assert_eq!(
+            parsed,
+            Nip19Entity::Addr {
+                kind: 30023,
+                pubkey: [0x11u8; 32],
+                d_tag: "post-1".to_string(),
+                relays: vec!["wss://relay.example.com".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn nevent_with_author_hint_parses_id_and_author_separately() {
+        // A standard nevent carrying both the id (type 0) and the optional
+        // author pubkey (type 2) must not confuse the author for the id.
+        let id = [0x42u8; 32];
+        let author = [0x77u8; 32];
+        let mut data = Vec::new();
+        data.push(TLV_SPECIAL);
+        data.extend_from_slice(&(32u16).to_be_bytes());
+        data.extend_from_slice(&id);
+        data.push(TLV_AUTHOR);
+        data.extend_from_slice(&(32u16).to_be_bytes());
+        data.extend_from_slice(&author);
+        data.push(TLV_KIND);
+        data.extend_from_slice(&(4u16).to_be_bytes());
+        data.extend_from_slice(&7u32.to_be_bytes());
+
+        let encoded = bech32m_encode("nevent", &data).unwrap();
+        match parse_nip19(&encoded).unwrap() {
+            Nip19Entity::Event {
+                id: got_id,
+                author: got_author,
+                kind,
+                ..
+            } => {
+                assert_eq!(got_id, id, "id must come from the type-0 TLV");
+                assert_eq!(
+                    got_author,
+                    Some(author),
+                    "author must come from the type-2 TLV"
+                );
+                assert_eq!(kind, Some(7));
+            }
+            _ => panic!("expected event"),
+        }
+    }
+
+    #[test]
+    fn decodes_standard_vectors() {
+        // The npub from the NIP-19 spec.
+        let npub =
+            parse_nip19("npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6").unwrap();
+        match npub {
+            Nip19Entity::Pubkey(pk) => {
+                assert_eq!(
+                    hex::encode(pk),
+                    "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d"
+                );
+            }
+            _ => panic!("expected pubkey"),
+        }
+        // A standard nevent (id at TLV type 0) must decode, even though the
+        // old code expected the id at type 2.
+        let mut data = Vec::new();
+        data.push(TLV_SPECIAL);
+        data.extend_from_slice(&(32u16).to_be_bytes());
+        data.extend_from_slice(&[0x42u8; 32]);
+        data.push(TLV_KIND);
+        data.extend_from_slice(&(4u16).to_be_bytes());
+        data.extend_from_slice(&1u32.to_be_bytes());
+        let encoded = bech32m_encode("nevent", &data).unwrap();
+        match parse_nip19(&encoded).unwrap() {
+            Nip19Entity::Event { id, kind, .. } => {
+                assert_eq!(id, [0x42u8; 32]);
+                assert_eq!(kind, Some(1));
+            }
+            _ => panic!("expected event"),
+        }
+        // A standard naddr (d at type 0, author at type 2) must decode.
+        let mut data = Vec::new();
+        let d = b"";
+        data.push(TLV_SPECIAL);
+        data.extend_from_slice(&(d.len() as u16).to_be_bytes());
+        data.extend_from_slice(d);
+        data.push(TLV_AUTHOR);
+        data.extend_from_slice(&(32u16).to_be_bytes());
+        data.extend_from_slice(&[0x22u8; 32]);
+        data.push(TLV_KIND);
+        data.extend_from_slice(&(4u16).to_be_bytes());
+        data.extend_from_slice(&0u32.to_be_bytes());
+        let encoded = bech32m_encode("naddr", &data).unwrap();
+        match parse_nip19(&encoded).unwrap() {
+            Nip19Entity::Addr {
+                kind,
+                pubkey,
+                d_tag,
+                ..
+            } => {
+                assert_eq!(kind, 0);
+                assert_eq!(pubkey, [0x22u8; 32]);
+                assert_eq!(d_tag, "");
+            }
+            _ => panic!("expected addr"),
+        }
     }
 }

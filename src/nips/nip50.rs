@@ -2,16 +2,25 @@
 //!
 //! Filters may carry a `search` string. The relay maintains a word index of
 //! event content: an event matches when at least one query term appears in
-//! its content, and the results are ordered by how many terms match
-//! (relevance), with the `limit` applied after that ordering.
+//! its content, and the results are ordered by relevance — each term is
+//! weighted by its inverse document frequency (`1 / (1 + ln df)`, estimated
+//! from the word index), so rarer terms dominate the ranking — with the
+//! `limit` applied after that ordering. The number of query terms used is
+//! capped (see `SEARCH_MAX_TERMS` in the scan engine) so a pathological
+//! search string cannot fan out into hundreds of index ranges.
 
 /// Tokenizes text into lowercase alphanumeric words of length >= 2.
+///
+/// Lowercasing is Unicode-aware (`to_lowercase`) so that the indexed words
+/// match the per-event term check in the scan engine, which lowercases the
+/// content with the same function: a query for an accented or non-ASCII
+/// uppercase term must find the same events the index contains.
 pub fn tokenize(text: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut current = String::new();
     for ch in text.chars() {
         if ch.is_alphanumeric() {
-            current.push(ch.to_ascii_lowercase());
+            current.extend(ch.to_lowercase());
         } else if !current.is_empty() {
             if current.len() >= 2 {
                 words.push(std::mem::take(&mut current));

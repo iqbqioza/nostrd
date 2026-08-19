@@ -109,22 +109,24 @@ pub async fn rpc_handler(
             if !is_pubkey(pubkey) {
                 return rpc_err("invalid pubkey");
             }
-            let mut access = relay.access.write().await;
-            if !access.blocked_pubkeys.iter().any(|p| p == pubkey) {
-                access.blocked_pubkeys.push(pubkey.to_string());
+            {
+                let mut access = relay.access.write().await;
+                if !access.blocked_pubkeys.iter().any(|p| p == pubkey) {
+                    access.blocked_pubkeys.push(pubkey.to_string());
+                }
             }
+            relay.persist_access().await;
             rpc_ok(json!(true))
         }
         "unbanpubkey" => {
             let Some(pubkey) = params.first().and_then(Value::as_str) else {
                 return rpc_err("invalid params");
             };
-            relay
-                .access
-                .write()
-                .await
-                .blocked_pubkeys
-                .retain(|p| p != pubkey);
+            {
+                let mut access = relay.access.write().await;
+                access.blocked_pubkeys.retain(|p| p != pubkey);
+            }
+            relay.persist_access().await;
             rpc_ok(json!(true))
         }
         "listbannedpubkeys" => {
@@ -143,22 +145,27 @@ pub async fn rpc_handler(
             if !is_pubkey(pubkey) {
                 return rpc_err("invalid pubkey");
             }
-            let mut access = relay.access.write().await;
-            if !access.allowed_pubkeys.iter().any(|p| p == pubkey) {
-                access.allowed_pubkeys.push(pubkey.to_string());
+            {
+                let mut access = relay.access.write().await;
+                // NIP-86: allowing a pubkey also un-bans it (matching the
+                // legacy endpoint), so `banpubkey` can be reverted.
+                access.blocked_pubkeys.retain(|p| p != pubkey);
+                if !access.allowed_pubkeys.iter().any(|p| p == pubkey) {
+                    access.allowed_pubkeys.push(pubkey.to_string());
+                }
             }
+            relay.persist_access().await;
             rpc_ok(json!(true))
         }
         "unallowpubkey" => {
             let Some(pubkey) = params.first().and_then(Value::as_str) else {
                 return rpc_err("invalid params");
             };
-            relay
-                .access
-                .write()
-                .await
-                .allowed_pubkeys
-                .retain(|p| p != pubkey);
+            {
+                let mut access = relay.access.write().await;
+                access.allowed_pubkeys.retain(|p| p != pubkey);
+            }
+            relay.persist_access().await;
             rpc_ok(json!(true))
         }
         "listallowedpubkeys" => {
@@ -174,20 +181,29 @@ pub async fn rpc_handler(
             let Some(kind) = params.first().and_then(Value::as_u64) else {
                 return rpc_err("invalid params");
             };
-            let mut access = relay.access.write().await;
-            if !access.allowed_kinds.contains(&kind) {
-                access.allowed_kinds.push(kind);
+            {
+                let mut access = relay.access.write().await;
+                // NIP-86: allowing a kind also un-blocks it (matching the
+                // legacy endpoint), so `disallowkind` can be reverted.
+                access.blocked_kinds.retain(|k| *k != kind);
+                if !access.allowed_kinds.contains(&kind) {
+                    access.allowed_kinds.push(kind);
+                }
             }
+            relay.persist_access().await;
             rpc_ok(json!(true))
         }
         "disallowkind" => {
             let Some(kind) = params.first().and_then(Value::as_u64) else {
                 return rpc_err("invalid params");
             };
-            let mut access = relay.access.write().await;
-            if !access.blocked_kinds.contains(&kind) {
-                access.blocked_kinds.push(kind);
+            {
+                let mut access = relay.access.write().await;
+                if !access.blocked_kinds.contains(&kind) {
+                    access.blocked_kinds.push(kind);
+                }
             }
+            relay.persist_access().await;
             rpc_ok(json!(true))
         }
         "listallowedkinds" => {
@@ -198,6 +214,21 @@ pub async fn rpc_handler(
             let Some(value) = params.first().and_then(Value::as_str) else {
                 return rpc_err("invalid params");
             };
+            // Bound the value (it is served to every client in the NIP-11
+            // document) and reject control characters, which some clients
+            // may not render or may misinterpret.
+            let max_len = match method {
+                "changerelayname" => 200,
+                "changerelaydescription" => 10_000,
+                _ => 4_000, // icon URL
+            };
+            if value.len() > max_len
+                || value
+                    .chars()
+                    .any(|c| c.is_control() && c != '\n' && c != '\t')
+            {
+                return rpc_err("invalid params: value too long or contains control characters");
+            }
             let mut cfg = relay.config.write().await;
             match method {
                 "changerelayname" => cfg.relay.name = value.to_string(),
@@ -232,13 +263,12 @@ pub async fn rpc_handler(
             let description = params.get(2).and_then(Value::as_str).unwrap_or("");
             let color = params.get(3).and_then(Value::as_str).unwrap_or("");
             let order = params.get(4).and_then(Value::as_i64);
-            if relay
-                .create_role(id, label, description, color, order)
-                .await
-            {
+            if relay.edit_role(id, label, description, color, order).await {
                 rpc_ok(json!(true))
             } else {
-                rpc_err("restricted: NIP-43 is disabled or the relay key is not configured")
+                rpc_err(
+                    "restricted: role not found, NIP-43 is disabled or the relay key is not configured",
+                )
             }
         }
         "deleterole" => {
@@ -286,17 +316,24 @@ pub async fn rpc_handler(
             if ip.parse::<std::net::IpAddr>().is_err() {
                 return rpc_err("invalid ip address");
             }
-            let mut access = relay.access.write().await;
-            if !access.blocked_ips.iter().any(|i| i == ip) {
-                access.blocked_ips.push(ip.to_string());
+            {
+                let mut access = relay.access.write().await;
+                if !access.blocked_ips.iter().any(|i| i == ip) {
+                    access.blocked_ips.push(ip.to_string());
+                }
             }
+            relay.persist_access().await;
             rpc_ok(json!(true))
         }
         "unblockip" => {
             let Some(ip) = params.first().and_then(Value::as_str) else {
                 return rpc_err("invalid params");
             };
-            relay.access.write().await.blocked_ips.retain(|i| i != ip);
+            {
+                let mut access = relay.access.write().await;
+                access.blocked_ips.retain(|i| i != ip);
+            }
+            relay.persist_access().await;
             rpc_ok(json!(true))
         }
         "listblockedips" => {
@@ -360,14 +397,18 @@ fn is_pubkey(value: &str) -> bool {
 }
 
 /// Constant-time comparison for the management token: the token must not be
-/// recoverable through response-timing differences of the comparison.
+/// recoverable through response-timing differences of the comparison. The
+/// length check short-circuits (the length is not secret), and equal-length
+/// inputs are compared with no early exit.
 fn ct_eq(a: &str, b: &str) -> bool {
     let a = a.as_bytes();
     let b = b.as_bytes();
-    let mut diff = (a.len() ^ b.len()) as u8;
-    let n = a.len().max(b.len());
-    for i in 0..n {
-        diff |= a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0);
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
     }
     diff == 0
 }
@@ -407,4 +448,24 @@ async fn rpc_authenticated(relay: &Relay, headers: &HeaderMap, uri: &axum::http:
         return true;
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ct_eq_rejects_unequal_lengths_and_nul_padding() {
+        assert!(ct_eq("secret-token", "secret-token"));
+        assert!(!ct_eq("secret-token", "secret-token2"));
+        // The old comparator masked length differences that are multiples of
+        // 256 and treated NUL bytes as "missing": these must never match.
+        let mut padded = String::from("secret-token");
+        padded.push_str(&"\0".repeat(256));
+        assert!(!ct_eq("secret-token", &padded));
+        assert!(!ct_eq("a", "a\0"));
+        assert!(!ct_eq("", "x"));
+        assert!(!ct_eq("x", ""));
+        assert!(ct_eq("", ""));
+    }
 }

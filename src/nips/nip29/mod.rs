@@ -486,15 +486,76 @@ impl GroupStore {
     /// Rebuilds the in-memory group state from the stored moderation events.
     pub async fn rebuild(&mut self, db: &DbClient) {
         let kinds: Vec<u64> = (MOD_MIN..=MOD_MAX).chain([LEAVE]).collect();
-        let filter: Filter =
-            serde_json::from_value(json!({ "kinds": kinds })).expect("static filter");
-        let (mut events, _) = db.query(vec![filter], 1_000_000, unix_now()).await;
+        // Walk every stored group event in pages (newest first) instead of
+        // one giant query: a single query with a huge limit would be truncated
+        // by the scan's collection cap / work budget and could exceed the
+        // database request timeout, silently rebuilding an incomplete group
+        // store (missing groups → private content world-readable, admin
+        // writes rejected, deleted groups resurrected).
+        const PAGE: usize = 50_000;
+        let mut events: Vec<Event> = Vec::new();
+        let mut until: Option<u64> = None;
+        loop {
+            let mut filter: Filter =
+                serde_json::from_value(json!({ "kinds": kinds })).expect("static filter");
+            filter.until = until;
+            // `query_full` gives each page the full-scan work budget (not the
+            // smaller per-query one), so a single second holding more events
+            // than the small budget cannot be silently cut mid-boundary.
+            let (page, more) = db.query_full(vec![filter], PAGE, unix_now()).await;
+            if page.is_empty() {
+                break;
+            }
+            let min_created = page.iter().map(|e| e.created_at).min().unwrap_or(0);
+            let full = page.len() >= PAGE;
+            if !full && more {
+                log::warn!(
+                    "group state rebuild ended early (scan budget exhausted with {} events in \
+                     the page): the in-memory group store may be incomplete after this restart",
+                    page.len()
+                );
+                events.extend(page);
+                break;
+            }
+            events.extend(page);
+            if !full {
+                // Fewer than a page: every remaining event was collected.
+                break;
+            }
+            if min_created == 0 {
+                break;
+            }
+            // The scan collects every event at the boundary timestamp, so
+            // stepping the cursor just below it cannot skip any event.
+            until = Some(min_created - 1);
+        }
         // Chronological order (the scan is per-kind, not globally ordered) so
-        // that later events win.
-        events.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));
+        // that later events win. Within the same second the kind is used as a
+        // tie-breaker: the group-establishing events apply first (9007 create,
+        // 9008 delete), then the member/settings operations (9000-9006,
+        // 9009-9010) which need the group to exist, and joins/leaves last.
+        events.sort_by(|a, b| {
+            (a.created_at, group_rank(a.kind), a.kind, &a.id).cmp(&(
+                b.created_at,
+                group_rank(b.kind),
+                b.kind,
+                &b.id,
+            ))
+        });
         for event in events {
             self.apply(&event, "", unix_now(), false);
         }
+    }
+}
+
+/// Replay order of group events within the same second: the create/delete
+/// establish the group before the member/settings operations, joins and
+/// leaves come last.
+fn group_rank(kind: u64) -> u8 {
+    match kind {
+        9007 | 9008 => 0,
+        9021 | 9022 => 2,
+        _ => 1,
     }
 }
 

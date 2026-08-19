@@ -21,6 +21,8 @@ pub const ADD_USER: u64 = 8000;
 pub const REMOVE_USER: u64 = 8001;
 pub const JOIN: u64 = 28934;
 pub const LEAVE: u64 = 28936;
+/// Tag on a `kind:33534` tombstone marking a role as deleted.
+pub const DELETED_TAG: &str = "deleted";
 
 #[derive(Debug, Clone, Default)]
 pub struct Role {
@@ -58,7 +60,17 @@ impl RoleStore {
     }
 
     pub fn delete(&mut self, id: &str) -> bool {
-        self.roles.remove(id).is_some()
+        if self.roles.remove(id).is_some() {
+            // Drop lingering assignments to the deleted role so the
+            // membership event never lists a non-existent role.
+            for roles in self.assignments.values_mut() {
+                roles.retain(|r| r != id);
+            }
+            self.assignments.retain(|_, roles| !roles.is_empty());
+            true
+        } else {
+            false
+        }
     }
 
     pub fn assign(&mut self, pubkey: &str, role: &str) -> bool {
@@ -128,6 +140,16 @@ impl RoleStore {
         event
     }
 
+    /// `kind:33534` tombstone for a deleted role. Publishing it (addressable,
+    /// `d`-tagged) replaces the stored role definition so that `delete_role`
+    /// survives the restart rebuild; the rebuild skips tombstones.
+    pub fn role_deletion_event(&self, id: &str, relay_pubkey: &str, now: u64) -> Event {
+        let mut event = Self::base(ROLE_DEFINITION, relay_pubkey, now);
+        event.tags.push(vec!["d".into(), id.to_string()]);
+        event.tags.push(vec![DELETED_TAG.into()]);
+        event
+    }
+
     /// `kind:13534` membership list: every assigned pubkey with its roles.
     pub fn membership_event(&self, relay_pubkey: &str, now: u64) -> Event {
         let mut event = Self::base(MEMBERSHIP_LIST, relay_pubkey, now);
@@ -165,7 +187,7 @@ impl RoleStore {
         let filter: Filter =
             serde_json::from_value(json!({ "kinds": [ROLE_DEFINITION, MEMBERSHIP_LIST] }))
                 .expect("static filter");
-        let (events, _) = db.query(vec![filter], 1_000_000, unix_now()).await;
+        let (events, _) = db.query_full(vec![filter], 1_000_000, unix_now()).await;
         for event in events {
             if event.pubkey != relay_pubkey {
                 continue;
@@ -175,6 +197,21 @@ impl RoleStore {
                     let Some(id) = tag_value(&event, "d") else {
                         continue;
                     };
+                    // A `["deleted"]` tombstone (published by `delete_role`)
+                    // must not resurrect the role on restart; lingering
+                    // assignments to the deleted role are dropped too.
+                    if event
+                        .tags
+                        .iter()
+                        .any(|t| t.first().map(String::as_str) == Some(DELETED_TAG))
+                    {
+                        self.roles.remove(id);
+                        for roles in self.assignments.values_mut() {
+                            roles.retain(|r| r != id);
+                        }
+                        self.assignments.retain(|_, roles| !roles.is_empty());
+                        continue;
+                    }
                     self.roles.insert(
                         id.to_string(),
                         Role {
@@ -327,6 +364,83 @@ mod tests {
             store.rebuild(&db, &relay_pk).await;
             assert_eq!(store.roles.len(), 1);
             assert_eq!(store.roles["king"].label, "real");
+        });
+    }
+
+    #[test]
+    fn rebuild_skips_deleted_role_tombstones() {
+        use crate::nips::nip01;
+        use std::sync::Arc;
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir()
+            .join("nostrd-nip43-delete-test")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        let cfg = crate::config::DatabaseConfig {
+            path,
+            ..Default::default()
+        };
+        let db = crate::db::DbClient::open(
+            &cfg,
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay_pk = "aa".repeat(32);
+            let role = Event {
+                id: String::new(),
+                pubkey: relay_pk.clone(),
+                created_at: 100,
+                kind: ROLE_DEFINITION,
+                tags: vec![
+                    vec!["-".into()],
+                    vec!["d".into(), "king".into()],
+                    vec!["label".into(), "king".into()],
+                ],
+                content: String::new(),
+                sig: String::new(),
+            };
+            // The tombstone replaces the role definition (newer, addressable).
+            let tombstone = Event {
+                id: String::new(),
+                pubkey: relay_pk.clone(),
+                created_at: 200,
+                kind: ROLE_DEFINITION,
+                tags: vec![
+                    vec!["-".into()],
+                    vec!["d".into(), "king".into()],
+                    vec![DELETED_TAG.into()],
+                ],
+                content: String::new(),
+                sig: String::new(),
+            };
+            let mut events = vec![role, tombstone];
+            for ev in &mut events {
+                ev.id = nip01::compute_id(ev);
+            }
+            let now = unix_now();
+            assert_eq!(
+                db.put(events[0].clone(), now).await,
+                crate::db::PutOutcome::Stored
+            );
+            assert_eq!(
+                db.put(events[1].clone(), now).await,
+                crate::db::PutOutcome::Replaced,
+                "the tombstone replaces the stored role definition"
+            );
+            let mut store = RoleStore::default();
+            store.rebuild(&db, &relay_pk).await;
+            assert!(
+                !store.roles.contains_key("king"),
+                "a deleted role must not resurrect on restart"
+            );
         });
     }
 }

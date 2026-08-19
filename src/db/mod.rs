@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
 
-use scan::NegItems;
+use scan::{FULL_SCAN_BUDGET, NegItems, SCAN_BUDGET};
 use store::Store;
 
 use crate::config::DatabaseConfig;
@@ -74,6 +74,9 @@ enum Msg {
         limit: usize,
         now: u64,
         ascending: bool,
+        /// Upper bound on the number of index candidates the scan may
+        /// examine before giving up (anti-DoS work budget).
+        budget: usize,
         reply: oneshot::Sender<(Vec<Event>, bool)>,
     },
     /// Accepts many events in a single write transaction (one commit).
@@ -85,6 +88,11 @@ enum Msg {
     /// pubkey when unknown and returns `(created, first_seen)` per entry.
     TouchFirstSeen {
         entries: Vec<([u8; 32], u64)>,
+        reply: oneshot::Sender<Vec<(bool, u64)>>,
+    },
+    /// Read-only first-seen lookup (does not record anything).
+    FirstSeenStatus {
+        pubkeys: Vec<[u8; 32]>,
         reply: oneshot::Sender<Vec<(bool, u64)>>,
     },
     /// NIP-77: query returning only `(created_at, id)` records so that large
@@ -106,6 +114,8 @@ enum Msg {
         addresses: Vec<nip09::Address>,
         request_pubkey: Option<String>,
         request_created: u64,
+        /// NIP-29 9005 moderation: restrict deletion to events of this group.
+        group: Option<String>,
         reply: oneshot::Sender<usize>,
     },
     Vanish {
@@ -145,6 +155,15 @@ enum Msg {
     },
     ListBanned {
         reply: oneshot::Sender<Vec<(String, String)>>,
+    },
+    /// Persists the access control lists (NIP-86 runtime bans/allowlists).
+    SaveAccess {
+        access: crate::config::AccessControl,
+        reply: oneshot::Sender<()>,
+    },
+    /// Loads the persisted access control lists.
+    LoadAccess {
+        reply: oneshot::Sender<Option<crate::config::AccessControl>>,
     },
     PurgeExpired {
         now: u64,
@@ -246,14 +265,29 @@ impl DbClient {
         self.request_with(make, &self.read_tx).await
     }
 
-    async fn request_with<R: Default>(
+    /// Sends a write request to the writer thread and waits for the reply
+    /// *without* a response timeout. A write that reached the writer queue is
+    /// guaranteed to be processed (the writer always replies, on commit,
+    /// abort or shutdown), so waiting for the true outcome is preferable to a
+    /// false "database timeout": an event that later commits while the caller
+    /// already reported failure would skip its side-effects (live broadcast,
+    /// NIP-09 deletion, NIP-29 group state, NIP-43 leave). The overload
+    /// fail-fast still rejects new writes while the queue is deep.
+    async fn request_write<R: Default>(&self, make: impl FnOnce(oneshot::Sender<R>) -> Msg) -> R {
+        let Some(rx) = self.send_request(make, &self.tx) else {
+            return R::default();
+        };
+        rx.await.unwrap_or_default()
+    }
+
+    /// Overload check, queued-work accounting and send. Returns the reply
+    /// receiver, or `None` when the request failed fast (queue full) or could
+    /// not be sent (in which case nothing was queued and nothing will commit).
+    fn send_request<R>(
         &self,
         make: impl FnOnce(oneshot::Sender<R>) -> Msg,
         channel: &mpsc::UnboundedSender<Msg>,
-    ) -> R {
-        // Overload protection: when the database thread's queue is already
-        // deep, new requests fail fast instead of accumulating in memory.
-        // Callers degrade gracefully (empty replies, error outcomes).
+    ) -> Option<oneshot::Receiver<R>> {
         if self.pending_msgs.load(std::sync::atomic::Ordering::Relaxed) >= self.max_pending_msgs
             || self
                 .pending_events
@@ -263,7 +297,7 @@ impl DbClient {
             // Surface the overload in the stats (db_errors).
             self.errors
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return R::default();
+            return None;
         }
         let (tx, rx) = oneshot::channel();
         let msg = make(tx);
@@ -287,8 +321,19 @@ impl DbClient {
                 self.pending_events
                     .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             }
-            return R::default();
+            return None;
         }
+        Some(rx)
+    }
+
+    async fn request_with<R: Default>(
+        &self,
+        make: impl FnOnce(oneshot::Sender<R>) -> Msg,
+        channel: &mpsc::UnboundedSender<Msg>,
+    ) -> R {
+        let Some(rx) = self.send_request(make, channel) else {
+            return R::default();
+        };
         if self.timeout_secs == 0 {
             return rx.await.unwrap_or_default();
         }
@@ -299,7 +344,8 @@ impl DbClient {
     }
 
     pub async fn put(&self, event: Event, now: u64) -> PutOutcome {
-        self.request(|reply| Msg::Put { event, now, reply }).await
+        self.request_write(|reply| Msg::Put { event, now, reply })
+            .await
     }
 
     pub async fn query(&self, filters: Vec<Filter>, limit: usize, now: u64) -> (Vec<Event>, bool) {
@@ -320,6 +366,28 @@ impl DbClient {
             limit,
             now,
             ascending,
+            budget: SCAN_BUDGET,
+            reply,
+        })
+        .await
+    }
+
+    /// Like [`Self::query_directed`] but with a much larger scan budget for
+    /// the startup rebuilds (NIP-29 group state, NIP-43 role store): they
+    /// legitimately walk the whole event history and must not be truncated
+    /// by the anti-DoS candidate budget.
+    pub async fn query_full(
+        &self,
+        filters: Vec<Filter>,
+        limit: usize,
+        now: u64,
+    ) -> (Vec<Event>, bool) {
+        self.request_read(|reply| Msg::Query {
+            filters,
+            limit,
+            now,
+            ascending: false,
+            budget: FULL_SCAN_BUDGET,
             reply,
         })
         .await
@@ -350,6 +418,7 @@ impl DbClient {
             limit,
             now,
             ascending,
+            budget: SCAN_BUDGET,
             reply: tx,
         };
         if self.api_read_tx.send(msg).is_err() {
@@ -378,9 +447,18 @@ impl DbClient {
             .await
     }
 
+    /// Read-only first-seen lookup (no write): returns `(created, first_seen)`
+    /// per pubkey. Used by the pre-store age check so that a failed first
+    /// event (expired/duplicate/invalid) does not start the account-age clock.
+    pub async fn first_seen_batch(&self, pubkeys: Vec<[u8; 32]>) -> Vec<(bool, u64)> {
+        self.request_read(|reply| Msg::FirstSeenStatus { pubkeys, reply })
+            .await
+    }
+
     /// Stores a batch of events in a single write transaction.
     pub async fn put_batch(&self, events: Vec<(Event, u64)>) -> Vec<PutOutcome> {
-        self.request(|reply| Msg::PutBatch { events, reply }).await
+        self.request_write(|reply| Msg::PutBatch { events, reply })
+            .await
     }
 
     /// NIP-77: returns only `(created_at, id)` records of the matching
@@ -417,6 +495,22 @@ impl DbClient {
             addresses,
             request_pubkey,
             request_created,
+            group: None,
+            reply,
+        })
+        .await
+    }
+
+    /// NIP-29 `kind:9005`: deletes the `e`-tag targets but only when they
+    /// belong to `group`, so a group admin cannot delete another group's
+    /// events.
+    pub async fn apply_group_deletion(&self, targets: Vec<String>, group: String) -> usize {
+        self.request(|reply| Msg::Delete {
+            targets,
+            addresses: Vec::new(),
+            request_pubkey: None,
+            request_created: u64::MAX,
+            group: Some(group),
             reply,
         })
         .await
@@ -479,6 +573,18 @@ impl DbClient {
 
     pub async fn list_banned_events(&self) -> Vec<(String, String)> {
         self.request_read(|reply| Msg::ListBanned { reply }).await
+    }
+
+    /// Persists the access control lists (NIP-86 runtime bans/allowlists).
+    pub async fn save_access(&self, access: crate::config::AccessControl) {
+        let _ = self
+            .request(|reply| Msg::SaveAccess { access, reply })
+            .await;
+    }
+
+    /// Loads the persisted access control lists, if any.
+    pub async fn load_access(&self) -> Option<crate::config::AccessControl> {
+        self.request_read(|reply| Msg::LoadAccess { reply }).await
     }
 
     /// The created_at of the stored version of a replaceable/addressable

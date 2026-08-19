@@ -29,9 +29,18 @@ pub(crate) const REPLACEABLE: &str = "replaceable";
 pub(crate) const VANISH: &str = "vanish";
 pub(crate) const BANNED: &str = "banned";
 pub(crate) const FIRST_SEEN: &str = "first_seen";
+pub(crate) const ACCESS: &str = "access";
 pub(crate) const CREATED_LEN: usize = 8;
 pub(crate) const ID_LEN: usize = 32;
 pub(crate) const TAG_VALUE_MAX: usize = 1024;
+/// LMDB's maximum key size (`MDB_MAXKEYSIZE`). Index keys longer than this
+/// are rejected with `MDB_BAD_VALSIZE`, which would abort the *entire* write
+/// batch and reject every connection's events in the drain window. Over-long
+/// variable-length index components (tag values, words, `d` tags) are
+/// therefore skipped/truncated at indexing time instead of erroring: the
+/// event itself is still stored, only lookup by the pathological value is
+/// unavailable.
+pub(crate) const MAX_INDEX_KEY: usize = 511;
 
 /// Minimum free space required before a batch of writes is committed.
 /// Writing to the memory map of a file on a completely full disk raises
@@ -40,10 +49,11 @@ pub(crate) const TAG_VALUE_MAX: usize = 1024;
 pub(crate) const DISK_FREE_MARGIN: u64 = 32 * 1024 * 1024;
 
 /// Applies `puts` in one write transaction and commits. When the commit
-/// fails because the memory map is full, the map is grown (up to
-/// `map_max_size`) and the whole batch is re-applied in a fresh
-/// transaction. Returns one outcome per put; all outcomes are
-/// `Invalid("...")` when the batch cannot be committed.
+/// fails because the memory map is full, the whole batch is re-applied in a
+/// fresh transaction if the map can grow (it cannot at runtime: the map is
+/// opened once at its ceiling and never resized, so `MapFull` fails the
+/// batch). Returns one outcome per put; all outcomes are `Invalid("...")`
+/// when the batch cannot be committed.
 pub(crate) fn apply_put_batch(
     store: &Store,
     thread_errors: &Arc<std::sync::atomic::AtomicU64>,
@@ -190,6 +200,9 @@ pub(crate) struct Store {
     pub(crate) banned: Database<Bytes, Bytes>,
     /// pubkey (32 bytes) -> unix timestamp of the first accepted event.
     pub(crate) first_seen: Database<Bytes, Bytes>,
+    /// Serialized access control lists (NIP-86 runtime bans/allowlists), kept
+    /// under a single fixed key so they survive restarts.
+    pub(crate) access: Database<Bytes, Bytes>,
     /// NIP-40 expiration handling is only active when the NIP is enabled.
     /// Shared with the relay so that a config reload can toggle it at runtime.
     pub(crate) expiry_enabled: Arc<std::sync::atomic::AtomicBool>,
@@ -255,6 +268,7 @@ impl Store {
         let vanish = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(VANISH))?;
         let banned = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(BANNED))?;
         let first_seen = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(FIRST_SEEN))?;
+        let access = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(ACCESS))?;
         wtxn.commit()?;
 
         Ok(Store {
@@ -271,6 +285,7 @@ impl Store {
             vanish,
             banned,
             first_seen,
+            access,
             expiry_enabled,
             max_indexed_words: max_indexed_words.max(1),
             map_max_size,
@@ -334,10 +349,31 @@ impl Store {
             vanish: self.vanish,
             banned: self.banned,
             first_seen: self.first_seen,
+            access: self.access,
             expiry_enabled: Arc::clone(&self.expiry_enabled),
             max_indexed_words: self.max_indexed_words,
             map_max_size: self.map_max_size,
         }
+    }
+
+    /// Persists the access control lists under a single fixed key. The
+    /// whole `AccessControl` is serialized as JSON so NIP-86 mutations
+    /// survive restarts.
+    pub(crate) fn save_access(&self, access: &crate::config::AccessControl) -> Result<()> {
+        let data = serde_json::to_vec(access)?;
+        let mut wtxn = self.env.write_txn()?;
+        self.access.put(&mut wtxn, b"access", &data)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Loads the persisted access control lists, if any.
+    pub(crate) fn load_access(&self) -> Result<Option<crate::config::AccessControl>> {
+        let rtxn = self.env.read_txn()?;
+        let Some(raw) = self.access.get(&rtxn, b"access")? else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_slice(raw)?))
     }
 }
 
@@ -411,6 +447,22 @@ pub(crate) fn replaceable_key(kind: u64, pubkey: &[u8], dtag: &str) -> Vec<u8> {
     key.extend_from_slice(dtag.as_bytes());
     key
 }
+
+/// Truncates a `d` tag at a character boundary to a byte length that keeps
+/// the replaceable index key under LMDB's key-size limit (see
+/// [`MAX_INDEX_KEY`]). Only used for the index key; the stored event keeps
+/// its full `d` tag.
+pub(crate) fn dtag_key_safe(dtag: &str) -> &str {
+    let max = MAX_INDEX_KEY.saturating_sub(CREATED_LEN + ID_LEN + 4);
+    if dtag.len() <= max {
+        return dtag;
+    }
+    let mut end = max;
+    while end > 0 && !dtag.is_char_boundary(end) {
+        end -= 1;
+    }
+    &dtag[..end]
+}
 impl Store {
     // ----- event persistence -----
 
@@ -470,7 +522,11 @@ impl Store {
             } else {
                 String::new()
             };
-            let rkey = replaceable_key(event.kind, &pubkey, &dtag);
+            // The `d` tag is truncated for the index key only: a value long
+            // enough to exceed LMDB's key-size limit would abort the whole
+            // write batch, and realistic addressable events use short `d`
+            // tags. The stored event keeps its full `d` tag.
+            let rkey = replaceable_key(event.kind, &pubkey, dtag_key_safe(&dtag));
             let old = self.replaceable.get(wtxn, &rkey)?;
             let had_old = old.is_some();
             if let Some(old) = old
@@ -534,11 +590,12 @@ impl Store {
             .put(wtxn, &kind_key(event.kind, created, id), b"")?;
         for tag in &event.tags {
             if indexable_tag(tag) {
-                self.by_tag.put(
-                    wtxn,
-                    &tag_key(tag[0].as_bytes()[0], tag[1].as_bytes(), created, id),
-                    b"",
-                )?;
+                let key = tag_key(tag[0].as_bytes()[0], tag[1].as_bytes(), created, id);
+                // Skip rather than error: an over-long key would abort the
+                // whole write batch (see MAX_INDEX_KEY).
+                if key.len() <= MAX_INDEX_KEY {
+                    self.by_tag.put(wtxn, &key, b"")?;
+                }
             }
         }
         if self
@@ -553,7 +610,12 @@ impl Store {
                 .iter()
                 .take(self.max_indexed_words)
             {
-                by_word.put(wtxn, &word_key(word, created, id), b"")?;
+                let key = word_key(word, created, id);
+                // Skip rather than error: an over-long word would abort the
+                // whole write batch (see MAX_INDEX_KEY).
+                if key.len() <= MAX_INDEX_KEY {
+                    by_word.put(wtxn, &key, b"")?;
+                }
             }
         }
         Ok(())
@@ -572,6 +634,22 @@ impl Store {
         self.events.delete(wtxn, id)?;
         self.by_created
             .delete(wtxn, &created_key(event.created_at, id))?;
+        // NIP-01/33: clear the replaceable/addressable slot so a later
+        // re-publication (e.g. after the event was expired or deleted) is
+        // judged against the current state instead of a stale entry. The
+        // key must match the one written by `put_event_in` (which truncates
+        // over-long `d` tags via `dtag_key_safe`).
+        if is_replaceable(&event) {
+            let dtag = if nip33::is_param_replaceable_kind(event.kind) {
+                nip33::dtag(&event)
+            } else {
+                String::new()
+            };
+            self.replaceable.delete(
+                wtxn,
+                &replaceable_key(event.kind, &pubkey, dtag_key_safe(&dtag)),
+            )?;
+        }
         self.by_pubkey
             .delete(wtxn, &pubkey_key(&pubkey, event.created_at, id))?;
         // NIP-26: drop the delegator's index entry as well.
@@ -635,6 +713,23 @@ impl Store {
         }
     }
 
+    /// Read-only first-seen lookup: returns `(created, first_seen)` without
+    /// recording anything. `created` is `true` when the pubkey has never been
+    /// seen (so its first stored event may establish the account).
+    pub(crate) fn first_seen_status(
+        &self,
+        rtxn: &heed::RoTxn,
+        pubkey: &[u8],
+    ) -> Result<(bool, u64)> {
+        match self.first_seen.get(rtxn, pubkey)? {
+            Some(raw) if raw.len() >= 8 => {
+                let ts = u64::from_be_bytes(raw[..8].try_into().unwrap());
+                Ok((false, ts))
+            }
+            _ => Ok((true, 0)),
+        }
+    }
+
     pub(crate) fn replaceable_created_at(
         &self,
         kind: u64,
@@ -648,7 +743,9 @@ impl Store {
             return Ok(None);
         }
         let rtxn = self.env.read_txn()?;
-        let key = replaceable_key(kind, &pubkey, d);
+        // The stored slot key truncates over-long `d` tags (see
+        // `put_event_in` / `dtag_key_safe`), so the lookup must too.
+        let key = replaceable_key(kind, &pubkey, dtag_key_safe(d));
         let Some(value) = self.replaceable.get(&rtxn, &key)? else {
             return Ok(None);
         };

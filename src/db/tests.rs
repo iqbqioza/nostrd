@@ -207,6 +207,51 @@ fn deletion_by_address_and_author() {
 }
 
 #[test]
+fn deletion_by_address_with_empty_d() {
+    // NIP-09 `a`-tag deletion of a *replaceable* event (kind 0/3, empty `d`)
+    // must work: the replaceable slot key is kind(8)+pubkey(32)+dlen(4)+d(0)
+    // = 44 bytes, and the deletion walk used to skip keys < 48 bytes.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // A replaceable profile event (kind 0) with an empty `d` tag.
+        let e1 = event(0, "profile", now, vec![]);
+        assert_eq!(db.put(e1.clone(), now).await, PutOutcome::Stored);
+
+        let address = crate::nips::nip09::Address {
+            kind: 0,
+            pubkey: "0000000000000000000000000000000000000000000000000000000000000000".into(),
+            d: String::new(),
+        };
+        let removed = db
+            .apply_deletion(
+                vec![],
+                vec![address],
+                Some("0000000000000000000000000000000000000000000000000000000000000000".into()),
+                u64::MAX,
+            )
+            .await;
+        assert_eq!(
+            removed, 1,
+            "kind 0 with empty d must be deletable by address"
+        );
+        let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [0]})).unwrap();
+        let (res, _) = db.query(vec![f], 10, now).await;
+        assert!(res.is_empty());
+    });
+}
+
+#[test]
 fn deletion_requests_are_never_deleted() {
     let db = DbClient::open(
         &config(),
@@ -437,9 +482,9 @@ fn gift_wraps_to_are_deleted() {
 
 // ----- database growth -----
 fn map_grows_beyond_initial_size() {
-    // The database must keep accepting writes once it outgrows the
-    // initial map size: the map is grown automatically up to
-    // map_max_size, without degrading reads or writes.
+    // The database must keep accepting writes beyond a small configured map
+    // size: the map is opened at the ceiling (map_max_size) up front as a
+    // sparse virtual reservation, so `map_size` only acts as a floor.
     let cfg = DatabaseConfig {
         map_size: 256 * 1024,
         map_max_size: 32 * 1024 * 1024,
@@ -483,6 +528,351 @@ fn map_grows_beyond_initial_size() {
 }
 
 #[test]
+fn ids_filter_checks_every_id_regardless_of_limit() {
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let e1 = event(1, "first", now, vec![]);
+        let e2 = event(1, "second", now - 1, vec![]);
+        assert_eq!(db.put(e1.clone(), now).await, PutOutcome::Stored);
+        assert_eq!(db.put(e2.clone(), now).await, PutOutcome::Stored);
+        // With `limit: 1` the scan must still look past the first id: if
+        // the first id does not exist but a later one does, it is found.
+        let missing = "00".repeat(32);
+        let f: Filter = serde_json::from_value(serde_json::json!({
+            "ids": [missing, e2.id],
+            "limit": 1
+        }))
+        .unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 1, "the existing id must be found");
+        assert_eq!(res[0].id, e2.id);
+        // Without a limit every id is checked too.
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({ "ids": [e1.id, e2.id] })).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 2);
+    });
+}
+
+#[test]
+fn nip28_channel_queries_use_e_tag_index() {
+    // NIP-28 channel messages reference their channel with an `e` tag; the
+    // generic tag index must serve `{"#e": [channel_id]}` queries.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // The channel itself (kind 40) and its messages (kind 42).
+        let channel = event(
+            40,
+            "channel about",
+            now,
+            vec![vec!["name".into(), "nostrd".into()]],
+        );
+        assert_eq!(db.put(channel.clone(), now).await, PutOutcome::Stored);
+        for i in 0..3 {
+            let msg = event(
+                42,
+                &format!("message {i}"),
+                now - i as u64,
+                vec![vec!["e".into(), channel.id.clone()]],
+            );
+            assert_eq!(db.put(msg.clone(), now).await, PutOutcome::Stored);
+        }
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"kinds": [42], "#e": [channel.id]})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 3, "channel messages must be served via #e");
+        // Messages referencing another channel are not returned.
+        let other: Filter =
+            serde_json::from_value(serde_json::json!({"#e": ["ff".repeat(32)]})).unwrap();
+        let (res, _) = db.query(vec![other], 500, now).await;
+        assert!(res.is_empty());
+    });
+}
+
+#[test]
+fn overlong_index_components_do_not_poison_the_batch() {
+    // LMDB rejects keys >= 512 bytes with MDB_BAD_VALSIZE. A tag value or
+    // content word long enough to produce such a key used to abort the whole
+    // merged write batch (rejecting every connection's events); the index
+    // must now skip the over-long entry instead of erroring.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let long_tag = "x".repeat(500);
+        let e_long_tag = event(
+            1,
+            "has a long tag",
+            now,
+            vec![vec!["t".into(), long_tag.clone()]],
+        );
+        let long_word = "w".repeat(500);
+        let e_long_word = event(1, &long_word, now - 1, vec![]);
+        let e_normal = event(1, "normal note", now - 2, vec![]);
+        let results = db
+            .put_batch(vec![
+                (e_long_tag.clone(), now),
+                (e_long_word.clone(), now),
+                (e_normal.clone(), now),
+            ])
+            .await;
+        assert_eq!(
+            results,
+            vec![PutOutcome::Stored, PutOutcome::Stored, PutOutcome::Stored],
+            "over-long index components must not poison the batch"
+        );
+        // All three events are stored and reachable without the long filter.
+        let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 3);
+        // The long tag value is not indexed, so a filter for it matches nothing.
+        let f: Filter = serde_json::from_value(serde_json::json!({"#t": [long_tag]})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert!(res.is_empty());
+    });
+}
+
+#[test]
+fn multi_filter_req_survives_an_early_limit() {
+    // A first filter that hits its limit immediately (e.g. `limit: 0`) must
+    // not abort the rest of the multi-filter REQ: `[{"limit":0},{"kinds":[1]}]`
+    // still returns the kind-1 events from the second filter.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let e1 = event(1, "one", now, vec![]);
+        let e2 = event(1, "two", now - 1, vec![]);
+        assert_eq!(db.put(e1.clone(), now).await, PutOutcome::Stored);
+        assert_eq!(db.put(e2.clone(), now).await, PutOutcome::Stored);
+
+        let f: Vec<Filter> = serde_json::from_value(serde_json::json!([
+            {"limit": 0},
+            {"kinds": [1]}
+        ]))
+        .unwrap();
+        let (res, _) = db.query(f, 500, now).await;
+        assert_eq!(res.len(), 2, "the second filter must still be evaluated");
+    });
+}
+
+#[test]
+fn ids_filter_supports_prefixes() {
+    // NIP-01: `ids` entries may be event-id prefixes.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let e1 = event(1, "one", now, vec![]);
+        let e2 = event(1, "two", now - 1, vec![]);
+        assert_eq!(db.put(e1.clone(), now).await, PutOutcome::Stored);
+        assert_eq!(db.put(e2.clone(), now).await, PutOutcome::Stored);
+        assert!(e1.id != e2.id);
+
+        let prefix = &e1.id[..16];
+        let f: Filter = serde_json::from_value(serde_json::json!({"ids": [prefix]})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 1, "the prefix matches only its own event");
+        assert_eq!(res[0].id, e1.id);
+    });
+}
+
+#[test]
+fn group_deletion_is_scoped_to_the_group() {
+    // NIP-29 kind:9005 moderation deletion must only delete events of the
+    // admin's own group: an admin of one group cannot remove another
+    // group's events by referencing their ids.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let e1 = event(
+            9000,
+            "in group a",
+            now,
+            vec![vec!["h".into(), "group-a".into()]],
+        );
+        let e2 = event(
+            9000,
+            "in group b",
+            now,
+            vec![vec!["h".into(), "group-b".into()]],
+        );
+        assert_eq!(db.put(e1.clone(), now).await, PutOutcome::Stored);
+        assert_eq!(db.put(e2.clone(), now).await, PutOutcome::Stored);
+        let removed = db
+            .apply_group_deletion(vec![e1.id.clone(), e2.id.clone()], "group-a".into())
+            .await;
+        assert_eq!(removed, 1, "only the group-a event may be deleted");
+        let f: Filter = serde_json::from_value(serde_json::json!({"ids": [e1.id]})).unwrap();
+        let (res, _) = db.query(vec![f], 10, now).await;
+        assert!(res.is_empty(), "group-a event deleted");
+        let f: Filter = serde_json::from_value(serde_json::json!({"ids": [e2.id]})).unwrap();
+        let (res, _) = db.query(vec![f], 10, now).await;
+        assert_eq!(res.len(), 1, "group-b event must survive");
+    });
+}
+
+#[test]
+fn vanish_keeps_delegatee_events_of_a_delegator() {
+    // NIP-62: a request to vanish removes only events *authored* by the
+    // pubkey. NIP-26 delegatee events are indexed under the delegator too,
+    // so a delegator's vanish must not delete the delegatee's events.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let delegator = "aa".repeat(32);
+        let delegatee = "bb".repeat(32);
+        let mut e = event(
+            1,
+            "delegated",
+            now,
+            vec![vec![
+                "delegation".into(),
+                delegator.clone(),
+                "kind=1".into(),
+                "00".repeat(64),
+            ]],
+        );
+        e.pubkey = delegatee.clone();
+        e.id = nip01::compute_id(&e);
+        assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
+
+        // Vanish the delegator: the delegatee-authored event survives.
+        let removed = db
+            .apply_vanish(hex::decode(&delegator).unwrap().try_into().unwrap())
+            .await;
+        assert_eq!(removed, 0, "delegator's vanish removes no delegatee events");
+        let f: Filter = serde_json::from_value(serde_json::json!({"ids": [e.id]})).unwrap();
+        let (res, _) = db.query(vec![f], 10, now).await;
+        assert_eq!(res.len(), 1, "delegatee event must survive");
+
+        // Vanish the delegatee: their own event is removed.
+        let removed = db
+            .apply_vanish(hex::decode(&delegatee).unwrap().try_into().unwrap())
+            .await;
+        assert_eq!(removed, 1);
+        let f: Filter = serde_json::from_value(serde_json::json!({"ids": [e.id]})).unwrap();
+        let (res, _) = db.query(vec![f], 10, now).await;
+        assert!(res.is_empty());
+    });
+}
+
+#[test]
+fn access_control_persists_across_reopen() {
+    // NIP-86 runtime bans/allowlists survive restarts: the access control is
+    // stored in the database and restored when the database is reopened.
+    let cfg = config();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        {
+            let db = DbClient::open(
+                &cfg,
+                true,
+                Arc::new(Default::default()),
+                0,
+                128,
+                4096,
+                262144,
+            )
+            .unwrap();
+            let mut access = crate::config::AccessControl::default();
+            access.blocked_pubkeys.push("aa".repeat(32));
+            access.allowed_kinds.push(5);
+            access.blocked_ips.push("203.0.113.9".into());
+            db.save_access(access.clone()).await;
+            let loaded = db.load_access().await.expect("persisted access loads");
+            assert_eq!(loaded.blocked_pubkeys, access.blocked_pubkeys);
+            assert_eq!(loaded.allowed_kinds, access.allowed_kinds);
+            assert_eq!(loaded.blocked_ips, access.blocked_ips);
+        }
+        // Reopen the same database: the state is restored.
+        let db = DbClient::open(
+            &cfg,
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
+        let loaded = db.load_access().await.expect("persisted access loads");
+        assert_eq!(loaded.blocked_pubkeys, vec!["aa".repeat(32)]);
+        assert_eq!(loaded.allowed_kinds, vec![5]);
+        assert_eq!(loaded.blocked_ips, vec![String::from("203.0.113.9")]);
+    });
+}
+
+#[test]
 
 // ----- trust period and expiry toggling -----
 fn first_seen_trust_period() {
@@ -520,6 +910,39 @@ fn first_seen_trust_period() {
         // A different pubkey is created independently.
         let (created, _) = db.touch_first_seen_batch(vec![([8u8; 32], now)]).await[0];
         assert!(created);
+    });
+}
+
+#[test]
+fn read_only_first_seen_does_not_record() {
+    // The pre-store age check must not write first-seen: a rejected first
+    // event (expired/duplicate/invalid) must not start the account-age clock.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let pubkey = [9u8; 32];
+        let (created, _) = db.first_seen_batch(vec![pubkey]).await[0];
+        assert!(created, "never seen before");
+        // Repeated read-only lookups still report "created": nothing written.
+        let (created, _) = db.first_seen_batch(vec![pubkey]).await[0];
+        assert!(created, "read-only lookup must not record first-seen");
+        // Recording happens explicitly on a successful store.
+        let (created, ts) = db.touch_first_seen_batch(vec![(pubkey, 1234)]).await[0];
+        assert!(created);
+        assert_eq!(ts, 1234);
+        // Now the read-only lookup reports "not created" with the recorded time.
+        let (created, ts) = db.first_seen_batch(vec![pubkey]).await[0];
+        assert!(!created);
+        assert_eq!(ts, 1234);
     });
 }
 
@@ -692,6 +1115,40 @@ fn search_results_are_relevance_ordered() {
 }
 
 #[test]
+fn search_ranks_rare_terms_higher() {
+    // NIP-50 with IDF weighting: a note matching the rarer term ranks above
+    // a newer note matching only the common term.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // "zebra" is rare (only the first note has it); "meetup" is common.
+        let rare = event(1, "zebra meetup notes", now - 50, vec![]);
+        let common = event(1, "meetup reminder", now, vec![]);
+        assert_eq!(db.put(rare.clone(), now).await, PutOutcome::Stored);
+        assert_eq!(db.put(common.clone(), now).await, PutOutcome::Stored);
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"search": "zebra meetup"})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 2);
+        assert_eq!(
+            res[0].id, rare.id,
+            "the rare-term match ranks first despite being older"
+        );
+        assert_eq!(res[1].id, common.id);
+    });
+}
+
+#[test]
 fn created_at_ties_are_not_split_across_pages() {
     // NIP-01 ordering / NIP-67: when the limit cuts inside a group of
     // events sharing the oldest created_at, every event at that
@@ -829,17 +1286,24 @@ fn neg_items_carry_visibility_flags() {
         }
         let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap();
         let (items, _) = db.neg_items(f, 100, now).await;
-        let by_id = |id: &str| items.iter().find(|i| hex::encode(i.1) == id).unwrap();
-        assert!(by_id(&protected.id).2, "protected flag set");
-        assert!(!by_id(&plain.id).2, "plain events are not protected");
+        let by_id = |id: &str| items.iter().find(|i| hex::encode(i.id) == id).unwrap();
+        assert!(by_id(&protected.id).protected, "protected flag set");
+        assert!(
+            !by_id(&plain.id).protected,
+            "plain events are not protected"
+        );
         assert_eq!(
-            by_id(&grouped.id).3.as_deref(),
+            by_id(&grouped.id).gid.as_deref(),
             Some("g1"),
             "group id captured"
         );
         assert!(
-            !by_id(&grouped.id).4,
+            !by_id(&grouped.id).meta,
             "regular group events are not metadata"
+        );
+        assert!(
+            by_id(&plain.id).wrap_recipients.is_none(),
+            "non-gift-wraps carry no recipients"
         );
     });
 }
@@ -1041,6 +1505,123 @@ fn query_directed_ascending() {
         let ids: Vec<_> = asc2.iter().map(|e| e.created_at).collect();
         assert_eq!(ids, vec![now - 200, now - 100]);
         assert!(more);
+    });
+}
+
+#[test]
+fn deleted_replaceable_can_be_re_published() {
+    // Regression: remove_event must clear the replaceable slot, otherwise an
+    // NIP-09-deleted replaceable event could not be re-published with an
+    // older created_at (the stale slot would win the tie-break).
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let pk = "0000000000000000000000000000000000000000000000000000000000000000";
+        let d = vec![vec!["d".to_string(), "post-1".to_string()]];
+        let v1 = event(30023, "v1", now - 10, d.clone());
+        let v2 = event(30023, "v2", now, d.clone());
+        assert_eq!(db.put(v1.clone(), now).await, PutOutcome::Stored);
+        assert_eq!(db.put(v2.clone(), now).await, PutOutcome::Replaced);
+        // Deleting v2 removes it but must also clear the replaceable slot.
+        assert_eq!(
+            db.apply_deletion(vec![v2.id.clone()], vec![], Some(pk.into()), u64::MAX)
+                .await,
+            1
+        );
+        // Re-publishing the older version is now accepted again.
+        assert_eq!(
+            db.put(v1.clone(), now).await,
+            PutOutcome::Stored,
+            "the older version must be storable after the deletion"
+        );
+    });
+}
+
+#[test]
+fn purged_replaceable_can_be_re_published() {
+    // Regression: the NIP-40 purge of an expired addressable event must
+    // clear its replaceable slot, otherwise the stale entry would keep
+    // rejecting an older re-publication.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let d = vec![vec!["d".to_string(), "post-1".to_string()]];
+        let v1 = event(30023, "v1", now - 10, d.clone());
+        let mut v2 = event(30023, "v2", now, d.clone());
+        // Expires shortly after storage, so it is storable first.
+        v2.tags
+            .push(vec!["expiration".into(), (now + 5).to_string()]);
+        assert_eq!(db.put(v1.clone(), now).await, PutOutcome::Stored);
+        assert_eq!(db.put(v2.clone(), now).await, PutOutcome::Replaced);
+        // Later, the purge removes v2 and must clear the slot.
+        assert_eq!(db.purge_expired(now + 10).await, 1);
+        assert_eq!(
+            db.put(v1.clone(), now).await,
+            PutOutcome::Stored,
+            "the older version must be storable after the purge"
+        );
+    });
+}
+
+#[test]
+fn neg_items_carry_gift_wrap_recipients() {
+    // NIP-59: negentropy records of gift wraps must carry their recipients
+    // so the connection layer can withhold them from anyone else.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let recipient = "b83130de0d1386592fe7b9f407f5f1ae8f1db91d772e484b3d81df0fa2e88f24";
+        let wrap = event(
+            1059,
+            "encrypted",
+            now,
+            vec![vec!["p".into(), recipient.into()]],
+        );
+        let plain = event(1, "plain", now, vec![]);
+        assert_eq!(db.put(wrap.clone(), now).await, PutOutcome::Stored);
+        assert_eq!(db.put(plain.clone(), now).await, PutOutcome::Stored);
+        let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [1, 1059]})).unwrap();
+        let (items, _) = db.neg_items(f, 100, now).await;
+        let wrap_item = items.iter().find(|i| hex::encode(i.id) == wrap.id).unwrap();
+        assert_eq!(
+            wrap_item.wrap_recipients.as_deref(),
+            Some(&[recipient.to_string()][..])
+        );
+        let plain_item = items
+            .iter()
+            .find(|i| hex::encode(i.id) == plain.id)
+            .unwrap();
+        assert!(plain_item.wrap_recipients.is_none());
     });
 }
 

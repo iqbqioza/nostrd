@@ -10,7 +10,9 @@ use std::sync::Arc;
 
 use secp256k1::{Keypair, Secp256k1, XOnlyPublicKey};
 use std::collections::HashMap;
-use tokio::sync::{RwLock, Semaphore, broadcast, mpsc};
+use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
+use tokio::sync::RwLock;
+use tokio::sync::{broadcast, mpsc};
 
 use crate::config::{AccessControl, Config};
 use crate::db::{DbClient, PutOutcome};
@@ -38,8 +40,9 @@ pub struct Relay {
     /// NIP-43 role definitions and member assignments.
     pub roles: Arc<RwLock<RoleStore>>,
     /// Limits concurrent `/api/v1` queries so a flood of REST traffic
-    /// fails fast (503) instead of piling up behind WebSocket work.
-    pub api_limit: Arc<Semaphore>,
+    /// fails fast (503) instead of piling up behind WebSocket work. The
+    /// limit is adjustable at runtime (SIGHUP config reload).
+    pub api_limit: Arc<ApiLimiter>,
     /// Active WebSocket connections per source IP, so a socket flood from
     /// a single host cannot consume the whole connection budget.
     per_ip_connections: std::sync::Mutex<HashMap<String, usize>>,
@@ -58,6 +61,67 @@ pub struct LiveBusConfig {
     pub batch_interval_ms: u64,
     /// Maximum events per flushed batch.
     pub batch_size: usize,
+}
+
+/// Bounds the number of concurrently served `/api/v1` queries. Implemented
+/// with a cheap atomic counter instead of a `tokio::sync::Semaphore` so the
+/// limit can be changed at runtime (SIGHUP config reload) without
+/// reallocating the shared handle.
+pub struct ApiLimiter {
+    max: AtomicUsize,
+    in_flight: AtomicIsize,
+}
+
+/// An acquired `/api/v1` slot; the slot is released when the guard drops,
+/// on every exit path of the request handler.
+pub struct ApiPermit {
+    limiter: Arc<ApiLimiter>,
+}
+
+impl Drop for ApiPermit {
+    fn drop(&mut self) {
+        self.limiter.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl ApiLimiter {
+    fn new(max: usize) -> Arc<ApiLimiter> {
+        Arc::new(ApiLimiter {
+            max: AtomicUsize::new(max.max(1)),
+            in_flight: AtomicIsize::new(0),
+        })
+    }
+
+    /// Applies a new concurrency ceiling (from a config reload). The ceiling
+    /// takes effect for every new request.
+    pub fn set_max(&self, max: usize) {
+        self.max.store(max.max(1), Ordering::Relaxed);
+    }
+
+    /// Reserves one in-flight slot when one is free, returning the guard
+    /// that releases it. `None` when the limiter is saturated (503).
+    pub fn try_acquire(self: &Arc<Self>) -> Option<ApiPermit> {
+        let max = self.max.load(Ordering::Relaxed) as isize;
+        let mut cur = self.in_flight.load(Ordering::Relaxed);
+        loop {
+            if cur >= max {
+                return None;
+            }
+            match self.in_flight.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Some(ApiPermit {
+                        limiter: Arc::clone(self),
+                    });
+                }
+                Err(actual) => cur = actual,
+            }
+        }
+    }
 }
 
 impl Relay {
@@ -84,12 +148,17 @@ impl Relay {
                 }
             }
         };
-        let api_max_concurrent = config.read().await.limits.api_max_concurrent.max(1);
+        let api_max_concurrent = config.read().await.limits.api_max_concurrent;
+        // Seed the access control: the persisted runtime state wins, so NIP-86
+        // bans/allowlists survive restarts; the config `access` section seeds
+        // the very first run only (when no runtime state exists yet).
+        let access = match db.load_access().await {
+            Some(access) => access,
+            None => config.read().await.access.clone(),
+        };
         Relay {
-            // Seed the access control from the config so operator bans and
-            // allowlists survive restarts.
             config: Arc::clone(&config),
-            access: Arc::new(RwLock::new(config.read().await.access.clone())),
+            access: Arc::new(RwLock::new(access)),
             db,
             stats,
             live,
@@ -99,7 +168,7 @@ impl Relay {
             live_batch_size,
             groups: Arc::new(RwLock::new(GroupStore::default())),
             roles: Arc::new(RwLock::new(RoleStore::default())),
-            api_limit: Arc::new(Semaphore::new(api_max_concurrent)),
+            api_limit: ApiLimiter::new(api_max_concurrent),
             per_ip_connections: std::sync::Mutex::new(HashMap::new()),
             key,
             secp,
@@ -162,6 +231,14 @@ impl Relay {
 
     pub fn secp(&self) -> &Secp256k1<secp256k1::All> {
         &self.secp
+    }
+
+    /// Persists the current access control lists to the database so NIP-86
+    /// runtime bans/allowlists survive restarts. Callers must release the
+    /// `access` write lock before awaiting this.
+    pub async fn persist_access(&self) {
+        let access = self.access.read().await.clone();
+        self.db.save_access(access).await;
     }
 
     /// Registers a new WebSocket connection from `ip` if it does not exceed
@@ -239,11 +316,15 @@ impl Relay {
 
         // First-seen trust check: a pubkey's first accepted event records
         // its arrival; events from pubkeys first seen within the configured
-        // window are rejected (spam from freshly created accounts).
+        // window are rejected (spam from freshly created accounts). The
+        // lookup is read-only here — the first-seen timestamp is only
+        // persisted once an event actually stores, so a rejected first event
+        // (expired/duplicate/invalid) cannot pre-warm the account-age clock.
+        let mut persist_first_seen = false;
         if cfg.limits.new_pubkey_min_age_secs > 0
             && let Some(pubkey) = event.pubkey_bytes()
         {
-            let first_seens = self.db.touch_first_seen_batch(vec![(pubkey, now)]).await;
+            let first_seens = self.db.first_seen_batch(vec![pubkey]).await;
             let Some(&(created, first_seen)) = first_seens.first() else {
                 // The database is unavailable or overloaded: fail closed.
                 self.stats.bump(&self.stats.events_rejected, 1);
@@ -252,6 +333,7 @@ impl Relay {
                     None,
                 );
             };
+            persist_first_seen = created;
             if !created && now.saturating_sub(first_seen) < cfg.limits.new_pubkey_min_age_secs {
                 self.stats.bump(&self.stats.events_rejected, 1);
                 return (
@@ -262,6 +344,15 @@ impl Relay {
         }
 
         let outcome = self.db.put(event.clone(), now).await;
+        if persist_first_seen
+            && matches!(
+                outcome,
+                PutOutcome::Stored | PutOutcome::Replaced | PutOutcome::Ephemeral
+            )
+            && let Some(pubkey) = event.pubkey_bytes()
+        {
+            self.db.touch_first_seen_batch(vec![(pubkey, now)]).await;
+        }
         let (nip9, nip43, nip29_enabled) =
             (cfg.nip_enabled(9), cfg.nip_enabled(43), cfg.nip_enabled(29));
         drop(cfg);
@@ -323,7 +414,7 @@ impl Relay {
                     }
                 }
             }
-            let known: std::collections::HashSet<Vec<u8>> = if prefixes.is_empty() {
+            let mut known: std::collections::HashSet<Vec<u8>> = if prefixes.is_empty() {
                 std::collections::HashSet::new()
             } else {
                 let existing = self.db.prefixes_exist(prefixes.clone()).await;
@@ -333,6 +424,17 @@ impl Relay {
                     .filter_map(|(p, exists)| exists.then_some(p))
                     .collect()
             };
+            // References to sibling events of the same batch are valid: the
+            // group state changes are applied sequentially, so an earlier
+            // event of the batch is a legitimate `previous` target even
+            // though it is not committed to the database yet.
+            for event in &events {
+                if let Ok(id_bytes) = hex::decode(&event.id) {
+                    for len in 1..=id_bytes.len() {
+                        known.insert(id_bytes[..len].to_vec());
+                    }
+                }
+            }
             let mut out = Vec::with_capacity(events.len());
             for event in events {
                 let id = event.id.clone();
@@ -384,13 +486,16 @@ impl Relay {
 
         // First-seen trust check: pubkeys first seen within the configured
         // window may not publish (their first event established the
-        // account). Performed in one database round trip for the batch.
+        // account). Performed in one database round trip for the batch. The
+        // lookup is read-only; first-seen is only persisted for events that
+        // actually store, so a failed first event cannot pre-warm the clock.
+        let mut new_pubkeys: Vec<bool> = Vec::new();
         if min_age > 0 && !puts.is_empty() {
-            let entries: Vec<([u8; 32], u64)> = puts
+            let pubkeys: Vec<[u8; 32]> = puts
                 .iter()
-                .map(|e| (e.pubkey_bytes().unwrap_or([0u8; 32]), now))
+                .map(|e| e.pubkey_bytes().unwrap_or([0u8; 32]))
                 .collect();
-            let first_seens = self.db.touch_first_seen_batch(entries).await;
+            let first_seens = self.db.first_seen_batch(pubkeys).await;
             if first_seens.len() != puts.len() {
                 // The database is unavailable or overloaded: every pending
                 // event of the batch fails closed.
@@ -406,6 +511,7 @@ impl Relay {
             } else {
                 let mut kept = Vec::with_capacity(puts.len());
                 let mut kept_slots = Vec::with_capacity(put_slots.len());
+                let mut kept_new = Vec::with_capacity(puts.len());
                 for ((event, slot), (created, first_seen)) in
                     puts.into_iter().zip(put_slots).zip(first_seens)
                 {
@@ -416,12 +522,14 @@ impl Relay {
                             PutOutcome::Invalid("restricted: your account is too new".into()),
                         );
                     } else {
+                        kept_new.push(created);
                         kept.push(event);
                         kept_slots.push(slot);
                     }
                 }
                 puts = kept;
                 put_slots = kept_slots;
+                new_pubkeys = kept_new;
             }
         }
 
@@ -433,17 +541,34 @@ impl Relay {
                 .await
         };
         if outcomes.len() != puts.len() {
-            // A timed-out (or failed) request returns no outcomes: every
-            // pending event is reported as failed instead of being replied
-            // with an empty id.
-            outcomes = vec![PutOutcome::Invalid("error: database timeout".into()); puts.len()];
+            // The write was rejected before it was queued (overload
+            // fail-fast): nothing will commit, so every pending event is
+            // reported as failed instead of being replied with an empty id.
+            outcomes = vec![PutOutcome::Invalid("error: database overloaded".into()); puts.len()];
         }
 
-        for ((event, outcome), slot) in puts.into_iter().zip(outcomes).zip(put_slots) {
+        // Record the first-seen timestamp only for accounts whose first
+        // event actually stored: a failed first event must not pre-warm the
+        // account-age clock.
+        let is_new_vec = if new_pubkeys.is_empty() {
+            vec![false; puts.len()]
+        } else {
+            new_pubkeys
+        };
+        let mut persist_first_seen: Vec<[u8; 32]> = Vec::new();
+        for (((event, outcome), slot), is_new) in puts
+            .into_iter()
+            .zip(outcomes)
+            .zip(put_slots)
+            .zip(is_new_vec)
+        {
             let id = event.id.clone();
             match outcome {
                 PutOutcome::Stored | PutOutcome::Replaced | PutOutcome::Ephemeral => {
                     self.stats.bump(&self.stats.events_accepted, 1);
+                    if is_new && let Some(pk) = event.pubkey_bytes() {
+                        persist_first_seen.push(pk);
+                    }
                     self.after_put(&event, now, nip9_enabled, roles_enabled, groups_enabled)
                         .await;
                 }
@@ -455,6 +580,13 @@ impl Relay {
                 }
             }
             results[slot] = (id, outcome);
+        }
+        if !persist_first_seen.is_empty() {
+            self.db
+                .touch_first_seen_batch(
+                    persist_first_seen.into_iter().map(|pk| (pk, now)).collect(),
+                )
+                .await;
         }
 
         for (id, event) in vanishes {
@@ -541,12 +673,17 @@ impl Relay {
         );
 
         if event.kind == 9005 {
-            // Group moderation delete-event: admins may delete any event.
-            let removed = self
-                .db
-                .apply_deletion(nip29::delete_targets(event), vec![], None, u64::MAX)
-                .await;
-            self.stats.bump(&self.stats.events_deleted, removed as u64);
+            // Group moderation delete-event: admins may delete events, but
+            // only within their own group — an admin of one group must not
+            // be able to delete another group's content (or the relay's
+            // metadata) by referencing its id.
+            if let Some(gid) = nip29::group_id(event) {
+                let removed = self
+                    .db
+                    .apply_group_deletion(nip29::delete_targets(event), gid.to_string())
+                    .await;
+                self.stats.bump(&self.stats.events_deleted, removed as u64);
+            }
         }
 
         for mut ev in generated {
@@ -570,12 +707,8 @@ mod tests {
 
     #[test]
     fn nsec_detection() {
-        // A real-looking 63-character nsec string.
-        let nsec = "nsec1";
-        let body: String = (0..58)
-            .map(|i| "qpzry9x8gf2tvdw0s3jn54khce6mua7l".as_bytes()[i % 32] as char)
-            .collect();
-        let key = format!("{nsec}{body}");
+        // A real nsec (checksum-valid bech32m) is detected.
+        let key = crate::nips::nip19::bech32m_encode("nsec", &[0x42u8; 32]).unwrap();
         assert_eq!(key.len(), 63);
         assert!(contains_secret_key(&format!("look at my key {key} here")));
         assert!(contains_secret_key(&key));
@@ -585,15 +718,26 @@ mod tests {
 
         // Too short: not a key.
         assert!(!contains_secret_key("nsec1"));
-        assert!(!contains_secret_key(&format!("nsec1{}", &body[..40])));
+        assert!(!contains_secret_key(&format!("nsec1{}", &key[5..45])));
 
         // Invalid bech32 characters are not matched.
-        let mut bad = body.clone().into_bytes();
-        bad[0] = b'B'; // 'B' is not in the bech32 charset
-        let bad: String = bad.into_iter().map(|b| b as char).collect();
+        let mut bad = key[5..].chars().collect::<Vec<_>>();
+        bad[0] = 'B'; // 'B' is not in the bech32 charset
+        let bad: String = bad.into_iter().collect();
         assert!(!contains_secret_key(&format!("nsec1{bad}")));
 
-        // Case-insensitive prefix.
-        assert!(contains_secret_key(&format!("NSEC1{body}")));
+        // A checksum-invalid look-alike (quoted fake key / garbage) is NOT
+        // flagged: content cannot be censored by baiting a user into quoting
+        // an nsec-shaped string.
+        let fake_body: String = (0..58)
+            .map(|i| "qpzry9x8gf2tvdw0s3jn54khce6mua7l".as_bytes()[i % 32] as char)
+            .collect();
+        assert!(
+            !contains_secret_key(&format!("nsec1{fake_body}")),
+            "an invalid-checksum nsec look-alike must not be flagged"
+        );
+
+        // Case-insensitive prefix with a valid checksum.
+        assert!(contains_secret_key(&format!("NSEC1{}", &key[5..])));
     }
 }

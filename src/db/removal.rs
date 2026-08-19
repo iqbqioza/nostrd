@@ -2,7 +2,8 @@
 //! vanish and the NIP-40 expiration purge.
 
 use super::store::{
-    CREATED_LEN, ID_LEN, Store, created_key, delegated_by, pubkey_key, replaceable_key, tag_key,
+    CREATED_LEN, ID_LEN, Store, created_key, delegated_by, dtag_key_safe, pubkey_key,
+    replaceable_key, tag_key,
 };
 use crate::error::Result;
 use crate::event::Event;
@@ -17,12 +18,14 @@ impl Store {
     /// deleted events may be; `addresses` are NIP-09 `a` tags referencing
     /// addressable events, whose every version up to `request_created` is
     /// removed.
-    pub(crate) fn apply_deletion(
+    /// Like [`Self::apply_deletion_group`] with no group scope (NIP-09).
+    pub(crate) fn apply_deletion_group(
         &self,
         targets: &[String],
         addresses: &[nip09::Address],
         request_pubkey: Option<&str>,
         request_created: u64,
+        group: Option<&str>,
     ) -> Result<usize> {
         let mut wtxn = self.env.write_txn()?;
         let mut removed = 0usize;
@@ -50,6 +53,17 @@ impl Store {
             if let Some(pubkey) = request_pubkey
                 && event.pubkey != pubkey
                 && !delegated_by(&event, pubkey)
+            {
+                continue;
+            }
+            // NIP-29 9005 moderation: restrict to events of the admin's own
+            // group, so a group admin cannot delete another group's content
+            // (or the relay's metadata) by referencing its id.
+            if let Some(gid) = group
+                && crate::nips::nip29::group_id_any(&event)
+                    .map(str::to_string)
+                    .as_deref()
+                    != Some(gid)
             {
                 continue;
             }
@@ -86,7 +100,7 @@ impl Store {
                 .collect();
             for (key, value) in entries {
                 // key = kind(8) + pubkey(32) + dlen(4) + d
-                if key.len() < CREATED_LEN * 2 + ID_LEN {
+                if key.len() < CREATED_LEN + ID_LEN + 4 {
                     continue;
                 }
                 if key[CREATED_LEN..CREATED_LEN + ID_LEN] != pubkey {
@@ -101,7 +115,9 @@ impl Store {
                     continue;
                 }
                 let d = &key[CREATED_LEN + ID_LEN + 4..];
-                if d != address.d.as_bytes() {
+                // The stored slot key truncates over-long `d` tags (see
+                // `dtag_key_safe`), so compare against the truncated form.
+                if d != dtag_key_safe(&address.d).as_bytes() {
                     continue;
                 }
                 if value.len() < CREATED_LEN + ID_LEN {
@@ -176,11 +192,23 @@ impl Store {
             .range(&wtxn, &range)?
             .filter_map(|item| item.ok().map(|(k, _)| k[k.len() - ID_LEN..].to_vec()))
             .collect();
+        let pubkey_hex = hex::encode(pubkey);
         for id in ids {
-            if self.events.get(&wtxn, &id)?.is_some() {
-                self.remove_event(&mut wtxn, &id)?;
-                removed += 1;
+            let Some(raw) = self.events.get(&wtxn, &id)? else {
+                continue;
+            };
+            let Ok(event) = serde_json::from_slice::<Event>(raw) else {
+                continue;
+            };
+            // NIP-62: only events *authored* by the vanished pubkey are
+            // removed. NIP-26 delegatee events are indexed under the
+            // delegator's pubkey too, but they belong to the delegatee and
+            // must survive a delegator's request to vanish.
+            if event.pubkey != pubkey_hex {
+                continue;
             }
+            self.remove_event(&mut wtxn, &id)?;
+            removed += 1;
         }
 
         // NIP-59 gift wraps addressed to the vanished pubkey. The by_tag
