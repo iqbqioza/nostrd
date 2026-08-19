@@ -663,12 +663,8 @@ mod tests {
 
     #[test]
     fn nsec_detection() {
-        // A real-looking 63-character nsec string.
-        let nsec = "nsec1";
-        let body: String = (0..58)
-            .map(|i| "qpzry9x8gf2tvdw0s3jn54khce6mua7l".as_bytes()[i % 32] as char)
-            .collect();
-        let key = format!("{nsec}{body}");
+        // A real nsec (checksum-valid bech32m) is detected.
+        let key = crate::nips::nip19::bech32m_encode("nsec", &[0x42u8; 32]).unwrap();
         assert_eq!(key.len(), 63);
         assert!(contains_secret_key(&format!("look at my key {key} here")));
         assert!(contains_secret_key(&key));
@@ -678,15 +674,26 @@ mod tests {
 
         // Too short: not a key.
         assert!(!contains_secret_key("nsec1"));
-        assert!(!contains_secret_key(&format!("nsec1{}", &body[..40])));
+        assert!(!contains_secret_key(&format!("nsec1{}", &key[5..45])));
 
         // Invalid bech32 characters are not matched.
-        let mut bad = body.clone().into_bytes();
-        bad[0] = b'B'; // 'B' is not in the bech32 charset
-        let bad: String = bad.into_iter().map(|b| b as char).collect();
+        let mut bad = key[5..].chars().collect::<Vec<_>>();
+        bad[0] = 'B'; // 'B' is not in the bech32 charset
+        let bad: String = bad.into_iter().collect();
         assert!(!contains_secret_key(&format!("nsec1{bad}")));
 
-        // Case-insensitive prefix.
-        assert!(contains_secret_key(&format!("NSEC1{body}")));
+        // A checksum-invalid look-alike (quoted fake key / garbage) is NOT
+        // flagged: content cannot be censored by baiting a user into quoting
+        // an nsec-shaped string.
+        let fake_body: String = (0..58)
+            .map(|i| "qpzry9x8gf2tvdw0s3jn54khce6mua7l".as_bytes()[i % 32] as char)
+            .collect();
+        assert!(
+            !contains_secret_key(&format!("nsec1{fake_body}")),
+            "an invalid-checksum nsec look-alike must not be flagged"
+        );
+
+        // Case-insensitive prefix with a valid checksum.
+        assert!(contains_secret_key(&format!("NSEC1{}", &key[5..])));
     }
 }

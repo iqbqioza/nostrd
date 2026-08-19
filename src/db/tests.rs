@@ -772,6 +772,61 @@ fn group_deletion_is_scoped_to_the_group() {
 }
 
 #[test]
+fn vanish_keeps_delegatee_events_of_a_delegator() {
+    // NIP-62: a request to vanish removes only events *authored* by the
+    // pubkey. NIP-26 delegatee events are indexed under the delegator too,
+    // so a delegator's vanish must not delete the delegatee's events.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let delegator = "aa".repeat(32);
+        let delegatee = "bb".repeat(32);
+        let mut e = event(
+            1,
+            "delegated",
+            now,
+            vec![vec![
+                "delegation".into(),
+                delegator.clone(),
+                "kind=1".into(),
+                "00".repeat(64),
+            ]],
+        );
+        e.pubkey = delegatee.clone();
+        e.id = nip01::compute_id(&e);
+        assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
+
+        // Vanish the delegator: the delegatee-authored event survives.
+        let removed = db
+            .apply_vanish(hex::decode(&delegator).unwrap().try_into().unwrap())
+            .await;
+        assert_eq!(removed, 0, "delegator's vanish removes no delegatee events");
+        let f: Filter = serde_json::from_value(serde_json::json!({"ids": [e.id]})).unwrap();
+        let (res, _) = db.query(vec![f], 10, now).await;
+        assert_eq!(res.len(), 1, "delegatee event must survive");
+
+        // Vanish the delegatee: their own event is removed.
+        let removed = db
+            .apply_vanish(hex::decode(&delegatee).unwrap().try_into().unwrap())
+            .await;
+        assert_eq!(removed, 1);
+        let f: Filter = serde_json::from_value(serde_json::json!({"ids": [e.id]})).unwrap();
+        let (res, _) = db.query(vec![f], 10, now).await;
+        assert!(res.is_empty());
+    });
+}
+
+#[test]
 fn access_control_persists_across_reopen() {
     // NIP-86 runtime bans/allowlists survive restarts: the access control is
     // stored in the database and restored when the database is reopened.

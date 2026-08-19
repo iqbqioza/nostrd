@@ -58,6 +58,34 @@ fn verify_checksum(hrp: &[u8], data: &[u8]) -> Option<bool> {
     }
 }
 
+/// Whether `s` is a complete `hrp`-prefixed bech32/bech32m string with a
+/// valid checksum (BIP-173). Case-insensitive (BIP-173 permits all-lowercase
+/// or all-uppercase). Used by the nsec-leak detector so that strings merely
+/// *resembling* a key (`nsec1` + charset chars but a bad checksum) are not
+/// mistaken for real secret keys.
+pub(crate) fn bech32_checksum_valid(hrp: &str, s: &str) -> bool {
+    let s = s.to_lowercase();
+    let Some(body) = s.strip_prefix(hrp).and_then(|r| r.strip_prefix('1')) else {
+        return false;
+    };
+    if body.len() < 6 {
+        return false;
+    }
+    let data: Option<Vec<u8>> = body
+        .chars()
+        .map(|ch| {
+            if !ch.is_ascii() {
+                return None;
+            }
+            CHARSET.iter().position(|&c| c == ch as u8).map(|p| p as u8)
+        })
+        .collect();
+    let Some(data) = data else {
+        return false;
+    };
+    verify_checksum(hrp.as_bytes(), &data).is_some()
+}
+
 /// Create a bech32m checksum for `data` (without checksum).
 fn create_checksum(hrp: &[u8], data: &[u8]) -> Vec<u8> {
     let mut values = hrp_expand(hrp);
@@ -358,7 +386,7 @@ pub fn parse_nip19(input: &str) -> Result<Nip19Entity, Bech32Error> {
 
 /// Encode 8-bit bytes into bech32m with the given HRP.
 #[allow(dead_code)]
-fn bech32m_encode(hrp: &str, data: &[u8]) -> Result<String, Bech32Error> {
+pub(crate) fn bech32m_encode(hrp: &str, data: &[u8]) -> Result<String, Bech32Error> {
     let data_5bit = convert_bits(data, 8, 5, true)?;
     let checksum = create_checksum(hrp.as_bytes(), &data_5bit);
     let mut combined = data_5bit;

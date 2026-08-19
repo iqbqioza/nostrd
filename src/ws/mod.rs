@@ -322,6 +322,14 @@ pub async fn handle_connection(
             live_batch = live_fut => {
                 match live_batch {
                     Ok(batch) => {
+                        // Refresh the cached NIP-40/NIP-42 flags so a config
+                        // reload (e.g. re-enabling NIP-40 expiry) takes effect
+                        // even for idle connections that only receive live
+                        // events and never send another frame.
+                        let cfg = conn.relay.config.read().await;
+                        conn.expiry_enabled = cfg.nip_enabled(40);
+                        conn.giftwrap_restricted = cfg.nip_enabled(42);
+                        drop(cfg);
                         // The group store lock is only taken when the batch
                         // actually contains group events (rare); ordinary
                         // traffic skips the shared lock entirely.

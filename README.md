@@ -12,7 +12,7 @@ nostrd is designed around two goals:
 - **All relay-side NIPs implemented** — see the [NIP support](#nip-support) table.
 - **REST API** — a read-only HTTP API at `/api/v1/...` for querying events by `npub1`, `nevent1` or `naddr1`, with its own dedicated database reader thread and concurrency limiter so REST traffic can never stall WebSocket subscribers.
 - **LMDB persistence (via `heed`)** — durable, crash-safe storage; the memory map is a sparse virtual-address reservation opened at its configured ceiling, so it never needs a runtime resize (which would be unsafe with concurrent reader threads) and physical memory stays small.
-- **Overload protection** — the database queue is bounded; when it fills up, new requests fail fast instead of accumulating in memory.
+- **Overload protection** — the database queue is bounded; when it fills up, new requests fail fast instead of accumulating in memory. Writes that reach the queue always wait for their true outcome, so a queued event can never silently commit after the relay reported a false failure (which would skip its side-effects).
 - **Reader/writer thread split** — reads are served by dedicated threads that never take the LMDB write lock, so a stalled writer (slow disk, external lock holder) cannot take the relay down for readers. The REST API gets its own reader thread, isolated from WebSocket REQ/COUNT/NEG queries.
 - **Per-IP connection cap** — a single host cannot consume the whole connection budget.
 - **Panic-safe** — task panics are contained and logged, and connection accounting is released on every exit path.
@@ -78,7 +78,7 @@ Query parameters (all optional):
 | `search` | NIP-50 full-text search on event content (length capped by `limits.api_max_search_bytes`). |
 | `e` / `p` / `t` / `d` | Filter on `#e`, `#p`, `#t` or `#d` tags (for `npub1`/`nevent1`/`note1`; the `d` tag of an `naddr1` is taken from the address itself unless overridden). |
 
-Only `GET` is supported; WebSocket upgrade requests to `/api/v1` are rejected with `403`. The API applies the same visibility rules as an anonymous WebSocket connection: NIP-70 protected events, NIP-59 gift wraps and NIP-29 private/hidden group content are withheld.
+Only `GET` is supported; WebSocket upgrade requests to `/api/v1` are rejected with `403`. The API applies the same visibility rules as an anonymous WebSocket connection: NIP-70 protected events, NIP-59 gift wraps and NIP-29 private/hidden group content are withheld. Pagination (`offset` and the `more` flag) is computed over the *visible* sequence, so hidden events between pages do not skip or duplicate rows.
 
 ## Commands
 
@@ -164,6 +164,16 @@ allowed_pubkeys = []            # the database and survive restarts; this sectio
 blocked_kinds = []              # seeds them on the very first run only
 blocked_ips = []
 ```
+
+`nostrd check` (and startup) validate the file and warn about common misconfigurations — e.g. an empty `relay.public_url` with a wildcard/loopback bind (which would break NIP-42 AUTH, NIP-62 vanish and NIP-86 NIP-98 auth), a `require_pow` high enough to make mining infeasible, incomplete LiveKit settings, or the `require_auth` + `send_auth_challenge = false` lockout.
+
+### Anti-abuse limits
+
+In addition to the tunables above, a few hard bounds are fixed to keep the relay responsive under abuse:
+
+- A single filter may carry at most **512 `ids` or `authors` entries**; larger filters are rejected (the per-candidate match is linear in these arrays, so unbounded arrays would allow quadratic work per REQ).
+- Event ids in `ids` filters may be prefixes, but only full 32-byte ids and even-length prefixes are matched (odd-length/empty entries are ignored, consistently for historical and live delivery).
+- Over-long index keys (a tag value, content word or `d` tag long enough to exceed LMDB's key-size limit) are skipped at indexing time rather than aborting the write batch; the event is still stored.
 
 ## NIP support
 

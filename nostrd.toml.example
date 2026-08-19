@@ -14,8 +14,14 @@
 #   nostrd check    validate this file and exit
 #   nostrd init     write a default configuration and exit
 #
-# Sending SIGHUP to the daemon reloads this file at runtime (limits and
-# server settings apply immediately; the NIP-40 toggle is applied live too).
+# Sending SIGHUP to the daemon reloads this file at runtime: most limits,
+# server auth settings, the NIP toggles (including the NIP-40 toggle, applied
+# live) and the REST API concurrency ceiling apply immediately. A few settings
+# are captured at startup and require a full restart: live_buffer /
+# live_batch_size / live_batch_interval_ms, server.api_host, server.
+# management_port, server.metrics_enabled, the database request timeouts and
+# queue caps, purge_interval_secs, stats_interval_secs and max_indexed_words.
+# An invalid reloaded file is rejected (the old configuration stays in force).
 # =============================================================================
 
 # -----------------------------------------------------------------------------
@@ -46,10 +52,12 @@ post_policy = ""
 private_key = ""
 
 # Public URL of this relay as seen by clients (e.g. "wss://relay.example.com").
-# Used for NIP-62 request-to-vanish matching and NIP-42 auth relay-tag checks;
-# falls back to server.host:server.port when empty. Always set this when the
-# relay sits behind a TLS-terminating proxy or Cloudflare Tunnel, where the
-# public scheme is wss while the local listener is plain ws.
+# Used for NIP-62 request-to-vanish matching, NIP-42 auth relay-tag checks and
+# NIP-86 NIP-98 admin auth; falls back to server.host:server.port when empty,
+# which with a wildcard or loopback bind (0.0.0.0, 127.0.0.1) never matches a
+# client's URL and silently breaks all three. Always set this when the relay
+# sits behind a TLS-terminating proxy or Cloudflare Tunnel, where the public
+# scheme is wss while the local listener is plain ws.
 public_url = ""
 
 # Optional LiveKit server URL for NIP-29 live audio/video rooms.
@@ -111,7 +119,10 @@ admin_pubkey = ""
 # EVENT messages are honored.
 require_auth = false
 
-# Send the NIP-42 AUTH challenge to every new connection.
+# Send the NIP-42 AUTH challenge to every new connection. The challenge is
+# only ever sent at connect time, so `require_auth = true` with this set to
+# false is a total lockout (no client can authenticate); `nostrd check` warns
+# about the combination.
 send_auth_challenge = true
 
 # Expose Prometheus metrics on GET /metrics (text format). Served on the API
@@ -136,6 +147,10 @@ max_ws_message_size = 1048576
 
 # Maximum number of filters in a single REQ/COUNT message.
 max_filters = 20
+
+# A single filter may carry at most 512 `ids` or `authors` entries (a fixed
+# relay limit, not configurable): the per-candidate match is linear in these
+# arrays, and larger filters are rejected to bound per-request work.
 
 # Maximum number of active subscriptions per connection.
 max_subscriptions = 20

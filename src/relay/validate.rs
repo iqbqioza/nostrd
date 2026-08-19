@@ -253,19 +253,26 @@ fn is_bech32_char(byte: u8) -> bool {
     b"qpzry9x8gf2tvdw0s3jn54khce6mua7l".contains(&byte)
 }
 
-/// Returns `true` when the text contains a secret key: an `nsec1` prefix
-/// (case-insensitive) followed by at least 58 bech32 characters.
+/// Returns `true` when the text contains a real secret key: an `nsec1`
+/// prefix (case-insensitive) followed by 58 bech32 characters whose bech32
+/// checksum validates. A string that merely *resembles* a key (e.g. quoted
+/// in an article, or `nsec1` + charset garbage with a bad checksum) is not
+/// flagged, so the check cannot be used to censor content by baiting a
+/// user into quoting a fake key.
 pub(crate) fn contains_secret_key(text: &str) -> bool {
     let bytes = text.as_bytes();
+    let win = NSEC_PREFIX.len() + NSEC_BODY_LEN;
     let mut i = 0;
-    while i + NSEC_PREFIX.len() + NSEC_BODY_LEN <= bytes.len() {
-        if bytes[i..i + NSEC_PREFIX.len()]
-            .iter()
-            .zip(NSEC_PREFIX)
-            .all(|(b, p)| b.to_ascii_lowercase() == *p)
-            && bytes[i + NSEC_PREFIX.len()..i + NSEC_PREFIX.len() + NSEC_BODY_LEN]
+    while i + win <= bytes.len() {
+        if text.is_char_boundary(i)
+            && bytes[i..i + NSEC_PREFIX.len()]
+                .iter()
+                .zip(NSEC_PREFIX)
+                .all(|(b, p)| b.to_ascii_lowercase() == *p)
+            && bytes[i + NSEC_PREFIX.len()..i + win]
                 .iter()
                 .all(|b| is_bech32_char(*b))
+            && crate::nips::nip19::bech32_checksum_valid("nsec", &text[i..i + win])
         {
             return true;
         }
