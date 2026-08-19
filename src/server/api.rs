@@ -268,6 +268,15 @@ async fn query_and_respond(
         );
     };
     let now = unix_now();
+    // NIP-50: when the search capability is disabled, strip `search` from the
+    // filters (like the WebSocket path) so the REST API cannot trigger a
+    // full-range term scan that a WS client could never run.
+    let mut filters = filters;
+    if !relay.config.read().await.nip_enabled(50) {
+        for f in &mut filters {
+            f.search = None;
+        }
+    }
     // Pagination: fetch `limit + offset + 1` so `more` can be decided from
     // the *visible* sequence (events hidden between pages — protected, gift
     // wraps, private groups — must not make a client skip a page or stop

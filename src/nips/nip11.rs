@@ -20,6 +20,9 @@ pub fn relay_info(config: &Config, stats: &Stats, self_pubkey: Option<&str>) -> 
     let mut info = json!({
         "name": config.relay.name,
         "description": config.relay.description,
+        "pubkey": config.relay.pubkey,
+        "contact": config.relay.contact,
+        "icon": config.relay.icon,
         "supported_nips": config.supported_nips(),
         "software": env!("CARGO_PKG_REPOSITORY"),
         "version": env!("CARGO_PKG_VERSION"),
@@ -131,6 +134,20 @@ mod tests {
         assert!(info.get("icon").is_none());
         assert!(info.get("posting_policy").is_none());
         assert!(info.get("payments_url").is_none());
+    }
+
+    #[test]
+    fn identity_fields_are_advertised_when_set() {
+        let mut cfg = Config::default();
+        cfg.relay.pubkey = "aa".repeat(32);
+        cfg.relay.contact = "https://example.com/contact".to_string();
+        cfg.relay.icon = "https://example.com/icon.png".to_string();
+        let stats = Stats::new();
+        let info = relay_info(&cfg, &stats, Some(&"bb".repeat(32)));
+        assert_eq!(info["pubkey"], "aa".repeat(32));
+        assert_eq!(info["contact"], "https://example.com/contact");
+        assert_eq!(info["icon"], "https://example.com/icon.png");
+        assert_eq!(info["self"], "bb".repeat(32));
     }
 
     #[test]

@@ -36,13 +36,14 @@ name = "nostrd"
 # Short description of the relay.
 description = "A minimal and stable Nostr relay"
 
-# Administrative contact pubkey (32-byte hex) advertised in the info document.
+# Administrative contact pubkey (32-byte hex). Advertised as the NIP-11
+# "pubkey" field (omitted when empty); it does not need to match private_key.
 pubkey = ""
 
-# Alternative contact (URL or mailto URI).
+# Alternative contact (URL or mailto URI), advertised in the info document.
 contact = ""
 
-# Relay icon URL.
+# Relay icon URL, advertised in the info document.
 icon = ""
 
 # Posting policy text advertised in the info document.

@@ -104,6 +104,9 @@ Every setting is optional — missing entries fall back to the defaults. `nostrd
 [relay]
 name = "nostrd"                 # relay name (NIP-11)
 description = "..."             # relay description (NIP-11)
+pubkey = ""                     # administrative contact pubkey (NIP-11 "pubkey")
+contact = ""                    # alternative contact (URL or mailto, NIP-11)
+icon = ""                       # relay icon URL (NIP-11)
 private_key = ""                # hex secret key of the relay itself (required for
                                 # NIP-29 group metadata and NIP-43 membership events;
                                 # its pubkey is advertised as the NIP-11 "self")
@@ -113,7 +116,7 @@ enabled_nips = []               # explicit NIP allowlist (empty = all except dis
 disabled_nips = []              # NIPs to disable
 
 [server]
-host = "0.0.0.0"                # bind address; "127.0.0.1" = local only,
+host = "127.0.0.1"              # bind address; "127.0.0.1" = local only (the default),
                                 # "0.0.0.0" = all interfaces
 port = 8080
 api_host = ""                   # hostname dedicated to the REST API; empty =
@@ -163,6 +166,7 @@ log_max_files = 5               # rotated log backups to keep
 blocked_pubkeys = []            # NIP-86 runtime bans/allowlists are persisted in
 allowed_pubkeys = []            # the database and survive restarts; this section
 blocked_kinds = []              # seeds them on the very first run only
+allowed_kinds = []
 blocked_ips = []
 ```
 
