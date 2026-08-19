@@ -14,7 +14,7 @@ use serde_json::{Value, json};
 
 use crate::event::Event;
 use crate::filter::Filter;
-use crate::nips::{nip29, nip42, nip77};
+use crate::nips::{nip29, nip42};
 use crate::relay::Relay;
 use crate::stats::Stats;
 
@@ -40,8 +40,10 @@ pub struct Conn {
     subs: HashMap<String, (Vec<Filter>, usize)>,
     /// Bytes held by the filters of all active subscriptions.
     pub(crate) sub_bytes: usize,
-    /// NIP-77 negentropy state per subscription id.
-    neg: HashMap<String, Vec<nip77::Item>>,
+    /// NIP-77 negentropy state per subscription id: the held items plus the
+    /// remaining number of NEG-MSG rounds (a budget so a peer cannot drive
+    /// unbounded CPU-bounded reconciliation work with tiny messages).
+    neg: HashMap<String, negentropy::NegState>,
     /// Total number of negentropy items held across all open NEG-OPEN
     /// subscriptions, so that a connection cannot pin more than twice the
     /// configured per-query maximum in memory.
@@ -284,11 +286,20 @@ pub async fn handle_connection(
                 }
                 // Batch window: keep reading for a moment so consecutive
                 // EVENT messages from a busy publisher share one database
-                // commit, then flush the queue when the socket is idle.
+                // commit, then flush the queue when the socket is idle. The
+                // iteration cap bounds the window so a client flooding
+                // frames cannot starve this connection's live delivery and
+                // outgoing flush (which only run in the outer select).
                 let mut too_large = false;
-                while let Ok(Some(Ok(frame))) =
-                    tokio::time::timeout(std::time::Duration::from_millis(1), receiver.next()).await
-                {
+                for _ in 0..EVENT_BATCH * 4 {
+                    let Ok(Some(Ok(frame))) = tokio::time::timeout(
+                        std::time::Duration::from_millis(1),
+                        receiver.next(),
+                    )
+                    .await
+                    else {
+                        break;
+                    };
                     if conn.handle_frame(frame, max_msg_size).await {
                         too_large = true;
                         break;

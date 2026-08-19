@@ -147,6 +147,9 @@ pub async fn rpc_handler(
             }
             {
                 let mut access = relay.access.write().await;
+                // NIP-86: allowing a pubkey also un-bans it (matching the
+                // legacy endpoint), so `banpubkey` can be reverted.
+                access.blocked_pubkeys.retain(|p| p != pubkey);
                 if !access.allowed_pubkeys.iter().any(|p| p == pubkey) {
                     access.allowed_pubkeys.push(pubkey.to_string());
                 }
@@ -180,6 +183,9 @@ pub async fn rpc_handler(
             };
             {
                 let mut access = relay.access.write().await;
+                // NIP-86: allowing a kind also un-blocks it (matching the
+                // legacy endpoint), so `disallowkind` can be reverted.
+                access.blocked_kinds.retain(|k| *k != kind);
                 if !access.allowed_kinds.contains(&kind) {
                     access.allowed_kinds.push(kind);
                 }
@@ -242,13 +248,12 @@ pub async fn rpc_handler(
             let description = params.get(2).and_then(Value::as_str).unwrap_or("");
             let color = params.get(3).and_then(Value::as_str).unwrap_or("");
             let order = params.get(4).and_then(Value::as_i64);
-            if relay
-                .create_role(id, label, description, color, order)
-                .await
-            {
+            if relay.edit_role(id, label, description, color, order).await {
                 rpc_ok(json!(true))
             } else {
-                rpc_err("restricted: NIP-43 is disabled or the relay key is not configured")
+                rpc_err(
+                    "restricted: role not found, NIP-43 is disabled or the relay key is not configured",
+                )
             }
         }
         "deleterole" => {

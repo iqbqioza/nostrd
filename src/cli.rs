@@ -172,7 +172,11 @@ impl Cli {
                 std::io::Error::last_os_error()
             )));
         }
-        wait_for_stop(&self.load_config()?.daemon.pid_file);
+        if !wait_for_stop(&self.load_config()?.daemon.pid_file) {
+            return Err(Error::Other(format!(
+                "daemon (pid {pid}) did not stop in time"
+            )));
+        }
         Ok(())
     }
 
@@ -252,7 +256,9 @@ fn process_alive(pid: u32) -> bool {
     ret == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
-fn wait_for_stop(pid_file: &Path) {
+/// Waits up to 10 seconds for the daemon to exit (the pid file to disappear).
+/// Returns `true` when the daemon stopped, `false` when it is still running.
+fn wait_for_stop(pid_file: &Path) -> bool {
     for _ in 0..100 {
         let gone = std::fs::read_to_string(pid_file)
             .ok()
@@ -261,7 +267,7 @@ fn wait_for_stop(pid_file: &Path) {
             .unwrap_or(true);
         if gone {
             let _ = std::fs::remove_file(pid_file);
-            return;
+            return true;
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -269,4 +275,5 @@ fn wait_for_stop(pid_file: &Path) {
         "daemon did not stop in time; pid file {} still exists",
         pid_file.display()
     );
+    false
 }

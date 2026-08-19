@@ -586,6 +586,14 @@ async fn reload_handler(
                 match Config::load(&config_path) {
                     Ok(mut new_config) => {
                         new_config.absolutize_paths(&config_path);
+                        // Validate before applying: a parseable-but-invalid
+                        // file (zero limits, bad keys, map layout) must not
+                        // silently disable the relay at runtime. The old
+                        // configuration stays in force on failure.
+                        if let Err(e) = new_config.validate() {
+                            error!("config reload rejected: {e}");
+                            continue;
+                        }
                         db.set_expiry_enabled(new_config.nip_enabled(40));
                         api_limit.set_max(new_config.limits.api_max_concurrent);
                         *config.write().await = new_config;

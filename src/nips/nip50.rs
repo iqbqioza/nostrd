@@ -10,12 +10,17 @@
 //! search string cannot fan out into hundreds of index ranges.
 
 /// Tokenizes text into lowercase alphanumeric words of length >= 2.
+///
+/// Lowercasing is Unicode-aware (`to_lowercase`) so that the indexed words
+/// match the per-event term check in the scan engine, which lowercases the
+/// content with the same function: a query for an accented or non-ASCII
+/// uppercase term must find the same events the index contains.
 pub fn tokenize(text: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut current = String::new();
     for ch in text.chars() {
         if ch.is_alphanumeric() {
-            current.push(ch.to_ascii_lowercase());
+            current.extend(ch.to_lowercase());
         } else if !current.is_empty() {
             if current.len() >= 2 {
                 words.push(std::mem::take(&mut current));

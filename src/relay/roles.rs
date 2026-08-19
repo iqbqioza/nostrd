@@ -94,6 +94,26 @@ impl super::Relay {
         true
     }
 
+    /// NIP-86 `editrole`: updates an *existing* role. A typo'd or missing id
+    /// must not silently create a brand-new role, so the role must already
+    /// exist (unlike `create_role`).
+    pub async fn edit_role(
+        &self,
+        id: &str,
+        label: &str,
+        description: &str,
+        color: &str,
+        order: Option<i64>,
+    ) -> bool {
+        if !self.config.read().await.nip_enabled(43) || self.key.is_none() {
+            return false;
+        }
+        if !self.roles.read().await.roles.contains_key(id) {
+            return false;
+        }
+        self.create_role(id, label, description, color, order).await
+    }
+
     pub async fn delete_role(&self, id: &str) -> bool {
         if !self.config.read().await.nip_enabled(43) || self.key.is_none() {
             return false;

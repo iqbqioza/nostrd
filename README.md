@@ -93,7 +93,7 @@ Only `GET` is supported; WebSocket upgrade requests to `/api/v1` are rejected wi
 
 All commands accept `--config <path>` (default `./nostrd.toml`).
 
-Sending `SIGHUP` to the daemon reloads the configuration at runtime (limits and server settings apply immediately — including the REST API concurrency ceiling — and the NIP-40 toggle is applied live too). The access control lists are runtime-managed (NIP-86) and are **not** overwritten by a reload.
+Sending `SIGHUP` to the daemon reloads the configuration at runtime: most limits, server auth settings, the NIP toggles (including the NIP-40 toggle, applied live) and the REST API concurrency ceiling apply immediately. A few settings are captured at startup and require a full restart: `live_buffer`/`live_batch_size`/`live_batch_interval_ms`, `server.api_host`, `server.management_port`, `server.metrics_enabled`, the database request timeouts/queue caps, `purge_interval_secs`, `stats_interval_secs` and `max_indexed_words`. An invalid reloaded file is rejected (the old configuration stays in force). The access control lists are runtime-managed (NIP-86) and are **not** overwritten by a reload.
 
 ## Configuration
 

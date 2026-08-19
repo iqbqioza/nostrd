@@ -33,6 +33,14 @@ pub(crate) const ACCESS: &str = "access";
 pub(crate) const CREATED_LEN: usize = 8;
 pub(crate) const ID_LEN: usize = 32;
 pub(crate) const TAG_VALUE_MAX: usize = 1024;
+/// LMDB's maximum key size (`MDB_MAXKEYSIZE`). Index keys longer than this
+/// are rejected with `MDB_BAD_VALSIZE`, which would abort the *entire* write
+/// batch and reject every connection's events in the drain window. Over-long
+/// variable-length index components (tag values, words, `d` tags) are
+/// therefore skipped/truncated at indexing time instead of erroring: the
+/// event itself is still stored, only lookup by the pathological value is
+/// unavailable.
+pub(crate) const MAX_INDEX_KEY: usize = 511;
 
 /// Minimum free space required before a batch of writes is committed.
 /// Writing to the memory map of a file on a completely full disk raises
@@ -438,6 +446,22 @@ pub(crate) fn replaceable_key(kind: u64, pubkey: &[u8], dtag: &str) -> Vec<u8> {
     key.extend_from_slice(dtag.as_bytes());
     key
 }
+
+/// Truncates a `d` tag at a character boundary to a byte length that keeps
+/// the replaceable index key under LMDB's key-size limit (see
+/// [`MAX_INDEX_KEY`]). Only used for the index key; the stored event keeps
+/// its full `d` tag.
+pub(crate) fn dtag_key_safe(dtag: &str) -> &str {
+    let max = MAX_INDEX_KEY.saturating_sub(CREATED_LEN + ID_LEN + 4);
+    if dtag.len() <= max {
+        return dtag;
+    }
+    let mut end = max;
+    while end > 0 && !dtag.is_char_boundary(end) {
+        end -= 1;
+    }
+    &dtag[..end]
+}
 impl Store {
     // ----- event persistence -----
 
@@ -497,7 +521,11 @@ impl Store {
             } else {
                 String::new()
             };
-            let rkey = replaceable_key(event.kind, &pubkey, &dtag);
+            // The `d` tag is truncated for the index key only: a value long
+            // enough to exceed LMDB's key-size limit would abort the whole
+            // write batch, and realistic addressable events use short `d`
+            // tags. The stored event keeps its full `d` tag.
+            let rkey = replaceable_key(event.kind, &pubkey, dtag_key_safe(&dtag));
             let old = self.replaceable.get(wtxn, &rkey)?;
             let had_old = old.is_some();
             if let Some(old) = old
@@ -561,11 +589,12 @@ impl Store {
             .put(wtxn, &kind_key(event.kind, created, id), b"")?;
         for tag in &event.tags {
             if indexable_tag(tag) {
-                self.by_tag.put(
-                    wtxn,
-                    &tag_key(tag[0].as_bytes()[0], tag[1].as_bytes(), created, id),
-                    b"",
-                )?;
+                let key = tag_key(tag[0].as_bytes()[0], tag[1].as_bytes(), created, id);
+                // Skip rather than error: an over-long key would abort the
+                // whole write batch (see MAX_INDEX_KEY).
+                if key.len() <= MAX_INDEX_KEY {
+                    self.by_tag.put(wtxn, &key, b"")?;
+                }
             }
         }
         if self
@@ -580,7 +609,12 @@ impl Store {
                 .iter()
                 .take(self.max_indexed_words)
             {
-                by_word.put(wtxn, &word_key(word, created, id), b"")?;
+                let key = word_key(word, created, id);
+                // Skip rather than error: an over-long word would abort the
+                // whole write batch (see MAX_INDEX_KEY).
+                if key.len() <= MAX_INDEX_KEY {
+                    by_word.put(wtxn, &key, b"")?;
+                }
             }
         }
         Ok(())

@@ -567,6 +567,121 @@ fn nip28_channel_queries_use_e_tag_index() {
 }
 
 #[test]
+fn overlong_index_components_do_not_poison_the_batch() {
+    // LMDB rejects keys >= 512 bytes with MDB_BAD_VALSIZE. A tag value or
+    // content word long enough to produce such a key used to abort the whole
+    // merged write batch (rejecting every connection's events); the index
+    // must now skip the over-long entry instead of erroring.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let long_tag = "x".repeat(500);
+        let e_long_tag = event(
+            1,
+            "has a long tag",
+            now,
+            vec![vec!["t".into(), long_tag.clone()]],
+        );
+        let long_word = "w".repeat(500);
+        let e_long_word = event(1, &long_word, now - 1, vec![]);
+        let e_normal = event(1, "normal note", now - 2, vec![]);
+        let results = db
+            .put_batch(vec![
+                (e_long_tag.clone(), now),
+                (e_long_word.clone(), now),
+                (e_normal.clone(), now),
+            ])
+            .await;
+        assert_eq!(
+            results,
+            vec![PutOutcome::Stored, PutOutcome::Stored, PutOutcome::Stored],
+            "over-long index components must not poison the batch"
+        );
+        // All three events are stored and reachable without the long filter.
+        let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 3);
+        // The long tag value is not indexed, so a filter for it matches nothing.
+        let f: Filter = serde_json::from_value(serde_json::json!({"#t": [long_tag]})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert!(res.is_empty());
+    });
+}
+
+#[test]
+fn multi_filter_req_survives_an_early_limit() {
+    // A first filter that hits its limit immediately (e.g. `limit: 0`) must
+    // not abort the rest of the multi-filter REQ: `[{"limit":0},{"kinds":[1]}]`
+    // still returns the kind-1 events from the second filter.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let e1 = event(1, "one", now, vec![]);
+        let e2 = event(1, "two", now - 1, vec![]);
+        assert_eq!(db.put(e1.clone(), now).await, PutOutcome::Stored);
+        assert_eq!(db.put(e2.clone(), now).await, PutOutcome::Stored);
+
+        let f: Vec<Filter> = serde_json::from_value(serde_json::json!([
+            {"limit": 0},
+            {"kinds": [1]}
+        ]))
+        .unwrap();
+        let (res, _) = db.query(f, 500, now).await;
+        assert_eq!(res.len(), 2, "the second filter must still be evaluated");
+    });
+}
+
+#[test]
+fn ids_filter_supports_prefixes() {
+    // NIP-01: `ids` entries may be event-id prefixes.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let e1 = event(1, "one", now, vec![]);
+        let e2 = event(1, "two", now - 1, vec![]);
+        assert_eq!(db.put(e1.clone(), now).await, PutOutcome::Stored);
+        assert_eq!(db.put(e2.clone(), now).await, PutOutcome::Stored);
+        assert!(e1.id != e2.id);
+
+        let prefix = &e1.id[..16];
+        let f: Filter = serde_json::from_value(serde_json::json!({"ids": [prefix]})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 1, "the prefix matches only its own event");
+        assert_eq!(res[0].id, e1.id);
+    });
+}
+
+#[test]
 fn access_control_persists_across_reopen() {
     // NIP-86 runtime bans/allowlists survive restarts: the access control is
     // stored in the database and restored when the database is reopened.

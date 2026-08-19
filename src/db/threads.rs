@@ -211,7 +211,12 @@ pub(crate) fn spawn(
                 };
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let shutdown = handle_read_msg(&read_store, &read_errors, msg);
-                    read_pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    // `Msg::Shutdown` is sent directly (never through
+                    // `request_read`), so it was not counted; decrementing
+                    // for it would underflow the pending counter.
+                    if !shutdown {
+                        read_pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     shutdown
                 }));
                 match result {
@@ -239,7 +244,10 @@ pub(crate) fn spawn(
                 };
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let shutdown = handle_read_msg(&api_store, &api_errors, msg);
-                    api_thread_pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    // `Msg::Shutdown` is not counted (see the reader thread).
+                    if !shutdown {
+                        api_thread_pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    }
                     shutdown
                 }));
                 match result {
@@ -283,7 +291,13 @@ pub(crate) fn spawn(
                         Err(_) => break,
                     }
                 }
-                let drained_msgs = msgs.len();
+                let drained_msgs: usize = msgs
+                    .iter()
+                    // `Msg::Shutdown` is sent directly (never through
+                    // `request`), so it was not counted in `pending_msgs`;
+                    // counting it here would underflow the counter.
+                    .filter(|m| !matches!(m, Msg::Shutdown))
+                    .count();
                 let drained_events: usize = msgs
                     .iter()
                     .map(|m| match m {

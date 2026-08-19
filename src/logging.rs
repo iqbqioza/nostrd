@@ -156,7 +156,7 @@ fn format_record(record: &log::Record) -> String {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     format!(
-        "[{:?} {}  {}] {}\n",
+        "[{} {}  {}] {}\n",
         utc_format(now),
         record.level(),
         record.target(),

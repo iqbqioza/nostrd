@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path as AxPath, State};
+use axum::extract::{OriginalUri, Path as AxPath, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -56,6 +56,7 @@ async fn check_auth(
     headers: &HeaderMap,
     state: &AdminState,
     method: &str,
+    uri: &axum::http::Uri,
 ) -> std::result::Result<(), Response> {
     let relay = &state.relay;
     let cfg = relay.config.read().await;
@@ -78,13 +79,18 @@ async fn check_auth(
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Nostr "))
             .ok_or_else(|| unauthorized("missing NIP-98 auth"))?;
+        // NIP-98: the `u` tag must be the absolute request URL (host, path
+        // and query all match), matching the JSON-RPC path.
+        let url_ok = |tag: &str| {
+            nip98::matches_request_url(tag, &cfg.relay_identity(), uri.path(), uri.query())
+        };
         if nip98::verify(
             auth,
             Some(&cfg.server.admin_pubkey),
             relay.secp(),
             true,
             method,
-            |_| true,
+            url_ok,
         )
         .await
         .is_some()
@@ -107,8 +113,12 @@ fn bad_request(msg: &str) -> Response {
     (StatusCode::BAD_REQUEST, Json(json!({ "error": msg }))).into_response()
 }
 
-async fn admin_info(State(state): State<Arc<AdminState>>, headers: HeaderMap) -> Response {
-    if let Err(resp) = check_auth(&headers, &state, "GET").await {
+async fn admin_info(
+    uri: OriginalUri,
+    State(state): State<Arc<AdminState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(resp) = check_auth(&headers, &state, "GET", &uri).await {
         return resp;
     }
     let cfg = state.relay.config.read().await;
@@ -120,19 +130,24 @@ async fn admin_info(State(state): State<Arc<AdminState>>, headers: HeaderMap) ->
     .into_response()
 }
 
-async fn admin_stats(State(state): State<Arc<AdminState>>, headers: HeaderMap) -> Response {
-    if let Err(resp) = check_auth(&headers, &state, "GET").await {
+async fn admin_stats(
+    uri: OriginalUri,
+    State(state): State<Arc<AdminState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(resp) = check_auth(&headers, &state, "GET", &uri).await {
         return resp;
     }
     Json(state.relay.stats.as_json()).into_response()
 }
 
 async fn block_pubkey(
+    uri: OriginalUri,
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
     Json(body): Json<PubkeyBody>,
 ) -> Response {
-    if let Err(resp) = check_auth(&headers, &state, "POST").await {
+    if let Err(resp) = check_auth(&headers, &state, "POST", &uri).await {
         return resp;
     }
     if hex::decode(&body.pubkey)
@@ -151,11 +166,12 @@ async fn block_pubkey(
 }
 
 async fn allow_pubkey(
+    uri: OriginalUri,
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
     Json(body): Json<PubkeyBody>,
 ) -> Response {
-    if let Err(resp) = check_auth(&headers, &state, "POST").await {
+    if let Err(resp) = check_auth(&headers, &state, "POST", &uri).await {
         return resp;
     }
     let mut access = state.relay.access.write().await;
@@ -166,11 +182,12 @@ async fn allow_pubkey(
 }
 
 async fn block_kind(
+    uri: OriginalUri,
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
     Json(body): Json<KindBody>,
 ) -> Response {
-    if let Err(resp) = check_auth(&headers, &state, "POST").await {
+    if let Err(resp) = check_auth(&headers, &state, "POST", &uri).await {
         return resp;
     }
     let mut access = state.relay.access.write().await;
@@ -183,11 +200,12 @@ async fn block_kind(
 }
 
 async fn allow_kind(
+    uri: OriginalUri,
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
     Json(body): Json<KindBody>,
 ) -> Response {
-    if let Err(resp) = check_auth(&headers, &state, "POST").await {
+    if let Err(resp) = check_auth(&headers, &state, "POST", &uri).await {
         return resp;
     }
     let mut access = state.relay.access.write().await;
@@ -198,11 +216,12 @@ async fn allow_kind(
 }
 
 async fn event_status(
+    uri: OriginalUri,
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
     AxPath(id): AxPath<String>,
 ) -> Response {
-    if let Err(resp) = check_auth(&headers, &state, "GET").await {
+    if let Err(resp) = check_auth(&headers, &state, "GET", &uri).await {
         return resp;
     }
     let filter: Value = json!({ "ids": [id] });
@@ -217,8 +236,12 @@ async fn event_status(
     Json(json!({ "ok": true, "found": true, "event": event[0] })).into_response()
 }
 
-async fn shutdown(State(state): State<Arc<AdminState>>, headers: HeaderMap) -> Response {
-    if let Err(resp) = check_auth(&headers, &state, "POST").await {
+async fn shutdown(
+    uri: OriginalUri,
+    State(state): State<Arc<AdminState>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(resp) = check_auth(&headers, &state, "POST", &uri).await {
         return resp;
     }
     let _ = state.shutdown.send(true);

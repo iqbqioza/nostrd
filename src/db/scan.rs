@@ -572,11 +572,23 @@ impl Store {
             // ids examined, so `{"ids": [A, B], "limit": 1}` must still find
             // B when A does not exist. The work budget bounds the walk.
             for id in ids {
-                if let Ok(id) = hex::decode(id)
-                    && !consider(&id)?
-                {
-                    *more = true;
-                    return Ok(false);
+                if let Ok(id) = hex::decode(id) {
+                    if id.len() == ID_LEN {
+                        if !consider(&id)? {
+                            *more = true;
+                            return Ok(false);
+                        }
+                    } else if !id.is_empty() {
+                        // NIP-01: `ids` entries may be event-id *prefixes*.
+                        // Walk the events range of that prefix (bounded by
+                        // the work budget); the collection limit and the
+                        // final created_at sort apply as usual.
+                        let start = prefix_start(&id);
+                        let end = prefix_end(&id);
+                        if !self.walk_events_prefix(rtxn, &start, &end, &mut consider, more)? {
+                            return Ok(false);
+                        }
+                    }
                 }
             }
             return Ok(out.full());
@@ -691,7 +703,12 @@ impl Store {
 
         let start = created_key(since, &[0u8; ID_LEN]);
         let end = created_key(until, &[0xffu8; ID_LEN]);
-        Ok(!self.walk_created_range(
+        // A per-filter limit/budget stop only ends this filter's walk, like
+        // every other index path: the remaining filters still contribute
+        // results. (Returning `true` here used to drop the rest of a
+        // multi-filter REQ whenever the first filter hit its limit, e.g. a
+        // `{"limit": 0}` filter killed the whole query.)
+        if !self.walk_created_range(
             rtxn,
             self.by_created,
             &start,
@@ -699,7 +716,10 @@ impl Store {
             ascending,
             &mut consider,
             more,
-        )?)
+        )? {
+            return Ok(false);
+        }
+        Ok(out.full())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -727,6 +747,33 @@ impl Store {
             let (key, _) = item?;
             let id = &key[key.len() - ID_LEN..];
             if !consider(id)? {
+                *more = true;
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Walks the `events` database over the id range `[start, end]` (an
+    /// id-prefix range from NIP-01 `ids` filters), handing every full id key
+    /// to `consider`. The range is inclusive on both ends so the maximum id
+    /// with the prefix is covered.
+    fn walk_events_prefix(
+        &self,
+        rtxn: &RoTxn,
+        start: &[u8],
+        end: &[u8],
+        mut consider: impl FnMut(&[u8]) -> Result<bool>,
+        more: &mut bool,
+    ) -> Result<bool> {
+        let range = (
+            std::ops::Bound::Included(start),
+            std::ops::Bound::Included(end),
+        );
+        let iter = self.events.range(rtxn, &range)?;
+        for item in iter {
+            let (key, _) = item?;
+            if !consider(key)? {
                 *more = true;
                 return Ok(false);
             }
@@ -811,6 +858,20 @@ impl Store {
     }
 }
 
+/// The smallest 32-byte id sharing `prefix` (for NIP-01 id-prefix ranges).
+fn prefix_start(prefix: &[u8]) -> Vec<u8> {
+    let mut v = prefix.to_vec();
+    v.resize(ID_LEN, 0);
+    v
+}
+
+/// The largest 32-byte id sharing `prefix`.
+fn prefix_end(prefix: &[u8]) -> Vec<u8> {
+    let mut v = prefix.to_vec();
+    v.resize(ID_LEN, 0xff);
+    v
+}
+
 #[allow(clippy::too_many_arguments)]
 fn consider_event<C: ScanCollector>(
     ctx: &ScanContext<'_>,
@@ -848,9 +909,16 @@ fn consider_event<C: ScanCollector>(
     if !is_deliverable(ctx, &event, filter, terms, now)? {
         return Ok(true);
     }
-    seen.insert(id.to_vec());
     let id = id.try_into().unwrap_or([0u8; 32]);
-    Ok(out.push(event, id, limit))
+    // Only record the event as seen when it was actually collected: an event
+    // that hit this filter's limit (push failed) must still be available to
+    // a later filter of the same REQ, e.g. `[{"limit":0},{"kinds":[1]}]`.
+    if out.push(event, id, limit) {
+        seen.insert(id.to_vec());
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }
 
 fn is_deliverable(

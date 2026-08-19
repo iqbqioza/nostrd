@@ -30,10 +30,14 @@ pub struct Filter {
 impl Filter {
     /// Performs an in-memory match (used for live events and final checks).
     pub fn matches(&self, ev: &Event) -> bool {
-        if let Some(ids) = &self.ids
-            && !ids.iter().any(|id| id == &ev.id)
-        {
-            return false;
+        if let Some(ids) = &self.ids {
+            // NIP-01: `ids` entries may be full ids or prefixes.
+            let matches = ids
+                .iter()
+                .any(|id| id == &ev.id || (id.len() < ev.id.len() && ev.id.starts_with(id)));
+            if !matches {
+                return false;
+            }
         }
         // NIP-26: events published under a delegation tag match filters on
         // the delegator's pubkey as well as on the event's own author.

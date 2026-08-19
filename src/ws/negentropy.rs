@@ -10,6 +10,21 @@ use crate::util::unix_now;
 
 use super::value_string;
 
+/// NIP-77 negentropy state for one open subscription.
+pub(crate) struct NegState {
+    pub(crate) items: Vec<nip77::Item>,
+    /// Remaining NEG-MSG rounds for this subscription. The reconciliation
+    /// protocol completes in a bounded number of rounds proportional to the
+    /// number of divergent ranges; a peer that keeps sending NEG-MSG with
+    /// bogus fingerprints would otherwise force an unbounded, CPU-bounded
+    /// bisection over the held items on every message.
+    pub(crate) rounds_left: u32,
+}
+
+/// Cap on the number of NEG-MSG rounds a single subscription may consume
+/// before it is closed (generous for legitimate syncs).
+pub(crate) const MAX_NEG_MSG_ROUNDS: u32 = 128;
+
 impl super::Conn {
     pub(crate) fn send_neg_err(&mut self, sub_id: &str, reason: &str) {
         self.send_json(json!(["NEG-ERR", sub_id, reason]));
@@ -128,7 +143,7 @@ impl super::Conn {
         // existing one (NIP-77): release the old items from the accounting
         // first so the total does not drift upward.
         if let Some(old) = self.neg.remove(&sub_id) {
-            self.neg_total = self.neg_total.saturating_sub(old.len());
+            self.neg_total = self.neg_total.saturating_sub(old.items.len());
         }
         if self.neg_total.saturating_add(items.len()) > total_cap {
             self.send_json(json!([
@@ -143,7 +158,13 @@ impl super::Conn {
         match nip77::respond(&items, &initial) {
             Ok(response) => {
                 self.neg_total += items.len();
-                self.neg.insert(sub_id.clone(), items);
+                self.neg.insert(
+                    sub_id.clone(),
+                    NegState {
+                        items,
+                        rounds_left: MAX_NEG_MSG_ROUNDS,
+                    },
+                );
                 self.send_neg_msg(&sub_id, &response);
             }
             Err(reason) => {
@@ -169,17 +190,25 @@ impl super::Conn {
             self.send_notice("error: NEG-MSG message must be hex");
             return;
         };
-        let Some(items) = self.neg.get(&sub_id) else {
+        let Some(state) = self.neg.get_mut(&sub_id) else {
             self.send_neg_err(&sub_id, "closed: unknown subscription");
             return;
         };
-        match nip77::respond(items, &message) {
+        // NIP-77: "After a NEG-ERR is issued, the subscription is considered
+        // to be closed." Exhausting the round budget closes it too.
+        if state.rounds_left == 0 {
+            if let Some(state) = self.neg.remove(&sub_id) {
+                self.neg_total = self.neg_total.saturating_sub(state.items.len());
+            }
+            self.send_neg_err(&sub_id, "error: too many negentropy messages");
+            return;
+        }
+        state.rounds_left -= 1;
+        match nip77::respond(&state.items, &message) {
             Ok(response) => self.send_neg_msg(&sub_id, &response),
             Err(reason) => {
-                // NIP-77: "After a NEG-ERR is issued, the subscription is
-                // considered to be closed."
-                if let Some(items) = self.neg.remove(&sub_id) {
-                    self.neg_total = self.neg_total.saturating_sub(items.len());
+                if let Some(state) = self.neg.remove(&sub_id) {
+                    self.neg_total = self.neg_total.saturating_sub(state.items.len());
                 }
                 self.send_neg_err(&sub_id, &format!("error: {reason}"));
             }
@@ -191,8 +220,8 @@ impl super::Conn {
             self.send_notice("error: NEG-CLOSE requires a subscription id");
             return;
         };
-        if let Some(items) = self.neg.remove(&sub_id) {
-            self.neg_total = self.neg_total.saturating_sub(items.len());
+        if let Some(state) = self.neg.remove(&sub_id) {
+            self.neg_total = self.neg_total.saturating_sub(state.items.len());
         }
     }
 }
