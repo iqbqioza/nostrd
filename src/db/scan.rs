@@ -16,11 +16,24 @@ use crate::event::Event;
 use crate::filter::Filter;
 use crate::nips::{nip40, nip50};
 
-/// `(created_at, id, protected, group_id, is_meta)` records returned by the
-/// NIP-77 negentropy query. The visibility flags let the connection layer
-/// withhold NIP-70 protected events from unauthenticated peers and NIP-29
-/// private/hidden group content from non-members, mirroring the REQ path.
-pub(crate) type NegItems = Vec<(u64, [u8; 32], bool, Option<String>, bool)>;
+/// A single NIP-77 negentropy record returned by a negentropy query. The
+/// visibility flags let the connection layer withhold NIP-70 protected
+/// events from unauthenticated peers, NIP-29 private/hidden group content
+/// from non-members and NIP-59 gift wraps from anyone but their
+/// recipients, mirroring the REQ path.
+pub(crate) struct NegItem {
+    pub created: u64,
+    pub id: [u8; 32],
+    pub protected: bool,
+    pub gid: Option<String>,
+    pub meta: bool,
+    /// p-tag recipients of a NIP-59 gift wrap (kind 1059), `None` for every
+    /// other kind. Kept so the connection layer can serve wraps only to
+    /// their recipients without loading the full events back.
+    pub wrap_recipients: Option<Vec<String>>,
+}
+
+pub(crate) type NegItems = Vec<NegItem>;
 
 /// The database handles and transaction of one scan, bundled so the
 /// per-candidate checks stay readable.
@@ -58,7 +71,12 @@ const SEARCH_BUDGET_MAX: usize = 100_000;
 /// combined with an impossible kind) would otherwise walk the whole range
 /// and stall the reader thread for seconds. The cap is large enough that
 /// legitimate subscriptions are never truncated in practice.
-const SCAN_BUDGET: usize = 200_000;
+pub(crate) const SCAN_BUDGET: usize = 200_000;
+
+/// Budget used by the startup rebuilds (NIP-29 group state, NIP-43 role
+/// store): they must read the whole history, so they may walk far more
+/// candidates than a client-driven subscription.
+pub(crate) const FULL_SCAN_BUDGET: usize = 4_000_000;
 
 /// Output collector for a scan: either full events (REQ/COUNT) or
 /// `(created_at, id)` records (NIP-77 negentropy, memory-efficient).
@@ -225,17 +243,35 @@ impl ScanCollector for ItemCollector {
             }
             None => (None, false),
         };
-        self.items
-            .push((event.created_at, id, protected, gid, meta));
+        let wrap_recipients = if event.kind == crate::nips::nip62::GIFT_WRAP_KIND {
+            Some(
+                event
+                    .tags
+                    .iter()
+                    .filter(|t| t.len() >= 2 && t[0] == "p")
+                    .map(|t| t[1].clone())
+                    .collect(),
+            )
+        } else {
+            None
+        };
+        self.items.push(NegItem {
+            created: event.created_at,
+            id,
+            protected,
+            gid,
+            meta,
+            wrap_recipients,
+        });
         true
     }
     fn sort_key(&mut self) {
         self.items
-            .sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+            .sort_by(|a, b| b.created.cmp(&a.created).then_with(|| a.id.cmp(&b.id)));
     }
     fn sort_asc(&mut self) {
         self.items
-            .sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            .sort_by(|a, b| a.created.cmp(&b.created).then_with(|| a.id.cmp(&b.id)));
     }
     fn sort_relevance(&mut self, terms: &[String]) {
         // Negentropy items are re-sorted by the protocol anyway; keep the
@@ -265,6 +301,7 @@ impl Store {
         max_limit: usize,
         count_mode: bool,
         ascending: bool,
+        budget: usize,
     ) -> Result<(Vec<Event>, bool)> {
         let has_search = filters.iter().any(Filter::has_search);
         // NIP-50: relevance ordering needs more candidates than the response
@@ -282,7 +319,7 @@ impl Store {
             ScanKind::Query
         };
         let mut out = EventCollector::new(collect_cap, !count_mode);
-        let more = self.scan_collect(filters, now, max_limit, kind, ascending, &mut out)?;
+        let more = self.scan_collect(filters, now, max_limit, kind, ascending, budget, &mut out)?;
         Ok((out.events, more))
     }
 
@@ -294,6 +331,7 @@ impl Store {
         filter: &Filter,
         now: u64,
         max_items: usize,
+        budget: usize,
     ) -> Result<(NegItems, bool)> {
         let collect_cap = if filter.has_search() {
             max_items
@@ -309,6 +347,7 @@ impl Store {
             max_items,
             ScanKind::Negentropy,
             false,
+            budget,
             &mut out,
         )?;
         Ok((out.items, more))
@@ -318,6 +357,7 @@ impl Store {
     /// candidate walks and collects into `out`. Returns `true` when the
     /// scan stopped at a limit instead of exhausting the matches
     /// (NIP-67 EOSE completeness hint).
+    #[allow(clippy::too_many_arguments)]
     fn scan_collect<C: ScanCollector>(
         &self,
         filters: &[Filter],
@@ -325,6 +365,7 @@ impl Store {
         max_limit: usize,
         kind: ScanKind,
         ascending: bool,
+        budget: usize,
         out: &mut C,
     ) -> Result<bool> {
         let count_mode = matches!(kind, ScanKind::Count);
@@ -384,7 +425,7 @@ impl Store {
                 seen: &mut seen,
                 out,
             };
-            let stop = self.scan_filter(&rtxn, &scan, &mut collect, &mut more)?;
+            let stop = self.scan_filter(&rtxn, &scan, &mut collect, budget, &mut more)?;
             if stop {
                 break;
             }
@@ -419,6 +460,7 @@ impl Store {
         rtxn: &RoTxn,
         scan: &FilterScan<'_>,
         collect: &mut Collect<'_, C>,
+        budget: usize,
         more: &mut bool,
     ) -> Result<bool> {
         let FilterScan {
@@ -451,6 +493,7 @@ impl Store {
                 seen,
                 out,
                 limit,
+                budget,
                 &mut examined,
             )
         };
@@ -706,6 +749,7 @@ fn consider_event<C: ScanCollector>(
     seen: &mut HashSet<Vec<u8>>,
     out: &mut C,
     limit: usize,
+    budget: usize,
     examined: &mut usize,
 ) -> Result<bool> {
     if out.full() {
@@ -713,11 +757,11 @@ fn consider_event<C: ScanCollector>(
         // ranges of this filter) instead of walking them to completion.
         return Ok(false);
     }
-    // Work budget: give up after examining `SCAN_BUDGET` candidates so a
+    // Work budget: give up after examining `budget` candidates so a
     // filter matching nothing cannot walk an entire index range and stall
     // the reader thread (which also serves WebSocket REQ/COUNT/NEG).
     *examined += 1;
-    if *examined > SCAN_BUDGET {
+    if *examined > budget {
         return Ok(false);
     }
     if seen.contains(id) {

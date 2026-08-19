@@ -82,30 +82,40 @@ impl super::Conn {
             ]));
             return;
         }
-        // NIP-70/NIP-29: withhold protected events from unauthenticated
-        // peers and private/hidden group content from non-members, exactly
-        // like the REQ path.
+        // NIP-70/NIP-59/NIP-29: withhold protected events from
+        // unauthenticated peers, gift wraps from anyone but their
+        // recipients, and private/hidden group content from non-members,
+        // exactly like the REQ path.
         let items: Vec<nip77::Item> = {
             let groups = self.relay.groups.read().await;
             items
                 .into_iter()
-                .filter(|(_, _, protected, gid, meta)| {
-                    if *protected && !self.is_authed() {
+                .filter(|item| {
+                    if item.protected && !self.is_authed() {
                         return false;
                     }
-                    if let Some(gid) = gid {
+                    if item.wrap_recipients.is_some()
+                        && !self.authed_pubkeys.iter().any(|pk| {
+                            item.wrap_recipients
+                                .as_ref()
+                                .is_some_and(|recips| recips.iter().any(|r| r == pk))
+                        })
+                    {
+                        return false;
+                    }
+                    if let Some(gid) = &item.gid {
                         if self.authed_pubkeys.is_empty() {
-                            groups.visible_gid(gid, *meta, None)
+                            groups.visible_gid(gid, item.meta, None)
                         } else {
                             self.authed_pubkeys
                                 .iter()
-                                .any(|pk| groups.visible_gid(gid, *meta, Some(pk)))
+                                .any(|pk| groups.visible_gid(gid, item.meta, Some(pk)))
                         }
                     } else {
                         true
                     }
                 })
-                .map(|(created, id, _, _, _)| (created, id))
+                .map(|item| (item.created, item.id))
                 .collect()
         };
         let items = nip77::sort_items(items);

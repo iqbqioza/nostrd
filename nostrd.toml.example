@@ -246,18 +246,17 @@ max_dbs = 32
 # Maximum number of concurrent reader threads.
 max_readers = 128
 
-# Initial memory map size in bytes. The map is opened at this size and never
-# resized at runtime: resizing would require that no read transactions are
-# active, which cannot be guaranteed while the shared reader and the REST API
-# reader threads hold concurrent read transactions. Physical memory and disk
-# usage grow only with the data actually stored (sparse file).
+# Memory map size in bytes. The map is a virtual address space reservation
+# backed by a sparse file: physical memory and disk usage grow only with the
+# data actually stored. The map is opened at map_max_size (or map_size,
+# whichever is larger) and never resized at runtime: resizing would require
+# that no read transactions are active, which cannot be guaranteed while the
+# shared reader and the REST API reader threads hold concurrent read
+# transactions. This setting therefore acts as a floor.
 map_size = 1073741824
 
-# Upper bound for the memory map. This is a virtual address space reservation
-# backed by a sparse file: physical memory and disk usage grow only with the
-# data actually stored. The map is opened at map_max_size on startup (or at
-# map_size, whichever is larger), so this setting is the real ceiling. On
-# 32-bit systems it is capped at 2 GiB.
+# Real ceiling of the memory map in bytes. On 32-bit systems it is capped at
+# 2 GiB.
 map_max_size = 1099511627776
 
 # Interval in seconds between NIP-40 expired-event purge runs.

@@ -5,7 +5,7 @@
 mod api;
 mod livekit;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -164,49 +164,6 @@ async fn host_split(api_host: &str, request: Request, next: Next) -> Response {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::body::Body;
-    use axum::http::{Request, header};
-
-    fn req(host: &str, path: &str) -> Request<Body> {
-        Request::builder()
-            .uri(path)
-            .header(header::HOST, host)
-            .body(Body::empty())
-            .unwrap()
-    }
-
-    #[test]
-    fn host_is_api_matches_exact_host() {
-        assert!(host_is_api("api.example.com", &req("api.example.com", "/")));
-        assert!(!host_is_api(
-            "api.example.com",
-            &req("relay.example.com", "/")
-        ));
-    }
-
-    #[test]
-    fn host_is_api_ignores_port_and_case() {
-        assert!(host_is_api(
-            "api.example.com",
-            &req("api.example.com:8080", "/")
-        ));
-        assert!(host_is_api("api.example.com", &req("API.EXAMPLE.COM", "/")));
-        assert!(!host_is_api(
-            "api.example.com",
-            &req("notapi.example.com", "/")
-        ));
-    }
-
-    #[test]
-    fn host_is_api_rejects_missing_host() {
-        let bare = Request::builder().uri("/").body(Body::empty()).unwrap();
-        assert!(!host_is_api("api.example.com", &bare));
-    }
-}
-
 pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> Result<()> {
     let private_key = config.relay.private_key.clone();
     let live = crate::relay::LiveBusConfig {
@@ -298,6 +255,7 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
         config_path,
         relay.config.clone(),
         relay.db.clone(),
+        relay.api_limit.clone(),
         shutdown_rx.clone(),
     )));
 
@@ -508,14 +466,23 @@ async fn stats_writer(relay: Arc<Relay>, mut shutdown: watch::Receiver<bool>) {
                     .db_size_bytes
                     .store(relay.db.size_on_disk().await, std::sync::atomic::Ordering::Relaxed);
                 relay.stats.bump(&relay.stats.db_errors, relay.db.take_errors());
-                if let Ok(json) = serde_json::to_string_pretty(&relay.stats.as_json())
-                    && std::fs::write(&path, json).is_err()
-                {
-                    error!("cannot write stats file {}", path.display());
+                if let Ok(json) = serde_json::to_string_pretty(&relay.stats.as_json()) {
+                    write_atomic(&path, json.as_bytes());
                 }
             }
             _ = shutdown.changed() => break,
         }
+    }
+}
+
+/// Writes `data` to `path` atomically (temp file + rename) so a crash in
+/// the middle of a write never leaves a truncated stats file behind.
+fn write_atomic(path: &Path, data: &[u8]) {
+    let tmp = path.with_extension("tmp");
+    let result = std::fs::write(&tmp, data).and_then(|()| std::fs::rename(&tmp, path));
+    if let Err(e) = result {
+        error!("cannot write {}: {e}", path.display());
+        let _ = std::fs::remove_file(&tmp);
     }
 }
 
@@ -569,6 +536,7 @@ async fn reload_handler(
     config_path: PathBuf,
     config: Arc<tokio::sync::RwLock<Config>>,
     db: DbClient,
+    api_limit: Arc<crate::relay::ApiLimiter>,
     mut shutdown: watch::Receiver<bool>,
 ) {
     let mut hangup = match signal(SignalKind::hangup()) {
@@ -585,6 +553,7 @@ async fn reload_handler(
                     Ok(mut new_config) => {
                         new_config.absolutize_paths(&config_path);
                         db.set_expiry_enabled(new_config.nip_enabled(40));
+                        api_limit.set_max(new_config.limits.api_max_concurrent);
                         *config.write().await = new_config;
                         info!("configuration reloaded from {}", config_path.display());
                     }
@@ -593,5 +562,48 @@ async fn reload_handler(
             }
             _ = shutdown.changed() => break,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, header};
+
+    fn req(host: &str, path: &str) -> Request<Body> {
+        Request::builder()
+            .uri(path)
+            .header(header::HOST, host)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[test]
+    fn host_is_api_matches_exact_host() {
+        assert!(host_is_api("api.example.com", &req("api.example.com", "/")));
+        assert!(!host_is_api(
+            "api.example.com",
+            &req("relay.example.com", "/")
+        ));
+    }
+
+    #[test]
+    fn host_is_api_ignores_port_and_case() {
+        assert!(host_is_api(
+            "api.example.com",
+            &req("api.example.com:8080", "/")
+        ));
+        assert!(host_is_api("api.example.com", &req("API.EXAMPLE.COM", "/")));
+        assert!(!host_is_api(
+            "api.example.com",
+            &req("notapi.example.com", "/")
+        ));
+    }
+
+    #[test]
+    fn host_is_api_rejects_missing_host() {
+        let bare = Request::builder().uri("/").body(Body::empty()).unwrap();
+        assert!(!host_is_api("api.example.com", &bare));
     }
 }

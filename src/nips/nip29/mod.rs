@@ -488,7 +488,7 @@ impl GroupStore {
         let kinds: Vec<u64> = (MOD_MIN..=MOD_MAX).chain([LEAVE]).collect();
         let filter: Filter =
             serde_json::from_value(json!({ "kinds": kinds })).expect("static filter");
-        let (mut events, _) = db.query(vec![filter], 1_000_000, unix_now()).await;
+        let (mut events, _) = db.query_full(vec![filter], 1_000_000, unix_now()).await;
         // Chronological order (the scan is per-kind, not globally ordered) so
         // that later events win.
         events.sort_by(|a, b| (a.created_at, &a.id).cmp(&(b.created_at, &b.id)));

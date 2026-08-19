@@ -10,7 +10,9 @@ use std::sync::Arc;
 
 use secp256k1::{Keypair, Secp256k1, XOnlyPublicKey};
 use std::collections::HashMap;
-use tokio::sync::{RwLock, Semaphore, broadcast, mpsc};
+use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
+use tokio::sync::RwLock;
+use tokio::sync::{broadcast, mpsc};
 
 use crate::config::{AccessControl, Config};
 use crate::db::{DbClient, PutOutcome};
@@ -38,8 +40,9 @@ pub struct Relay {
     /// NIP-43 role definitions and member assignments.
     pub roles: Arc<RwLock<RoleStore>>,
     /// Limits concurrent `/api/v1` queries so a flood of REST traffic
-    /// fails fast (503) instead of piling up behind WebSocket work.
-    pub api_limit: Arc<Semaphore>,
+    /// fails fast (503) instead of piling up behind WebSocket work. The
+    /// limit is adjustable at runtime (SIGHUP config reload).
+    pub api_limit: Arc<ApiLimiter>,
     /// Active WebSocket connections per source IP, so a socket flood from
     /// a single host cannot consume the whole connection budget.
     per_ip_connections: std::sync::Mutex<HashMap<String, usize>>,
@@ -58,6 +61,67 @@ pub struct LiveBusConfig {
     pub batch_interval_ms: u64,
     /// Maximum events per flushed batch.
     pub batch_size: usize,
+}
+
+/// Bounds the number of concurrently served `/api/v1` queries. Implemented
+/// with a cheap atomic counter instead of a `tokio::sync::Semaphore` so the
+/// limit can be changed at runtime (SIGHUP config reload) without
+/// reallocating the shared handle.
+pub struct ApiLimiter {
+    max: AtomicUsize,
+    in_flight: AtomicIsize,
+}
+
+/// An acquired `/api/v1` slot; the slot is released when the guard drops,
+/// on every exit path of the request handler.
+pub struct ApiPermit {
+    limiter: Arc<ApiLimiter>,
+}
+
+impl Drop for ApiPermit {
+    fn drop(&mut self) {
+        self.limiter.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl ApiLimiter {
+    fn new(max: usize) -> Arc<ApiLimiter> {
+        Arc::new(ApiLimiter {
+            max: AtomicUsize::new(max.max(1)),
+            in_flight: AtomicIsize::new(0),
+        })
+    }
+
+    /// Applies a new concurrency ceiling (from a config reload). The ceiling
+    /// takes effect for every new request.
+    pub fn set_max(&self, max: usize) {
+        self.max.store(max.max(1), Ordering::Relaxed);
+    }
+
+    /// Reserves one in-flight slot when one is free, returning the guard
+    /// that releases it. `None` when the limiter is saturated (503).
+    pub fn try_acquire(self: &Arc<Self>) -> Option<ApiPermit> {
+        let max = self.max.load(Ordering::Relaxed) as isize;
+        let mut cur = self.in_flight.load(Ordering::Relaxed);
+        loop {
+            if cur >= max {
+                return None;
+            }
+            match self.in_flight.compare_exchange_weak(
+                cur,
+                cur + 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    return Some(ApiPermit {
+                        limiter: Arc::clone(self),
+                    });
+                }
+                Err(actual) => cur = actual,
+            }
+        }
+    }
 }
 
 impl Relay {
@@ -84,7 +148,7 @@ impl Relay {
                 }
             }
         };
-        let api_max_concurrent = config.read().await.limits.api_max_concurrent.max(1);
+        let api_max_concurrent = config.read().await.limits.api_max_concurrent;
         Relay {
             // Seed the access control from the config so operator bans and
             // allowlists survive restarts.
@@ -99,7 +163,7 @@ impl Relay {
             live_batch_size,
             groups: Arc::new(RwLock::new(GroupStore::default())),
             roles: Arc::new(RwLock::new(RoleStore::default())),
-            api_limit: Arc::new(Semaphore::new(api_max_concurrent)),
+            api_limit: ApiLimiter::new(api_max_concurrent),
             per_ip_connections: std::sync::Mutex::new(HashMap::new()),
             key,
             secp,

@@ -829,17 +829,24 @@ fn neg_items_carry_visibility_flags() {
         }
         let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap();
         let (items, _) = db.neg_items(f, 100, now).await;
-        let by_id = |id: &str| items.iter().find(|i| hex::encode(i.1) == id).unwrap();
-        assert!(by_id(&protected.id).2, "protected flag set");
-        assert!(!by_id(&plain.id).2, "plain events are not protected");
+        let by_id = |id: &str| items.iter().find(|i| hex::encode(i.id) == id).unwrap();
+        assert!(by_id(&protected.id).protected, "protected flag set");
+        assert!(
+            !by_id(&plain.id).protected,
+            "plain events are not protected"
+        );
         assert_eq!(
-            by_id(&grouped.id).3.as_deref(),
+            by_id(&grouped.id).gid.as_deref(),
             Some("g1"),
             "group id captured"
         );
         assert!(
-            !by_id(&grouped.id).4,
+            !by_id(&grouped.id).meta,
             "regular group events are not metadata"
+        );
+        assert!(
+            by_id(&plain.id).wrap_recipients.is_none(),
+            "non-gift-wraps carry no recipients"
         );
     });
 }
@@ -1041,6 +1048,123 @@ fn query_directed_ascending() {
         let ids: Vec<_> = asc2.iter().map(|e| e.created_at).collect();
         assert_eq!(ids, vec![now - 200, now - 100]);
         assert!(more);
+    });
+}
+
+#[test]
+fn deleted_replaceable_can_be_re_published() {
+    // Regression: remove_event must clear the replaceable slot, otherwise an
+    // NIP-09-deleted replaceable event could not be re-published with an
+    // older created_at (the stale slot would win the tie-break).
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let pk = "0000000000000000000000000000000000000000000000000000000000000000";
+        let d = vec![vec!["d".to_string(), "post-1".to_string()]];
+        let v1 = event(30023, "v1", now - 10, d.clone());
+        let v2 = event(30023, "v2", now, d.clone());
+        assert_eq!(db.put(v1.clone(), now).await, PutOutcome::Stored);
+        assert_eq!(db.put(v2.clone(), now).await, PutOutcome::Replaced);
+        // Deleting v2 removes it but must also clear the replaceable slot.
+        assert_eq!(
+            db.apply_deletion(vec![v2.id.clone()], vec![], Some(pk.into()), u64::MAX)
+                .await,
+            1
+        );
+        // Re-publishing the older version is now accepted again.
+        assert_eq!(
+            db.put(v1.clone(), now).await,
+            PutOutcome::Stored,
+            "the older version must be storable after the deletion"
+        );
+    });
+}
+
+#[test]
+fn purged_replaceable_can_be_re_published() {
+    // Regression: the NIP-40 purge of an expired addressable event must
+    // clear its replaceable slot, otherwise the stale entry would keep
+    // rejecting an older re-publication.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let d = vec![vec!["d".to_string(), "post-1".to_string()]];
+        let v1 = event(30023, "v1", now - 10, d.clone());
+        let mut v2 = event(30023, "v2", now, d.clone());
+        // Expires shortly after storage, so it is storable first.
+        v2.tags
+            .push(vec!["expiration".into(), (now + 5).to_string()]);
+        assert_eq!(db.put(v1.clone(), now).await, PutOutcome::Stored);
+        assert_eq!(db.put(v2.clone(), now).await, PutOutcome::Replaced);
+        // Later, the purge removes v2 and must clear the slot.
+        assert_eq!(db.purge_expired(now + 10).await, 1);
+        assert_eq!(
+            db.put(v1.clone(), now).await,
+            PutOutcome::Stored,
+            "the older version must be storable after the purge"
+        );
+    });
+}
+
+#[test]
+fn neg_items_carry_gift_wrap_recipients() {
+    // NIP-59: negentropy records of gift wraps must carry their recipients
+    // so the connection layer can withhold them from anyone else.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let recipient = "b83130de0d1386592fe7b9f407f5f1ae8f1db91d772e484b3d81df0fa2e88f24";
+        let wrap = event(
+            1059,
+            "encrypted",
+            now,
+            vec![vec!["p".into(), recipient.into()]],
+        );
+        let plain = event(1, "plain", now, vec![]);
+        assert_eq!(db.put(wrap.clone(), now).await, PutOutcome::Stored);
+        assert_eq!(db.put(plain.clone(), now).await, PutOutcome::Stored);
+        let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [1, 1059]})).unwrap();
+        let (items, _) = db.neg_items(f, 100, now).await;
+        let wrap_item = items.iter().find(|i| hex::encode(i.id) == wrap.id).unwrap();
+        assert_eq!(
+            wrap_item.wrap_recipients.as_deref(),
+            Some(&[recipient.to_string()][..])
+        );
+        let plain_item = items
+            .iter()
+            .find(|i| hex::encode(i.id) == plain.id)
+            .unwrap();
+        assert!(plain_item.wrap_recipients.is_none());
     });
 }
 

@@ -256,8 +256,9 @@ async fn query_and_respond(
 ) -> (StatusCode, Json<Value>) {
     // Concurrency limiter: at most `api_max_concurrent` `/api/v1` queries
     // run at once. When saturated, the request fails fast with 503 so a
-    // flood of REST traffic cannot pile up behind the shared database.
-    let Ok(permit) = relay.api_limit.clone().try_acquire_owned() else {
+    // flood of REST traffic cannot pile up behind the shared database. The
+    // permit releases the slot on every exit path of this handler.
+    let Some(_permit) = relay.api_limit.try_acquire() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({ "error": "server is busy, try again shortly" })),
@@ -271,7 +272,7 @@ async fn query_and_respond(
         .db
         .api_query(filters, max_limit.saturating_add(skip), now, ascending)
         .await;
-    drop(permit);
+    drop(_permit);
 
     // The REST API is unauthenticated, so it must apply the same
     // visibility rules as an anonymous WebSocket connection: NIP-70

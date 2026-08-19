@@ -165,7 +165,7 @@ impl RoleStore {
         let filter: Filter =
             serde_json::from_value(json!({ "kinds": [ROLE_DEFINITION, MEMBERSHIP_LIST] }))
                 .expect("static filter");
-        let (events, _) = db.query(vec![filter], 1_000_000, unix_now()).await;
+        let (events, _) = db.query_full(vec![filter], 1_000_000, unix_now()).await;
         for event in events {
             if event.pubkey != relay_pubkey {
                 continue;

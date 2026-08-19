@@ -361,12 +361,33 @@ impl super::Conn {
             .db
             .count(filters.clone(), count_limit, unix_now())
             .await;
-        // NIP-70: protected events are only counted for authenticated
-        // clients, so COUNT never leaks them to unauthenticated peers.
-        let events: Vec<Event> = events
-            .into_iter()
-            .filter(|e| self.is_authed() || !nip70::is_protected(e))
-            .collect();
+        // NIP-70/59/29: COUNT applies the same visibility rules as REQ, so
+        // an unauthenticated peer cannot learn the size of a private group,
+        // the existence of gift wraps or the count of protected events.
+        let events: Vec<Event> = {
+            let has_group_events = events.iter().any(nip29::is_group_event);
+            let groups = if has_group_events {
+                Some(self.relay.groups.read().await)
+            } else {
+                None
+            };
+            events
+                .into_iter()
+                .filter(|e| {
+                    (self.is_authed() || !nip70::is_protected(e))
+                        && self.gift_wrap_visible(e)
+                        && groups.as_deref().is_none_or(|g| {
+                            if self.authed_pubkeys.is_empty() {
+                                g.visible_to(e, None)
+                            } else {
+                                self.authed_pubkeys
+                                    .iter()
+                                    .any(|pk| g.visible_to(e, Some(pk)))
+                            }
+                        })
+                })
+                .collect()
+        };
         self.send_json(nip45::count_response(sub_id, &filters, &events, more));
     }
 

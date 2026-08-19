@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
 
-use scan::NegItems;
+use scan::{FULL_SCAN_BUDGET, NegItems, SCAN_BUDGET};
 use store::Store;
 
 use crate::config::DatabaseConfig;
@@ -74,6 +74,9 @@ enum Msg {
         limit: usize,
         now: u64,
         ascending: bool,
+        /// Upper bound on the number of index candidates the scan may
+        /// examine before giving up (anti-DoS work budget).
+        budget: usize,
         reply: oneshot::Sender<(Vec<Event>, bool)>,
     },
     /// Accepts many events in a single write transaction (one commit).
@@ -320,6 +323,28 @@ impl DbClient {
             limit,
             now,
             ascending,
+            budget: SCAN_BUDGET,
+            reply,
+        })
+        .await
+    }
+
+    /// Like [`Self::query_directed`] but with a much larger scan budget for
+    /// the startup rebuilds (NIP-29 group state, NIP-43 role store): they
+    /// legitimately walk the whole event history and must not be truncated
+    /// by the anti-DoS candidate budget.
+    pub async fn query_full(
+        &self,
+        filters: Vec<Filter>,
+        limit: usize,
+        now: u64,
+    ) -> (Vec<Event>, bool) {
+        self.request_read(|reply| Msg::Query {
+            filters,
+            limit,
+            now,
+            ascending: false,
+            budget: FULL_SCAN_BUDGET,
             reply,
         })
         .await
@@ -350,6 +375,7 @@ impl DbClient {
             limit,
             now,
             ascending,
+            budget: SCAN_BUDGET,
             reply: tx,
         };
         if self.api_read_tx.send(msg).is_err() {
