@@ -248,12 +248,14 @@ impl std::error::Error for Bech32Error {}
 // NIP-19 TLV parsing
 // ---------------------------------------------------------------------------
 
-const TLV_PUBKEY: u8 = 1;
-const TLV_EVENT: u8 = 2;
+/// NIP-19 TLV types (19.md): `0` = special (nprofile pubkey / nevent id /
+/// naddr `d` tag), `1` = relay, `2` = author (pubkey), `3` = kind (32-bit
+/// big-endian). Earlier revisions used non-standard numbers here, which made
+/// every standard `nevent1`/`naddr1` undecodable.
+const TLV_SPECIAL: u8 = 0;
+const TLV_RELAY: u8 = 1;
+const TLV_AUTHOR: u8 = 2;
 const TLV_KIND: u8 = 3;
-const TLV_RELAY: u8 = 4;
-const TLV_DTAG: u8 = 5;
-const TLV_AUTHOR: u8 = 6;
 
 fn parse_tlv(data: &[u8]) -> Result<Vec<(u8, Vec<u8>)>, Bech32Error> {
     let mut items = Vec::new();
@@ -310,7 +312,7 @@ pub fn parse_nip19(input: &str) -> Result<Nip19Entity, Bech32Error> {
             let mut kind = None;
             for (tlv_type, value) in &tlv {
                 match *tlv_type {
-                    TLV_EVENT if value.len() == 32 => {
+                    TLV_SPECIAL if value.len() == 32 => {
                         let mut buf = [0u8; 32];
                         buf.copy_from_slice(value);
                         id = Some(buf);
@@ -352,12 +354,12 @@ pub fn parse_nip19(input: &str) -> Result<Nip19Entity, Bech32Error> {
                         let k = u32::from_be_bytes([value[0], value[1], value[2], value[3]]);
                         kind = Some(k as u64);
                     }
-                    TLV_PUBKEY if value.len() == 32 => {
+                    TLV_AUTHOR if value.len() == 32 => {
                         let mut buf = [0u8; 32];
                         buf.copy_from_slice(value);
                         pubkey = Some(buf);
                     }
-                    TLV_DTAG => {
+                    TLV_SPECIAL => {
                         if let Ok(s) = std::str::from_utf8(value) {
                             d_tag = Some(s.to_string());
                         }
@@ -496,9 +498,10 @@ mod tests {
             author: None,
             kind: None,
         };
-        // Encode via TLV manually for the test
+        // Encode with the standard TLV types: 0 = special (event id),
+        // 1 = relay.
         let mut data = Vec::new();
-        data.push(TLV_EVENT);
+        data.push(TLV_SPECIAL);
         data.extend_from_slice(&(32u16).to_be_bytes());
         data.extend_from_slice(&id);
         let relay = b"wss://relay.example.com";
@@ -509,5 +512,97 @@ mod tests {
         let encoded = bech32m_encode("nevent", &data).unwrap();
         let parsed = parse_nip19(&encoded).unwrap();
         assert_eq!(parsed, entity);
+    }
+
+    #[test]
+    fn naddr_roundtrip_with_standard_types() {
+        // A standard naddr: d-tag at 0, relay at 1, author pubkey at 2, kind
+        // at 3.
+        let mut data = Vec::new();
+        let d = b"post-1";
+        data.push(TLV_SPECIAL);
+        data.extend_from_slice(&(d.len() as u16).to_be_bytes());
+        data.extend_from_slice(d);
+        let relay = b"wss://relay.example.com";
+        data.push(TLV_RELAY);
+        data.extend_from_slice(&(relay.len() as u16).to_be_bytes());
+        data.extend_from_slice(relay);
+        data.push(TLV_AUTHOR);
+        data.extend_from_slice(&(32u16).to_be_bytes());
+        data.extend_from_slice(&[0x11u8; 32]);
+        data.push(TLV_KIND);
+        data.extend_from_slice(&(4u16).to_be_bytes());
+        data.extend_from_slice(&30023u32.to_be_bytes());
+
+        let encoded = bech32m_encode("naddr", &data).unwrap();
+        let parsed = parse_nip19(&encoded).unwrap();
+        assert_eq!(
+            parsed,
+            Nip19Entity::Addr {
+                kind: 30023,
+                pubkey: [0x11u8; 32],
+                d_tag: "post-1".to_string(),
+                relays: vec!["wss://relay.example.com".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn decodes_standard_vectors() {
+        // The npub from the NIP-19 spec.
+        let npub =
+            parse_nip19("npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6").unwrap();
+        match npub {
+            Nip19Entity::Pubkey(pk) => {
+                assert_eq!(
+                    hex::encode(pk),
+                    "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d"
+                );
+            }
+            _ => panic!("expected pubkey"),
+        }
+        // A standard nevent (id at TLV type 0) must decode, even though the
+        // old code expected the id at type 2.
+        let mut data = Vec::new();
+        data.push(TLV_SPECIAL);
+        data.extend_from_slice(&(32u16).to_be_bytes());
+        data.extend_from_slice(&[0x42u8; 32]);
+        data.push(TLV_KIND);
+        data.extend_from_slice(&(4u16).to_be_bytes());
+        data.extend_from_slice(&1u32.to_be_bytes());
+        let encoded = bech32m_encode("nevent", &data).unwrap();
+        match parse_nip19(&encoded).unwrap() {
+            Nip19Entity::Event { id, kind, .. } => {
+                assert_eq!(id, [0x42u8; 32]);
+                assert_eq!(kind, Some(1));
+            }
+            _ => panic!("expected event"),
+        }
+        // A standard naddr (d at type 0, author at type 2) must decode.
+        let mut data = Vec::new();
+        let d = b"";
+        data.push(TLV_SPECIAL);
+        data.extend_from_slice(&(d.len() as u16).to_be_bytes());
+        data.extend_from_slice(d);
+        data.push(TLV_AUTHOR);
+        data.extend_from_slice(&(32u16).to_be_bytes());
+        data.extend_from_slice(&[0x22u8; 32]);
+        data.push(TLV_KIND);
+        data.extend_from_slice(&(4u16).to_be_bytes());
+        data.extend_from_slice(&0u32.to_be_bytes());
+        let encoded = bech32m_encode("naddr", &data).unwrap();
+        match parse_nip19(&encoded).unwrap() {
+            Nip19Entity::Addr {
+                kind,
+                pubkey,
+                d_tag,
+                ..
+            } => {
+                assert_eq!(kind, 0);
+                assert_eq!(pubkey, [0x22u8; 32]);
+                assert_eq!(d_tag, "");
+            }
+            _ => panic!("expected addr"),
+        }
     }
 }
