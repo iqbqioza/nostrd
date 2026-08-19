@@ -85,6 +85,7 @@ Only `GET` is supported; WebSocket upgrade requests to `/api/v1` are rejected wi
 | Command | Description |
 | --- | --- |
 | `nostrd init` | Write a default configuration file and exit |
+| `nostrd genkey` | Generate a relay secret key (for NIP-29 group metadata and NIP-43 membership events) and write it into `relay.private_key` of the config file. Preserves the rest of the file; asks for confirmation (y/N) when a key is already set. Prints the relay pubkey (the NIP-11 `self`). |
 | `nostrd start` | Start the relay as a daemon (`--foreground` to stay in the shell) |
 | `nostrd stop` | Stop the running daemon |
 | `nostrd restart` | Stop and start again (reloads `nostrd.toml`) |

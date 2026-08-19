@@ -32,6 +32,10 @@ pub struct Cli {
 pub enum Command {
     /// Write a default nostrd.toml and exit.
     Init,
+    /// Generate a relay secret key for NIP-29 and write it into nostrd.toml
+    /// (asks for confirmation when relay.private_key is already set).
+    #[command(name = "genkey")]
+    GenKey,
     /// Start the relay as a daemon (or in the foreground with --foreground).
     Start {
         #[arg(long)]
@@ -55,6 +59,7 @@ impl Cli {
     pub fn prepare(&mut self) -> Result<()> {
         match self.command {
             Command::Init => return init_config(&self.config),
+            Command::GenKey => return self.genkey(),
             Command::Check => {
                 let cfg = self.load_config()?;
                 cfg.validate()?;
@@ -145,18 +150,33 @@ impl Cli {
             .stdout(devnull.try_clone()?)
             .stderr(devnull);
 
-        daemon
-            .start()
-            .map_err(|e| Error::Config(format!("failed to daemonize: {e}")))?;
-
-        // Only the daemon child reaches this point.
-        self.daemonized = true;
-        info!(
-            "daemon started (pid {}), log: {}",
-            std::process::id(),
-            cfg.daemon.log_file.display()
-        );
-        Ok(())
+        match daemon.execute() {
+            // Parent: the daemon has forked and the first child exited.
+            // Report the pid (read from the pid file, which the daemon
+            // writes just after the first child exits) and terminate, so the
+            // foreground `nostrd start`/`restart` returns with a clear
+            // message instead of silently.
+            daemonize::Outcome::Parent(result) => {
+                result.map_err(|e| Error::Config(format!("failed to daemonize: {e}")))?;
+                match wait_for_pid_file(&cfg.daemon.pid_file) {
+                    Some(pid) => print_line(&format!("nostrd started (pid {pid})")),
+                    None => print_line("nostrd started"),
+                }
+                flush_stdout();
+                std::process::exit(0);
+            }
+            // Only the daemon child reaches this point.
+            daemonize::Outcome::Child(result) => {
+                result.map_err(|e| Error::Config(format!("failed to daemonize: {e}")))?;
+                self.daemonized = true;
+                info!(
+                    "daemon started (pid {}), log: {}",
+                    std::process::id(),
+                    cfg.daemon.log_file.display()
+                );
+                Ok(())
+            }
+        }
     }
 
     fn stop(&self) -> Result<()> {
@@ -167,7 +187,7 @@ impl Cli {
                 return Ok(());
             }
         };
-        info!("stopping nostrd (pid {pid})");
+        print_line(&format!("stopping nostrd (pid {pid})"));
         // SAFETY: `kill` only touches the targeted process id.
         let ret = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
         if ret != 0 {
@@ -181,6 +201,7 @@ impl Cli {
                 "daemon (pid {pid}) did not stop in time"
             )));
         }
+        print_line("nostrd stopped");
         Ok(())
     }
 
@@ -194,6 +215,59 @@ impl Cli {
         let raw = std::fs::read_to_string(&cfg.daemon.stats_file)?;
         let value: serde_json::Value = serde_json::from_str(&raw)?;
         print_line(&serde_json::to_string_pretty(&value)?);
+        Ok(())
+    }
+
+    /// `nostrd genkey`: generates a relay secret key (for NIP-29 group
+    /// metadata and NIP-43 membership events) and writes it into
+    /// `relay.private_key` of the config file, preserving the rest of the
+    /// file. When `relay.private_key` is already set, the operator is asked
+    /// to confirm the overwrite (y/N).
+    fn genkey(&self) -> Result<()> {
+        if !self.config.exists() {
+            return Err(Error::Config(format!(
+                "{} not found; run 'nostrd init' first",
+                self.config.display()
+            )));
+        }
+        let existing = Config::load(&self.config)?.relay.private_key.clone();
+        let key = generate_secret_key_hex()?;
+
+        if !existing.is_empty() {
+            let prefix: String = existing.chars().take(8).collect();
+            print_line(&format!(
+                "relay.private_key is already set ({}...). Overwrite it? [y/N]",
+                prefix
+            ));
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer).map_err(Error::Io)?;
+            if !answer.trim().eq_ignore_ascii_case("y") {
+                print_line("aborted: relay.private_key unchanged");
+                return Ok(());
+            }
+        }
+
+        let text = std::fs::read_to_string(&self.config)?;
+        std::fs::write(&self.config, set_private_key_in_text(&text, &key))?;
+
+        // Print the relay's pubkey too: it is safe to share and useful for
+        // advertising the relay's `self` identity (NIP-11).
+        let pubkey = match secp256k1::SecretKey::from_slice(&hex::decode(&key).unwrap()) {
+            Ok(secret) => {
+                let secp = secp256k1::Secp256k1::new();
+                let keypair = secp256k1::Keypair::from_seckey_slice(&secp, &secret.secret_bytes())
+                    .map(|k| secp256k1::XOnlyPublicKey::from_keypair(&k).0.to_string());
+                keypair.unwrap_or_default()
+            }
+            Err(_) => String::new(),
+        };
+        print_line(&format!(
+            "wrote relay.private_key to {}",
+            self.config.display()
+        ));
+        if !pubkey.is_empty() {
+            print_line(&format!("relay pubkey (NIP-11 \"self\"): {pubkey}"));
+        }
         Ok(())
     }
 }
@@ -217,6 +291,26 @@ fn print_line(text: &str) {
     let _ = writeln!(std::io::stdout(), "{text}");
 }
 
+/// Flushes stdout so a completion message survives a `process::exit` (which
+/// runs no destructors and would otherwise drop a buffered write).
+fn flush_stdout() {
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+}
+
+/// Waits up to one second for the daemon's pid file to appear (the daemon
+/// writes it just after the first child exits, so the parent can read it a
+/// moment early) and returns the pid when the daemon is alive.
+fn wait_for_pid_file(path: &Path) -> Option<u32> {
+    for _ in 0..100 {
+        if let Some(pid) = running_pid(path) {
+            return Some(pid);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    None
+}
+
 fn init_config(path: &Path) -> Result<()> {
     match Config::write_default(path) {
         Ok(()) => print_line(&format!("wrote {}", path.display())),
@@ -227,6 +321,77 @@ fn init_config(path: &Path) -> Result<()> {
         Err(e) => return Err(e),
     }
     Ok(())
+}
+
+/// Generates a random secp256k1 secret key as lowercase hex (64 chars),
+/// retrying if the random bytes happen to be out of the valid range.
+fn generate_secret_key_hex() -> Result<String> {
+    for _ in 0..8 {
+        let mut bytes = [0u8; 32];
+        getrandom::getrandom(&mut bytes)
+            .map_err(|e| Error::Other(format!("cannot read random bytes: {e}")))?;
+        if let Ok(secret) = secp256k1::SecretKey::from_slice(&bytes) {
+            return Ok(hex::encode(secret.secret_bytes()));
+        }
+    }
+    Err(Error::Other("failed to generate a valid secret key".into()))
+}
+
+/// Replaces (or inserts) the `relay.private_key` value in a config file's
+/// text, preserving every other line, comment and section. Handles three
+/// cases: a `private_key` line already present in the `[relay]` section, no
+/// `private_key` line in `[relay]` (inserted right after the header), and no
+/// `[relay]` section at all (appended).
+fn set_private_key_in_text(text: &str, key: &str) -> String {
+    let line = format!("private_key = \"{key}\"");
+    let marker = "[relay]";
+    let Some(relay_pos) = text.find(marker) else {
+        // No [relay] section: append one at the end.
+        let mut s = text.to_string();
+        if !s.ends_with('\n') {
+            s.push('\n');
+        }
+        s.push_str(&format!("{marker}\n{line}\n"));
+        return s;
+    };
+    // Bound the [relay] section at the next `[section]` header.
+    let section_start = relay_pos + marker.len();
+    let rest = &text[section_start..];
+    let section_end = rest
+        .find("\n[")
+        .map(|i| section_start + i)
+        .unwrap_or(text.len());
+    let section = &text[section_start..section_end];
+
+    // Case 1: a `private_key` line already exists in the section — replace it.
+    if let Some(offset) = section
+        .lines()
+        .position(|l| l.trim_start().starts_with("private_key"))
+    {
+        let mut new_section = String::new();
+        for (i, l) in section.lines().enumerate() {
+            if i == offset {
+                let indent: String = l.chars().take_while(|c| c.is_whitespace()).collect();
+                new_section.push_str(&format!("{indent}{line}\n"));
+            } else {
+                new_section.push_str(l);
+                new_section.push('\n');
+            }
+        }
+        let mut s = text.to_string();
+        s.replace_range(section_start..section_end, &new_section);
+        return s;
+    }
+
+    // Case 2: no `private_key` line — insert it right after the `[relay]`
+    // header line.
+    let header_end = rest
+        .find('\n')
+        .map(|i| section_start + i + 1)
+        .unwrap_or(text.len());
+    let mut s = text.to_string();
+    s.insert_str(header_end, &format!("{line}\n"));
+    s
 }
 
 /// Resolves a possibly relative path against the current directory so that it
@@ -295,4 +460,50 @@ fn wait_for_stop(pid_file: &Path) -> bool {
         pid_file.display()
     );
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const KEY: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+    #[test]
+    fn replaces_existing_private_key_preserving_comments() {
+        let text = "# comment\n[relay]\nname = \"nostrd\"\n# my key\nprivate_key = \"\"\npublic_url = \"wss://x\"\n";
+        let out = set_private_key_in_text(text, KEY);
+        assert!(out.contains(&format!("private_key = \"{KEY}\"")));
+        assert!(!out.contains("private_key = \"\""));
+        // Comments and unrelated lines survive.
+        assert!(out.contains("# comment"));
+        assert!(out.contains("# my key"));
+        assert!(out.contains("name = \"nostrd\""));
+        assert!(out.contains("public_url = \"wss://x\""));
+    }
+
+    #[test]
+    fn inserts_private_key_after_relay_header() {
+        let text = "[relay]\nname = \"nostrd\"\n\n[server]\nport = 8080\n";
+        let out = set_private_key_in_text(text, KEY);
+        assert!(out.contains(&format!(
+            "[relay]\nprivate_key = \"{KEY}\"\nname = \"nostrd\""
+        )));
+        assert!(out.contains("[server]\nport = 8080"));
+    }
+
+    #[test]
+    fn appends_relay_section_when_missing() {
+        let text = "[server]\nport = 8080\n";
+        let out = set_private_key_in_text(text, KEY);
+        assert!(out.ends_with(&format!("[relay]\nprivate_key = \"{KEY}\"\n")));
+        assert!(out.starts_with("[server]\nport = 8080\n"));
+    }
+
+    #[test]
+    fn generated_key_is_valid_hex() {
+        let key = generate_secret_key_hex().unwrap();
+        assert_eq!(key.len(), 64);
+        assert!(hex::decode(&key).is_ok());
+        assert!(secp256k1::SecretKey::from_slice(&hex::decode(&key).unwrap()).is_ok());
+    }
 }

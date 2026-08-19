@@ -13,6 +13,8 @@
 #   nostrd stats    show live statistics of the running daemon
 #   nostrd check    validate this file and exit
 #   nostrd init     write a default configuration and exit
+#   nostrd genkey   generate a relay secret key (NIP-29) and write it into
+#                   relay.private_key of this file (confirms overwrite if set)
 #
 # Sending SIGHUP to the daemon reloads this file at runtime: most limits,
 # server auth settings, the NIP toggles (including the NIP-40 toggle, applied
