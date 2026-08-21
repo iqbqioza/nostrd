@@ -541,6 +541,17 @@ impl Config {
                  REQ/EVENT/COUNT messages will be refused"
             );
         }
+
+        // NIP-29: the group metadata/members/admins snapshots (39000-39005)
+        // are relay-signed and are only generated when the relay has a key.
+        // Without one, clients get no 39001/39002 at group creation.
+        if self.nip_enabled(29) && self.relay.private_key.trim().is_empty() {
+            log::warn!(
+                "relay.private_key is empty while NIP-29 is enabled: the relay cannot sign \
+                 group metadata (39000-39005), so 39001 (admins) / 39002 (members) snapshots \
+                 are not generated at group creation; run 'nostrd genkey' to set a key"
+            );
+        }
         Ok(())
     }
 }

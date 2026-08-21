@@ -132,8 +132,9 @@ pub struct Group {
 }
 
 impl Group {
-    /// The relay's own key and any member carrying at least one role counts
-    /// as an admin.
+    /// A member carrying at least one role is an admin. (The relay's own key
+    /// is handled separately: its relay-generated events are stored directly
+    /// and never go through this check.)
     pub fn is_admin(&self, pubkey: &str) -> bool {
         self.members
             .get(pubkey)
@@ -212,6 +213,30 @@ impl GroupStore {
             }
             if event.kind == 9002 {
                 validate_edit_metadata(self, gid, group, event)?;
+            }
+            if event.kind == 9000 {
+                // NIP-29: the roles of each `p`-tag subject are replaced; a
+                // `p` tag without roles demotes the subject to a plain member.
+                // Refuse to leave the group with no admin at all (the creator
+                // or any admin could otherwise be silently demoted and the
+                // group left unmanageable).
+                let grants_roles = event.tags.iter().any(|t| t.len() > 2 && t[0] == P);
+                if !grants_roles {
+                    let demoted: HashSet<&str> = event
+                        .tags
+                        .iter()
+                        .filter(|t| t.len() == 2 && t[0] == P)
+                        .map(|t| t[1].as_str())
+                        .collect();
+                    // An admin keeps their roles unless named in a `p` tag.
+                    let retains_admin = group
+                        .members
+                        .iter()
+                        .any(|(pk, roles)| !roles.is_empty() && !demoted.contains(pk.as_str()));
+                    if !retains_admin {
+                        return Err("restricted: the group must retain at least one admin".into());
+                    }
+                }
             }
             return Ok(());
         }
@@ -485,7 +510,10 @@ impl GroupStore {
 
     /// Rebuilds the in-memory group state from the stored moderation events.
     pub async fn rebuild(&mut self, db: &DbClient) {
-        let kinds: Vec<u64> = (MOD_MIN..=MOD_MAX).chain([LEAVE]).collect();
+        // 9021 JOIN is included so that honored joins survive a restart even
+        // on relays without a private key (which never emit the relay-signed
+        // 9000 put-user that would otherwise carry the membership).
+        let kinds: Vec<u64> = (MOD_MIN..=MOD_MAX).chain([JOIN, LEAVE]).collect();
         // Walk every stored group event in pages (newest first) instead of
         // one giant query: a single query with a huge limit would be truncated
         // by the scan's collection cap / work budget and could exceed the

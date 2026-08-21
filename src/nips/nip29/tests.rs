@@ -181,6 +181,53 @@ fn put_user_roles_replace_previous_roles() {
 }
 
 #[test]
+fn last_admin_cannot_be_demoted() {
+    // The group must retain at least one admin: a 9000 that would demote
+    // every admin (e.g. the creator) to a plain member is rejected, so the
+    // creator cannot be silently turned into a mere member.
+    let store = seeded();
+    // ADMIN is the only admin (creator); demoting them leaves no admin.
+    let demote = event(9000, ADMIN, Some("g1"), vec![vec![P.into(), ADMIN.into()]]);
+    assert!(
+        store.validate_write(&demote).is_err(),
+        "last admin cannot be demoted"
+    );
+
+    // Demoting the creator while granting roles to another pubkey is fine.
+    let transfer = event(
+        9000,
+        ADMIN,
+        Some("g1"),
+        vec![
+            vec![P.into(), ADMIN.into()],
+            vec![P.into(), USER.into(), "admin".into()],
+        ],
+    );
+    assert!(
+        store.validate_write(&transfer).is_ok(),
+        "a new admin may be granted"
+    );
+    // Demoting a non-last admin is still allowed.
+    let mut store2 = seeded();
+    store2.apply(
+        &event(
+            9000,
+            ADMIN,
+            Some("g1"),
+            vec![vec![P.into(), USER.into(), "mod".into()]],
+        ),
+        "",
+        1,
+        false,
+    );
+    let demote_user = event(9000, ADMIN, Some("g1"), vec![vec![P.into(), USER.into()]]);
+    assert!(
+        store2.validate_write(&demote_user).is_ok(),
+        "a non-last admin may be demoted"
+    );
+}
+
+#[test]
 fn closed_group_rejects_joins() {
     // NIP-29: `closed` means join requests are ignored — rejected and
     // not stored; admission happens via an invite code or an admin's
@@ -312,4 +359,58 @@ fn rebuild_order_applies_create_before_member_ops() {
     }
     let g = store.group("g1").unwrap();
     assert!(g.is_member(OTHER), "the member op and join must both apply");
+}
+
+#[test]
+fn rebuild_keeps_join_membership() {
+    // A honored 9021 JOIN must survive a restart rebuild even though the
+    // relay (keyless here) never emits a relay-signed 9000 put-user.
+    use crate::db::DbClient;
+    use crate::nips::nip01;
+    use std::sync::Arc;
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let path = std::env::temp_dir()
+        .join("nostrd-nip29-rebuild")
+        .join(format!("{:x}-{id}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    let cfg = crate::config::DatabaseConfig {
+        path,
+        ..Default::default()
+    };
+    let db = DbClient::open(
+        &cfg,
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let now = 1_700_000_000;
+        let mut create = event(CREATE_GROUP, ADMIN, Some("g1"), vec![]);
+        create.created_at = now;
+        create.id = nip01::compute_id(&create);
+        assert_eq!(
+            db.put(create.clone(), now).await,
+            crate::db::PutOutcome::Stored
+        );
+        // A plain member JOINs (no relay-signed 9000 is stored on keyless relays).
+        let mut join = event(JOIN, OTHER, Some("g1"), vec![]);
+        join.created_at = now;
+        join.id = nip01::compute_id(&join);
+        assert_eq!(
+            db.put(join.clone(), now).await,
+            crate::db::PutOutcome::Stored
+        );
+
+        let mut store = GroupStore::default();
+        store.rebuild(&db).await;
+        let g = store.group("g1").expect("group rebuilt");
+        assert!(g.is_admin(ADMIN), "creator is admin after rebuild");
+        assert!(g.is_member(OTHER), "JOIN membership survives rebuild");
+    });
 }
