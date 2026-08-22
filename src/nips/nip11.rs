@@ -47,11 +47,6 @@ pub fn relay_info(config: &Config, stats: &Stats, self_pubkey: Option<&str>) -> 
             "created_at_upper_limit": crate::util::unix_now() + limits.max_created_at_future,
             "default_limit": limits.max_limit,
         },
-        // The relay never purges by age: events are kept indefinitely unless
-        // a NIP-40 expiration elapses, a NIP-09 deletion/NIP-62 vanish/NIP-86
-        // ban removes them, or the operator prunes the database. A `null`
-        // time means indefinite retention.
-        "retention": [{ "kinds": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 40, 41, 42, 43, 44, 10000, 10001, 10002, 30000, 30001, 30023, 30078], "time": null }],
         "relay_countries": [],
         "language_tags": [],
         "tags": [],
@@ -117,17 +112,12 @@ mod tests {
     }
 
     #[test]
-    fn retention_is_indefinite() {
+    fn retention_is_not_advertised() {
         let info = info();
-        let retention = info["retention"].as_array().expect("retention is an array");
-        assert_eq!(retention.len(), 1);
-        let entry = &retention[0];
         assert!(
-            entry["time"].is_null(),
-            "no age-based purge means indefinite retention"
+            info.get("retention").is_none(),
+            "NIP-11 does not define a retention field; advertising one breaks strict parsers"
         );
-        let kinds = entry["kinds"].as_array().expect("kinds is an array");
-        assert!(!kinds.is_empty());
     }
 
     #[test]
