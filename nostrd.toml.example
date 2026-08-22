@@ -52,8 +52,11 @@ icon = ""
 post_policy = ""
 
 # Hex-encoded secret key of the relay itself. When set, the relay can sign
-# and publish NIP-29 group metadata events and NIP-43 role/membership events,
-# and its pubkey is advertised as the NIP-11 `self` field.
+# and publish NIP-29 group metadata events (39000-39005, including the
+# 39001 admins / 39002 members snapshots) and NIP-43 role/membership events,
+# and its pubkey is advertised as the NIP-11 `self` field. Without a key,
+# NIP-29 groups still work but the relay cannot generate the 39000-39005
+# snapshots at group creation. Generate one with `nostrd genkey`.
 private_key = ""
 
 # Public URL of this relay as seen by clients (e.g. "wss://relay.example.com").

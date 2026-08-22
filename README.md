@@ -109,8 +109,10 @@ pubkey = ""                     # administrative contact pubkey (NIP-11 "pubkey"
 contact = ""                    # alternative contact (URL or mailto, NIP-11)
 icon = ""                       # relay icon URL (NIP-11)
 private_key = ""                # hex secret key of the relay itself (required for
-                                # NIP-29 group metadata and NIP-43 membership events;
-                                # its pubkey is advertised as the NIP-11 "self")
+                                # NIP-29 group metadata 39000-39005, including the
+                                # 39001 admins / 39002 members snapshots, and NIP-43
+                                # membership events; its pubkey is advertised as the
+                                # NIP-11 "self"; generate with `nostrd genkey`)
 public_url = ""                 # public URL as seen by clients (e.g. "wss://relay.example.com");
                                 # set this behind a TLS-terminating proxy / Cloudflare Tunnel
 enabled_nips = []               # explicit NIP allowlist (empty = all except disabled_nips)
