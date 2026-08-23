@@ -395,10 +395,10 @@ impl Config {
         };
         hex32(&self.relay.pubkey, "relay.pubkey")?;
         hex32(&self.server.admin_pubkey, "server.admin_pubkey")?;
-        for pk in &self.access.blocked_pubkeys {
+        for (pk, _) in &self.access.blocked_pubkeys {
             hex32(pk, "access.blocked_pubkeys")?;
         }
-        for pk in &self.access.allowed_pubkeys {
+        for (pk, _) in &self.access.allowed_pubkeys {
             hex32(pk, "access.allowed_pubkeys")?;
         }
 
@@ -427,7 +427,7 @@ impl Config {
         }
 
         // Blocked IPs must parse as IP addresses.
-        for ip in &self.access.blocked_ips {
+        for (ip, _) in &self.access.blocked_ips {
             ip.parse::<std::net::IpAddr>().map_err(|_| {
                 Error::Config(format!(
                     "access.blocked_ips contains an invalid IP address: {ip:?}"
@@ -561,19 +561,52 @@ impl Config {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AccessControl {
-    pub blocked_pubkeys: Vec<String>,
-    pub allowed_pubkeys: Vec<String>,
+    /// (pubkey, reason) pairs; the reason is reported by NIP-86
+    /// `listbannedpubkeys`.
+    #[serde(deserialize_with = "de_access_entries")]
+    pub blocked_pubkeys: Vec<(String, String)>,
+    #[serde(deserialize_with = "de_access_entries")]
+    pub allowed_pubkeys: Vec<(String, String)>,
     pub blocked_kinds: Vec<u64>,
     pub allowed_kinds: Vec<u64>,
-    pub blocked_ips: Vec<String>,
+    /// (ip, reason) pairs, reported by NIP-86 `listblockedips`.
+    #[serde(deserialize_with = "de_access_entries")]
+    pub blocked_ips: Vec<(String, String)>,
+}
+
+/// Deserializes an access list that accepts both the current format —
+/// `[["pubkey", "reason"], ...]` — and the legacy format — `["pubkey", ...]`
+/// (plain strings). The persisted JSON and the TOML `[access]` section both
+/// go through this, so upgrading never fails to read the old data: the
+/// legacy entries simply get an empty reason.
+fn de_access_entries<'de, D>(de: D) -> std::result::Result<Vec<(String, String)>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let items: Vec<serde_json::Value> = serde::Deserialize::deserialize(de)?;
+    items
+        .into_iter()
+        .map(|v| match v {
+            serde_json::Value::String(s) => Ok((s, String::new())),
+            serde_json::Value::Array(a) if a.len() >= 2 && a[0].is_string() && a[1].is_string() => {
+                Ok((
+                    a[0].as_str().unwrap().to_string(),
+                    a[1].as_str().unwrap().to_string(),
+                ))
+            }
+            other => Err(serde::de::Error::custom(format!(
+                "invalid access list entry: {other}"
+            ))),
+        })
+        .collect()
 }
 
 impl AccessControl {
     pub fn allows_pubkey(&self, pubkey: &str) -> bool {
-        if self.blocked_pubkeys.iter().any(|p| p == pubkey) {
+        if self.blocked_pubkeys.iter().any(|(p, _)| p == pubkey) {
             return false;
         }
-        self.allowed_pubkeys.is_empty() || self.allowed_pubkeys.iter().any(|p| p == pubkey)
+        self.allowed_pubkeys.is_empty() || self.allowed_pubkeys.iter().any(|(p, _)| p == pubkey)
     }
 
     pub fn allows_kind(&self, kind: u64) -> bool {
@@ -906,12 +939,49 @@ mod tests {
     #[test]
     fn access_control() {
         let mut ac = AccessControl::default();
-        ac.blocked_pubkeys.push("bad".into());
+        ac.blocked_pubkeys.push(("bad".into(), String::new()));
         assert!(!ac.allows_pubkey("bad"));
         assert!(ac.allows_pubkey("good"));
         ac.blocked_kinds.push(5);
         assert!(!ac.allows_kind(5));
         assert!(ac.allows_kind(1));
+    }
+
+    #[test]
+    fn access_entries_accept_legacy_and_pairs() {
+        // The persisted JSON and the TOML [access] section may carry the
+        // legacy plain-string form; reading it must not fail (the entries
+        // get an empty reason).
+        let legacy = AccessControl {
+            blocked_pubkeys: vec![("aa".repeat(32), String::new())],
+            allowed_pubkeys: Vec::new(),
+            blocked_kinds: vec![],
+            allowed_kinds: vec![],
+            blocked_ips: vec![("203.0.113.9".into(), String::new())],
+        };
+        let json = serde_json::to_string(&legacy).unwrap();
+        // Simulate the pre-reason persisted document.
+        let old_json = r#"{"blocked_pubkeys":["REPL"],"allowed_pubkeys":[],"blocked_kinds":[],"allowed_kinds":[],"blocked_ips":["203.0.113.9"]}"#;
+        let old_json = old_json.replace("REPL", &"aa".repeat(32));
+        let parsed: AccessControl = serde_json::from_str(&old_json).expect("legacy JSON reads");
+        assert_eq!(parsed.blocked_pubkeys[0].0, "aa".repeat(32));
+        assert_eq!(
+            parsed.blocked_pubkeys[0].1, "",
+            "legacy entries get an empty reason"
+        );
+        assert_eq!(parsed.blocked_ips[0].0, "203.0.113.9");
+        // The current format round-trips with its reasons.
+        let with_reason = AccessControl {
+            blocked_pubkeys: vec![("bb".repeat(32), "spam".to_string())],
+            ..Default::default()
+        };
+        let raw = serde_json::to_string(&with_reason).unwrap();
+        let parsed: AccessControl = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            parsed.blocked_pubkeys[0],
+            ("bb".repeat(32), "spam".to_string())
+        );
+        let _ = json;
     }
 
     #[test]
@@ -957,10 +1027,10 @@ mod tests {
     #[test]
     fn validation_rejects_bad_access_entries() {
         let mut cfg = Config::default();
-        cfg.access.blocked_pubkeys = vec!["not-hex".into()];
+        cfg.access.blocked_pubkeys = vec![("not-hex".into(), String::new())];
         assert!(cfg.validate().is_err(), "blocked pubkeys must be hex");
         cfg.access.blocked_pubkeys.clear();
-        cfg.access.blocked_ips = vec!["not-an-ip".into()];
+        cfg.access.blocked_ips = vec![("not-an-ip".into(), String::new())];
         assert!(cfg.validate().is_err(), "blocked IPs must parse");
     }
 

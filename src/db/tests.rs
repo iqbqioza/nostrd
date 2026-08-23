@@ -845,9 +845,13 @@ fn access_control_persists_across_reopen() {
             )
             .unwrap();
             let mut access = crate::config::AccessControl::default();
-            access.blocked_pubkeys.push("aa".repeat(32));
+            access
+                .blocked_pubkeys
+                .push(("aa".repeat(32), String::new()));
             access.allowed_kinds.push(5);
-            access.blocked_ips.push("203.0.113.9".into());
+            access
+                .blocked_ips
+                .push(("203.0.113.9".into(), String::new()));
             db.save_access(access.clone()).await;
             let loaded = db.load_access().await.expect("persisted access loads");
             assert_eq!(loaded.blocked_pubkeys, access.blocked_pubkeys);
@@ -866,9 +870,15 @@ fn access_control_persists_across_reopen() {
         )
         .unwrap();
         let loaded = db.load_access().await.expect("persisted access loads");
-        assert_eq!(loaded.blocked_pubkeys, vec!["aa".repeat(32)]);
+        assert_eq!(
+            loaded.blocked_pubkeys,
+            vec![("aa".repeat(32), String::new())]
+        );
         assert_eq!(loaded.allowed_kinds, vec![5]);
-        assert_eq!(loaded.blocked_ips, vec![String::from("203.0.113.9")]);
+        assert_eq!(
+            loaded.blocked_ips,
+            vec![(String::from("203.0.113.9"), String::new())]
+        );
     });
 }
 

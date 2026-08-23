@@ -406,7 +406,7 @@ async fn ws_handler(State(relay): State<Arc<Relay>>, request: Request) -> Respon
             .await
             .blocked_ips
             .iter()
-            .any(|blocked| blocked.parse::<std::net::IpAddr>().is_ok_and(|b| b == ip))
+            .any(|(blocked, _)| blocked.parse::<std::net::IpAddr>().is_ok_and(|b| b == ip))
     {
         return StatusCode::FORBIDDEN.into_response();
     }

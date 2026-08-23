@@ -366,7 +366,7 @@ pub async fn handle_connection(
                                 .await
                                 .blocked_ips
                                 .iter()
-                                .any(|b| b.parse::<std::net::IpAddr>().is_ok_and(|b| b == peer_ip));
+                                .any(|(b, _)| b.parse::<std::net::IpAddr>().is_ok_and(|b| b == peer_ip));
                             if blocked {
                                 break;
                             }

@@ -79,7 +79,7 @@ pub async fn rpc_handler(
         .await
         .blocked_ips
         .iter()
-        .any(|b| b.parse::<std::net::IpAddr>().is_ok_and(|b| b == peer.ip()))
+        .any(|(b, _)| b.parse::<std::net::IpAddr>().is_ok_and(|b| b == peer.ip()))
     {
         return StatusCode::FORBIDDEN.into_response();
     }
@@ -117,7 +117,7 @@ pub async fn rpc_handler(
     match method {
         "supportedmethods" => rpc_ok(json!(SUPPORTED_METHODS)),
         "banpubkey" => {
-            let (Some(pubkey), _reason) = (
+            let (Some(pubkey), reason) = (
                 params.first().and_then(Value::as_str),
                 params.get(1).and_then(Value::as_str).unwrap_or(""),
             ) else {
@@ -128,8 +128,10 @@ pub async fn rpc_handler(
             }
             {
                 let mut access = relay.access.write().await;
-                if !access.blocked_pubkeys.iter().any(|p| p == pubkey) {
-                    access.blocked_pubkeys.push(pubkey.to_string());
+                if !access.blocked_pubkeys.iter().any(|(p, _)| p == pubkey) {
+                    access
+                        .blocked_pubkeys
+                        .push((pubkey.to_string(), reason.to_string()));
                 }
             }
             relay.persist_access().await;
@@ -141,7 +143,7 @@ pub async fn rpc_handler(
             };
             {
                 let mut access = relay.access.write().await;
-                access.blocked_pubkeys.retain(|p| p != pubkey);
+                access.blocked_pubkeys.retain(|(p, _)| p != pubkey);
             }
             relay.persist_access().await;
             rpc_ok(json!(true))
@@ -151,12 +153,15 @@ pub async fn rpc_handler(
             let list: Vec<Value> = access
                 .blocked_pubkeys
                 .iter()
-                .map(|pubkey| json!({ "pubkey": pubkey, "reason": "" }))
+                .map(|(pubkey, reason)| json!({ "pubkey": pubkey, "reason": reason }))
                 .collect();
             rpc_ok(json!(list))
         }
         "allowpubkey" => {
-            let Some(pubkey) = params.first().and_then(Value::as_str) else {
+            let (Some(pubkey), reason) = (
+                params.first().and_then(Value::as_str),
+                params.get(1).and_then(Value::as_str).unwrap_or(""),
+            ) else {
                 return rpc_err("invalid params");
             };
             if !is_pubkey(pubkey) {
@@ -166,9 +171,11 @@ pub async fn rpc_handler(
                 let mut access = relay.access.write().await;
                 // NIP-86: allowing a pubkey also un-bans it (matching the
                 // legacy endpoint), so `banpubkey` can be reverted.
-                access.blocked_pubkeys.retain(|p| p != pubkey);
-                if !access.allowed_pubkeys.iter().any(|p| p == pubkey) {
-                    access.allowed_pubkeys.push(pubkey.to_string());
+                access.blocked_pubkeys.retain(|(p, _)| p != pubkey);
+                if !access.allowed_pubkeys.iter().any(|(p, _)| p == pubkey) {
+                    access
+                        .allowed_pubkeys
+                        .push((pubkey.to_string(), reason.to_string()));
                 }
             }
             relay.persist_access().await;
@@ -180,7 +187,7 @@ pub async fn rpc_handler(
             };
             {
                 let mut access = relay.access.write().await;
-                access.allowed_pubkeys.retain(|p| p != pubkey);
+                access.allowed_pubkeys.retain(|(p, _)| p != pubkey);
             }
             relay.persist_access().await;
             rpc_ok(json!(true))
@@ -190,7 +197,7 @@ pub async fn rpc_handler(
             let list: Vec<Value> = access
                 .allowed_pubkeys
                 .iter()
-                .map(|pubkey| json!({ "pubkey": pubkey, "reason": "" }))
+                .map(|(pubkey, reason)| json!({ "pubkey": pubkey, "reason": reason }))
                 .collect();
             rpc_ok(json!(list))
         }
@@ -333,7 +340,10 @@ pub async fn rpc_handler(
             rpc_ok(json!(true))
         }
         "blockip" => {
-            let Some(ip) = params.first().and_then(Value::as_str) else {
+            let (Some(ip), reason) = (
+                params.first().and_then(Value::as_str),
+                params.get(1).and_then(Value::as_str).unwrap_or(""),
+            ) else {
                 return rpc_err("invalid params");
             };
             if ip.parse::<std::net::IpAddr>().is_err() {
@@ -341,8 +351,10 @@ pub async fn rpc_handler(
             }
             {
                 let mut access = relay.access.write().await;
-                if !access.blocked_ips.iter().any(|i| i == ip) {
-                    access.blocked_ips.push(ip.to_string());
+                if !access.blocked_ips.iter().any(|(i, _)| i == ip) {
+                    access
+                        .blocked_ips
+                        .push((ip.to_string(), reason.to_string()));
                 }
             }
             relay.persist_access().await;
@@ -356,7 +368,7 @@ pub async fn rpc_handler(
             };
             {
                 let mut access = relay.access.write().await;
-                access.blocked_ips.retain(|i| i != ip);
+                access.blocked_ips.retain(|(i, _)| i != ip);
             }
             relay.persist_access().await;
             // Re-connect checks: unblocking also bumps the version so
@@ -370,7 +382,7 @@ pub async fn rpc_handler(
             let list: Vec<Value> = access
                 .blocked_ips
                 .iter()
-                .map(|ip| json!({ "ip": ip, "reason": "" }))
+                .map(|(ip, reason)| json!({ "ip": ip, "reason": reason }))
                 .collect();
             rpc_ok(json!(list))
         }

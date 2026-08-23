@@ -116,6 +116,8 @@ pub struct GroupSettings {
     pub picture: String,
     pub banner: String,
     pub about: String,
+    /// NIP-29: the group supports LiveKit audio/video rooms.
+    pub livekit: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -608,6 +610,12 @@ fn validate_edit_metadata(
     group: &Group,
     event: &Event,
 ) -> Result<(), String> {
+    // NIP-29: "A kind:9002 MAY carry at most one parent tag". A second
+    // parent tag would be silently ignored (only the first is applied), so
+    // the edit is rejected outright instead.
+    if tag_values(event, "parent").count() > 1 {
+        return Err("restricted: at most one parent tag is allowed".into());
+    }
     // A parent value must not create a cycle or self-reference, and the
     // parent must exist and the author must be its admin.
     if let Some(parent) = tag_value(event, H).and_then(|_| tag_value(event, "parent")) {
