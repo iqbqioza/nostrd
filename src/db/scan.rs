@@ -428,12 +428,24 @@ impl Store {
         out: &mut C,
     ) -> Result<bool> {
         let count_mode = matches!(kind, ScanKind::Count);
-        let sort_search = matches!(kind, ScanKind::Query);
+        // NIP-50 relevance ordering only applies when *every* filter of the
+        // REQ is a search filter. A REQ mixing search and plain filters
+        // (e.g. `[{"search": "x", "limit": 5}, {"kinds": [1], "limit": 10}]`)
+        // must return the union of both: truncating the whole response to
+        // the search filters' limits would silently drop the plain
+        // filters' results, and relevance-sorting would reorder them.
+        let has_plain = filters.iter().any(|f| !f.has_search());
+        let sort_search = matches!(kind, ScanKind::Query) && !has_plain;
         if max_limit == 0 {
             return Ok(false);
         }
         let rtxn = self.env.read_txn()?;
         let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        // Work budget shared by every filter of this REQ: an anti-DoS cap on
+        // the candidates examined across all filters, so a REQ with many
+        // filters cannot multiply the budget (e.g. 20 filters x 200k
+        // examinations) and stall the reader thread.
+        let mut examined = 0usize;
         // `more` is true when a scan stopped because of a limit instead of
         // exhausting the matching records (NIP-67 EOSE completeness hint).
         let mut more = false;
@@ -451,9 +463,10 @@ impl Store {
             let has_search = filter.has_search();
             let limit = if count_mode {
                 max_limit
-            } else if has_search {
-                // NIP-50: the limit is applied after the relevance sort, so
-                // candidates are gathered up to the collection budget.
+            } else if has_search && sort_search {
+                // NIP-50 (pure-search REQ): the limit is applied after the
+                // relevance sort, so candidates are gathered up to the
+                // collection budget.
                 out.cap()
             } else {
                 filter.limit.unwrap_or(max_limit).min(max_limit)
@@ -493,7 +506,8 @@ impl Store {
                 seen: &mut seen,
                 out,
             };
-            let stop = self.scan_filter(&rtxn, &scan, &mut collect, budget, &mut more)?;
+            let stop =
+                self.scan_filter(&rtxn, &scan, &mut collect, budget, &mut examined, &mut more)?;
             if stop {
                 break;
             }
@@ -530,6 +544,7 @@ impl Store {
         scan: &FilterScan<'_>,
         collect: &mut Collect<'_, C>,
         budget: usize,
+        examined: &mut usize,
         more: &mut bool,
     ) -> Result<bool> {
         let FilterScan {
@@ -541,7 +556,6 @@ impl Store {
         } = *scan;
         let seen = &mut *collect.seen;
         let out = &mut *collect.out;
-        let mut examined = 0usize;
         let ctx = ScanContext {
             events: self.events,
             deleted: self.deleted,
@@ -553,16 +567,7 @@ impl Store {
         };
         let mut consider = |id: &[u8]| -> Result<bool> {
             consider_event(
-                &ctx,
-                id,
-                filter,
-                terms,
-                now,
-                seen,
-                out,
-                limit,
-                budget,
-                &mut examined,
+                &ctx, id, filter, terms, now, seen, out, limit, budget, examined,
             )
         };
 
@@ -677,6 +682,11 @@ impl Store {
                 {
                     return Ok(false);
                 }
+                // A tag attribute with no string values (e.g. a numeric
+                // `{"#a": 123}`) matches nothing: the final in-memory
+                // `Filter::matches` requires every tag attribute to match,
+                // so an empty value set yields zero results — consistent
+                // with this index path.
                 return Ok(out.full());
             }
             // Multi-letter tag names are not indexed (NIP-01 only requires
@@ -945,10 +955,11 @@ fn is_deliverable(
     }
     if !terms.is_empty() {
         // NIP-50: an event matches when at least one query term is present
-        // in its content; the relevance ordering ranks events matching
-        // every term first.
-        let content = event.content.to_lowercase();
-        if !terms.iter().any(|t| content.contains(t.as_str())) {
+        // as a whole word in its content; the relevance ordering ranks
+        // events matching every term first. Whole-word matching keeps the
+        // index walk, the non-indexed fallback and the live delivery
+        // consistent (see `nip50::matches_terms`).
+        if !crate::nips::nip50::matches_terms(&event.content, terms) {
             return Ok(false);
         }
     }

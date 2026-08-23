@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use secp256k1::{Keypair, Secp256k1, XOnlyPublicKey};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::RwLock;
 use tokio::sync::{broadcast, mpsc};
 
@@ -46,10 +46,60 @@ pub struct Relay {
     /// Active WebSocket connections per source IP, so a socket flood from
     /// a single host cannot consume the whole connection budget.
     per_ip_connections: std::sync::Mutex<HashMap<String, usize>>,
+    /// Bumped whenever the blocked-IP list changes (NIP-86 blockip/
+    /// unblockip): connections compare this against the value captured at
+    /// connect and re-check the list (and close) when it changed, so a
+    /// newly blocked IP's existing connections are dropped too.
+    pub ip_blocks_version: AtomicU64,
     /// The relay's own keypair (from `relay.private_key`), used to sign
     /// NIP-29 and NIP-43 relay-generated events.
     key: Option<Keypair>,
     secp: Secp256k1<secp256k1::All>,
+    /// Path of the config file, set at startup so NIP-86 runtime changes
+    /// (relay name/description/icon) can be persisted to disk; without
+    /// persistence a SIGHUP config reload would silently revert them.
+    pub config_path: Arc<tokio::sync::RwLock<Option<std::path::PathBuf>>>,
+    /// Strictly monotonic stamp for relay-generated events: see
+    /// [`StampClock`].
+    stamps: StampClock,
+}
+
+/// Issues strictly increasing timestamps for relay-generated events.
+///
+/// The relay stamps its generated replaceable events (NIP-29 39000-39005,
+/// NIP-43 33534/13534) so that the newest group/role state always wins the
+/// NIP-01 replacement tie-break. With plain `unix_now()` stamps, two group
+/// events applied in the same second would share a timestamp and the
+/// replacement would fall back to the id comparison — where a *stale*,
+/// later-committed version could beat the newer state. The clock guarantees
+/// that stamps reflect the order in which the state was applied, not the
+/// order in which the events happen to be stored.
+pub(crate) struct StampClock {
+    last: AtomicU64,
+}
+
+impl StampClock {
+    fn new() -> Self {
+        StampClock {
+            last: AtomicU64::new(0),
+        }
+    }
+
+    /// Returns a timestamp strictly greater than every previously issued
+    /// stamp and at least `floor`.
+    pub(crate) fn stamp(&self, floor: u64) -> u64 {
+        let mut cur = self.last.load(Ordering::Relaxed);
+        loop {
+            let next = cur.max(floor.saturating_sub(1)).saturating_add(1);
+            match self
+                .last
+                .compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return next,
+                Err(actual) => cur = actual,
+            }
+        }
+    }
 }
 
 /// Tuning of the live fan-out bus.
@@ -170,9 +220,19 @@ impl Relay {
             roles: Arc::new(RwLock::new(RoleStore::default())),
             api_limit: ApiLimiter::new(api_max_concurrent),
             per_ip_connections: std::sync::Mutex::new(HashMap::new()),
+            ip_blocks_version: AtomicU64::new(0),
             key,
             secp,
+            config_path: Arc::new(tokio::sync::RwLock::new(None)),
+            stamps: StampClock::new(),
         }
+    }
+
+    /// A strictly monotonic timestamp for relay-generated events (see
+    /// [`StampClock`]): at least `floor`, and greater than every stamp
+    /// issued before.
+    pub(crate) fn stamp_floor(&self, floor: u64) -> u64 {
+        self.stamps.stamp(floor)
     }
 
     /// Spawns the live batching task. Must be called once, after the relay
@@ -248,10 +308,12 @@ impl Relay {
         if max_per_ip == 0 {
             return true;
         }
+        // Recover from a poisoned lock instead of panicking: a panic while
+        // holding the map would otherwise kill every later connection.
         let mut map = self
             .per_ip_connections
             .lock()
-            .expect("per-IP connection map poisoned");
+            .unwrap_or_else(|p| p.into_inner());
         let count = map.entry(ip.to_string()).or_insert(0);
         if *count >= max_per_ip {
             return false;
@@ -263,10 +325,12 @@ impl Relay {
     /// Releases one connection slot for `ip` (called when the connection
     /// closes).
     pub fn release_connection(&self, ip: &std::net::IpAddr) {
+        // Recover from a poisoned lock instead of panicking: a panic while
+        // holding the map would otherwise kill every later connection.
         let mut map = self
             .per_ip_connections
             .lock()
-            .expect("per-IP connection map poisoned");
+            .unwrap_or_else(|p| p.into_inner());
         if let Some(count) = map.get_mut(&ip.to_string()) {
             *count = count.saturating_sub(1);
             if *count == 0 {
@@ -277,6 +341,46 @@ impl Relay {
 
     pub fn has_relay_key(&self) -> bool {
         self.key.is_some()
+    }
+
+    /// Bumps the blocked-IP version so every connection re-checks the list
+    /// (and closes when its source IP is now blocked).
+    pub fn note_ip_blocks_changed(&self) {
+        self.ip_blocks_version.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Persists a runtime change of one `[relay]` config field (e.g. the
+    /// NIP-86 `changerelayname`/`changerelaydescription`/`changerelayicon`
+    /// methods) to the config file, preserving comments and unrelated
+    /// lines. A failure only warns: the change stays applied in memory
+    /// until the next config reload.
+    pub async fn persist_relay_field(&self, field: &str, value: &str) {
+        let Some(path) = self.config_path.read().await.clone() else {
+            log::warn!(
+                "cannot persist relay.{field}: the config file path is unknown \
+                 (running without a config file?); the change applies until the \
+                 next config reload"
+            );
+            return;
+        };
+        match std::fs::read_to_string(&path) {
+            Ok(text) => {
+                let updated = crate::config::set_relay_field_in_text(&text, field, value);
+                if let Err(e) = crate::config::write_text_atomic(&path, &updated) {
+                    log::warn!(
+                        "cannot persist relay.{field} to {}: {e}; the change applies \
+                         until the next config reload",
+                        path.display()
+                    );
+                }
+            }
+            Err(e) => {
+                log::warn!(
+                    "cannot read {} to persist relay.{field}: {e}",
+                    path.display()
+                );
+            }
+        }
     }
 
     /// Validates and stores a single event. The live path batches events
@@ -449,7 +553,9 @@ impl Relay {
         let mut results: Vec<(String, PutOutcome)> = Vec::with_capacity(events.len());
         let mut puts: Vec<Event> = Vec::new();
         let mut put_slots: Vec<usize> = Vec::new();
-        let mut vanishes: Vec<(String, Event)> = Vec::new();
+        // (slot, id, event) of the vanish requests, resolved at the end so
+        // the OK replies keep the order of the received batch.
+        let mut vanishes: Vec<(usize, String, Event)> = Vec::new();
 
         // This path only sees events without group involvement: batches
         // containing group events (an `h` tag or a moderation/join/leave
@@ -467,7 +573,8 @@ impl Relay {
                     continue;
                 }
                 crate::relay::validate::Precheck::Vanish => {
-                    vanishes.push((id, event));
+                    vanishes.push((results.len(), id, event));
+                    results.push((String::new(), PutOutcome::Invalid(String::new())));
                     continue;
                 }
                 crate::relay::validate::Precheck::Accept => {}
@@ -589,11 +696,11 @@ impl Relay {
                 .await;
         }
 
-        for (id, event) in vanishes {
+        for (slot, id, event) in vanishes {
             if let Some(pubkey) = event.pubkey_bytes() {
                 self.vanish_pubkey(pubkey).await;
             }
-            results.push((id, PutOutcome::Stored));
+            results[slot] = (id, PutOutcome::Stored);
         }
 
         results
@@ -662,15 +769,16 @@ impl Relay {
     /// relay-generated metadata events.
     async fn apply_group_event(&self, event: &Event, now: u64) {
         let relay_pubkey = self.relay_pubkey().unwrap_or_default();
-        // Relay-generated events are stamped strictly after the event that
-        // triggered them so that a startup rebuild replays them in the
-        // correct order even when everything happened within the same second.
-        let generated = self.groups.write().await.apply(
-            event,
-            &relay_pubkey,
-            now.max(event.created_at.saturating_add(1)),
-            self.has_relay_key(),
-        );
+        // Relay-generated events are stamped with the strictly monotonic
+        // clock (not plain `now`): two events applied in the same second
+        // must still be distinguishable, or the NIP-01 id tie-break could
+        // let a stale, later-committed version win.
+        let stamp = self.stamp_floor(now.max(event.created_at.saturating_add(1)));
+        let generated =
+            self.groups
+                .write()
+                .await
+                .apply(event, &relay_pubkey, stamp, self.has_relay_key());
 
         if event.kind == 9005 {
             // Group moderation delete-event: admins may delete events, but
@@ -692,18 +800,23 @@ impl Relay {
     }
 }
 
-fn relay_dtag(event: &Event) -> String {
-    event
-        .tags
-        .iter()
-        .find(|t| t.len() >= 2 && t[0] == "d")
-        .map(|t| t[1].clone())
-        .unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
+    use super::StampClock;
     use super::validate::contains_secret_key;
+
+    #[test]
+    fn stamp_clock_is_strictly_monotonic() {
+        let clock = StampClock::new();
+        let a = clock.stamp(100);
+        let b = clock.stamp(50);
+        let c = clock.stamp(1000);
+        let d = clock.stamp(0);
+        assert!(a >= 100);
+        assert!(b > a, "a lower floor must not lower the stamp");
+        assert!(c > b && c >= 1000);
+        assert!(d > c, "a zero floor must not lower the stamp");
+    }
 
     #[test]
     fn nsec_detection() {
@@ -737,7 +850,13 @@ mod tests {
             "an invalid-checksum nsec look-alike must not be flagged"
         );
 
-        // Case-insensitive prefix with a valid checksum.
-        assert!(contains_secret_key(&format!("NSEC1{}", &key[5..])));
+        // Case-insensitive prefix with a valid checksum: an all-uppercase
+        // key is still a real key (bech32 permits all-uppercase).
+        let upper = key.to_uppercase();
+        assert!(contains_secret_key(&upper));
+
+        // A *mixed-case* string (uppercase prefix, lowercase data) is
+        // invalid bech32 and must not be flagged.
+        assert!(!contains_secret_key(&format!("NSEC1{}", &key[5..])));
     }
 }

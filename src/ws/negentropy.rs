@@ -52,7 +52,7 @@ impl super::Conn {
         };
         let max_sub_id_len = self.relay.config.read().await.limits.max_sub_id_len;
         if sub_id.len() > max_sub_id_len {
-            self.send_notice("error: NEG-OPEN subscription id too long");
+            self.send_neg_err(&sub_id, "error: NEG-OPEN subscription id too long");
             return;
         }
         let filter: Filter = match serde_json::from_value::<Filter>(rest[1].clone()) {
@@ -62,7 +62,7 @@ impl super::Conn {
                 filter
             }
             Err(_) => {
-                self.send_notice("error: invalid NEG-OPEN filter");
+                self.send_neg_err(&sub_id, "error: invalid NEG-OPEN filter");
                 return;
             }
         };
@@ -71,11 +71,11 @@ impl super::Conn {
             return;
         }
         let Some(initial) = rest[2].as_str() else {
-            self.send_notice("error: NEG-OPEN message must be hex");
+            self.send_neg_err(&sub_id, "error: NEG-OPEN message must be hex");
             return;
         };
         let Ok(initial) = hex::decode(initial) else {
-            self.send_notice("error: NEG-OPEN message must be hex");
+            self.send_neg_err(&sub_id, "error: NEG-OPEN message must be hex");
             return;
         };
         // NIP-42: an auth-requiring relay applies the same policy to
@@ -149,12 +149,20 @@ impl super::Conn {
         // memory on a single connection.
         let total_cap = max_items.saturating_mul(2);
         // A NEG-OPEN for an already open subscription id replaces the
-        // existing one (NIP-77): release the old items from the accounting
-        // first so the total does not drift upward.
-        if let Some(old) = self.neg.remove(&sub_id) {
-            self.neg_total = self.neg_total.saturating_sub(old.items.len());
-        }
-        if self.neg_total.saturating_add(items.len()) > total_cap {
+        // existing one (NIP-77). Account for the replacement *before*
+        // removing the old state, so a failing NEG-OPEN (too many items)
+        // cannot silently close the peer's existing subscription.
+        let old_len = self
+            .neg
+            .get(&sub_id)
+            .map(|state| state.items.len())
+            .unwrap_or(0);
+        if self
+            .neg_total
+            .saturating_sub(old_len)
+            .saturating_add(items.len())
+            > total_cap
+        {
             self.send_json(json!([
                 "NEG-ERR",
                 sub_id,
@@ -162,6 +170,9 @@ impl super::Conn {
                 total_cap
             ]));
             return;
+        }
+        if let Some(old) = self.neg.remove(&sub_id) {
+            self.neg_total = self.neg_total.saturating_sub(old.items.len());
         }
 
         match nip77::respond(&items, &initial) {

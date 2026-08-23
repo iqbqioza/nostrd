@@ -90,18 +90,14 @@ impl Filter {
         {
             return false;
         }
-        // NIP-50: an event matches when at least one search term appears in
-        // the content; the database scan ranks full matches first.
+        // NIP-50: an event matches when at least one search term appears in the
+        // content as a whole word; the database scan ranks full matches
+        // first and the word index and the non-indexed fallback agree.
         if let Some(search) = self.search.as_deref()
             && !search.trim().is_empty()
+            && !crate::nips::nip50::matches_terms(&ev.content, &crate::nips::nip50::terms(search))
         {
-            let content = ev.content.to_lowercase();
-            if !crate::nips::nip50::terms(search)
-                .iter()
-                .any(|term| content.contains(term.as_str()))
-            {
-                return false;
-            }
+            return false;
         }
         self.tags.iter().all(|(name, value)| {
             let tag_name = name.strip_prefix('#').unwrap_or(name);

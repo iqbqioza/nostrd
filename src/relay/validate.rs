@@ -250,7 +250,11 @@ impl super::Relay {
 }
 
 fn is_bech32_char(byte: u8) -> bool {
-    b"qpzry9x8gf2tvdw0s3jn54khce6mua7l".contains(&byte)
+    // bech32 is case-insensitive: an all-uppercase encoding of a real key
+    // is still a real key, so the detector must accept uppercase data
+    // characters too (the checksum verification below is case-insensitive
+    // as well, and `bech32_checksum_valid` rejects mixed-case strings).
+    b"qpzry9x8gf2tvdw0s3jn54khce6mua7l".contains(&byte.to_ascii_lowercase())
 }
 
 /// Returns `true` when the text contains a real secret key: an `nsec1`

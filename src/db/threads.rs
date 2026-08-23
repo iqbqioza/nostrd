@@ -128,22 +128,6 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             let _ = reply.send(out);
             false
         }
-        Msg::ReplaceableCreatedAt {
-            kind,
-            pubkey,
-            d,
-            reply,
-        } => {
-            let created = match store.replaceable_created_at(kind, &pubkey, &d) {
-                Ok(created) => created,
-                Err(e) => {
-                    db_error(errors, &e);
-                    None
-                }
-            };
-            let _ = reply.send(created);
-            false
-        }
         Msg::ListBanned { reply } => {
             let banned = match store.list_banned() {
                 Ok(banned) => banned,
@@ -480,34 +464,14 @@ pub(crate) fn spawn(
                                     let _ = reply.send(exists);
                                 }
                                 Msg::PrefixesExist { prefixes, reply } => {
-                                    let mut out = Vec::with_capacity(prefixes.len());
-                                    for prefix in &prefixes {
-                                        let exists = match store.event_id_prefix_exists(prefix) {
-                                            Ok(exists) => exists,
-                                            Err(e) => {
-                                                db_error(&thread_errors, &e);
-                                                false
-                                            }
-                                        };
-                                        out.push(exists);
-                                    }
+                                    let out = match store.prefixes_exist(&prefixes) {
+                                        Ok(out) => out,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            vec![false; prefixes.len()]
+                                        }
+                                    };
                                     let _ = reply.send(out);
-                                }
-                                Msg::ReplaceableCreatedAt {
-                                    kind,
-                                    pubkey,
-                                    d,
-                                    reply,
-                                } => {
-                                    let created =
-                                        match store.replaceable_created_at(kind, &pubkey, &d) {
-                                            Ok(created) => created,
-                                            Err(e) => {
-                                                db_error(&thread_errors, &e);
-                                                None
-                                            }
-                                        };
-                                    let _ = reply.send(created);
                                 }
                                 Msg::Ban { id, reason, reply } => {
                                     let banned = match store.apply_ban(&id, &reason) {

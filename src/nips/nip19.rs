@@ -60,10 +60,15 @@ fn verify_checksum(hrp: &[u8], data: &[u8]) -> Option<bool> {
 
 /// Whether `s` is a complete `hrp`-prefixed bech32/bech32m string with a
 /// valid checksum (BIP-173). Case-insensitive (BIP-173 permits all-lowercase
-/// or all-uppercase). Used by the nsec-leak detector so that strings merely
-/// *resembling* a key (`nsec1` + charset chars but a bad checksum) are not
-/// mistaken for real secret keys.
+/// or all-uppercase) but a *mixed-case* string is invalid bech32 and
+/// returns `false`, so the nsec-leak detector never mistakes a mixed-case
+/// look-alike for a real secret key.
 pub(crate) fn bech32_checksum_valid(hrp: &str, s: &str) -> bool {
+    let is_lower = !s.chars().any(|c| c.is_ascii_uppercase());
+    let is_upper = !s.chars().any(|c| c.is_ascii_lowercase());
+    if !is_lower && !is_upper {
+        return false;
+    }
     let s = s.to_lowercase();
     let Some(body) = s.strip_prefix(hrp).and_then(|r| r.strip_prefix('1')) else {
         return false;
@@ -360,8 +365,11 @@ pub fn parse_nip19(input: &str) -> Result<Nip19Entity, Bech32Error> {
                         pubkey = Some(buf);
                     }
                     TLV_SPECIAL => {
-                        if let Ok(s) = std::str::from_utf8(value) {
-                            d_tag = Some(s.to_string());
+                        // A present-but-invalid d tag must not silently
+                        // resolve to the `d=""` address (a different event).
+                        match std::str::from_utf8(value) {
+                            Ok(s) => d_tag = Some(s.to_string()),
+                            Err(_) => return Err(Bech32Error::InvalidTlv),
                         }
                     }
                     TLV_RELAY => {

@@ -56,6 +56,13 @@ pub struct Conn {
     /// Events received but not yet accepted; flushed in batches so the
     /// database commit cost is amortized over many events.
     pub(crate) pending_events: Vec<Event>,
+    /// Live-event receiver, created when the first REQ subscribes (before
+    /// the query runs, so no stored event can fall into the gap between the
+    /// query and the subscription) and dropped when the last subscription
+    /// closes, so connections without active subscriptions are never woken
+    /// by live events. A duplicate delivery of an event that is both in the
+    /// query result and live is harmless (clients deduplicate by id).
+    pub(crate) live: Option<tokio::sync::broadcast::Receiver<Arc<Vec<Event>>>>,
     /// Whether this connection delivers NIP-40 expired events live. Cached
     /// from the config on connect and refreshed whenever a message arrives,
     /// so the per-batch live path avoids the shared config lock.
@@ -241,6 +248,12 @@ pub async fn handle_connection(
     });
 
     let challenge = nip42::generate_challenge();
+    // Blocked-IP version captured at connect: when the NIP-86 admin
+    // blocks (or unblocks) an IP, every connection re-checks the list and
+    // closes if its own source IP became blocked.
+    let mut blocks_version = relay
+        .ip_blocks_version
+        .load(std::sync::atomic::Ordering::Relaxed);
 
     let mut conn = Conn {
         relay,
@@ -254,6 +267,7 @@ pub async fn handle_connection(
         challenge,
         authed_pubkeys: Vec::new(),
         pending_events: Vec::new(),
+        live: None,
         expiry_enabled,
         giftwrap_restricted,
         dropped: 0,
@@ -263,11 +277,6 @@ pub async fn handle_connection(
         out_bytes_total: 0,
     };
     conn.send_auth_challenge().await;
-
-    // The live receiver is created lazily on the first REQ: connections
-    // that only publish never register with the broadcast channel, so they
-    // are not woken up by live events at all.
-    let mut live: Option<tokio::sync::broadcast::Receiver<Arc<Vec<Event>>>> = None;
 
     // A single task per connection: incoming messages and live batches are
     // processed in the same loop, and outgoing messages are flushed to the
@@ -283,7 +292,7 @@ pub async fn handle_connection(
             }
         }
         let live_fut = async {
-            match live.as_mut() {
+            match conn.live.as_mut() {
                 Some(rx) => rx.recv().await,
                 None => std::future::pending().await,
             }
@@ -320,6 +329,26 @@ pub async fn handle_connection(
                     Ok(Some(Err(_))) => break,
                     Ok(Some(Ok(frame))) => {
                         last_activity = std::time::Instant::now();
+                        // Re-check the blocked-IP list when it changed since
+                        // connect: a newly blocked IP's existing connections
+                        // are dropped (a version bump also re-checks after
+                        // an unblock; the list is then empty).
+                        let version =
+                            conn.relay.ip_blocks_version.load(std::sync::atomic::Ordering::Relaxed);
+                        if version != blocks_version {
+                            blocks_version = version;
+                            let blocked = conn
+                                .relay
+                                .access
+                                .read()
+                                .await
+                                .blocked_ips
+                                .iter()
+                                .any(|b| b.parse::<std::net::IpAddr>().is_ok_and(|b| b == peer_ip));
+                            if blocked {
+                                break;
+                            }
+                        }
                         if conn.handle_frame(frame, max_msg_size).await {
                             break;
                         }
@@ -356,14 +385,13 @@ pub async fn handle_connection(
                     break;
                 }
                 conn.flush_pending_events().await;
-                // Subscribe to live events once the first REQ arrives and
-                // drop the receiver again when every subscription is closed,
+                // Drop the receiver again when every subscription is closed,
                 // so connections without active subscriptions are never
-                // woken by live events.
-                if live.is_none() && !conn.subs.is_empty() {
-                    live = Some(conn.relay.live.subscribe());
-                } else if live.is_some() && conn.subs.is_empty() {
-                    live = None;
+                // woken by live events. (Subscribing happens in `handle_req`
+                // *before* the query, so no stored event can fall into the
+                // gap between the query and the subscription.)
+                if conn.live.is_some() && conn.subs.is_empty() {
+                    conn.live = None;
                 }
             }
             _ = ping_fut => {
@@ -560,6 +588,7 @@ mod tests {
             challenge: "test-challenge".into(),
             authed_pubkeys: Vec::new(),
             pending_events: Vec::new(),
+            live: None,
             expiry_enabled,
             giftwrap_restricted,
             dropped: 0,
@@ -730,6 +759,21 @@ mod tests {
                 msgs.iter().any(|m| m[0] == "CLOSED"
                     && m[2].as_str().unwrap_or("").contains("too many filters")),
                 "too many filters must be refused with CLOSED"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn text_ping_is_answered_with_pong() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.handle_text("[\"PING\"]").await;
+            let msgs = outgoing_json(&conn);
+            assert!(
+                msgs.iter().any(|m| m[0] == "PONG"),
+                "a text PING must be answered with a PONG"
             );
             conn.relay.db.shutdown();
         });

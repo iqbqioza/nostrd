@@ -302,6 +302,7 @@ impl Config {
             .map_err(|e| Error::Config(format!("cannot read {}: {e}", path.display())))?;
         let cfg: Config = toml::from_str(&raw)
             .map_err(|e| Error::Config(format!("invalid {}: {e}", path.display())))?;
+        warn_unknown_fields(&raw);
         Ok(cfg)
     }
 
@@ -580,6 +581,259 @@ impl AccessControl {
             return false;
         }
         self.allowed_kinds.is_empty() || self.allowed_kinds.contains(&kind)
+    }
+}
+
+/// Escapes a string for a TOML basic string literal.
+pub(crate) fn toml_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 8);
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Replaces (or inserts) a `field = "value"` line inside the `[relay]`
+/// section of a config file's text, preserving every other line, comment
+/// and section. Handles three cases: a matching line already present in the
+/// `[relay]` section (replaced), no such line in `[relay]` (inserted right
+/// after the header), and no `[relay]` section at all (appended).
+/// Used by `nostrd genkey` (private_key) and the NIP-86 relay-name changes.
+pub(crate) fn set_relay_field_in_text(text: &str, field: &str, value: &str) -> String {
+    let line = format!("{field} = \"{}\"", toml_escape(value));
+
+    // Locate a real `[relay]` section header: a line whose trimmed text
+    // starts with `[relay]` followed by `]`. A `[relay]` inside a comment or
+    // a string value is not a section header and must not match.
+    let mut header_start = None;
+    let mut offset = 0;
+    for l in text.split_inclusive('\n') {
+        let t = l.trim();
+        // `[relay]` header line: exactly `[relay]`, or `[relay]` followed by
+        // whitespace or a comment. A `[relay]` inside a comment or a string
+        // value does not start with `[relay]` as a header.
+        if t == "[relay]"
+            || t.starts_with("[relay] ")
+            || t.starts_with("[relay]\t")
+            || t.starts_with("[relay]#")
+        {
+            header_start = Some(offset);
+            break;
+        }
+        offset += l.len();
+    }
+    let Some(header_start) = header_start else {
+        // No [relay] section: append one at the end.
+        let mut s = text.to_string();
+        if !s.ends_with('\n') {
+            s.push('\n');
+        }
+        s.push_str(&format!("[relay]\n{line}\n"));
+        return s;
+    };
+
+    // The header line ends at the first newline after its start (or EOF when
+    // it is the last line without a trailing newline).
+    let header_end = text[header_start..]
+        .find('\n')
+        .map(|i| header_start + i + 1)
+        .unwrap_or(text.len());
+
+    // Bound the section at the next `[section]` header line.
+    let mut section_end = text.len();
+    let mut cursor = header_end;
+    for l in text[header_end..].split_inclusive('\n') {
+        let t = l.trim();
+        if t.starts_with('[') && t.ends_with(']') {
+            section_end = cursor;
+            break;
+        }
+        cursor += l.len();
+    }
+    let section = &text[header_end..section_end];
+
+    // Case 1: a matching line already exists in the section — replace it.
+    if let Some(offset) = section
+        .lines()
+        .position(|l| l.trim_start().starts_with(field))
+    {
+        let mut new_section = String::new();
+        for (i, l) in section.lines().enumerate() {
+            if i == offset {
+                let indent: String = l.chars().take_while(|c| c.is_whitespace()).collect();
+                new_section.push_str(&format!("{indent}{line}\n"));
+            } else {
+                new_section.push_str(l);
+                new_section.push('\n');
+            }
+        }
+        let mut s = text.to_string();
+        s.replace_range(header_end..section_end, &new_section);
+        return s;
+    }
+
+    // Case 2: no matching line — insert it right after the `[relay]`
+    // header line, keeping the header on its own line even when the header
+    // is the last line of the file without a trailing newline.
+    let mut s = text.to_string();
+    if header_end >= s.len() {
+        // Header is the last line without a trailing newline.
+        s.push('\n');
+        s.push_str(&line);
+        s.push('\n');
+    } else {
+        s.insert_str(header_end, &format!("{line}\n"));
+    }
+    s
+}
+
+/// Writes `text` to `path` atomically (temp file + rename) so a crash in
+/// the middle of a write never leaves a truncated config file behind.
+pub(crate) fn write_text_atomic(path: &Path, text: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Warns about config keys the schema does not know (a typo like
+/// `server.potr = 9000` would otherwise be silently ignored and the relay
+/// start with the default value). Implemented as a warning rather than a
+/// hard error because older config files legitimately carry keys the schema
+/// dropped (e.g. `software`/`version`).
+fn warn_unknown_fields(raw: &str) {
+    let Ok(value) = raw.parse::<toml::Value>() else {
+        return;
+    };
+    let known: &[(&str, &[&str])] = &[
+        (
+            "relay",
+            &[
+                "name",
+                "description",
+                "pubkey",
+                "contact",
+                "icon",
+                "post_policy",
+                "private_key",
+                "public_url",
+                "livekit_url",
+                "livekit_api_key",
+                "livekit_api_secret",
+                "enabled_nips",
+                "disabled_nips",
+            ],
+        ),
+        (
+            "server",
+            &[
+                "host",
+                "port",
+                "api_host",
+                "management_port",
+                "management_host",
+                "management_token",
+                "admin_pubkey",
+                "require_auth",
+                "send_auth_challenge",
+                "metrics_enabled",
+            ],
+        ),
+        (
+            "limits",
+            &[
+                "max_connections",
+                "max_connections_per_ip",
+                "max_ws_message_size",
+                "max_filters",
+                "max_subscriptions",
+                "max_limit",
+                "count_limit",
+                "max_sub_id_len",
+                "max_content_bytes",
+                "max_tags",
+                "max_tag_value_bytes",
+                "max_created_at_future",
+                "require_pow",
+                "max_indexed_words",
+                "buffer_size",
+                "neg_max_items",
+                "db_request_timeout_secs",
+                "new_pubkey_min_age_secs",
+                "max_out_queue_bytes",
+                "ws_idle_timeout_secs",
+                "db_queue_msgs",
+                "db_queue_events",
+                "max_sub_bytes",
+                "group_late_publish_secs",
+                "api_max_concurrent",
+                "api_max_limit",
+                "api_max_offset",
+                "api_max_search_bytes",
+                "live_batch_interval_ms",
+                "live_batch_size",
+                "live_buffer",
+            ],
+        ),
+        (
+            "database",
+            &[
+                "path",
+                "max_dbs",
+                "max_readers",
+                "map_size",
+                "map_max_size",
+                "purge_interval_secs",
+                "search_index",
+            ],
+        ),
+        (
+            "daemon",
+            &[
+                "pid_file",
+                "log_file",
+                "stats_file",
+                "stats_interval_secs",
+                "log_max_size_bytes",
+                "log_max_files",
+            ],
+        ),
+        (
+            "access",
+            &[
+                "blocked_pubkeys",
+                "allowed_pubkeys",
+                "blocked_kinds",
+                "allowed_kinds",
+                "blocked_ips",
+            ],
+        ),
+    ];
+    let Some(table) = value.as_table() else {
+        return;
+    };
+    for (section, keys) in known {
+        let Some(Some(t)) = table.get(*section).map(toml::Value::as_table) else {
+            continue;
+        };
+        for (key, _) in t {
+            if !keys.contains(&key.as_str()) {
+                log::warn!(
+                    "unknown config key [{section}].{key} is ignored; check the spelling \
+                     (the relay runs with the default for this field)"
+                );
+            }
+        }
     }
 }
 

@@ -177,7 +177,11 @@ pub async fn api_handler(
             ..
         } => {
             let hex_pk = hex::encode(pubkey);
-            let limit = params.limit.unwrap_or(100).min(500);
+            // `bound_params` already capped `params.limit` at
+            // `limits.api_max_limit` when one is configured; there is no
+            // hardcoded ceiling here (a configured `api_max_limit: 0` means
+            // "no bound").
+            let limit = params.limit.unwrap_or(100);
             // No per-filter `limit`: see the Pubkey handler.
             let mut filter = Filter {
                 authors: Some(vec![hex_pk]),
@@ -222,7 +226,11 @@ pub async fn api_kind_handler(
     match entity {
         Nip19Entity::Pubkey(pk) => {
             let hex_pk = hex::encode(pk);
-            let limit = params.limit.unwrap_or(100).min(500);
+            // `bound_params` already capped `params.limit` at
+            // `limits.api_max_limit` when one is configured; there is no
+            // hardcoded ceiling here (a configured `api_max_limit: 0` means
+            // "no bound").
+            let limit = params.limit.unwrap_or(100);
             // No per-filter `limit`: query_and_respond fetches `limit+offset+1`
             // pre-filter rows (via the max_limit parameter) so pagination over
             // the visible sequence works even when hidden events are present.

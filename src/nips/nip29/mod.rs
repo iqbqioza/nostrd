@@ -562,6 +562,13 @@ impl GroupStore {
         // tie-breaker: the group-establishing events apply first (9007 create,
         // 9008 delete), then the member/settings operations (9000-9006,
         // 9009-9010) which need the group to exist, and joins/leaves last.
+        // Known limitation: events of the same kind within the same second
+        // are ordered by id, not by arrival — two conflicting 9000 edits in
+        // the same second (e.g. grant-then-revoke of a role) may replay in
+        // the wrong order after a restart. The relay stamps its generated
+        // metadata strictly monotonic, so the *stored* 39000-39005 always
+        // reflect the latest state; only the in-memory member map could
+        // diverge until the next edit.
         events.sort_by(|a, b| {
             (a.created_at, group_rank(a.kind), a.kind, &a.id).cmp(&(
                 b.created_at,

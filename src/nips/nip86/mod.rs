@@ -103,7 +103,10 @@ pub async fn rpc_handler(
     match method {
         "supportedmethods" => rpc_ok(json!(SUPPORTED_METHODS)),
         "banpubkey" => {
-            let Some(pubkey) = params.first().and_then(Value::as_str) else {
+            let (Some(pubkey), _reason) = (
+                params.first().and_then(Value::as_str),
+                params.get(1).and_then(Value::as_str).unwrap_or(""),
+            ) else {
                 return rpc_err("invalid params");
             };
             if !is_pubkey(pubkey) {
@@ -230,11 +233,17 @@ pub async fn rpc_handler(
                 return rpc_err("invalid params: value too long or contains control characters");
             }
             let mut cfg = relay.config.write().await;
-            match method {
-                "changerelayname" => cfg.relay.name = value.to_string(),
-                "changerelaydescription" => cfg.relay.description = value.to_string(),
-                _ => cfg.relay.icon = value.to_string(),
-            }
+            let (field, _) = match method {
+                "changerelayname" => ("name", cfg.relay.name = value.to_string()),
+                "changerelaydescription" => {
+                    ("description", cfg.relay.description = value.to_string())
+                }
+                _ => ("icon", cfg.relay.icon = value.to_string()),
+            };
+            // Persist the change to the config file so it survives a SIGHUP
+            // reload and a restart (without persistence the reload handler
+            // would silently revert it).
+            relay.persist_relay_field(field, value).await;
             rpc_ok(json!(true))
         }
         // NIP-43 role management.
@@ -323,6 +332,8 @@ pub async fn rpc_handler(
                 }
             }
             relay.persist_access().await;
+            // Drop existing connections from this IP, not just new ones.
+            relay.note_ip_blocks_changed();
             rpc_ok(json!(true))
         }
         "unblockip" => {
@@ -334,6 +345,10 @@ pub async fn rpc_handler(
                 access.blocked_ips.retain(|i| i != ip);
             }
             relay.persist_access().await;
+            // Re-connect checks: unblocking also bumps the version so
+            // connections that were blocked mid-flight re-verify (a version
+            // bump with an empty list is harmless).
+            relay.note_ip_blocks_changed();
             rpc_ok(json!(true))
         }
         "listblockedips" => {

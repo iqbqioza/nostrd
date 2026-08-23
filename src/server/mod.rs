@@ -48,13 +48,19 @@ unsafe fn set_sock_opt(stream: &tokio::net::TcpStream, opt: libc::c_int, value: 
     let value: libc::c_int = value;
     // SAFETY: `stream` holds a valid socket descriptor and the option value
     // is a valid pointer to a `libc::c_int`.
-    unsafe {
+    let ret = unsafe {
         libc::setsockopt(
             stream.as_raw_fd(),
             libc::SOL_SOCKET,
             opt,
             &value as *const libc::c_int as *const libc::c_void,
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if ret != 0 {
+        log::warn!(
+            "setsockopt({opt}) failed: {}",
+            std::io::Error::last_os_error()
         );
     }
 }
@@ -200,6 +206,9 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
     Arc::get_mut(&mut relay)
         .expect("relay not cloned yet")
         .start_live_bus();
+    // Make the config file path known to the relay so NIP-86 runtime
+    // changes (relay name/description/icon) can be persisted to disk.
+    *relay.config_path.write().await = Some(config_path.clone());
 
     // Rebuild the NIP-29 group state from the stored moderation events.
     if relay.config.read().await.nip_enabled(29) {
@@ -607,6 +616,38 @@ async fn reload_handler(
                                 "relay.private_key changed in the reloaded config but is fixed \
                                  at startup; a restart is required to apply it"
                             );
+                        }
+                        // Settings that shape the HTTP router are also fixed
+                        // at startup: a reload cannot rebuild the routes.
+                        let static_routes = [
+                            ("server.api_host", old.server.api_host != new_config.server.api_host),
+                            (
+                                "server.metrics_enabled",
+                                old.server.metrics_enabled != new_config.server.metrics_enabled,
+                            ),
+                            (
+                                "relay.livekit_url",
+                                old.relay.livekit_url != new_config.relay.livekit_url,
+                            ),
+                            (
+                                "relay.livekit_api_key",
+                                old.relay.livekit_api_key != new_config.relay.livekit_api_key,
+                            ),
+                            (
+                                "relay.livekit_api_secret",
+                                old.relay.livekit_api_secret
+                                    != new_config.relay.livekit_api_secret,
+                            ),
+                            ("relay.enabled_nips", old.relay.enabled_nips != new_config.relay.enabled_nips),
+                            ("relay.disabled_nips", old.relay.disabled_nips != new_config.relay.disabled_nips),
+                        ];
+                        for (name, changed) in static_routes {
+                            if changed {
+                                warn!(
+                                    "{name} changed in the reloaded config but the routes are \
+                                     fixed at startup; a restart is required to apply it"
+                                );
+                            }
                         }
                         drop(old);
                         *config.write().await = new_config;
