@@ -1,0 +1,381 @@
+# nostrd Troubleshooting
+
+This page collects the errors you are most likely to meet while running nostrd, together with step-by-step fixes.
+
+**Three things to check first**:
+
+1. `nostrd check` validates your config (9 out of 10 errors are config mistakes)
+2. `tail -f nostrd.log` shows the log (the cause of the error is almost always there)
+3. `nostrd restart` restarts the daemon cleanly
+
+---
+
+## Table of Contents
+
+1. [Cannot Start](#1-cannot-start)
+2. [Cannot Connect / Behaves Strangely](#2-cannot-connect--behaves-strangely)
+3. [Errors When Publishing](#3-errors-when-publishing)
+4. [Search, Groups, Auth](#4-search-groups-auth)
+5. [Database and Disk](#5-database-and-disk)
+6. [Daemon Operation](#6-daemon-operation)
+7. [Still Not Solved?](#7-still-not-solved)
+
+---
+
+## 1. Cannot Start
+
+### 1-1. `error: cannot bind to 0.0.0.0:80: Permission denied`
+
+**Cause**: Port 80 can only be bound by root.
+
+**Fix**: Run with `sudo`, or change the port to something like 8080.
+
+```bash
+# Change port = 8080 in the config file, then:
+./target/release/nostrd --config nostrd.toml start
+```
+
+### 1-2. `error: cannot bind to ...: Address already in use`
+
+**Cause**: Another process (an old nostrd or a different server) is already using the port.
+
+**Fix**:
+
+```bash
+# See what is using the port
+ss -tlnp | grep :8080
+
+# If nostrd is running, restart it
+./target/release/nostrd --config nostrd.toml restart
+
+# If it is another process, stop it and retry
+```
+
+### 1-3. `already running (pid 1234); use 'nostrd stop' or 'nostrd restart'`
+
+**Cause**: nostrd is already running; `start` refuses to start a second instance.
+
+**Fix**: Use `nostrd restart`, or just use the running instance.
+
+### 1-4. `nostrd stop` hangs / `did not stop in time`
+
+**Cause**: The daemon is stuck or not responding.
+
+**Fix**:
+
+```bash
+# Check the process
+ps aux | grep nostrd
+
+# If it really will not stop, force-kill it
+kill -9 <PID>
+# Remove a stale pid file if present
+rm -f nostrd.pid
+```
+
+### 1-5. `error: invalid nostrd.toml: TOML parse error`
+
+**Cause**: The config file is not valid TOML. Common mistakes: forgetting quotes around a string, or writing the same key twice.
+
+**Fix**: The error message includes a line number. Check and fix that line.
+
+```toml
+# Correct examples
+name = "my relay"        # strings are quoted with "
+port = 8080              # numbers are plain
+enabled_nips = [1, 50]   # lists are wrapped in [ ]
+```
+
+### 1-6. `error: cannot read nostrd.toml: No such file or directory`
+
+**Cause**: The config file does not exist.
+
+**Fix**:
+
+```bash
+./target/release/nostrd --config nostrd.toml init
+```
+
+### 1-7. `error: relay.private_key is not a valid secp256k1 secret key`
+
+**Cause**: `relay.private_key` is not a valid 64-character hex key.
+
+**Fix**: Run `nostrd genkey` to generate a correct key (or set `private_key = ""`).
+
+### 1-8. Lots of warnings in the log at startup
+
+`[WARN]` log lines tell you about configuration problems. The main ones:
+
+| Warning | Meaning and fix |
+| --- | --- |
+| `relay.public_url is empty and server.host is "0.0.0.0"...` | `public_url` is not set. **NIP-42 auth, NIP-62 vanish and NIP-98 admin auth will not work.** Set `wss://your-public-url` |
+| `relay.private_key is empty while NIP-29 is enabled...` | Groups need a secret key. Run `nostrd genkey` |
+| `unknown config key [relay].software is ignored` | An unused legacy key (or a typo) in the config. Check the key name |
+| `unknown config section [serve] is ignored` | A typo in a section name (e.g. `[serve]` instead of `[server]`). Fix it |
+| `server.require_auth is true but server.send_auth_challenge is false...` | This combination locks everyone out. Change one of the two |
+| `limits.require_pow = 64 ... practically unmineable` | The PoW requirement is so high nobody can post. Lower `require_pow` |
+| `livekit_url is set but livekit_api_key/livekit_api_secret are empty` | LiveKit credentials are incomplete |
+
+---
+
+## 2. Cannot Connect / Behaves Strangely
+
+### 2-1. Client gets `connection refused`
+
+**Cause**: The relay is not running, or a firewall is blocking the port.
+
+**Fix**:
+
+```bash
+# Is the relay up?
+curl http://127.0.0.1:8080/health
+
+# From outside (using the server's IP/port)
+curl http://YOUR_SERVER_IP:8080/health
+
+# Check the firewall (example: ufw)
+sudo ufw status
+# Open the port if needed
+sudo ufw allow 8080
+```
+
+### 2-2. External clients cannot connect, local ones can
+
+**Cause**: `server.host` is still `127.0.0.1` (the default), which only accepts local connections.
+
+**Fix**: Set `host = "0.0.0.0"` in the config and restart.
+
+### 2-3. Cannot connect through a Cloudflare tunnel
+
+When using Cloudflare Tunnel:
+
+- The relay runs plain HTTP; Cloudflare terminates TLS, so clients use `wss://`. Set `public_url = "wss://..."` on the relay (this makes NIP-42 auth work)
+- Cloudflare adds an `X-Forwarded-Proto` header. nostrd treats `ws`/`wss`/`http`/`https` values the same, so no extra configuration is normally needed
+
+### 2-4. `error: message too large` and the connection closes
+
+**Cause**: A single message exceeds `max_ws_message_size` (default 1 MB).
+
+**Fix**: Raise `limits.max_ws_message_size` if you need larger events — but also check the client's own limits.
+
+### 2-5. `too many subscriptions` / `too many filters` errors
+
+**Cause**: The per-connection caps were reached (subscriptions default 20, filters default 20).
+
+**Fix**: Raise `limits.max_subscriptions` / `limits.max_filters` (and check the client settings).
+
+### 2-6. New connections are refused under load
+
+**Cause**: `max_connections` (default 10000) was reached, or the per-IP cap (`max_connections_per_ip`) kicked in.
+
+**Fix**: Review and adjust the settings. `max_connections_per_ip = 0` disables the per-IP cap (be careful about floods).
+
+### 2-7. Connections drop after a while
+
+**Cause**: If `ws_idle_timeout_secs` is set, idle connections are closed. Healthy clients answer the relay's PING with a PONG and stay connected; only dead peers are reaped.
+
+**Fix**: This is intentional. Set `ws_idle_timeout_secs = 0` to disable it.
+
+---
+
+## 3. Errors When Publishing
+
+### 3-1. `OK` is `false` — error reference
+
+When publishing fails, the 4th element of the `OK` message explains why. The common ones:
+
+| Error | Meaning and fix |
+| --- | --- |
+| `invalid: signature verification failed` | The event signature is invalid (possibly a broken client key) |
+| `invalid: content too large` | Content exceeds `max_content_bytes` (default 64K characters). Shorten it or raise the limit |
+| `invalid: too many tags` | More tags than `max_tags` (default 2000) |
+| `invalid: tag value too large` | A tag value exceeds `max_tag_value_bytes` (default 1 KB) |
+| `mute: event creation date is in the future` | Timestamp too far in the future (beyond `max_created_at_future`) |
+| `mute: event contains secret key material` | The content or tags contain an nsec-looking string. **Never post secret keys.** Remove the string and the event is accepted |
+| `duplicate: event already stored` | The same event is already stored (normal) |
+| `blocked: pubkey not allowed` | The pubkey is banned (`banpubkey`) or outside the allowlist |
+| `blocked: kind not allowed` | This kind is disallowed |
+| `blocked: event has been banned` | The event id is banned |
+| `blocked: event has been deleted` | Re-publishing a deleted event |
+| `invalid: event has expired` | The NIP-40 expiration has passed |
+| `pow: difficulty requirement not reached` | The event does not meet `require_pow` |
+| `auth-required: ...` | Authentication is required (when `require_auth` is on) |
+| `restricted: ...` | Access restrictions (groups, account age, ...) |
+| `restricted: your account is too new` | The account was created within `new_pubkey_min_age_secs`. Wait and retry |
+| `restricted: unknown group` | The group does not exist (create it first) |
+| `restricted: you are not an admin of this group` | Only admins can send moderation events |
+| `restricted: this group is closed` | The group is `closed`; join requests without an invite code are not honored |
+| `invalid: event is too old for this group` | The event is older than `group_late_publish_secs` |
+
+### 3-2. Events are stored but do not show up in subscriptions
+
+Possible causes:
+
+1. **NIP-70 protected events** (with a `-` tag) are only delivered to authenticated clients. If the subscriber is not authenticated, it cannot see them (by spec)
+2. **NIP-29 private-group** events are only delivered to members
+3. **NIP-40 expired** events are not delivered
+
+### 3-3. Old group events are rejected
+
+Group posts have a time limit (`group_late_publish_secs`, default 7 days). Older events are rejected with `invalid: event is too old for this group`.
+
+---
+
+## 4. Search, Groups, Auth
+
+### 4-1. Search returns 0 results / unexpected results
+
+nostrd search matches **whole words**. Note that:
+
+- `search = "rust"` matches events containing the word "rust", but `"ru"` does NOT match "rust" as a substring
+- Only words in the event content are searched
+- If `search_index = false`, search still works but is slower
+- If NIP-50 is disabled (`disabled_nips = [50]`), `search` is ignored (a NOTICE is sent)
+
+### 4-2. Group metadata (39000-39005) is not generated
+
+**Cause**: `relay.private_key` is not set. Group snapshots are signed by the relay's own key, so without it nothing is generated.
+
+**Fix**:
+
+```bash
+./target/release/nostrd --config nostrd.toml genkey
+./target/release/nostrd --config nostrd.toml restart
+```
+
+### 4-3. `restricted: unknown group` rejects group events
+
+**Cause**: The group does not exist. In NIP-29, moderation events and join requests (9021) cannot target a group before it is created (kind 9007).
+
+**Fix**: Create the group with a 9007 event first.
+
+### 4-4. `restricted: you are not an admin of this group`
+
+**Cause**: Moderation (adding members, etc.) requires an admin (a member with a role). The creator is an admin.
+
+**Fix**: Ask an admin to grant you a role, or create your own group.
+
+### 4-5. `restricted: this group is closed`
+
+**Cause**: The group is `closed`; join requests without an invite code are not auto-approved.
+
+**Fix**: Ask an admin for an invite code (9009) and join with a `code` tag.
+
+### 4-6. Protected events are rejected with `auth-required`
+
+**Cause**: NIP-70 protected events (with a `-` tag) may only be published by the authenticated author **on the same connection**.
+
+**Fix**: Enable NIP-42 auth in the client before publishing.
+
+### 4-7. AUTH (NIP-42) returns `false`
+
+Common causes:
+
+1. `relay.public_url` is unset or wrong — the AUTH event's `relay` tag does not match the relay's URL. Set `wss://...` and `restart`
+2. Stale challenge — you sent AUTH on a different connection, or reused an old challenge
+3. The client clock is off — the AUTH event's `created_at` must be within ±10 minutes of now
+
+### 4-8. NIP-86 management API returns `401 unauthorized`
+
+**Cause**: Missing or wrong credentials.
+
+**Fix**:
+
+- Set `management_token` and send `Authorization: Bearer <token>`
+- Or set `admin_pubkey` and send a NIP-98 auth event (the `u` tag must match the relay URL exactly; a `payload` tag is required)
+- If neither is set, the management API is disabled entirely
+
+---
+
+## 5. Database and Disk
+
+### 5-1. `database map is full: increase database.map_max_size`
+
+**Cause**: The LMDB memory-map ceiling (default 1 TB of virtual address space; actual disk usage grows with data) was reached — effectively, the database is full.
+
+**Fix**: Raise `database.map_max_size` and `restart`.
+
+### 5-2. `disk is full: refusing to commit N events`
+
+**Cause**: Less than 32 MB of free disk space. Writes stop (to protect the data); reads continue.
+
+**Fix**: Free up disk space. Writes resume automatically once space is available.
+
+```bash
+df -h /path/to/data
+```
+
+### 5-3. `nostrd check` reports `map_size must not exceed map_max_size`
+
+**Cause**: `database.map_size` is larger than `map_max_size`.
+
+**Fix**: Set `map_size` at or below `map_max_size` (the defaults are fine).
+
+### 5-4. Checking the database size
+
+```bash
+curl http://127.0.0.1:8080/relay/stats
+# => "db_size_bytes" in bytes
+```
+
+### 5-5. Backing up / moving the database
+
+All data lives in the `database.path` directory. **Stop the relay before copying** (copying a live database can corrupt it).
+
+```bash
+./target/release/nostrd --config nostrd.toml stop
+cp -a ./data ./data-backup
+./target/release/nostrd --config nostrd.toml start
+```
+
+---
+
+## 6. Daemon Operation
+
+### 6-1. `nostrd stats` says `nostrd is not running (no stats file)`
+
+**Cause**: The stats file does not exist — the daemon is not running, or it started less than a few seconds ago.
+
+**Fix**: Run `nostrd start`, wait a few seconds, and try again.
+
+### 6-2. The log grows without bound
+
+**Cause**: `log_max_size_bytes` is 0 (rotation disabled).
+
+**Fix**: Set `log_max_size_bytes = 52428800` (50 MB) and `log_max_files = 5`. Rotation is automatic.
+
+### 6-3. Changes to the config do not take effect after reload
+
+**Cause**: You reloaded (SIGHUP) settings that are fixed at startup: `private_key`, `api_host`, `metrics_enabled`, LiveKit settings, and the NIP enable/disable lists.
+
+**Fix**: Use `nostrd restart`. The log contains a "a restart is required" warning in this case.
+
+### 6-4. The relay keeps dying by itself
+
+**Cause**: The machine rebooted, or the relay ran out of memory (OOM).
+
+**Fix**:
+
+1. Check the end of the log: `tail -50 nostrd.log`
+2. Check if the machine rebooted: `uptime` (a very short uptime means a reboot)
+3. Check memory: `free -h`
+4. Start the relay again: `nostrd start`
+
+> **Tip**: To start nostrd automatically on boot, register it as a systemd service with the relay's start command as `ExecStart`.
+
+### 6-5. systemd cannot start the relay on port 80
+
+A systemd service running as root can bind port 80. If you set `User=` to a regular user, either use a higher port (e.g. 8080) or add `AmbientCapabilities=CAP_NET_BIND_SERVICE` to the unit.
+
+---
+
+## 7. Still Not Solved?
+
+1. **Check the log**: `tail -100 nostrd.log` — it usually names the direct cause
+2. **Re-validate the config**: `nostrd check` — shows warnings and errors
+3. **Gather reproduction details**: what were you doing, which client, what exact error
+4. **Ask in the project repository**: https://github.com/iqbqioza/nostrd (when filing an issue, include the reproduction steps and the log)
+
+---
+
+This documentation is maintained against the actual behavior of the relay. If you find an error, please consider submitting a fix.
