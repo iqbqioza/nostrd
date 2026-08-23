@@ -468,11 +468,12 @@ pub async fn handle_connection(
         .bump(&conn.relay.stats.bytes_out, conn.out_bytes_total);
 
     // Release the connection's accounting: any subscriptions still open at
-    // disconnect were never CLOSE'd, so decrement them here.
-    conn.relay
-        .stats
-        .subscriptions_active
-        .fetch_sub(conn.subs.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    // disconnect were never CLOSE'd, so decrement them here (REQ
+    // subscriptions and negentropy subscriptions both hold a slot).
+    conn.relay.stats.subscriptions_active.fetch_sub(
+        (conn.subs.len() + conn.neg.len()) as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 #[cfg(test)]
@@ -774,6 +775,77 @@ mod tests {
             assert!(
                 msgs.iter().any(|m| m[0] == "PONG"),
                 "a text PING must be answered with a PONG"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+    #[test]
+    fn live_delivery_through_the_bus() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            conn.handle_req(&[json!("sub"), json!({"kinds": [30001]})])
+                .await;
+            assert!(conn.live.is_some(), "REQ must subscribe to live events");
+
+            let mut ev = signed_note(conn.relay.secp(), "live-check", now, vec![]);
+            ev.kind = 30001;
+            ev.id = crate::nips::nip01::compute_id(&ev);
+            // The relay broadcast path: queue, bus task, receiver, deliver.
+            conn.relay.broadcast(ev.clone());
+            let received = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                conn.live.as_mut().unwrap().recv(),
+            )
+            .await;
+            match received {
+                Ok(Ok(batch)) => {
+                    assert!(
+                        batch.iter().any(|e| e.id == ev.id),
+                        "the broadcast event must arrive on the live receiver"
+                    );
+                    conn.deliver_live(&ev, None);
+                    let msgs = outgoing_json(&conn);
+                    assert!(
+                        msgs.iter()
+                            .any(|m| m[0] == "EVENT" && m[2]["content"] == "live-check"),
+                        "deliver_live must queue the event for the subscriber"
+                    );
+                }
+                other => panic!("live bus did not deliver: {other:?}"),
+            }
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn neg_open_counts_towards_active_subscriptions() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let stats = conn.relay.stats.clone();
+            let before = stats
+                .subscriptions_active
+                .load(std::sync::atomic::Ordering::Relaxed);
+            // A NEG-OPEN with an empty client set (skip-to-infinity).
+            conn.handle_neg_open(&[json!("s"), json!({"kinds": [1]}), json!("61000000")])
+                .await;
+            let after_open = stats
+                .subscriptions_active
+                .load(std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(
+                after_open,
+                before + 1,
+                "an open NEG subscription must hold a slot"
+            );
+            conn.handle_neg_close(&[json!("s")]);
+            let after_close = stats
+                .subscriptions_active
+                .load(std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(
+                after_close, before,
+                "closing the NEG subscription must release the slot"
             );
             conn.relay.db.shutdown();
         });

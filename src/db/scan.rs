@@ -145,14 +145,17 @@ impl EventCollector {
 }
 
 /// The NIP-50 relevance score of an event: the sum of the weights of the
-/// query terms present in its content. Weights are the inverse document
-/// frequency of each term (`1 / (1 + ln df)`), so rarer terms dominate.
+/// query terms present in its content *as whole words*. Weights are the
+/// inverse document frequency of each term (`1 / (1 + ln df)`), so rarer
+/// terms dominate. Whole-word matching keeps the ranking consistent with
+/// the matching itself (a term present only as a substring of a longer
+/// word, e.g. "ru" inside "rust", contributes nothing).
 fn score(event: &Event, terms: &[String], weights: &[f64]) -> f64 {
-    let content = event.content.to_lowercase();
+    let words = crate::nips::nip50::tokenize(&event.content);
     terms
         .iter()
         .zip(weights)
-        .filter(|(t, _)| content.contains(t.as_str()))
+        .filter(|(t, _)| words.iter().any(|w| w == *t))
         .map(|(_, w)| w)
         .sum()
 }
@@ -200,13 +203,20 @@ impl ScanCollector for EventCollector {
         });
     }
     fn sort_relevance(&mut self, terms: &[String], weights: &[f64]) {
-        self.events.sort_by(|a, b| {
-            score(b, terms, weights)
-                .partial_cmp(&score(a, terms, weights))
+        // Score every event exactly once (the per-event tokenization is the
+        // expensive part; a comparator would re-tokenize each event on every
+        // comparison), then sort by the precomputed scores.
+        let mut scored: Vec<(f64, Event)> = std::mem::take(&mut self.events)
+            .into_iter()
+            .map(|event| (score(&event, terms, weights), event))
+            .collect();
+        scored.sort_by(|(sa, a), (sb, b)| {
+            sb.partial_cmp(sa)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| b.created_at.cmp(&a.created_at))
                 .then_with(|| a.id.cmp(&b.id))
         });
+        self.events = scored.into_iter().map(|(_, event)| event).collect();
     }
     fn truncate_to(&mut self, take: usize) {
         self.events.truncate(take);
@@ -964,4 +974,35 @@ fn is_deliverable(
         }
     }
     Ok(filter.matches(event))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::score;
+    use crate::event::Event;
+
+    fn ev(content: &str, created: u64) -> Event {
+        Event {
+            id: "a".repeat(64),
+            pubkey: "b".repeat(64),
+            created_at: created,
+            kind: 1,
+            tags: vec![],
+            content: content.into(),
+            sig: "c".repeat(128),
+        }
+    }
+
+    #[test]
+    fn relevance_score_counts_whole_words_only() {
+        let terms = vec!["ru".to_string(), "rust".to_string()];
+        let weights = vec![1.0, 1.0];
+        // "rust" is a whole word; "ru" is only a substring of "rust" and
+        // must contribute nothing (matching itself is whole-word, so the
+        // ranking must agree).
+        assert_eq!(score(&ev("I like rust", 1), &terms, &weights), 1.0);
+        // A content that actually contains "ru" as a word scores it.
+        assert_eq!(score(&ev("ru matters", 1), &terms, &weights), 1.0);
+        assert_eq!(score(&ev("ru and rust both", 1), &terms, &weights), 2.0);
+    }
 }

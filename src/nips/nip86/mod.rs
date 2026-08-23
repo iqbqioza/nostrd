@@ -65,10 +65,24 @@ fn rpc_err(message: &str) -> Response {
 /// NIP-86 JSON-RPC handler, mounted on `POST /` and `POST /ws`.
 pub async fn rpc_handler(
     State(relay): State<Arc<Relay>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     uri: axum::http::Uri,
     headers: HeaderMap,
     body: String,
 ) -> Response {
+    // NIP-86 `blockip` also applies to this endpoint: a blocked peer must
+    // not reach the management RPC (the WebSocket handler already refuses
+    // its connections).
+    if relay
+        .access
+        .read()
+        .await
+        .blocked_ips
+        .iter()
+        .any(|b| b.parse::<std::net::IpAddr>().is_ok_and(|b| b == peer.ip()))
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     // The spec requires the JSON-RPC content type (parameters such as
     // `; charset=utf-8` are tolerated).
     let is_rpc = headers

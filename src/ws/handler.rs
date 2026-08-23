@@ -299,9 +299,10 @@ impl super::Conn {
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             // NIP-77: a CLOSE on a subscription id also ends any negentropy
             // state held under the same id, releasing its items from the
-            // connection's memory accounting.
+            // connection's memory accounting and its subscription slot.
             if let Some(state) = self.neg.remove(sub_id) {
                 self.neg_total = self.neg_total.saturating_sub(state.items.len());
+                self.release_neg_stats_subscription();
             }
             // Drop the live receiver with the last subscription so
             // connection without active subscriptions are never woken.

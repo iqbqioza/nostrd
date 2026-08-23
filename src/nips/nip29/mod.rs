@@ -173,7 +173,10 @@ impl GroupStore {
         }
         let Some(group) = self.groups.get(gid) else {
             // Unknown groups are open: only a create-group event may target
-            // them explicitly.
+            // them explicitly. A JOIN to a group that does not exist (yet)
+            // would be stored but never honored (the state machine has no
+            // group to admit the user into), so it is rejected here like
+            // every other moderation event for an unknown group.
             if event.kind == CREATE_GROUP {
                 return Ok(());
             }

@@ -64,30 +64,40 @@ pub fn tag_matches(tag: &str, identity: &RelayIdentity<'_>) -> bool {
     }
     // Compare host:port, tolerating different schemes, paths and the
     // hostname variants (localhost vs 127.0.0.1 are intentionally not
-    // normalized further).
-    let authority = tag
-        .strip_prefix("wss://")
-        .or_else(|| tag.strip_prefix("ws://"))
-        .or_else(|| tag.strip_prefix("https://"))
-        .or_else(|| tag.strip_prefix("http://"))
-        .unwrap_or(tag);
-    let authority = authority.split(['/', '?', '#']).next().unwrap_or(authority);
+    // normalized further). The scheme and the hostname are both
+    // case-insensitive (RFC 3986 / DNS).
+    let authority = scheme_authority(tag);
     let (tag_host, tag_port) = split_host_port(authority);
     let authority = authority_of(identity);
     let (our_host, our_port) = split_host_port(&authority);
-    tag_host == our_host && (tag_port == our_port || tag_port.is_none())
+    tag_host.eq_ignore_ascii_case(our_host) && (tag_port == our_port || tag_port.is_none())
+}
+
+/// The authority part of a URL behind a known scheme (case-insensitive),
+/// or the whole input when the scheme is unknown or absent: "WSS://HOST/p"
+/// and "wss://HOST/p" both yield "HOST/p".
+fn scheme_authority(url: &str) -> &str {
+    match url.split_once("://") {
+        Some((scheme, rest)) if is_known_scheme(scheme) => {
+            rest.split(['/', '?', '#']).next().unwrap_or(rest)
+        }
+        _ => url,
+    }
+}
+
+fn is_known_scheme(scheme: &str) -> bool {
+    matches!(
+        scheme.to_ascii_lowercase().as_str(),
+        "wss" | "ws" | "https" | "http"
+    )
 }
 
 pub(crate) fn authority_of(identity: &RelayIdentity<'_>) -> String {
-    if let Some(rest) = identity
-        .public_url
-        .strip_prefix("wss://")
-        .or_else(|| identity.public_url.strip_prefix("ws://"))
-        .or_else(|| identity.public_url.strip_prefix("https://"))
-        .or_else(|| identity.public_url.strip_prefix("http://"))
-    {
-        let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
-        return authority.to_string();
+    if !identity.public_url.is_empty() {
+        let authority = scheme_authority(identity.public_url);
+        if authority != identity.public_url {
+            return authority.to_string();
+        }
     }
     // IPv6 literals must be bracketed to form a valid authority.
     if identity.host.contains(':') {
@@ -196,5 +206,24 @@ mod tests {
             ("relay.example.com", None)
         );
         assert_eq!(split_host_port("192.0.2.1:80"), ("192.0.2.1", Some(80)));
+    }
+    #[test]
+    fn url_matching_is_case_insensitive() {
+        // DNS hostnames are case-insensitive: a differently-cased relay URL
+        // must still match.
+        let identity = RelayIdentity::new("relay.example.com", 8080, "");
+        assert!(targets_us(
+            &event("WSS://RELAY.EXAMPLE.COM:8080"),
+            &identity
+        ));
+        assert!(targets_us(
+            &event("wss://Relay.Example.Com:8080/path"),
+            &identity
+        ));
+        // A different host still fails.
+        assert!(!targets_us(
+            &event("wss://OTHER.EXAMPLE.COM:8080"),
+            &identity
+        ));
     }
 }

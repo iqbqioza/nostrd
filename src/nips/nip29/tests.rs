@@ -414,3 +414,19 @@ fn rebuild_keeps_join_membership() {
         assert!(g.is_member(OTHER), "JOIN membership survives rebuild");
     });
 }
+
+#[test]
+fn join_to_unknown_group_is_rejected() {
+    // A JOIN for a group that does not exist (yet) would be stored but
+    // never honored — the state machine has no group to admit the user
+    // into — so it is rejected like every other moderation event for an
+    // unknown group. Only a 9007 create-group may target an unknown group.
+    let store = GroupStore::default();
+    let join = event(JOIN, USER, Some("ghost"), vec![]);
+    assert_eq!(
+        store.validate_write(&join).unwrap_err(),
+        "restricted: unknown group"
+    );
+    let create = event(CREATE_GROUP, USER, Some("ghost"), vec![]);
+    assert!(store.validate_write(&create).is_ok());
+}

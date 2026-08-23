@@ -716,6 +716,9 @@ fn warn_unknown_fields(raw: &str) {
         return;
     };
     let known: &[(&str, &[&str])] = &[
+        // `software`/`version` were part of the older config template and
+        // are recognized (and ignored) so operators upgrading from it are
+        // not warned about them on every start.
         (
             "relay",
             &[
@@ -732,6 +735,8 @@ fn warn_unknown_fields(raw: &str) {
                 "livekit_api_secret",
                 "enabled_nips",
                 "disabled_nips",
+                "software",
+                "version",
             ],
         ),
         (

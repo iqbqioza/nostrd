@@ -173,6 +173,12 @@ impl super::Conn {
         }
         if let Some(old) = self.neg.remove(&sub_id) {
             self.neg_total = self.neg_total.saturating_sub(old.items.len());
+            // Release the subscription slot of the replaced negentropy
+            // subscription (the new one re-acquires it below).
+            self.relay
+                .stats
+                .subscriptions_active
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
 
         match nip77::respond(&items, &initial) {
@@ -185,6 +191,13 @@ impl super::Conn {
                         rounds_left: MAX_NEG_MSG_ROUNDS,
                     },
                 );
+                // NEG-OPEN subscriptions are active subscriptions: they hold
+                // filters and items until closed, so they count towards
+                // `subscriptions_active` like REQ subscriptions.
+                self.relay
+                    .stats
+                    .subscriptions_active
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.send_neg_msg(&sub_id, &response);
             }
             Err(reason) => {
@@ -219,6 +232,7 @@ impl super::Conn {
         if state.rounds_left == 0 {
             if let Some(state) = self.neg.remove(&sub_id) {
                 self.neg_total = self.neg_total.saturating_sub(state.items.len());
+                self.release_neg_stats_subscription();
             }
             self.send_neg_err(&sub_id, "error: too many negentropy messages");
             return;
@@ -229,10 +243,20 @@ impl super::Conn {
             Err(reason) => {
                 if let Some(state) = self.neg.remove(&sub_id) {
                     self.neg_total = self.neg_total.saturating_sub(state.items.len());
+                    self.release_neg_stats_subscription();
                 }
                 self.send_neg_err(&sub_id, &format!("error: {reason}"));
             }
         }
+    }
+
+    /// Decrements `subscriptions_active` for a closed negentropy
+    /// subscription (every NEG-OPEN success acquired one slot).
+    pub(crate) fn release_neg_stats_subscription(&self) {
+        self.relay
+            .stats
+            .subscriptions_active
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub(crate) fn handle_neg_close(&mut self, rest: &[Value]) {
@@ -242,6 +266,7 @@ impl super::Conn {
         };
         if let Some(state) = self.neg.remove(&sub_id) {
             self.neg_total = self.neg_total.saturating_sub(state.items.len());
+            self.release_neg_stats_subscription();
         }
     }
 }
