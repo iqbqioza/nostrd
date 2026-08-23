@@ -636,12 +636,16 @@ impl Store {
             return Ok(out.full());
         }
 
-        if filter.has_search() {
+        if filter.has_search() && !terms.is_empty() {
             // With the word index available, scan the index of every term
             // and union the candidates in one merged walk (a note matching
             // only the second term must still be found, and the limit
             // applies to the union). Without the index, fall through to the
             // time-range scans, where the terms are checked per event.
+            // `terms` may be empty when the query consisted only of
+            // `key:value` extensions (NIP-50: unsupported extensions are
+            // ignored); such a query matches everything, like an empty
+            // search would.
             if let Some(by_word) = self.by_word {
                 let mut ranges: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(terms.len());
                 for word in terms {

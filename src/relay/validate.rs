@@ -4,7 +4,7 @@
 
 use crate::config::{AccessControl, Config};
 use crate::event::Event;
-use crate::nips::{nip01, nip13, nip26, nip29, nip43, nip62, nip70};
+use crate::nips::{nip01, nip09, nip13, nip26, nip29, nip43, nip62, nip70};
 
 /// A bech32-encoded nsec secret key is `nsec1` followed by 58 characters
 /// (52 data characters plus a 6-character checksum), 63 characters in total.
@@ -127,6 +127,18 @@ impl super::Relay {
         // NIP-01: each tag is an array of one or more strings.
         if event.tags.iter().any(|t| t.is_empty()) {
             return Err("invalid: empty tag".into());
+        }
+        // NIP-09: a deletion request is defined as having a list of one or
+        // more `e` or `a` tags. A kind-5 event with no targets has no
+        // effect and would only accumulate as meaningless history.
+        if cfg.nip_enabled(9)
+            && event.kind == nip09::DELETION_KIND
+            && !event
+                .tags
+                .iter()
+                .any(|t| t.len() >= 2 && (t[0] == "e" || t[0] == "a"))
+        {
+            return Err("invalid: deletion request must reference at least one event".into());
         }
 
         // NIP-11's `max_content_length` is a count of unicode characters,
