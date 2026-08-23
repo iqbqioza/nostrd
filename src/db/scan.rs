@@ -363,6 +363,14 @@ impl Store {
     }
 
     /// Collects events that match the filters, most recent first.
+    ///
+    /// `hidden_slack` lets a REQ over-fetch each filter's limit by a factor
+    /// (`limit * (hidden_slack + 1)`, capped at `max_limit`) so that events
+    /// hidden by the connection-level visibility rules (NIP-70 protected,
+    /// NIP-59 gift wraps, NIP-29 private/hidden groups) do not consume the
+    /// limit slots; the connection truncates the visible results back to the
+    /// requested limits. Pass 0 for COUNT, negentropy and the API.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn scan(
         &self,
         filters: &[Filter],
@@ -371,6 +379,7 @@ impl Store {
         count_mode: bool,
         ascending: bool,
         budget: usize,
+        hidden_slack: usize,
     ) -> Result<(Vec<Event>, bool)> {
         let has_search = filters.iter().any(Filter::has_search);
         // NIP-50: relevance ordering needs more candidates than the response
@@ -388,7 +397,16 @@ impl Store {
             ScanKind::Query
         };
         let mut out = EventCollector::new(collect_cap, !count_mode);
-        let more = self.scan_collect(filters, now, max_limit, kind, ascending, budget, &mut out)?;
+        let more = self.scan_collect(
+            filters,
+            now,
+            max_limit,
+            kind,
+            ascending,
+            budget,
+            hidden_slack,
+            &mut out,
+        )?;
         Ok((out.events, more))
     }
 
@@ -417,6 +435,7 @@ impl Store {
             ScanKind::Negentropy,
             false,
             budget,
+            0,
             &mut out,
         )?;
         Ok((out.items, more))
@@ -435,6 +454,7 @@ impl Store {
         kind: ScanKind,
         ascending: bool,
         budget: usize,
+        hidden_slack: usize,
         out: &mut C,
     ) -> Result<bool> {
         let count_mode = matches!(kind, ScanKind::Count);
@@ -479,7 +499,14 @@ impl Store {
                 // collection budget.
                 out.cap()
             } else {
-                filter.limit.unwrap_or(max_limit).min(max_limit)
+                let base = filter.limit.unwrap_or(max_limit).min(max_limit);
+                // Hidden-event slack: events withheld by the connection's
+                // visibility rules (NIP-70/59/29) must not consume the
+                // per-filter limit slots, so a REQ over-fetches a little
+                // and the connection truncates the visible results back to
+                // the requested limits.
+                base.saturating_mul(hidden_slack.saturating_add(1))
+                    .min(max_limit)
             };
             let terms = if has_search {
                 let terms = nip50::terms(filter.search.as_deref().unwrap_or(""));
@@ -669,7 +696,11 @@ impl Store {
             return Ok(out.full());
         }
 
-        if let Some((name, values)) = filter.tags.iter().next() {
+        // Only `#`-prefixed keys are tag constraints (NIP-01); an unknown
+        // non-`#` key (e.g. a typo like `"kind"`) is ignored by the scan
+        // just like it is by the final in-memory match, so it cannot turn
+        // the filter into an impossible query.
+        if let Some((name, values)) = filter.tags.iter().find(|(n, _)| n.starts_with('#')) {
             let tag_name = name.strip_prefix('#').unwrap_or(name);
             if tag_name.len() == 1 {
                 let name_byte = tag_name.as_bytes()[0];

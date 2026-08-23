@@ -584,7 +584,9 @@ impl AccessControl {
     }
 }
 
-/// Escapes a string for a TOML basic string literal.
+/// Escapes a string for a TOML basic string literal. The TOML spec requires
+/// every control character (U+0000-U+0008, U+000A-U+001F, U+007F) to be
+/// escaped; leaving one raw would make the written config file unparseable.
 pub(crate) fn toml_escape(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 8);
     for ch in value.chars() {
@@ -594,7 +596,7 @@ pub(crate) fn toml_escape(value: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\t' => out.push_str("\\t"),
             '\r' => out.push_str("\\r"),
-            c if (c as u32) < 0x20 => {
+            c if c.is_control() => {
                 out.push_str(&format!("\\u{:04x}", c as u32));
             }
             c => out.push(c),
@@ -827,11 +829,21 @@ fn warn_unknown_fields(raw: &str) {
     let Some(table) = value.as_table() else {
         return;
     };
-    for (section, keys) in known {
-        let Some(Some(t)) = table.get(*section).map(toml::Value::as_table) else {
+    // Unknown top-level sections (e.g. a typo'd `[serve]` instead of
+    // `[server]`) are silently ignored by serde; warn so the operator
+    // notices the section never took effect.
+    for (section, table) in table {
+        let Some(keys) = known.iter().find(|(s, _)| s == section).map(|(_, k)| *k) else {
+            log::warn!(
+                "unknown config section [{section}] is ignored; check the spelling \
+                 (the relay runs with the defaults for this section)"
+            );
             continue;
         };
-        for (key, _) in t {
+        let Some(table) = table.as_table() else {
+            continue;
+        };
+        for (key, _) in table {
             if !keys.contains(&key.as_str()) {
                 log::warn!(
                     "unknown config key [{section}].{key} is ignored; check the spelling \
@@ -961,4 +973,23 @@ mod tests {
             "max_connections must be at least 1"
         );
     }
+
+    #[test]
+    fn toml_escape_handles_all_control_chars() {
+        // U+007F (DEL) and other control characters must be escaped: the
+        // toml crate rejects them raw in basic strings.
+        for ch in ['\u{0}', '\u{7f}', '\u{1f}'] {
+            let escaped = toml_escape(&format!("a{ch}b"));
+            assert!(
+                !escaped.contains(ch),
+                "control character must be escaped, got {escaped:?}"
+            );
+            assert!(
+                toml::from_str::<toml::Value>(&format!("x = \"{escaped}\"")).is_ok(),
+                "escaped output must parse as TOML"
+            );
+        }
+        assert_eq!(toml_escape("quote\\backslash"), "quote\\\\backslash");
+    }
+
 }

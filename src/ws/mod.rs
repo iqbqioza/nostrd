@@ -850,4 +850,43 @@ mod tests {
             conn.relay.db.shutdown();
         });
     }
+
+    #[test]
+    fn req_hidden_events_do_not_consume_limit_slots() {
+        // Regression: NIP-70 protected events used to consume the per-filter
+        // limit during the scan, so a REQ with limit N returned fewer than N
+        // visible events (and re-REQing could never recover them). The scan
+        // now over-fetches and the connection truncates the visible results.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            let hidden = signed_note(
+                conn.relay.secp(),
+                "secret",
+                now,
+                vec![vec!["-".into()]],
+            );
+            let v1 = signed_note(conn.relay.secp(), "v1", now - 1, vec![]);
+            let v2 = signed_note(conn.relay.secp(), "v2", now - 2, vec![]);
+            let v3 = signed_note(conn.relay.secp(), "v3", now - 3, vec![]);
+            for e in [&hidden, &v1, &v2, &v3] {
+                conn.relay.db.put(e.clone(), now).await;
+            }
+            conn.handle_req(&[json!("sub"), json!({"kinds": [1], "limit": 3})])
+                .await;
+            let contents: Vec<String> = outgoing_json(&conn)
+                .iter()
+                .filter(|m| m[0] == "EVENT")
+                .map(|m| m[2]["content"].as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(
+                contents,
+                vec!["v1", "v2", "v3"],
+                "the hidden event must not consume a limit slot"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
 }

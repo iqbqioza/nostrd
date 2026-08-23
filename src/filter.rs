@@ -100,6 +100,12 @@ impl Filter {
             return false;
         }
         self.tags.iter().all(|(name, value)| {
+            // NIP-01: tag constraints are `#`-prefixed; any other key is an
+            // unknown filter field and is ignored (a typo like `"kind"` must
+            // not silently turn the whole filter into an impossible query).
+            if !name.starts_with('#') {
+                return true;
+            }
             let tag_name = name.strip_prefix('#').unwrap_or(name);
             let values = tag_string_values(value);
             values.iter().any(|v| {
@@ -227,4 +233,21 @@ mod tests {
         f.authors = Some(vec!["a".repeat(64); MAX_FILTER_MEMBERS + 1]);
         assert!(f.too_many_members());
     }
+
+    #[test]
+    fn unknown_non_tag_filter_keys_are_ignored() {
+        // NIP-01: tag constraints are `#`-prefixed; a typo like `"kind"`
+        // must not turn the filter into an impossible query (0 results) —
+        // it is ignored, so the filter matches by its other constraints.
+        let e = ev(1, vec![vec!["t".into(), "rust".into()]]);
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"kind": [1], "kinds": [1]})).unwrap();
+        assert!(f.matches(&e), "the unknown `kind` key must be ignored");
+        let f: Filter = serde_json::from_value(serde_json::json!({"foo": "bar"})).unwrap();
+        assert!(f.matches(&e), "an unknown non-tag key matches everything else");
+        // `#`-prefixed keys still constrain.
+        let f: Filter = serde_json::from_value(serde_json::json!({"#t": ["go"]})).unwrap();
+        assert!(!f.matches(&e));
+    }
+
 }

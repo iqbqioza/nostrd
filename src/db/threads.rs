@@ -62,9 +62,18 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             now,
             ascending,
             budget,
+            hidden_slack,
             reply,
         } => {
-            let out = match store.scan(&filters, now, limit, false, ascending, budget) {
+            let out = match store.scan(
+                &filters,
+                now,
+                limit,
+                false,
+                ascending,
+                budget,
+                hidden_slack,
+            ) {
                 Ok(out) => out,
                 Err(e) => {
                     db_error(errors, &e);
@@ -96,7 +105,7 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             now,
             reply,
         } => {
-            let out = match store.scan(&filters, now, limit, true, false, SCAN_BUDGET) {
+            let out = match store.scan(&filters, now, limit, true, false, SCAN_BUDGET, 0) {
                 Ok(out) => out,
                 Err(e) => {
                     db_error(errors, &e);
@@ -359,11 +368,18 @@ pub(crate) fn spawn(
                                     now,
                                     ascending,
                                     budget,
+                                    hidden_slack,
                                     reply,
                                 } => {
-                                    let out = match store
-                                        .scan(&filters, now, limit, false, ascending, budget)
-                                    {
+                                    let out = match store.scan(
+                                        &filters,
+                                        now,
+                                        limit,
+                                        false,
+                                        ascending,
+                                        budget,
+                                        hidden_slack,
+                                    ) {
                                         Ok(out) => out,
                                         Err(e) => {
                                             db_error(&thread_errors, &e);
@@ -401,6 +417,7 @@ pub(crate) fn spawn(
                                         true,
                                         false,
                                         SCAN_BUDGET,
+                                        0,
                                     ) {
                                         Ok(out) => out,
                                         Err(e) => {

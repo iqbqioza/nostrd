@@ -1485,11 +1485,11 @@ fn query_directed_ascending() {
         }
 
         let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap();
-        let (desc, _) = db.query_directed(vec![f.clone()], 500, now, false).await;
+        let (desc, _) = db.query_directed(vec![f.clone()], 500, now, false, 0).await;
         let ids: Vec<_> = desc.iter().map(|e| e.created_at).collect();
         assert_eq!(ids, vec![now, now - 100, now - 200]);
 
-        let (asc, _) = db.query_directed(vec![f], 500, now, true).await;
+        let (asc, _) = db.query_directed(vec![f], 500, now, true, 0).await;
         let ids: Vec<_> = asc.iter().map(|e| e.created_at).collect();
         assert_eq!(ids, vec![now - 200, now - 100, now]);
 
@@ -1500,6 +1500,7 @@ fn query_directed_ascending() {
                 2,
                 now,
                 true,
+                0,
             )
             .await;
         let ids: Vec<_> = asc2.iter().map(|e| e.created_at).collect();
@@ -1751,5 +1752,43 @@ fn long_dtags_do_not_collide_in_the_replaceable_index() {
             assert_eq!(res.len(), 1, "address {d:?} must resolve uniquely");
             assert_eq!(res[0].content, content);
         }
+    });
+}
+
+#[test]
+fn unknown_filter_keys_are_ignored_by_the_scan() {
+    // Regression: a filter carrying an unknown non-`#` key (e.g. a typo'd
+    // `"kind"`) must not silently return zero events — the key is ignored
+    // and the remaining constraints apply.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let e1 = event(1, "one", now, vec![vec!["t".into(), "rust".into()]]);
+        assert_eq!(db.put(e1.clone(), now).await, PutOutcome::Stored);
+
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"kind": [1], "kinds": [1]})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 1, "the unknown `kind` key must be ignored");
+
+        let f: Filter = serde_json::from_value(serde_json::json!({"foo": "bar"})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 1, "a filter with only unknown keys matches all");
+
+        // A `#`-prefixed constraint still applies.
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"foo": 1, "#t": ["go"]})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 0);
     });
 }

@@ -77,6 +77,10 @@ enum Msg {
         /// Upper bound on the number of index candidates the scan may
         /// examine before giving up (anti-DoS work budget).
         budget: usize,
+        /// REQ-only over-fetch factor for the per-filter limits, so events
+        /// hidden by the connection-level visibility rules (NIP-70/59/29)
+        /// do not consume the limit slots (see [`scan::Store::scan`]).
+        hidden_slack: usize,
         reply: oneshot::Sender<(Vec<Event>, bool)>,
     },
     /// Accepts many events in a single write transaction (one commit).
@@ -343,17 +347,28 @@ impl DbClient {
     }
 
     pub async fn query(&self, filters: Vec<Filter>, limit: usize, now: u64) -> (Vec<Event>, bool) {
-        self.query_directed(filters, limit, now, false).await
+        self.query_directed(filters, limit, now, false, 0).await
+    }
+
+    /// WebSocket REQ query: like [`Self::query`] but with the hidden-event
+    /// slack enabled (the scan over-fetches each filter's limit so that
+    /// events withheld by the connection's visibility rules do not consume
+    /// the limit slots; the connection truncates the visible results).
+    pub async fn query_req(&self, filters: Vec<Filter>, limit: usize, now: u64) -> (Vec<Event>, bool) {
+        self.query_directed(filters, limit, now, false, 1).await
     }
 
     /// Like [`Self::query`] but with an explicit scan direction: `false`
     /// returns newest events first (NIP-01), `true` returns oldest first.
+    /// `hidden_slack` over-fetches the per-filter limits (see
+    /// [`Msg::Query`]); the WebSocket REQ path uses 1, every other caller 0.
     pub async fn query_directed(
         &self,
         filters: Vec<Filter>,
         limit: usize,
         now: u64,
         ascending: bool,
+        hidden_slack: usize,
     ) -> (Vec<Event>, bool) {
         self.request_read(|reply| Msg::Query {
             filters,
@@ -361,6 +376,7 @@ impl DbClient {
             now,
             ascending,
             budget: SCAN_BUDGET,
+            hidden_slack,
             reply,
         })
         .await
@@ -382,6 +398,7 @@ impl DbClient {
             now,
             ascending: false,
             budget: FULL_SCAN_BUDGET,
+            hidden_slack: 0,
             reply,
         })
         .await
@@ -413,6 +430,7 @@ impl DbClient {
             now,
             ascending,
             budget: SCAN_BUDGET,
+            hidden_slack: 0,
             reply: tx,
         };
         if self.api_read_tx.send(msg).is_err() {

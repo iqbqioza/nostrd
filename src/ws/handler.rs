@@ -263,7 +263,16 @@ impl super::Conn {
         }
 
         let now = unix_now();
-        let (events, more) = self.relay.db.query(stored, max_limit, now).await;
+        // The scan over-fetches each filter's limit (hidden-event slack) so
+        // that events withheld by the visibility rules below do not consume
+        // the limit slots; the visible results are then truncated back to
+        // the requested per-filter limits (their sum, since the scan unions
+        // the filters).
+        let original_total: usize = stored
+            .iter()
+            .map(|f| f.limit.unwrap_or(max_limit).min(max_limit))
+            .sum();
+        let (events, more) = self.relay.db.query_req(stored, max_limit, now).await;
         let mut to_send = Vec::new();
         {
             let groups = self.relay.groups.read().await;
@@ -274,12 +283,14 @@ impl super::Conn {
                 to_send.push(event);
             }
         }
+        let truncated = to_send.len() > original_total;
+        to_send.truncate(original_total);
         for event in to_send {
             self.send_json(json!(["EVENT", sub_id, event]));
         }
         // NIP-67: EOSE completeness hint.
         if eose_hint {
-            let hint = if more { "more" } else { "finish" };
+            let hint = if more || truncated { "more" } else { "finish" };
             self.send_json(json!(["EOSE", sub_id, [hint]]));
         } else {
             self.send_json(json!(["EOSE", sub_id]));
