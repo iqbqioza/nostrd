@@ -116,6 +116,8 @@ pub struct GroupSettings {
     pub picture: String,
     pub banner: String,
     pub about: String,
+    /// NIP-29: the group supports LiveKit audio/video rooms.
+    pub livekit: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -173,7 +175,10 @@ impl GroupStore {
         }
         let Some(group) = self.groups.get(gid) else {
             // Unknown groups are open: only a create-group event may target
-            // them explicitly.
+            // them explicitly. A JOIN to a group that does not exist (yet)
+            // would be stored but never honored (the state machine has no
+            // group to admit the user into), so it is rejected here like
+            // every other moderation event for an unknown group.
             if event.kind == CREATE_GROUP {
                 return Ok(());
             }
@@ -562,6 +567,13 @@ impl GroupStore {
         // tie-breaker: the group-establishing events apply first (9007 create,
         // 9008 delete), then the member/settings operations (9000-9006,
         // 9009-9010) which need the group to exist, and joins/leaves last.
+        // Known limitation: events of the same kind within the same second
+        // are ordered by id, not by arrival — two conflicting 9000 edits in
+        // the same second (e.g. grant-then-revoke of a role) may replay in
+        // the wrong order after a restart. The relay stamps its generated
+        // metadata strictly monotonic, so the *stored* 39000-39005 always
+        // reflect the latest state; only the in-memory member map could
+        // diverge until the next edit.
         events.sort_by(|a, b| {
             (a.created_at, group_rank(a.kind), a.kind, &a.id).cmp(&(
                 b.created_at,
@@ -598,6 +610,12 @@ fn validate_edit_metadata(
     group: &Group,
     event: &Event,
 ) -> Result<(), String> {
+    // NIP-29: "A kind:9002 MAY carry at most one parent tag". A second
+    // parent tag would be silently ignored (only the first is applied), so
+    // the edit is rejected outright instead.
+    if tag_values(event, "parent").count() > 1 {
+        return Err("restricted: at most one parent tag is allowed".into());
+    }
     // A parent value must not create a cycle or self-reference, and the
     // parent must exist and the author must be its admin.
     if let Some(parent) = tag_value(event, H).and_then(|_| tag_value(event, "parent")) {

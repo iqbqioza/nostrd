@@ -845,9 +845,13 @@ fn access_control_persists_across_reopen() {
             )
             .unwrap();
             let mut access = crate::config::AccessControl::default();
-            access.blocked_pubkeys.push("aa".repeat(32));
+            access
+                .blocked_pubkeys
+                .push(("aa".repeat(32), String::new()));
             access.allowed_kinds.push(5);
-            access.blocked_ips.push("203.0.113.9".into());
+            access
+                .blocked_ips
+                .push(("203.0.113.9".into(), String::new()));
             db.save_access(access.clone()).await;
             let loaded = db.load_access().await.expect("persisted access loads");
             assert_eq!(loaded.blocked_pubkeys, access.blocked_pubkeys);
@@ -866,9 +870,15 @@ fn access_control_persists_across_reopen() {
         )
         .unwrap();
         let loaded = db.load_access().await.expect("persisted access loads");
-        assert_eq!(loaded.blocked_pubkeys, vec!["aa".repeat(32)]);
+        assert_eq!(
+            loaded.blocked_pubkeys,
+            vec![("aa".repeat(32), String::new())]
+        );
         assert_eq!(loaded.allowed_kinds, vec![5]);
-        assert_eq!(loaded.blocked_ips, vec![String::from("203.0.113.9")]);
+        assert_eq!(
+            loaded.blocked_ips,
+            vec![(String::from("203.0.113.9"), String::new())]
+        );
     });
 }
 
@@ -1485,11 +1495,11 @@ fn query_directed_ascending() {
         }
 
         let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap();
-        let (desc, _) = db.query_directed(vec![f.clone()], 500, now, false).await;
+        let (desc, _) = db.query_directed(vec![f.clone()], 500, now, false, 0).await;
         let ids: Vec<_> = desc.iter().map(|e| e.created_at).collect();
         assert_eq!(ids, vec![now, now - 100, now - 200]);
 
-        let (asc, _) = db.query_directed(vec![f], 500, now, true).await;
+        let (asc, _) = db.query_directed(vec![f], 500, now, true, 0).await;
         let ids: Vec<_> = asc.iter().map(|e| e.created_at).collect();
         assert_eq!(ids, vec![now - 200, now - 100, now]);
 
@@ -1500,6 +1510,7 @@ fn query_directed_ascending() {
                 2,
                 now,
                 true,
+                0,
             )
             .await;
         let ids: Vec<_> = asc2.iter().map(|e| e.created_at).collect();
@@ -1660,5 +1671,160 @@ fn api_query_uses_dedicated_reader_and_stays_healthy() {
         let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap();
         let (res, _) = db.query(vec![f], 500, now).await;
         assert_eq!(res.len(), 64);
+    });
+}
+
+#[test]
+fn mixed_search_and_plain_filters_return_the_union() {
+    // Regression: a REQ mixing a search filter and a plain filter must
+    // return the union of both (each with its own limit), not a response
+    // truncated to the search filters' limits — the old code applied the
+    // global relevance truncation to the whole output, silently dropping
+    // every plain-filter result.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let hit = event(1, "needle in a haystack", now, vec![]);
+        let plain1 = event(1, "plain one", now - 1, vec![]);
+        let plain2 = event(1, "plain two", now - 2, vec![]);
+        for ev in [&hit, &plain1, &plain2] {
+            assert_eq!(db.put(ev.clone(), now).await, PutOutcome::Stored);
+        }
+
+        let f: Vec<Filter> = serde_json::from_value(serde_json::json!([
+            {"search": "needle", "limit": 1},
+            {"kinds": [1], "limit": 2}
+        ]))
+        .unwrap();
+        let (res, _) = db.query(f, 500, now).await;
+        // The old code truncated the whole response to the search filters'
+        // limits, dropping every plain-filter result (only the hit would
+        // come back). The plain filter must now contribute its own events
+        // (the per-filter created_at boundary may cut the second plain
+        // event: it shares no timestamp with the limit-filling one).
+        assert_eq!(res.len(), 2, "search hit plus one plain event");
+        let ids: Vec<String> = res.iter().map(|e| e.id.clone()).collect();
+        assert!(ids.contains(&hit.id));
+        assert!(ids.contains(&plain1.id));
+    });
+}
+
+#[test]
+fn long_dtags_do_not_collide_in_the_replaceable_index() {
+    // Regression: two addressable events whose long `d` tags share the
+    // same prefix used to collide in the replaceable index (both truncated
+    // to the same key), making one replace the other. The index key now
+    // carries a fingerprint of the full value.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let d1 = format!("{}x", "a".repeat(600));
+        let d2 = format!("{}y", "a".repeat(600));
+        let e1 = event(30023, "one", now, vec![vec!["d".into(), d1.clone()]]);
+        let e2 = event(30023, "two", now, vec![vec!["d".into(), d2.clone()]]);
+        assert_eq!(db.put(e1.clone(), now).await, PutOutcome::Stored);
+        assert_eq!(
+            db.put(e2.clone(), now).await,
+            PutOutcome::Stored,
+            "a distinct long d tag must not be replaced by its prefix twin"
+        );
+
+        // Both events are individually addressable: querying each address
+        // returns its own version.
+        for (d, content) in [(&d1, "one"), (&d2, "two")] {
+            let f: Filter = serde_json::from_value(serde_json::json!({
+                "kinds": [30023],
+                "authors": ["0000000000000000000000000000000000000000000000000000000000000000"],
+                "#d": [d]
+            }))
+            .unwrap();
+            let (res, _) = db.query(vec![f], 500, now).await;
+            assert_eq!(res.len(), 1, "address {d:?} must resolve uniquely");
+            assert_eq!(res[0].content, content);
+        }
+    });
+}
+
+#[test]
+fn unknown_filter_keys_are_ignored_by_the_scan() {
+    // Regression: a filter carrying an unknown non-`#` key (e.g. a typo'd
+    // `"kind"`) must not silently return zero events — the key is ignored
+    // and the remaining constraints apply.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let e1 = event(1, "one", now, vec![vec!["t".into(), "rust".into()]]);
+        assert_eq!(db.put(e1.clone(), now).await, PutOutcome::Stored);
+
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"kind": [1], "kinds": [1]})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 1, "the unknown `kind` key must be ignored");
+
+        let f: Filter = serde_json::from_value(serde_json::json!({"foo": "bar"})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 1, "a filter with only unknown keys matches all");
+
+        // A `#`-prefixed constraint still applies.
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"foo": 1, "#t": ["go"]})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 0);
+    });
+}
+
+#[test]
+fn search_finds_big_events() {
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let content = format!("needle-{}", "z".repeat(300_000));
+        let e = event(1, &content, now, vec![]);
+        assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
+        let f: Filter = serde_json::from_value(serde_json::json!({"search": "needle"})).unwrap();
+        let (res, _) = db.query(vec![f.clone()], 500, now).await;
+        assert_eq!(res.len(), 1, "search must find the 300KB event");
+        let (res2, _) = db.query_req(vec![f], 500, now).await;
+        assert_eq!(res2.len(), 1);
     });
 }

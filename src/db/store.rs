@@ -448,20 +448,34 @@ pub(crate) fn replaceable_key(kind: u64, pubkey: &[u8], dtag: &str) -> Vec<u8> {
     key
 }
 
-/// Truncates a `d` tag at a character boundary to a byte length that keeps
-/// the replaceable index key under LMDB's key-size limit (see
-/// [`MAX_INDEX_KEY`]). Only used for the index key; the stored event keeps
-/// its full `d` tag.
-pub(crate) fn dtag_key_safe(dtag: &str) -> &str {
+/// Builds the index-key form of a `d` tag: the value itself when it fits
+/// under LMDB's key-size limit (see [`MAX_INDEX_KEY`]), otherwise a
+/// truncated prefix followed by a 4-byte fingerprint of the full value.
+/// The fingerprint guarantees that two distinct long `d` tags sharing the
+/// same prefix never collide in the index (a collision would make one
+/// replace the other, breaking NIP-33); the stored event keeps its full
+/// `d` tag.
+pub(crate) fn dtag_key_safe(dtag: &str) -> String {
     let max = MAX_INDEX_KEY.saturating_sub(CREATED_LEN + ID_LEN + 4);
     if dtag.len() <= max {
-        return dtag;
+        return dtag.to_string();
     }
-    let mut end = max;
+    // Reserve 8 hex chars (4 bytes) of fingerprint space.
+    let mut end = max.saturating_sub(8);
     while end > 0 && !dtag.is_char_boundary(end) {
         end -= 1;
     }
-    &dtag[..end]
+    let mut key = String::with_capacity(end + 8);
+    key.push_str(&dtag[..end]);
+    key.push_str(&dtag_fingerprint(dtag));
+    key
+}
+
+/// 8 hex characters (4 bytes) of the sha256 of `value`.
+fn dtag_fingerprint(value: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(value.as_bytes());
+    hex::encode(&digest[..4])
 }
 impl Store {
     // ----- event persistence -----
@@ -526,7 +540,7 @@ impl Store {
             // enough to exceed LMDB's key-size limit would abort the whole
             // write batch, and realistic addressable events use short `d`
             // tags. The stored event keeps its full `d` tag.
-            let rkey = replaceable_key(event.kind, &pubkey, dtag_key_safe(&dtag));
+            let rkey = replaceable_key(event.kind, &pubkey, &dtag_key_safe(&dtag));
             let old = self.replaceable.get(wtxn, &rkey)?;
             let had_old = old.is_some();
             if let Some(old) = old
@@ -647,7 +661,7 @@ impl Store {
             };
             self.replaceable.delete(
                 wtxn,
-                &replaceable_key(event.kind, &pubkey, dtag_key_safe(&dtag)),
+                &replaceable_key(event.kind, &pubkey, &dtag_key_safe(&dtag)),
             )?;
         }
         self.by_pubkey
@@ -728,33 +742,6 @@ impl Store {
             }
             _ => Ok((true, 0)),
         }
-    }
-
-    pub(crate) fn replaceable_created_at(
-        &self,
-        kind: u64,
-        pubkey: &str,
-        d: &str,
-    ) -> Result<Option<u64>> {
-        let Ok(pubkey) = hex::decode(pubkey) else {
-            return Ok(None);
-        };
-        if pubkey.len() != ID_LEN {
-            return Ok(None);
-        }
-        let rtxn = self.env.read_txn()?;
-        // The stored slot key truncates over-long `d` tags (see
-        // `put_event_in` / `dtag_key_safe`), so the lookup must too.
-        let key = replaceable_key(kind, &pubkey, dtag_key_safe(d));
-        let Some(value) = self.replaceable.get(&rtxn, &key)? else {
-            return Ok(None);
-        };
-        if value.len() < CREATED_LEN {
-            return Ok(None);
-        }
-        Ok(Some(u64::from_be_bytes(
-            value[..CREATED_LEN].try_into().unwrap(),
-        )))
     }
 
     /// Returns `true` when an event whose id starts with `prefix` is stored.

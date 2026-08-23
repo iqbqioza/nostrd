@@ -56,6 +56,13 @@ pub struct Conn {
     /// Events received but not yet accepted; flushed in batches so the
     /// database commit cost is amortized over many events.
     pub(crate) pending_events: Vec<Event>,
+    /// Live-event receiver, created when the first REQ subscribes (before
+    /// the query runs, so no stored event can fall into the gap between the
+    /// query and the subscription) and dropped when the last subscription
+    /// closes, so connections without active subscriptions are never woken
+    /// by live events. A duplicate delivery of an event that is both in the
+    /// query result and live is harmless (clients deduplicate by id).
+    pub(crate) live: Option<tokio::sync::broadcast::Receiver<Arc<Vec<Event>>>>,
     /// Whether this connection delivers NIP-40 expired events live. Cached
     /// from the config on connect and refreshed whenever a message arrives,
     /// so the per-batch live path avoids the shared config lock.
@@ -92,6 +99,28 @@ impl Conn {
     pub(crate) fn send_json(&mut self, value: Value) {
         if let Ok(text) = serde_json::to_string(&value) {
             self.send(Message::Text(text.into()));
+        }
+    }
+
+    /// Queues a message without the outgoing byte cap: used for one-shot
+    /// REQ responses, where a dropped event is lost permanently (the
+    /// subscription is answered once). The byte cap exists to protect
+    /// memory against slow readers on *continuous* live traffic, where a
+    /// drop is recoverable; a REQ response is bounded by the scan's
+    /// `max_limit` and the message-count cap instead. Live delivery keeps
+    /// the capped path.
+    pub(crate) fn send_json_uncapped(&mut self, value: Value) {
+        if let Ok(text) = serde_json::to_string(&value) {
+            if self.outgoing.len() >= OUT_QUEUE_LIMIT {
+                self.dropped += 1;
+                self.relay.stats.bump(&self.relay.stats.buffers_dropped, 1);
+                return;
+            }
+            let size = text.len();
+            self.out_bytes += size;
+            self.out_msgs += 1;
+            self.out_bytes_total += size as u64;
+            self.outgoing.push_back(Message::Text(text.into()));
         }
     }
 
@@ -241,6 +270,12 @@ pub async fn handle_connection(
     });
 
     let challenge = nip42::generate_challenge();
+    // Blocked-IP version captured at connect: when the NIP-86 admin
+    // blocks (or unblocks) an IP, every connection re-checks the list and
+    // closes if its own source IP became blocked.
+    let mut blocks_version = relay
+        .ip_blocks_version
+        .load(std::sync::atomic::Ordering::Relaxed);
 
     let mut conn = Conn {
         relay,
@@ -254,6 +289,7 @@ pub async fn handle_connection(
         challenge,
         authed_pubkeys: Vec::new(),
         pending_events: Vec::new(),
+        live: None,
         expiry_enabled,
         giftwrap_restricted,
         dropped: 0,
@@ -263,11 +299,6 @@ pub async fn handle_connection(
         out_bytes_total: 0,
     };
     conn.send_auth_challenge().await;
-
-    // The live receiver is created lazily on the first REQ: connections
-    // that only publish never register with the broadcast channel, so they
-    // are not woken up by live events at all.
-    let mut live: Option<tokio::sync::broadcast::Receiver<Arc<Vec<Event>>>> = None;
 
     // A single task per connection: incoming messages and live batches are
     // processed in the same loop, and outgoing messages are flushed to the
@@ -283,7 +314,7 @@ pub async fn handle_connection(
             }
         }
         let live_fut = async {
-            match live.as_mut() {
+            match conn.live.as_mut() {
                 Some(rx) => rx.recv().await,
                 None => std::future::pending().await,
             }
@@ -320,6 +351,26 @@ pub async fn handle_connection(
                     Ok(Some(Err(_))) => break,
                     Ok(Some(Ok(frame))) => {
                         last_activity = std::time::Instant::now();
+                        // Re-check the blocked-IP list when it changed since
+                        // connect: a newly blocked IP's existing connections
+                        // are dropped (a version bump also re-checks after
+                        // an unblock; the list is then empty).
+                        let version =
+                            conn.relay.ip_blocks_version.load(std::sync::atomic::Ordering::Relaxed);
+                        if version != blocks_version {
+                            blocks_version = version;
+                            let blocked = conn
+                                .relay
+                                .access
+                                .read()
+                                .await
+                                .blocked_ips
+                                .iter()
+                                .any(|(b, _)| b.parse::<std::net::IpAddr>().is_ok_and(|b| b == peer_ip));
+                            if blocked {
+                                break;
+                            }
+                        }
                         if conn.handle_frame(frame, max_msg_size).await {
                             break;
                         }
@@ -356,14 +407,13 @@ pub async fn handle_connection(
                     break;
                 }
                 conn.flush_pending_events().await;
-                // Subscribe to live events once the first REQ arrives and
-                // drop the receiver again when every subscription is closed,
+                // Drop the receiver again when every subscription is closed,
                 // so connections without active subscriptions are never
-                // woken by live events.
-                if live.is_none() && !conn.subs.is_empty() {
-                    live = Some(conn.relay.live.subscribe());
-                } else if live.is_some() && conn.subs.is_empty() {
-                    live = None;
+                // woken by live events. (Subscribing happens in `handle_req`
+                // *before* the query, so no stored event can fall into the
+                // gap between the query and the subscription.)
+                if conn.live.is_some() && conn.subs.is_empty() {
+                    conn.live = None;
                 }
             }
             _ = ping_fut => {
@@ -440,11 +490,12 @@ pub async fn handle_connection(
         .bump(&conn.relay.stats.bytes_out, conn.out_bytes_total);
 
     // Release the connection's accounting: any subscriptions still open at
-    // disconnect were never CLOSE'd, so decrement them here.
-    conn.relay
-        .stats
-        .subscriptions_active
-        .fetch_sub(conn.subs.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    // disconnect were never CLOSE'd, so decrement them here (REQ
+    // subscriptions and negentropy subscriptions both hold a slot).
+    conn.relay.stats.subscriptions_active.fetch_sub(
+        (conn.subs.len() + conn.neg.len()) as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
 }
 
 #[cfg(test)]
@@ -560,6 +611,7 @@ mod tests {
             challenge: "test-challenge".into(),
             authed_pubkeys: Vec::new(),
             pending_events: Vec::new(),
+            live: None,
             expiry_enabled,
             giftwrap_restricted,
             dropped: 0,
@@ -730,6 +782,173 @@ mod tests {
                 msgs.iter().any(|m| m[0] == "CLOSED"
                     && m[2].as_str().unwrap_or("").contains("too many filters")),
                 "too many filters must be refused with CLOSED"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn text_ping_is_answered_with_pong() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.handle_text("[\"PING\"]").await;
+            let msgs = outgoing_json(&conn);
+            assert!(
+                msgs.iter().any(|m| m[0] == "PONG"),
+                "a text PING must be answered with a PONG"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+    #[test]
+    fn live_delivery_through_the_bus() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            conn.handle_req(&[json!("sub"), json!({"kinds": [30001]})])
+                .await;
+            assert!(conn.live.is_some(), "REQ must subscribe to live events");
+
+            let mut ev = signed_note(conn.relay.secp(), "live-check", now, vec![]);
+            ev.kind = 30001;
+            ev.id = crate::nips::nip01::compute_id(&ev);
+            // The relay broadcast path: queue, bus task, receiver, deliver.
+            conn.relay.broadcast(ev.clone());
+            let received = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                conn.live.as_mut().unwrap().recv(),
+            )
+            .await;
+            match received {
+                Ok(Ok(batch)) => {
+                    assert!(
+                        batch.iter().any(|e| e.id == ev.id),
+                        "the broadcast event must arrive on the live receiver"
+                    );
+                    conn.deliver_live(&ev, None);
+                    let msgs = outgoing_json(&conn);
+                    assert!(
+                        msgs.iter()
+                            .any(|m| m[0] == "EVENT" && m[2]["content"] == "live-check"),
+                        "deliver_live must queue the event for the subscriber"
+                    );
+                }
+                other => panic!("live bus did not deliver: {other:?}"),
+            }
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn neg_open_counts_towards_active_subscriptions() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let stats = conn.relay.stats.clone();
+            let before = stats
+                .subscriptions_active
+                .load(std::sync::atomic::Ordering::Relaxed);
+            // A NEG-OPEN with an empty client set (skip-to-infinity).
+            conn.handle_neg_open(&[json!("s"), json!({"kinds": [1]}), json!("61000000")])
+                .await;
+            let after_open = stats
+                .subscriptions_active
+                .load(std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(
+                after_open,
+                before + 1,
+                "an open NEG subscription must hold a slot"
+            );
+            conn.handle_neg_close(&[json!("s")]);
+            let after_close = stats
+                .subscriptions_active
+                .load(std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(
+                after_close, before,
+                "closing the NEG subscription must release the slot"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn req_hidden_events_do_not_consume_limit_slots() {
+        // Regression: NIP-70 protected events used to consume the per-filter
+        // limit during the scan, so a REQ with limit N returned fewer than N
+        // visible events (and re-REQing could never recover them). The scan
+        // now over-fetches and the connection truncates the visible results.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            let hidden = signed_note(conn.relay.secp(), "secret", now, vec![vec!["-".into()]]);
+            let v1 = signed_note(conn.relay.secp(), "v1", now - 1, vec![]);
+            let v2 = signed_note(conn.relay.secp(), "v2", now - 2, vec![]);
+            let v3 = signed_note(conn.relay.secp(), "v3", now - 3, vec![]);
+            for e in [&hidden, &v1, &v2, &v3] {
+                conn.relay.db.put(e.clone(), now).await;
+            }
+            conn.handle_req(&[json!("sub"), json!({"kinds": [1], "limit": 3})])
+                .await;
+            let contents: Vec<String> = outgoing_json(&conn)
+                .iter()
+                .filter(|m| m[0] == "EVENT")
+                .map(|m| m[2]["content"].as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(
+                contents,
+                vec!["v1", "v2", "v3"],
+                "the hidden event must not consume a limit slot"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn req_response_bypasses_the_outgoing_byte_cap() {
+        // Regression: REQ response events used to be dropped by the
+        // outgoing byte cap (a dropped event is lost permanently — the
+        // subscription is answered once), so a REQ with large events
+        // silently returned fewer events than the filter requested.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            // A tiny per-connection cap so the queue would drop big messages.
+            conn.out_queue_bytes = 1024;
+            let now = unix_now();
+            let big = "x".repeat(10_000);
+            let mut ids = Vec::new();
+            for i in 0..5 {
+                let ev = signed_note(
+                    conn.relay.secp(),
+                    &format!("big-{i}-{big}"),
+                    now - i,
+                    vec![],
+                );
+                ids.push(ev.id.clone());
+                conn.relay.db.put(ev, now).await;
+            }
+            conn.handle_req(&[json!("sub"), json!({"kinds": [1], "limit": 5})])
+                .await;
+            let delivered: Vec<String> = outgoing_json(&conn)
+                .iter()
+                .filter(|m| m[0] == "EVENT")
+                .map(|m| m[2]["id"].as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(
+                delivered.len(),
+                5,
+                "all five response events must be queued despite the tiny cap"
+            );
+            assert!(
+                ids.iter().all(|id| delivered.contains(id)),
+                "no response event may be dropped"
+            );
+            assert!(
+                outgoing_json(&conn).iter().any(|m| m[0] == "EOSE"),
+                "the EOSE must be queued too"
             );
             conn.relay.db.shutdown();
         });

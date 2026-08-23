@@ -7,26 +7,16 @@ use crate::event::Event;
 use crate::nips::nip01;
 use crate::util::unix_now;
 
-use super::relay_dtag;
-
 impl super::Relay {
-    /// Signs, stores and broadcasts a relay-generated event. For replaceable
-    /// or addressable kinds the event is stamped strictly newer than the
-    /// stored version so that NIP-01's same-timestamp tie-break (lowest id
-    /// wins) can never keep an older version.
+    /// Signs, stores and broadcasts a relay-generated event. The event must
+    /// already carry a strictly monotonic [`StampClock`] stamp (all builders
+    /// stamp through `stamp_floor`); a stored version can never outrank the
+    /// newest state because the stamps reflect the order in which the state
+    /// was applied, not the order in which the events are stored.
     pub(crate) async fn store_relay_event(&self, event: &mut Event) -> bool {
         let Some(keypair) = &self.key else {
             return false;
         };
-        if (crate::nips::nip01::is_replaceable_kind(event.kind)
-            || crate::nips::nip33::is_param_replaceable_kind(event.kind))
-            && let Some(old_created) = self
-                .db
-                .replaceable_created_at(event.kind, &event.pubkey, &relay_dtag(event))
-                .await
-        {
-            event.created_at = event.created_at.max(old_created.saturating_add(1));
-        }
         if nip01::sign(event, keypair, &self.secp).is_err() {
             return false;
         }
@@ -50,7 +40,9 @@ impl super::Relay {
         let Some(relay_pubkey) = self.relay_pubkey() else {
             return;
         };
-        let now = unix_now();
+        // Stamped with the monotonic clock so concurrent changes cannot
+        // collide on a timestamp (see `StampClock`).
+        let now = self.stamp_floor(unix_now());
         let (add, pubkey) = match change {
             Some((add, pubkey)) => (add, Some(pubkey)),
             None => (false, None),
@@ -85,10 +77,12 @@ impl super::Relay {
             return false;
         }
         let relay_pubkey = self.relay_pubkey().unwrap_or_default();
+        // Stamped with the monotonic clock so concurrent role changes
+        // cannot collide on a timestamp (see `StampClock`).
         let event = {
             let mut roles = self.roles.write().await;
             roles.create(id, label, description, color, order);
-            roles.role_event(id, &relay_pubkey, unix_now())
+            roles.role_event(id, &relay_pubkey, self.stamp_floor(unix_now()))
         };
         self.publish_relay_event(event).await;
         true
@@ -126,7 +120,7 @@ impl super::Relay {
             let relay_pubkey = self.relay_pubkey().unwrap_or_default();
             let event = {
                 let roles = self.roles.read().await;
-                roles.role_deletion_event(id, &relay_pubkey, unix_now())
+                roles.role_deletion_event(id, &relay_pubkey, self.stamp_floor(unix_now()))
             };
             self.publish_relay_event(event).await;
             self.publish_membership(None).await;

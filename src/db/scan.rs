@@ -145,14 +145,17 @@ impl EventCollector {
 }
 
 /// The NIP-50 relevance score of an event: the sum of the weights of the
-/// query terms present in its content. Weights are the inverse document
-/// frequency of each term (`1 / (1 + ln df)`), so rarer terms dominate.
+/// query terms present in its content *as whole words*. Weights are the
+/// inverse document frequency of each term (`1 / (1 + ln df)`), so rarer
+/// terms dominate. Whole-word matching keeps the ranking consistent with
+/// the matching itself (a term present only as a substring of a longer
+/// word, e.g. "ru" inside "rust", contributes nothing).
 fn score(event: &Event, terms: &[String], weights: &[f64]) -> f64 {
-    let content = event.content.to_lowercase();
+    let words = crate::nips::nip50::tokenize(&event.content);
     terms
         .iter()
         .zip(weights)
-        .filter(|(t, _)| content.contains(t.as_str()))
+        .filter(|(t, _)| words.iter().any(|w| w == *t))
         .map(|(_, w)| w)
         .sum()
 }
@@ -200,13 +203,20 @@ impl ScanCollector for EventCollector {
         });
     }
     fn sort_relevance(&mut self, terms: &[String], weights: &[f64]) {
-        self.events.sort_by(|a, b| {
-            score(b, terms, weights)
-                .partial_cmp(&score(a, terms, weights))
+        // Score every event exactly once (the per-event tokenization is the
+        // expensive part; a comparator would re-tokenize each event on every
+        // comparison), then sort by the precomputed scores.
+        let mut scored: Vec<(f64, Event)> = std::mem::take(&mut self.events)
+            .into_iter()
+            .map(|event| (score(&event, terms, weights), event))
+            .collect();
+        scored.sort_by(|(sa, a), (sb, b)| {
+            sb.partial_cmp(sa)
                 .unwrap_or(std::cmp::Ordering::Equal)
                 .then_with(|| b.created_at.cmp(&a.created_at))
                 .then_with(|| a.id.cmp(&b.id))
         });
+        self.events = scored.into_iter().map(|(_, event)| event).collect();
     }
     fn truncate_to(&mut self, take: usize) {
         self.events.truncate(take);
@@ -353,6 +363,14 @@ impl Store {
     }
 
     /// Collects events that match the filters, most recent first.
+    ///
+    /// `hidden_slack` lets a REQ over-fetch each filter's limit by a factor
+    /// (`limit * (hidden_slack + 1)`, capped at `max_limit`) so that events
+    /// hidden by the connection-level visibility rules (NIP-70 protected,
+    /// NIP-59 gift wraps, NIP-29 private/hidden groups) do not consume the
+    /// limit slots; the connection truncates the visible results back to the
+    /// requested limits. Pass 0 for COUNT, negentropy and the API.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn scan(
         &self,
         filters: &[Filter],
@@ -361,6 +379,7 @@ impl Store {
         count_mode: bool,
         ascending: bool,
         budget: usize,
+        hidden_slack: usize,
     ) -> Result<(Vec<Event>, bool)> {
         let has_search = filters.iter().any(Filter::has_search);
         // NIP-50: relevance ordering needs more candidates than the response
@@ -378,7 +397,16 @@ impl Store {
             ScanKind::Query
         };
         let mut out = EventCollector::new(collect_cap, !count_mode);
-        let more = self.scan_collect(filters, now, max_limit, kind, ascending, budget, &mut out)?;
+        let more = self.scan_collect(
+            filters,
+            now,
+            max_limit,
+            kind,
+            ascending,
+            budget,
+            hidden_slack,
+            &mut out,
+        )?;
         Ok((out.events, more))
     }
 
@@ -407,6 +435,7 @@ impl Store {
             ScanKind::Negentropy,
             false,
             budget,
+            0,
             &mut out,
         )?;
         Ok((out.items, more))
@@ -425,15 +454,28 @@ impl Store {
         kind: ScanKind,
         ascending: bool,
         budget: usize,
+        hidden_slack: usize,
         out: &mut C,
     ) -> Result<bool> {
         let count_mode = matches!(kind, ScanKind::Count);
-        let sort_search = matches!(kind, ScanKind::Query);
+        // NIP-50 relevance ordering only applies when *every* filter of the
+        // REQ is a search filter. A REQ mixing search and plain filters
+        // (e.g. `[{"search": "x", "limit": 5}, {"kinds": [1], "limit": 10}]`)
+        // must return the union of both: truncating the whole response to
+        // the search filters' limits would silently drop the plain
+        // filters' results, and relevance-sorting would reorder them.
+        let has_plain = filters.iter().any(|f| !f.has_search());
+        let sort_search = matches!(kind, ScanKind::Query) && !has_plain;
         if max_limit == 0 {
             return Ok(false);
         }
         let rtxn = self.env.read_txn()?;
         let mut seen: HashSet<Vec<u8>> = HashSet::new();
+        // Work budget shared by every filter of this REQ: an anti-DoS cap on
+        // the candidates examined across all filters, so a REQ with many
+        // filters cannot multiply the budget (e.g. 20 filters x 200k
+        // examinations) and stall the reader thread.
+        let mut examined = 0usize;
         // `more` is true when a scan stopped because of a limit instead of
         // exhausting the matching records (NIP-67 EOSE completeness hint).
         let mut more = false;
@@ -451,12 +493,20 @@ impl Store {
             let has_search = filter.has_search();
             let limit = if count_mode {
                 max_limit
-            } else if has_search {
-                // NIP-50: the limit is applied after the relevance sort, so
-                // candidates are gathered up to the collection budget.
+            } else if has_search && sort_search {
+                // NIP-50 (pure-search REQ): the limit is applied after the
+                // relevance sort, so candidates are gathered up to the
+                // collection budget.
                 out.cap()
             } else {
-                filter.limit.unwrap_or(max_limit).min(max_limit)
+                let base = filter.limit.unwrap_or(max_limit).min(max_limit);
+                // Hidden-event slack: events withheld by the connection's
+                // visibility rules (NIP-70/59/29) must not consume the
+                // per-filter limit slots, so a REQ over-fetches a little
+                // and the connection truncates the visible results back to
+                // the requested limits.
+                base.saturating_mul(hidden_slack.saturating_add(1))
+                    .min(max_limit)
             };
             let terms = if has_search {
                 let terms = nip50::terms(filter.search.as_deref().unwrap_or(""));
@@ -493,7 +543,8 @@ impl Store {
                 seen: &mut seen,
                 out,
             };
-            let stop = self.scan_filter(&rtxn, &scan, &mut collect, budget, &mut more)?;
+            let stop =
+                self.scan_filter(&rtxn, &scan, &mut collect, budget, &mut examined, &mut more)?;
             if stop {
                 break;
             }
@@ -530,6 +581,7 @@ impl Store {
         scan: &FilterScan<'_>,
         collect: &mut Collect<'_, C>,
         budget: usize,
+        examined: &mut usize,
         more: &mut bool,
     ) -> Result<bool> {
         let FilterScan {
@@ -541,7 +593,6 @@ impl Store {
         } = *scan;
         let seen = &mut *collect.seen;
         let out = &mut *collect.out;
-        let mut examined = 0usize;
         let ctx = ScanContext {
             events: self.events,
             deleted: self.deleted,
@@ -553,16 +604,7 @@ impl Store {
         };
         let mut consider = |id: &[u8]| -> Result<bool> {
             consider_event(
-                &ctx,
-                id,
-                filter,
-                terms,
-                now,
-                seen,
-                out,
-                limit,
-                budget,
-                &mut examined,
+                &ctx, id, filter, terms, now, seen, out, limit, budget, examined,
             )
         };
 
@@ -654,7 +696,11 @@ impl Store {
             return Ok(out.full());
         }
 
-        if let Some((name, values)) = filter.tags.iter().next() {
+        // Only `#`-prefixed keys are tag constraints (NIP-01); an unknown
+        // non-`#` key (e.g. a typo like `"kind"`) is ignored by the scan
+        // just like it is by the final in-memory match, so it cannot turn
+        // the filter into an impossible query.
+        if let Some((name, values)) = filter.tags.iter().find(|(n, _)| n.starts_with('#')) {
             let tag_name = name.strip_prefix('#').unwrap_or(name);
             if tag_name.len() == 1 {
                 let name_byte = tag_name.as_bytes()[0];
@@ -677,6 +723,11 @@ impl Store {
                 {
                     return Ok(false);
                 }
+                // A tag attribute with no string values (e.g. a numeric
+                // `{"#a": 123}`) matches nothing: the final in-memory
+                // `Filter::matches` requires every tag attribute to match,
+                // so an empty value set yields zero results — consistent
+                // with this index path.
                 return Ok(out.full());
             }
             // Multi-letter tag names are not indexed (NIP-01 only requires
@@ -945,12 +996,44 @@ fn is_deliverable(
     }
     if !terms.is_empty() {
         // NIP-50: an event matches when at least one query term is present
-        // in its content; the relevance ordering ranks events matching
-        // every term first.
-        let content = event.content.to_lowercase();
-        if !terms.iter().any(|t| content.contains(t.as_str())) {
+        // as a whole word in its content; the relevance ordering ranks
+        // events matching every term first. Whole-word matching keeps the
+        // index walk, the non-indexed fallback and the live delivery
+        // consistent (see `nip50::matches_terms`).
+        if !crate::nips::nip50::matches_terms(&event.content, terms) {
             return Ok(false);
         }
     }
     Ok(filter.matches(event))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::score;
+    use crate::event::Event;
+
+    fn ev(content: &str, created: u64) -> Event {
+        Event {
+            id: "a".repeat(64),
+            pubkey: "b".repeat(64),
+            created_at: created,
+            kind: 1,
+            tags: vec![],
+            content: content.into(),
+            sig: "c".repeat(128),
+        }
+    }
+
+    #[test]
+    fn relevance_score_counts_whole_words_only() {
+        let terms = vec!["ru".to_string(), "rust".to_string()];
+        let weights = vec![1.0, 1.0];
+        // "rust" is a whole word; "ru" is only a substring of "rust" and
+        // must contribute nothing (matching itself is whole-word, so the
+        // ranking must agree).
+        assert_eq!(score(&ev("I like rust", 1), &terms, &weights), 1.0);
+        // A content that actually contains "ru" as a word scores it.
+        assert_eq!(score(&ev("ru matters", 1), &terms, &weights), 1.0);
+        assert_eq!(score(&ev("ru and rust both", 1), &terms, &weights), 2.0);
+    }
 }

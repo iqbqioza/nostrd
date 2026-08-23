@@ -54,8 +54,12 @@ pub fn hll(filters: &[Filter], events: &[Event]) -> Option<String> {
 /// The deterministic HLL offset for a filter (NIP-45): derived from the
 /// first tag attribute's first value — a 64-char hex id/pubkey, an address
 /// (`<kind>:<pubkey>:<d>`, using the pubkey part) or a sha256 hash.
+/// Per the spec the attribute must carry the `#` prefix: a non-`#` key is
+/// an unknown filter field (ignored by the scan) and must not influence
+/// the offset, or the registers would differ from other relays' for the
+/// same query.
 fn hll_offset(filter: &Filter) -> Option<usize> {
-    let (_, value) = filter.tags.iter().next()?;
+    let (_, value) = filter.tags.iter().find(|(n, _)| n.starts_with('#'))?;
     let value = crate::filter::tag_string_values(value).into_iter().next()?;
     let hex_string = if value.len() == 64 && hex::decode(&value).is_ok() {
         value
@@ -152,6 +156,21 @@ mod tests {
             h1,
             hll(std::slice::from_ref(&filter), std::slice::from_ref(&ev)).unwrap()
         );
+    }
+
+    #[test]
+    fn hll_offset_ignores_non_tag_keys() {
+        // NIP-45: the offset comes from the first `#`-prefixed tag
+        // attribute; a non-`#` key (an unknown filter field) must not
+        // influence it, or the registers would differ from other relays.
+        let mut hex = "a".repeat(64);
+        hex.replace_range(32..33, "c"); // c = 12 -> offset 20
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"foo": "bar", "#e": [hex]})).unwrap();
+        assert_eq!(hll_offset(&f), Some(20));
+        // Without any `#`-prefixed attribute the filter is not eligible.
+        let f: Filter = serde_json::from_value(serde_json::json!({"foo": "bar"})).unwrap();
+        assert!(hll_offset(&f).is_none());
     }
 
     #[test]

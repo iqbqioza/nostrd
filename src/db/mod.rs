@@ -77,6 +77,10 @@ enum Msg {
         /// Upper bound on the number of index candidates the scan may
         /// examine before giving up (anti-DoS work budget).
         budget: usize,
+        /// REQ-only over-fetch factor for the per-filter limits, so events
+        /// hidden by the connection-level visibility rules (NIP-70/59/29)
+        /// do not consume the limit slots (see [`scan::Store::scan`]).
+        hidden_slack: usize,
         reply: oneshot::Sender<(Vec<Event>, bool)>,
     },
     /// Accepts many events in a single write transaction (one commit).
@@ -137,12 +141,6 @@ enum Msg {
     PrefixesExist {
         prefixes: Vec<Vec<u8>>,
         reply: oneshot::Sender<Vec<bool>>,
-    },
-    ReplaceableCreatedAt {
-        kind: u64,
-        pubkey: String,
-        d: String,
-        reply: oneshot::Sender<Option<u64>>,
     },
     Ban {
         id: Vec<u8>,
@@ -349,17 +347,33 @@ impl DbClient {
     }
 
     pub async fn query(&self, filters: Vec<Filter>, limit: usize, now: u64) -> (Vec<Event>, bool) {
-        self.query_directed(filters, limit, now, false).await
+        self.query_directed(filters, limit, now, false, 0).await
+    }
+
+    /// WebSocket REQ query: like [`Self::query`] but with the hidden-event
+    /// slack enabled (the scan over-fetches each filter's limit so that
+    /// events withheld by the connection's visibility rules do not consume
+    /// the limit slots; the connection truncates the visible results).
+    pub async fn query_req(
+        &self,
+        filters: Vec<Filter>,
+        limit: usize,
+        now: u64,
+    ) -> (Vec<Event>, bool) {
+        self.query_directed(filters, limit, now, false, 1).await
     }
 
     /// Like [`Self::query`] but with an explicit scan direction: `false`
     /// returns newest events first (NIP-01), `true` returns oldest first.
+    /// `hidden_slack` over-fetches the per-filter limits (see
+    /// [`Msg::Query`]); the WebSocket REQ path uses 1, every other caller 0.
     pub async fn query_directed(
         &self,
         filters: Vec<Filter>,
         limit: usize,
         now: u64,
         ascending: bool,
+        hidden_slack: usize,
     ) -> (Vec<Event>, bool) {
         self.request_read(|reply| Msg::Query {
             filters,
@@ -367,6 +381,7 @@ impl DbClient {
             now,
             ascending,
             budget: SCAN_BUDGET,
+            hidden_slack,
             reply,
         })
         .await
@@ -388,6 +403,7 @@ impl DbClient {
             now,
             ascending: false,
             budget: FULL_SCAN_BUDGET,
+            hidden_slack: 0,
             reply,
         })
         .await
@@ -419,6 +435,7 @@ impl DbClient {
             now,
             ascending,
             budget: SCAN_BUDGET,
+            hidden_slack: 0,
             reply: tx,
         };
         if self.api_read_tx.send(msg).is_err() {
@@ -490,7 +507,7 @@ impl DbClient {
         request_pubkey: Option<String>,
         request_created: u64,
     ) -> usize {
-        self.request(|reply| Msg::Delete {
+        self.request_write(|reply| Msg::Delete {
             targets,
             addresses,
             request_pubkey,
@@ -505,7 +522,7 @@ impl DbClient {
     /// belong to `group`, so a group admin cannot delete another group's
     /// events.
     pub async fn apply_group_deletion(&self, targets: Vec<String>, group: String) -> usize {
-        self.request(|reply| Msg::Delete {
+        self.request_write(|reply| Msg::Delete {
             targets,
             addresses: Vec::new(),
             request_pubkey: None,
@@ -517,7 +534,7 @@ impl DbClient {
     }
 
     pub async fn apply_vanish(&self, pubkey: [u8; 32]) -> usize {
-        self.request(|reply| Msg::Vanish {
+        self.request_write(|reply| Msg::Vanish {
             pubkey: pubkey.to_vec(),
             reply,
         })
@@ -526,7 +543,7 @@ impl DbClient {
 
     /// NIP-59: deletes `kind:1059` gift wraps p-tagging `pubkey`.
     pub async fn delete_gift_wraps_to(&self, pubkey: [u8; 32]) -> usize {
-        self.request(|reply| Msg::GiftWrapPurge {
+        self.request_write(|reply| Msg::GiftWrapPurge {
             pubkey: pubkey.to_vec(),
             reply,
         })
@@ -555,7 +572,7 @@ impl DbClient {
     /// Bans an event id (NIP-86 banevent): removes it from storage and
     /// prevents re-publication. Returns whether the event was stored.
     pub async fn ban_event(&self, id: [u8; 32], reason: &str) -> bool {
-        self.request(|reply| Msg::Ban {
+        self.request_write(|reply| Msg::Ban {
             id: id.to_vec(),
             reason: reason.to_string(),
             reply,
@@ -564,7 +581,7 @@ impl DbClient {
     }
 
     pub async fn unban_event(&self, id: [u8; 32]) -> bool {
-        self.request(|reply| Msg::Unban {
+        self.request_write(|reply| Msg::Unban {
             id: id.to_vec(),
             reply,
         })
@@ -578,7 +595,7 @@ impl DbClient {
     /// Persists the access control lists (NIP-86 runtime bans/allowlists).
     pub async fn save_access(&self, access: crate::config::AccessControl) {
         let _ = self
-            .request(|reply| Msg::SaveAccess { access, reply })
+            .request_write(|reply| Msg::SaveAccess { access, reply })
             .await;
     }
 
@@ -587,21 +604,9 @@ impl DbClient {
         self.request_read(|reply| Msg::LoadAccess { reply }).await
     }
 
-    /// The created_at of the stored version of a replaceable/addressable
-    /// event, used by the relay to stamp its generated events strictly
-    /// newer.
-    pub async fn replaceable_created_at(&self, kind: u64, pubkey: &str, d: &str) -> Option<u64> {
-        self.request_read(|reply| Msg::ReplaceableCreatedAt {
-            kind,
-            pubkey: pubkey.to_string(),
-            d: d.to_string(),
-            reply,
-        })
-        .await
-    }
-
     pub async fn purge_expired(&self, now: u64) -> usize {
-        self.request(|reply| Msg::PurgeExpired { now, reply }).await
+        self.request_write(|reply| Msg::PurgeExpired { now, reply })
+            .await
     }
 
     pub async fn size_on_disk(&self) -> u64 {

@@ -414,3 +414,60 @@ fn rebuild_keeps_join_membership() {
         assert!(g.is_member(OTHER), "JOIN membership survives rebuild");
     });
 }
+
+#[test]
+fn join_to_unknown_group_is_rejected() {
+    // A JOIN for a group that does not exist (yet) would be stored but
+    // never honored — the state machine has no group to admit the user
+    // into — so it is rejected like every other moderation event for an
+    // unknown group. Only a 9007 create-group may target an unknown group.
+    let store = GroupStore::default();
+    let join = event(JOIN, USER, Some("ghost"), vec![]);
+    assert_eq!(
+        store.validate_write(&join).unwrap_err(),
+        "restricted: unknown group"
+    );
+    let create = event(CREATE_GROUP, USER, Some("ghost"), vec![]);
+    assert!(store.validate_write(&create).is_ok());
+}
+
+#[test]
+fn livekit_tag_and_single_parent() {
+    // NIP-29: a `livekit` tag in the metadata edit is mirrored in the
+    // 39000 event, and a 9002 carrying more than one `parent` tag is
+    // rejected (the spec allows at most one).
+    let mut store = seeded();
+    let edit = event(
+        9002,
+        ADMIN,
+        Some("g1"),
+        vec![vec!["livekit".into()], vec!["supported_kinds".into()]],
+    );
+    assert!(store.validate_write(&edit).is_ok());
+    let meta = store.apply(&edit, "", 1, true);
+    let meta_ev = meta
+        .iter()
+        .find(|e| e.kind == GROUP_META)
+        .expect("39000 emitted");
+    assert!(
+        meta_ev
+            .tags
+            .iter()
+            .any(|t| t.first().map(String::as_str) == Some("livekit")),
+        "the 39000 must carry the livekit tag"
+    );
+
+    let double_parent = event(
+        9002,
+        ADMIN,
+        Some("g1"),
+        vec![
+            vec!["parent".into(), "g2".into()],
+            vec!["parent".into(), "g3".into()],
+        ],
+    );
+    assert_eq!(
+        store.validate_write(&double_parent).unwrap_err(),
+        "restricted: at most one parent tag is allowed"
+    );
+}

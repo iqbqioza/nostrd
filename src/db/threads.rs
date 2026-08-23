@@ -62,9 +62,11 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             now,
             ascending,
             budget,
+            hidden_slack,
             reply,
         } => {
-            let out = match store.scan(&filters, now, limit, false, ascending, budget) {
+            let out = match store.scan(&filters, now, limit, false, ascending, budget, hidden_slack)
+            {
                 Ok(out) => out,
                 Err(e) => {
                     db_error(errors, &e);
@@ -96,7 +98,7 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             now,
             reply,
         } => {
-            let out = match store.scan(&filters, now, limit, true, false, SCAN_BUDGET) {
+            let out = match store.scan(&filters, now, limit, true, false, SCAN_BUDGET, 0) {
                 Ok(out) => out,
                 Err(e) => {
                     db_error(errors, &e);
@@ -126,22 +128,6 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
                 }
             };
             let _ = reply.send(out);
-            false
-        }
-        Msg::ReplaceableCreatedAt {
-            kind,
-            pubkey,
-            d,
-            reply,
-        } => {
-            let created = match store.replaceable_created_at(kind, &pubkey, &d) {
-                Ok(created) => created,
-                Err(e) => {
-                    db_error(errors, &e);
-                    None
-                }
-            };
-            let _ = reply.send(created);
             false
         }
         Msg::ListBanned { reply } => {
@@ -375,11 +361,18 @@ pub(crate) fn spawn(
                                     now,
                                     ascending,
                                     budget,
+                                    hidden_slack,
                                     reply,
                                 } => {
-                                    let out = match store
-                                        .scan(&filters, now, limit, false, ascending, budget)
-                                    {
+                                    let out = match store.scan(
+                                        &filters,
+                                        now,
+                                        limit,
+                                        false,
+                                        ascending,
+                                        budget,
+                                        hidden_slack,
+                                    ) {
                                         Ok(out) => out,
                                         Err(e) => {
                                             db_error(&thread_errors, &e);
@@ -417,6 +410,7 @@ pub(crate) fn spawn(
                                         true,
                                         false,
                                         SCAN_BUDGET,
+                                        0,
                                     ) {
                                         Ok(out) => out,
                                         Err(e) => {
@@ -480,34 +474,14 @@ pub(crate) fn spawn(
                                     let _ = reply.send(exists);
                                 }
                                 Msg::PrefixesExist { prefixes, reply } => {
-                                    let mut out = Vec::with_capacity(prefixes.len());
-                                    for prefix in &prefixes {
-                                        let exists = match store.event_id_prefix_exists(prefix) {
-                                            Ok(exists) => exists,
-                                            Err(e) => {
-                                                db_error(&thread_errors, &e);
-                                                false
-                                            }
-                                        };
-                                        out.push(exists);
-                                    }
+                                    let out = match store.prefixes_exist(&prefixes) {
+                                        Ok(out) => out,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            vec![false; prefixes.len()]
+                                        }
+                                    };
                                     let _ = reply.send(out);
-                                }
-                                Msg::ReplaceableCreatedAt {
-                                    kind,
-                                    pubkey,
-                                    d,
-                                    reply,
-                                } => {
-                                    let created =
-                                        match store.replaceable_created_at(kind, &pubkey, &d) {
-                                            Ok(created) => created,
-                                            Err(e) => {
-                                                db_error(&thread_errors, &e);
-                                                None
-                                            }
-                                        };
-                                    let _ = reply.send(created);
                                 }
                                 Msg::Ban { id, reason, reply } => {
                                     let banned = match store.apply_ban(&id, &reason) {

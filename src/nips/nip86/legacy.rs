@@ -170,8 +170,14 @@ async fn block_pubkey(
         return bad_request("invalid pubkey");
     }
     let mut access = state.relay.access.write().await;
-    if !access.blocked_pubkeys.iter().any(|p| p == &body.pubkey) {
-        access.blocked_pubkeys.push(body.pubkey.clone());
+    if !access
+        .blocked_pubkeys
+        .iter()
+        .any(|(p, _)| p == &body.pubkey)
+    {
+        access
+            .blocked_pubkeys
+            .push((body.pubkey.clone(), String::new()));
     }
     drop(access);
     state.relay.persist_access().await;
@@ -188,7 +194,7 @@ async fn allow_pubkey(
         return resp;
     }
     let mut access = state.relay.access.write().await;
-    access.blocked_pubkeys.retain(|p| p != &body.pubkey);
+    access.blocked_pubkeys.retain(|(p, _)| p != &body.pubkey);
     drop(access);
     state.relay.persist_access().await;
     Json(json!({ "ok": true, "allowed_pubkey": body.pubkey })).into_response()

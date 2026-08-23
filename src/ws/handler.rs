@@ -70,7 +70,11 @@ impl super::Conn {
                 self.flush_pending_events().await;
                 self.handle_neg_close(&msg[1..]);
             }
-            "PING" => {}
+            "PING" => {
+                // A de-facto nostr convention: answer text PING messages
+                // with a PONG so keep-alive probes get a response.
+                self.send_json(json!(["PONG"]));
+            }
             other => {
                 self.flush_pending_events().await;
                 self.send_notice(&format!("error: unsupported message type {other}"));
@@ -242,6 +246,13 @@ impl super::Conn {
         self.sub_bytes = next_total;
         self.subs
             .insert(sub_id.to_string(), (stored.clone(), sub_bytes));
+        // Subscribe to live events *before* running the query, so no event
+        // stored between the query and the subscription is missed (a
+        // duplicate delivery of an event that is both in the query result
+        // and live is harmless: clients deduplicate by id).
+        if self.live.is_none() {
+            self.live = Some(self.relay.live.subscribe());
+        }
         if replacing.is_none() {
             self.relay
                 .stats
@@ -252,7 +263,16 @@ impl super::Conn {
         }
 
         let now = unix_now();
-        let (events, more) = self.relay.db.query(stored, max_limit, now).await;
+        // The scan over-fetches each filter's limit (hidden-event slack) so
+        // that events withheld by the visibility rules below do not consume
+        // the limit slots; the visible results are then truncated back to
+        // the requested per-filter limits (their sum, since the scan unions
+        // the filters).
+        let original_total: usize = stored
+            .iter()
+            .map(|f| f.limit.unwrap_or(max_limit).min(max_limit))
+            .sum();
+        let (events, more) = self.relay.db.query_req(stored, max_limit, now).await;
         let mut to_send = Vec::new();
         {
             let groups = self.relay.groups.read().await;
@@ -263,15 +283,20 @@ impl super::Conn {
                 to_send.push(event);
             }
         }
+        let truncated = to_send.len() > original_total;
+        to_send.truncate(original_total);
+        // The response is queued without the outgoing byte cap: a dropped
+        // REQ event would be lost permanently (the byte cap only applies to
+        // the recoverable live traffic).
         for event in to_send {
-            self.send_json(json!(["EVENT", sub_id, event]));
+            self.send_json_uncapped(json!(["EVENT", sub_id, event]));
         }
         // NIP-67: EOSE completeness hint.
         if eose_hint {
-            let hint = if more { "more" } else { "finish" };
-            self.send_json(json!(["EOSE", sub_id, [hint]]));
+            let hint = if more || truncated { "more" } else { "finish" };
+            self.send_json_uncapped(json!(["EOSE", sub_id, [hint]]));
         } else {
-            self.send_json(json!(["EOSE", sub_id]));
+            self.send_json_uncapped(json!(["EOSE", sub_id]));
         }
     }
 
@@ -286,6 +311,18 @@ impl super::Conn {
                 .stats
                 .subscriptions_active
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            // NIP-77: a CLOSE on a subscription id also ends any negentropy
+            // state held under the same id, releasing its items from the
+            // connection's memory accounting and its subscription slot.
+            if let Some(state) = self.neg.remove(sub_id) {
+                self.neg_total = self.neg_total.saturating_sub(state.items.len());
+                self.release_neg_stats_subscription();
+            }
+            // Drop the live receiver with the last subscription so
+            // connection without active subscriptions are never woken.
+            if self.subs.is_empty() {
+                self.live = None;
+            }
         }
     }
 
@@ -340,6 +377,15 @@ impl super::Conn {
             self.send_notice("error: subscription id must be a string");
             return;
         };
+        if sub_id.is_empty() {
+            self.send_closed(sub_id, "invalid: subscription id must not be empty");
+            return;
+        }
+        let max_sub_id_len = self.relay.config.read().await.limits.max_sub_id_len;
+        if sub_id.len() > max_sub_id_len {
+            self.send_closed(sub_id, "invalid: subscription id too long");
+            return;
+        }
         // NIP-45: refusals must be answered with a CLOSED message.
         if !self.relay.config.read().await.nip_enabled(45) {
             self.send_closed(sub_id, "error: counting is not enabled on this relay");

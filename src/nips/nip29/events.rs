@@ -26,6 +26,7 @@ pub(crate) fn apply_settings(group: &mut Group, event: &Event) {
             "restricted" => settings.restricted = true,
             "closed" => settings.closed = true,
             "hidden" => settings.hidden = true,
+            "livekit" => settings.livekit = true,
             "supported_kinds" => {
                 settings.supported_kinds =
                     Some(tag[1..].iter().filter_map(|k| k.parse().ok()).collect())
@@ -80,6 +81,9 @@ pub(crate) fn build_meta_event(
     }
     if s.hidden {
         event.tags.push(vec!["hidden".into()]);
+    }
+    if s.livekit {
+        event.tags.push(vec!["livekit".into()]);
     }
     if let Some(kinds) = &s.supported_kinds {
         let mut tag = vec!["supported_kinds".to_string()];

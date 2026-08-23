@@ -65,10 +65,24 @@ fn rpc_err(message: &str) -> Response {
 /// NIP-86 JSON-RPC handler, mounted on `POST /` and `POST /ws`.
 pub async fn rpc_handler(
     State(relay): State<Arc<Relay>>,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
     uri: axum::http::Uri,
     headers: HeaderMap,
     body: String,
 ) -> Response {
+    // NIP-86 `blockip` also applies to this endpoint: a blocked peer must
+    // not reach the management RPC (the WebSocket handler already refuses
+    // its connections).
+    if relay
+        .access
+        .read()
+        .await
+        .blocked_ips
+        .iter()
+        .any(|(b, _)| b.parse::<std::net::IpAddr>().is_ok_and(|b| b == peer.ip()))
+    {
+        return StatusCode::FORBIDDEN.into_response();
+    }
     // The spec requires the JSON-RPC content type (parameters such as
     // `; charset=utf-8` are tolerated).
     let is_rpc = headers
@@ -103,7 +117,10 @@ pub async fn rpc_handler(
     match method {
         "supportedmethods" => rpc_ok(json!(SUPPORTED_METHODS)),
         "banpubkey" => {
-            let Some(pubkey) = params.first().and_then(Value::as_str) else {
+            let (Some(pubkey), reason) = (
+                params.first().and_then(Value::as_str),
+                params.get(1).and_then(Value::as_str).unwrap_or(""),
+            ) else {
                 return rpc_err("invalid params");
             };
             if !is_pubkey(pubkey) {
@@ -111,8 +128,10 @@ pub async fn rpc_handler(
             }
             {
                 let mut access = relay.access.write().await;
-                if !access.blocked_pubkeys.iter().any(|p| p == pubkey) {
-                    access.blocked_pubkeys.push(pubkey.to_string());
+                if !access.blocked_pubkeys.iter().any(|(p, _)| p == pubkey) {
+                    access
+                        .blocked_pubkeys
+                        .push((pubkey.to_string(), reason.to_string()));
                 }
             }
             relay.persist_access().await;
@@ -124,7 +143,7 @@ pub async fn rpc_handler(
             };
             {
                 let mut access = relay.access.write().await;
-                access.blocked_pubkeys.retain(|p| p != pubkey);
+                access.blocked_pubkeys.retain(|(p, _)| p != pubkey);
             }
             relay.persist_access().await;
             rpc_ok(json!(true))
@@ -134,12 +153,15 @@ pub async fn rpc_handler(
             let list: Vec<Value> = access
                 .blocked_pubkeys
                 .iter()
-                .map(|pubkey| json!({ "pubkey": pubkey, "reason": "" }))
+                .map(|(pubkey, reason)| json!({ "pubkey": pubkey, "reason": reason }))
                 .collect();
             rpc_ok(json!(list))
         }
         "allowpubkey" => {
-            let Some(pubkey) = params.first().and_then(Value::as_str) else {
+            let (Some(pubkey), reason) = (
+                params.first().and_then(Value::as_str),
+                params.get(1).and_then(Value::as_str).unwrap_or(""),
+            ) else {
                 return rpc_err("invalid params");
             };
             if !is_pubkey(pubkey) {
@@ -149,9 +171,11 @@ pub async fn rpc_handler(
                 let mut access = relay.access.write().await;
                 // NIP-86: allowing a pubkey also un-bans it (matching the
                 // legacy endpoint), so `banpubkey` can be reverted.
-                access.blocked_pubkeys.retain(|p| p != pubkey);
-                if !access.allowed_pubkeys.iter().any(|p| p == pubkey) {
-                    access.allowed_pubkeys.push(pubkey.to_string());
+                access.blocked_pubkeys.retain(|(p, _)| p != pubkey);
+                if !access.allowed_pubkeys.iter().any(|(p, _)| p == pubkey) {
+                    access
+                        .allowed_pubkeys
+                        .push((pubkey.to_string(), reason.to_string()));
                 }
             }
             relay.persist_access().await;
@@ -163,7 +187,7 @@ pub async fn rpc_handler(
             };
             {
                 let mut access = relay.access.write().await;
-                access.allowed_pubkeys.retain(|p| p != pubkey);
+                access.allowed_pubkeys.retain(|(p, _)| p != pubkey);
             }
             relay.persist_access().await;
             rpc_ok(json!(true))
@@ -173,7 +197,7 @@ pub async fn rpc_handler(
             let list: Vec<Value> = access
                 .allowed_pubkeys
                 .iter()
-                .map(|pubkey| json!({ "pubkey": pubkey, "reason": "" }))
+                .map(|(pubkey, reason)| json!({ "pubkey": pubkey, "reason": reason }))
                 .collect();
             rpc_ok(json!(list))
         }
@@ -230,11 +254,17 @@ pub async fn rpc_handler(
                 return rpc_err("invalid params: value too long or contains control characters");
             }
             let mut cfg = relay.config.write().await;
-            match method {
-                "changerelayname" => cfg.relay.name = value.to_string(),
-                "changerelaydescription" => cfg.relay.description = value.to_string(),
-                _ => cfg.relay.icon = value.to_string(),
-            }
+            let (field, _) = match method {
+                "changerelayname" => ("name", cfg.relay.name = value.to_string()),
+                "changerelaydescription" => {
+                    ("description", cfg.relay.description = value.to_string())
+                }
+                _ => ("icon", cfg.relay.icon = value.to_string()),
+            };
+            // Persist the change to the config file so it survives a SIGHUP
+            // reload and a restart (without persistence the reload handler
+            // would silently revert it).
+            relay.persist_relay_field(field, value).await;
             rpc_ok(json!(true))
         }
         // NIP-43 role management.
@@ -310,7 +340,10 @@ pub async fn rpc_handler(
             rpc_ok(json!(true))
         }
         "blockip" => {
-            let Some(ip) = params.first().and_then(Value::as_str) else {
+            let (Some(ip), reason) = (
+                params.first().and_then(Value::as_str),
+                params.get(1).and_then(Value::as_str).unwrap_or(""),
+            ) else {
                 return rpc_err("invalid params");
             };
             if ip.parse::<std::net::IpAddr>().is_err() {
@@ -318,11 +351,15 @@ pub async fn rpc_handler(
             }
             {
                 let mut access = relay.access.write().await;
-                if !access.blocked_ips.iter().any(|i| i == ip) {
-                    access.blocked_ips.push(ip.to_string());
+                if !access.blocked_ips.iter().any(|(i, _)| i == ip) {
+                    access
+                        .blocked_ips
+                        .push((ip.to_string(), reason.to_string()));
                 }
             }
             relay.persist_access().await;
+            // Drop existing connections from this IP, not just new ones.
+            relay.note_ip_blocks_changed();
             rpc_ok(json!(true))
         }
         "unblockip" => {
@@ -331,9 +368,13 @@ pub async fn rpc_handler(
             };
             {
                 let mut access = relay.access.write().await;
-                access.blocked_ips.retain(|i| i != ip);
+                access.blocked_ips.retain(|(i, _)| i != ip);
             }
             relay.persist_access().await;
+            // Re-connect checks: unblocking also bumps the version so
+            // connections that were blocked mid-flight re-verify (a version
+            // bump with an empty list is harmless).
+            relay.note_ip_blocks_changed();
             rpc_ok(json!(true))
         }
         "listblockedips" => {
@@ -341,7 +382,7 @@ pub async fn rpc_handler(
             let list: Vec<Value> = access
                 .blocked_ips
                 .iter()
-                .map(|ip| json!({ "ip": ip, "reason": "" }))
+                .map(|(ip, reason)| json!({ "ip": ip, "reason": reason }))
                 .collect();
             rpc_ok(json!(list))
         }

@@ -99,13 +99,23 @@ impl FileLogger {
         for i in (1..self.max_files).rev() {
             let from = backup_path(&self.path, i);
             let to = backup_path(&self.path, i + 1);
-            if from.exists() {
-                let _ = std::fs::rename(&from, &to);
+            if from.exists()
+                && let Err(e) = std::fs::rename(&from, &to)
+            {
+                eprintln!("cannot rotate log backup {}: {e}", from.display());
             }
         }
-        // The current file becomes `.1` and a fresh one is opened.
+        // The current file becomes `.1` and a fresh one is opened. A failed
+        // rename is logged (the old log content between the rotation size
+        // and the failure would otherwise be silently lost).
         let first = backup_path(&self.path, 1);
-        let _ = std::fs::rename(&self.path, &first);
+        if let Err(e) = std::fs::rename(&self.path, &first) {
+            eprintln!(
+                "cannot rotate log {} -> {}: {e}",
+                self.path.display(),
+                first.display()
+            );
+        }
         match OpenOptions::new()
             .create(true)
             .append(true)

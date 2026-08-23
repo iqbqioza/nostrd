@@ -302,6 +302,7 @@ impl Config {
             .map_err(|e| Error::Config(format!("cannot read {}: {e}", path.display())))?;
         let cfg: Config = toml::from_str(&raw)
             .map_err(|e| Error::Config(format!("invalid {}: {e}", path.display())))?;
+        warn_unknown_fields(&raw);
         Ok(cfg)
     }
 
@@ -394,10 +395,10 @@ impl Config {
         };
         hex32(&self.relay.pubkey, "relay.pubkey")?;
         hex32(&self.server.admin_pubkey, "server.admin_pubkey")?;
-        for pk in &self.access.blocked_pubkeys {
+        for (pk, _) in &self.access.blocked_pubkeys {
             hex32(pk, "access.blocked_pubkeys")?;
         }
-        for pk in &self.access.allowed_pubkeys {
+        for (pk, _) in &self.access.allowed_pubkeys {
             hex32(pk, "access.allowed_pubkeys")?;
         }
 
@@ -426,7 +427,7 @@ impl Config {
         }
 
         // Blocked IPs must parse as IP addresses.
-        for ip in &self.access.blocked_ips {
+        for (ip, _) in &self.access.blocked_ips {
             ip.parse::<std::net::IpAddr>().map_err(|_| {
                 Error::Config(format!(
                     "access.blocked_ips contains an invalid IP address: {ip:?}"
@@ -560,19 +561,52 @@ impl Config {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AccessControl {
-    pub blocked_pubkeys: Vec<String>,
-    pub allowed_pubkeys: Vec<String>,
+    /// (pubkey, reason) pairs; the reason is reported by NIP-86
+    /// `listbannedpubkeys`.
+    #[serde(deserialize_with = "de_access_entries")]
+    pub blocked_pubkeys: Vec<(String, String)>,
+    #[serde(deserialize_with = "de_access_entries")]
+    pub allowed_pubkeys: Vec<(String, String)>,
     pub blocked_kinds: Vec<u64>,
     pub allowed_kinds: Vec<u64>,
-    pub blocked_ips: Vec<String>,
+    /// (ip, reason) pairs, reported by NIP-86 `listblockedips`.
+    #[serde(deserialize_with = "de_access_entries")]
+    pub blocked_ips: Vec<(String, String)>,
+}
+
+/// Deserializes an access list that accepts both the current format —
+/// `[["pubkey", "reason"], ...]` — and the legacy format — `["pubkey", ...]`
+/// (plain strings). The persisted JSON and the TOML `[access]` section both
+/// go through this, so upgrading never fails to read the old data: the
+/// legacy entries simply get an empty reason.
+fn de_access_entries<'de, D>(de: D) -> std::result::Result<Vec<(String, String)>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let items: Vec<serde_json::Value> = serde::Deserialize::deserialize(de)?;
+    items
+        .into_iter()
+        .map(|v| match v {
+            serde_json::Value::String(s) => Ok((s, String::new())),
+            serde_json::Value::Array(a) if a.len() >= 2 && a[0].is_string() && a[1].is_string() => {
+                Ok((
+                    a[0].as_str().unwrap().to_string(),
+                    a[1].as_str().unwrap().to_string(),
+                ))
+            }
+            other => Err(serde::de::Error::custom(format!(
+                "invalid access list entry: {other}"
+            ))),
+        })
+        .collect()
 }
 
 impl AccessControl {
     pub fn allows_pubkey(&self, pubkey: &str) -> bool {
-        if self.blocked_pubkeys.iter().any(|p| p == pubkey) {
+        if self.blocked_pubkeys.iter().any(|(p, _)| p == pubkey) {
             return false;
         }
-        self.allowed_pubkeys.is_empty() || self.allowed_pubkeys.iter().any(|p| p == pubkey)
+        self.allowed_pubkeys.is_empty() || self.allowed_pubkeys.iter().any(|(p, _)| p == pubkey)
     }
 
     pub fn allows_kind(&self, kind: u64) -> bool {
@@ -580,6 +614,276 @@ impl AccessControl {
             return false;
         }
         self.allowed_kinds.is_empty() || self.allowed_kinds.contains(&kind)
+    }
+}
+
+/// Escapes a string for a TOML basic string literal. The TOML spec requires
+/// every control character (U+0000-U+0008, U+000A-U+001F, U+007F) to be
+/// escaped; leaving one raw would make the written config file unparseable.
+pub(crate) fn toml_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 8);
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            c if c.is_control() => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+/// Replaces (or inserts) a `field = "value"` line inside the `[relay]`
+/// section of a config file's text, preserving every other line, comment
+/// and section. Handles three cases: a matching line already present in the
+/// `[relay]` section (replaced), no such line in `[relay]` (inserted right
+/// after the header), and no `[relay]` section at all (appended).
+/// Used by `nostrd genkey` (private_key) and the NIP-86 relay-name changes.
+pub(crate) fn set_relay_field_in_text(text: &str, field: &str, value: &str) -> String {
+    let line = format!("{field} = \"{}\"", toml_escape(value));
+
+    // Locate a real `[relay]` section header: a line whose trimmed text
+    // starts with `[relay]` followed by `]`. A `[relay]` inside a comment or
+    // a string value is not a section header and must not match.
+    let mut header_start = None;
+    let mut offset = 0;
+    for l in text.split_inclusive('\n') {
+        let t = l.trim();
+        // `[relay]` header line: exactly `[relay]`, or `[relay]` followed by
+        // whitespace or a comment. A `[relay]` inside a comment or a string
+        // value does not start with `[relay]` as a header.
+        if t == "[relay]"
+            || t.starts_with("[relay] ")
+            || t.starts_with("[relay]\t")
+            || t.starts_with("[relay]#")
+        {
+            header_start = Some(offset);
+            break;
+        }
+        offset += l.len();
+    }
+    let Some(header_start) = header_start else {
+        // No [relay] section: append one at the end.
+        let mut s = text.to_string();
+        if !s.ends_with('\n') {
+            s.push('\n');
+        }
+        s.push_str(&format!("[relay]\n{line}\n"));
+        return s;
+    };
+
+    // The header line ends at the first newline after its start (or EOF when
+    // it is the last line without a trailing newline).
+    let header_end = text[header_start..]
+        .find('\n')
+        .map(|i| header_start + i + 1)
+        .unwrap_or(text.len());
+
+    // Bound the section at the next `[section]` header line.
+    let mut section_end = text.len();
+    let mut cursor = header_end;
+    for l in text[header_end..].split_inclusive('\n') {
+        let t = l.trim();
+        if t.starts_with('[') && t.ends_with(']') {
+            section_end = cursor;
+            break;
+        }
+        cursor += l.len();
+    }
+    let section = &text[header_end..section_end];
+
+    // Case 1: a matching line already exists in the section — replace it.
+    if let Some(offset) = section
+        .lines()
+        .position(|l| l.trim_start().starts_with(field))
+    {
+        let mut new_section = String::new();
+        for (i, l) in section.lines().enumerate() {
+            if i == offset {
+                let indent: String = l.chars().take_while(|c| c.is_whitespace()).collect();
+                new_section.push_str(&format!("{indent}{line}\n"));
+            } else {
+                new_section.push_str(l);
+                new_section.push('\n');
+            }
+        }
+        let mut s = text.to_string();
+        s.replace_range(header_end..section_end, &new_section);
+        return s;
+    }
+
+    // Case 2: no matching line — insert it right after the `[relay]`
+    // header line, keeping the header on its own line even when the header
+    // is the last line of the file without a trailing newline.
+    let mut s = text.to_string();
+    if header_end >= s.len() {
+        // Header is the last line without a trailing newline.
+        s.push('\n');
+        s.push_str(&line);
+        s.push('\n');
+    } else {
+        s.insert_str(header_end, &format!("{line}\n"));
+    }
+    s
+}
+
+/// Writes `text` to `path` atomically (temp file + rename) so a crash in
+/// the middle of a write never leaves a truncated config file behind.
+pub(crate) fn write_text_atomic(path: &Path, text: &str) -> std::io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, text)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+/// Warns about config keys the schema does not know (a typo like
+/// `server.potr = 9000` would otherwise be silently ignored and the relay
+/// start with the default value). Implemented as a warning rather than a
+/// hard error because older config files legitimately carry keys the schema
+/// dropped (e.g. `software`/`version`).
+fn warn_unknown_fields(raw: &str) {
+    let Ok(value) = raw.parse::<toml::Value>() else {
+        return;
+    };
+    let known: &[(&str, &[&str])] = &[
+        // `software`/`version` were part of the older config template and
+        // are recognized (and ignored) so operators upgrading from it are
+        // not warned about them on every start.
+        (
+            "relay",
+            &[
+                "name",
+                "description",
+                "pubkey",
+                "contact",
+                "icon",
+                "post_policy",
+                "private_key",
+                "public_url",
+                "livekit_url",
+                "livekit_api_key",
+                "livekit_api_secret",
+                "enabled_nips",
+                "disabled_nips",
+                "software",
+                "version",
+            ],
+        ),
+        (
+            "server",
+            &[
+                "host",
+                "port",
+                "api_host",
+                "management_port",
+                "management_host",
+                "management_token",
+                "admin_pubkey",
+                "require_auth",
+                "send_auth_challenge",
+                "metrics_enabled",
+            ],
+        ),
+        (
+            "limits",
+            &[
+                "max_connections",
+                "max_connections_per_ip",
+                "max_ws_message_size",
+                "max_filters",
+                "max_subscriptions",
+                "max_limit",
+                "count_limit",
+                "max_sub_id_len",
+                "max_content_bytes",
+                "max_tags",
+                "max_tag_value_bytes",
+                "max_created_at_future",
+                "require_pow",
+                "max_indexed_words",
+                "buffer_size",
+                "neg_max_items",
+                "db_request_timeout_secs",
+                "new_pubkey_min_age_secs",
+                "max_out_queue_bytes",
+                "ws_idle_timeout_secs",
+                "db_queue_msgs",
+                "db_queue_events",
+                "max_sub_bytes",
+                "group_late_publish_secs",
+                "api_max_concurrent",
+                "api_max_limit",
+                "api_max_offset",
+                "api_max_search_bytes",
+                "live_batch_interval_ms",
+                "live_batch_size",
+                "live_buffer",
+            ],
+        ),
+        (
+            "database",
+            &[
+                "path",
+                "max_dbs",
+                "max_readers",
+                "map_size",
+                "map_max_size",
+                "purge_interval_secs",
+                "search_index",
+            ],
+        ),
+        (
+            "daemon",
+            &[
+                "pid_file",
+                "log_file",
+                "stats_file",
+                "stats_interval_secs",
+                "log_max_size_bytes",
+                "log_max_files",
+            ],
+        ),
+        (
+            "access",
+            &[
+                "blocked_pubkeys",
+                "allowed_pubkeys",
+                "blocked_kinds",
+                "allowed_kinds",
+                "blocked_ips",
+            ],
+        ),
+    ];
+    let Some(table) = value.as_table() else {
+        return;
+    };
+    // Unknown top-level sections (e.g. a typo'd `[serve]` instead of
+    // `[server]`) are silently ignored by serde; warn so the operator
+    // notices the section never took effect.
+    for (section, table) in table {
+        let Some(keys) = known.iter().find(|(s, _)| s == section).map(|(_, k)| *k) else {
+            log::warn!(
+                "unknown config section [{section}] is ignored; check the spelling \
+                 (the relay runs with the defaults for this section)"
+            );
+            continue;
+        };
+        let Some(table) = table.as_table() else {
+            continue;
+        };
+        for (key, _) in table {
+            if !keys.contains(&key.as_str()) {
+                log::warn!(
+                    "unknown config key [{section}].{key} is ignored; check the spelling \
+                     (the relay runs with the default for this field)"
+                );
+            }
+        }
     }
 }
 
@@ -635,12 +939,49 @@ mod tests {
     #[test]
     fn access_control() {
         let mut ac = AccessControl::default();
-        ac.blocked_pubkeys.push("bad".into());
+        ac.blocked_pubkeys.push(("bad".into(), String::new()));
         assert!(!ac.allows_pubkey("bad"));
         assert!(ac.allows_pubkey("good"));
         ac.blocked_kinds.push(5);
         assert!(!ac.allows_kind(5));
         assert!(ac.allows_kind(1));
+    }
+
+    #[test]
+    fn access_entries_accept_legacy_and_pairs() {
+        // The persisted JSON and the TOML [access] section may carry the
+        // legacy plain-string form; reading it must not fail (the entries
+        // get an empty reason).
+        let legacy = AccessControl {
+            blocked_pubkeys: vec![("aa".repeat(32), String::new())],
+            allowed_pubkeys: Vec::new(),
+            blocked_kinds: vec![],
+            allowed_kinds: vec![],
+            blocked_ips: vec![("203.0.113.9".into(), String::new())],
+        };
+        let json = serde_json::to_string(&legacy).unwrap();
+        // Simulate the pre-reason persisted document.
+        let old_json = r#"{"blocked_pubkeys":["REPL"],"allowed_pubkeys":[],"blocked_kinds":[],"allowed_kinds":[],"blocked_ips":["203.0.113.9"]}"#;
+        let old_json = old_json.replace("REPL", &"aa".repeat(32));
+        let parsed: AccessControl = serde_json::from_str(&old_json).expect("legacy JSON reads");
+        assert_eq!(parsed.blocked_pubkeys[0].0, "aa".repeat(32));
+        assert_eq!(
+            parsed.blocked_pubkeys[0].1, "",
+            "legacy entries get an empty reason"
+        );
+        assert_eq!(parsed.blocked_ips[0].0, "203.0.113.9");
+        // The current format round-trips with its reasons.
+        let with_reason = AccessControl {
+            blocked_pubkeys: vec![("bb".repeat(32), "spam".to_string())],
+            ..Default::default()
+        };
+        let raw = serde_json::to_string(&with_reason).unwrap();
+        let parsed: AccessControl = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            parsed.blocked_pubkeys[0],
+            ("bb".repeat(32), "spam".to_string())
+        );
+        let _ = json;
     }
 
     #[test]
@@ -686,10 +1027,10 @@ mod tests {
     #[test]
     fn validation_rejects_bad_access_entries() {
         let mut cfg = Config::default();
-        cfg.access.blocked_pubkeys = vec!["not-hex".into()];
+        cfg.access.blocked_pubkeys = vec![("not-hex".into(), String::new())];
         assert!(cfg.validate().is_err(), "blocked pubkeys must be hex");
         cfg.access.blocked_pubkeys.clear();
-        cfg.access.blocked_ips = vec!["not-an-ip".into()];
+        cfg.access.blocked_ips = vec![("not-an-ip".into(), String::new())];
         assert!(cfg.validate().is_err(), "blocked IPs must parse");
     }
 
@@ -701,5 +1042,23 @@ mod tests {
             cfg.validate().is_err(),
             "max_connections must be at least 1"
         );
+    }
+
+    #[test]
+    fn toml_escape_handles_all_control_chars() {
+        // U+007F (DEL) and other control characters must be escaped: the
+        // toml crate rejects them raw in basic strings.
+        for ch in ['\u{0}', '\u{7f}', '\u{1f}'] {
+            let escaped = toml_escape(&format!("a{ch}b"));
+            assert!(
+                !escaped.contains(ch),
+                "control character must be escaped, got {escaped:?}"
+            );
+            assert!(
+                toml::from_str::<toml::Value>(&format!("x = \"{escaped}\"")).is_ok(),
+                "escaped output must parse as TOML"
+            );
+        }
+        assert_eq!(toml_escape("quote\\backslash"), "quote\\\\backslash");
     }
 }

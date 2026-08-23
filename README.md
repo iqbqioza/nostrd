@@ -203,7 +203,7 @@ All relay-side NIPs are implemented; client-side NIPs are stored and served as p
 | [42](https://github.com/nostr-protocol/nips/blob/master/42.md) | Client authentication (AUTH) |
 | [43](https://github.com/nostr-protocol/nips/blob/master/43.md) | Relay access metadata and requests (roles, membership lists, join/leave) |
 | [45](https://github.com/nostr-protocol/nips/blob/master/45.md) | Counting results (COUNT, with HyperLogLog registers) |
-| [50](https://github.com/nostr-protocol/nips/blob/master/50.md) | Search capability (relevance-ordered by IDF-weighted terms) |
+| [50](https://github.com/nostr-protocol/nips/blob/master/50.md) | Search capability (whole-word terms, relevance-ordered by IDF weights) |
 | [59](https://github.com/nostr-protocol/nips/blob/master/59.md) | Gift wrap (recipient-only serving, NIP-09/62 linked deletion) |
 | [62](https://github.com/nostr-protocol/nips/blob/master/62.md) | Request to vanish |
 | [67](https://github.com/nostr-protocol/nips/blob/master/67.md) | EOSE completeness hint (`finish`/`more`) |

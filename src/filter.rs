@@ -90,20 +90,22 @@ impl Filter {
         {
             return false;
         }
-        // NIP-50: an event matches when at least one search term appears in
-        // the content; the database scan ranks full matches first.
+        // NIP-50: an event matches when at least one search term appears in the
+        // content as a whole word; the database scan ranks full matches
+        // first and the word index and the non-indexed fallback agree.
         if let Some(search) = self.search.as_deref()
             && !search.trim().is_empty()
+            && !crate::nips::nip50::matches_terms(&ev.content, &crate::nips::nip50::terms(search))
         {
-            let content = ev.content.to_lowercase();
-            if !crate::nips::nip50::terms(search)
-                .iter()
-                .any(|term| content.contains(term.as_str()))
-            {
-                return false;
-            }
+            return false;
         }
         self.tags.iter().all(|(name, value)| {
+            // NIP-01: tag constraints are `#`-prefixed; any other key is an
+            // unknown filter field and is ignored (a typo like `"kind"` must
+            // not silently turn the whole filter into an impossible query).
+            if !name.starts_with('#') {
+                return true;
+            }
             let tag_name = name.strip_prefix('#').unwrap_or(name);
             let values = tag_string_values(value);
             values.iter().any(|v| {
@@ -230,5 +232,24 @@ mod tests {
         f.ids = None;
         f.authors = Some(vec!["a".repeat(64); MAX_FILTER_MEMBERS + 1]);
         assert!(f.too_many_members());
+    }
+
+    #[test]
+    fn unknown_non_tag_filter_keys_are_ignored() {
+        // NIP-01: tag constraints are `#`-prefixed; a typo like `"kind"`
+        // must not turn the filter into an impossible query (0 results) —
+        // it is ignored, so the filter matches by its other constraints.
+        let e = ev(1, vec![vec!["t".into(), "rust".into()]]);
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"kind": [1], "kinds": [1]})).unwrap();
+        assert!(f.matches(&e), "the unknown `kind` key must be ignored");
+        let f: Filter = serde_json::from_value(serde_json::json!({"foo": "bar"})).unwrap();
+        assert!(
+            f.matches(&e),
+            "an unknown non-tag key matches everything else"
+        );
+        // `#`-prefixed keys still constrain.
+        let f: Filter = serde_json::from_value(serde_json::json!({"#t": ["go"]})).unwrap();
+        assert!(!f.matches(&e));
     }
 }

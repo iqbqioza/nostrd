@@ -338,92 +338,10 @@ fn generate_secret_key_hex() -> Result<String> {
 }
 
 /// Replaces (or inserts) the `relay.private_key` value in a config file's
-/// text, preserving every other line, comment and section. Handles three
-/// cases: a `private_key` line already present in the `[relay]` section, no
-/// `private_key` line in `[relay]` (inserted right after the header), and no
-/// `[relay]` section at all (appended).
+/// text, preserving every other line, comment and section. Delegates to the
+/// shared [`crate::config::set_relay_field_in_text`] helper.
 fn set_private_key_in_text(text: &str, key: &str) -> String {
-    let line = format!("private_key = \"{key}\"");
-
-    // Locate a real `[relay]` section header: a line whose trimmed text
-    // starts with `[relay]` followed by `]`. A `[relay]` inside a comment or
-    // a string value is not a section header and must not match.
-    let mut header_start = None;
-    let mut offset = 0;
-    for l in text.split_inclusive('\n') {
-        let t = l.trim();
-        // `[relay]` header line: exactly `[relay]`, or `[relay]` followed by
-        // whitespace (a trailing comment). A `[relay]` inside a comment or a
-        // string value does not start with `[relay]` as a header.
-        if t == "[relay]" || t.starts_with("[relay] ") || t.starts_with("[relay]\t") {
-            header_start = Some(offset);
-            break;
-        }
-        offset += l.len();
-    }
-    let Some(header_start) = header_start else {
-        // No [relay] section: append one at the end.
-        let mut s = text.to_string();
-        if !s.ends_with('\n') {
-            s.push('\n');
-        }
-        s.push_str(&format!("[relay]\n{line}\n"));
-        return s;
-    };
-
-    // The header line ends at the first newline after its start (or EOF when
-    // it is the last line without a trailing newline).
-    let header_end = text[header_start..]
-        .find('\n')
-        .map(|i| header_start + i + 1)
-        .unwrap_or(text.len());
-
-    // Bound the section at the next `[section]` header line.
-    let mut section_end = text.len();
-    let mut cursor = header_end;
-    for l in text[header_end..].split_inclusive('\n') {
-        let t = l.trim();
-        if t.starts_with('[') && t.ends_with(']') {
-            section_end = cursor;
-            break;
-        }
-        cursor += l.len();
-    }
-    let section = &text[header_end..section_end];
-
-    // Case 1: a `private_key` line already exists in the section — replace it.
-    if let Some(offset) = section
-        .lines()
-        .position(|l| l.trim_start().starts_with("private_key"))
-    {
-        let mut new_section = String::new();
-        for (i, l) in section.lines().enumerate() {
-            if i == offset {
-                let indent: String = l.chars().take_while(|c| c.is_whitespace()).collect();
-                new_section.push_str(&format!("{indent}{line}\n"));
-            } else {
-                new_section.push_str(l);
-                new_section.push('\n');
-            }
-        }
-        let mut s = text.to_string();
-        s.replace_range(header_end..section_end, &new_section);
-        return s;
-    }
-
-    // Case 2: no `private_key` line — insert it right after the `[relay]`
-    // header line, keeping the header on its own line even when the header
-    // is the last line of the file without a trailing newline.
-    let mut s = text.to_string();
-    if header_end >= s.len() {
-        // Header is the last line without a trailing newline.
-        s.push('\n');
-        s.push_str(&line);
-        s.push('\n');
-    } else {
-        s.insert_str(header_end, &format!("{line}\n"));
-    }
-    s
+    crate::config::set_relay_field_in_text(text, "private_key", key)
 }
 
 /// Resolves a possibly relative path against the current directory so that it
@@ -551,6 +469,19 @@ mod tests {
         let out = set_private_key_in_text(text, KEY);
         assert!(out.ends_with(&format!("[relay]\nprivate_key = \"{KEY}\"\n")));
         assert!(out.starts_with("# [relay] mentioned in a comment\n"));
+        assert!(toml::from_str::<toml::Value>(&out).is_ok());
+    }
+
+    #[test]
+    fn relay_header_with_inline_comment_is_recognized() {
+        // `[relay]# a trailing comment` is a valid TOML header and must be
+        // recognized as the `[relay]` section; before the fix the key was
+        // appended as a *second* `[relay]` section, breaking the file with
+        // a duplicate key.
+        let text = "[relay]# my relay\nname = \"nostrd\"\n[server]\nport = 8080\n";
+        let out = set_private_key_in_text(text, KEY);
+        assert!(out.contains(&format!("[relay]# my relay\nprivate_key = \"{KEY}\"")));
+        assert!(out.contains("[server]\nport = 8080"));
         assert!(toml::from_str::<toml::Value>(&out).is_ok());
     }
 
