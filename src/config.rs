@@ -991,5 +991,4 @@ mod tests {
         }
         assert_eq!(toml_escape("quote\\backslash"), "quote\\\\backslash");
     }
-
 }

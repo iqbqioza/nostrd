@@ -1792,3 +1792,29 @@ fn unknown_filter_keys_are_ignored_by_the_scan() {
         assert_eq!(res.len(), 0);
     });
 }
+
+#[test]
+fn search_finds_big_events() {
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let content = format!("needle-{}", "z".repeat(300_000));
+        let e = event(1, &content, now, vec![]);
+        assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
+        let f: Filter = serde_json::from_value(serde_json::json!({"search": "needle"})).unwrap();
+        let (res, _) = db.query(vec![f.clone()], 500, now).await;
+        assert_eq!(res.len(), 1, "search must find the 300KB event");
+        let (res2, _) = db.query_req(vec![f], 500, now).await;
+        assert_eq!(res2.len(), 1);
+    });
+}

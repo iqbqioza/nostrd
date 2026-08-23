@@ -285,15 +285,18 @@ impl super::Conn {
         }
         let truncated = to_send.len() > original_total;
         to_send.truncate(original_total);
+        // The response is queued without the outgoing byte cap: a dropped
+        // REQ event would be lost permanently (the byte cap only applies to
+        // the recoverable live traffic).
         for event in to_send {
-            self.send_json(json!(["EVENT", sub_id, event]));
+            self.send_json_uncapped(json!(["EVENT", sub_id, event]));
         }
         // NIP-67: EOSE completeness hint.
         if eose_hint {
             let hint = if more || truncated { "more" } else { "finish" };
-            self.send_json(json!(["EOSE", sub_id, [hint]]));
+            self.send_json_uncapped(json!(["EOSE", sub_id, [hint]]));
         } else {
-            self.send_json(json!(["EOSE", sub_id]));
+            self.send_json_uncapped(json!(["EOSE", sub_id]));
         }
     }
 

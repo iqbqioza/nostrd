@@ -102,6 +102,28 @@ impl Conn {
         }
     }
 
+    /// Queues a message without the outgoing byte cap: used for one-shot
+    /// REQ responses, where a dropped event is lost permanently (the
+    /// subscription is answered once). The byte cap exists to protect
+    /// memory against slow readers on *continuous* live traffic, where a
+    /// drop is recoverable; a REQ response is bounded by the scan's
+    /// `max_limit` and the message-count cap instead. Live delivery keeps
+    /// the capped path.
+    pub(crate) fn send_json_uncapped(&mut self, value: Value) {
+        if let Ok(text) = serde_json::to_string(&value) {
+            if self.outgoing.len() >= OUT_QUEUE_LIMIT {
+                self.dropped += 1;
+                self.relay.stats.bump(&self.relay.stats.buffers_dropped, 1);
+                return;
+            }
+            let size = text.len();
+            self.out_bytes += size;
+            self.out_msgs += 1;
+            self.out_bytes_total += size as u64;
+            self.outgoing.push_back(Message::Text(text.into()));
+        }
+    }
+
     pub(crate) fn send_notice(&mut self, text: &str) {
         self.send_json(json!(["NOTICE", text]));
     }
@@ -861,12 +883,7 @@ mod tests {
         rt.block_on(async {
             let mut conn = build_conn().await;
             let now = unix_now();
-            let hidden = signed_note(
-                conn.relay.secp(),
-                "secret",
-                now,
-                vec![vec!["-".into()]],
-            );
+            let hidden = signed_note(conn.relay.secp(), "secret", now, vec![vec!["-".into()]]);
             let v1 = signed_note(conn.relay.secp(), "v1", now - 1, vec![]);
             let v2 = signed_note(conn.relay.secp(), "v2", now - 2, vec![]);
             let v3 = signed_note(conn.relay.secp(), "v3", now - 3, vec![]);
@@ -889,4 +906,51 @@ mod tests {
         });
     }
 
+    #[test]
+    fn req_response_bypasses_the_outgoing_byte_cap() {
+        // Regression: REQ response events used to be dropped by the
+        // outgoing byte cap (a dropped event is lost permanently — the
+        // subscription is answered once), so a REQ with large events
+        // silently returned fewer events than the filter requested.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            // A tiny per-connection cap so the queue would drop big messages.
+            conn.out_queue_bytes = 1024;
+            let now = unix_now();
+            let big = "x".repeat(10_000);
+            let mut ids = Vec::new();
+            for i in 0..5 {
+                let ev = signed_note(
+                    conn.relay.secp(),
+                    &format!("big-{i}-{big}"),
+                    now - i,
+                    vec![],
+                );
+                ids.push(ev.id.clone());
+                conn.relay.db.put(ev, now).await;
+            }
+            conn.handle_req(&[json!("sub"), json!({"kinds": [1], "limit": 5})])
+                .await;
+            let delivered: Vec<String> = outgoing_json(&conn)
+                .iter()
+                .filter(|m| m[0] == "EVENT")
+                .map(|m| m[2]["id"].as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(
+                delivered.len(),
+                5,
+                "all five response events must be queued despite the tiny cap"
+            );
+            assert!(
+                ids.iter().all(|id| delivered.contains(id)),
+                "no response event may be dropped"
+            );
+            assert!(
+                outgoing_json(&conn).iter().any(|m| m[0] == "EOSE"),
+                "the EOSE must be queued too"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
 }

@@ -244,10 +244,12 @@ mod tests {
             serde_json::from_value(serde_json::json!({"kind": [1], "kinds": [1]})).unwrap();
         assert!(f.matches(&e), "the unknown `kind` key must be ignored");
         let f: Filter = serde_json::from_value(serde_json::json!({"foo": "bar"})).unwrap();
-        assert!(f.matches(&e), "an unknown non-tag key matches everything else");
+        assert!(
+            f.matches(&e),
+            "an unknown non-tag key matches everything else"
+        );
         // `#`-prefixed keys still constrain.
         let f: Filter = serde_json::from_value(serde_json::json!({"#t": ["go"]})).unwrap();
         assert!(!f.matches(&e));
     }
-
 }

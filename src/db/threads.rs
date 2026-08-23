@@ -65,15 +65,8 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             hidden_slack,
             reply,
         } => {
-            let out = match store.scan(
-                &filters,
-                now,
-                limit,
-                false,
-                ascending,
-                budget,
-                hidden_slack,
-            ) {
+            let out = match store.scan(&filters, now, limit, false, ascending, budget, hidden_slack)
+            {
                 Ok(out) => out,
                 Err(e) => {
                     db_error(errors, &e);

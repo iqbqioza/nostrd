@@ -354,7 +354,12 @@ impl DbClient {
     /// slack enabled (the scan over-fetches each filter's limit so that
     /// events withheld by the connection's visibility rules do not consume
     /// the limit slots; the connection truncates the visible results).
-    pub async fn query_req(&self, filters: Vec<Filter>, limit: usize, now: u64) -> (Vec<Event>, bool) {
+    pub async fn query_req(
+        &self,
+        filters: Vec<Filter>,
+        limit: usize,
+        now: u64,
+    ) -> (Vec<Event>, bool) {
         self.query_directed(filters, limit, now, false, 1).await
     }
 
