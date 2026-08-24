@@ -12,6 +12,7 @@ nostrd is designed around two goals:
 
 ## Table of contents
 
+- [Documentation](#documentation)
 - [Features](#features)
 - [Install (pre-built binary)](#install-pre-built-binary)
 - [Requirements](#requirements)
@@ -26,6 +27,17 @@ nostrd is designed around two goals:
 - [Performance](#performance)
 - [Repository layout](#repository-layout)
 - [License](#license)
+
+## Documentation
+
+The detailed guides live in the [`docs/`](docs/) directory:
+
+| Document | Contents |
+| --- | --- |
+| [Manual](docs/MANUAL.md) | Installation, configuration, operation, NIP support, NIP-29 groups, LiveKit, logs and statistics |
+| [Configuration reference](docs/CONFIGURATION.md) | Every `nostrd.toml` option with its default and exact behavior, validation rules, SIGHUP reload, full example |
+| [HTTP REST API reference](docs/API.md) | `/api/v1` endpoints, query parameters, pagination, errors, status codes |
+| [Troubleshooting](docs/TROUBLESHOOTING.md) | Common errors and their step-by-step fixes |
 
 ## Features
 
@@ -96,35 +108,19 @@ Point your Nostr client at `ws://<host>:8080` (or `wss://<domain>` behind a TLS 
 
 ## REST API
 
-nostrd exposes a read-only HTTP API alongside the WebSocket server, on the same port under `/api/v1`. It is served by a dedicated database reader thread with its own concurrency limiter and query-parameter bounds, so heavy REST traffic cannot stall WebSocket subscribers.
-
-By default the API is served on every host, next to the WebSocket endpoint. Set `server.api_host` (e.g. `api_host = "api.example.com"`) to split the two by Host header on the same port: that hostname then serves only `/api/v1` and `/health`, while every other hostname (your relay's DNS name) serves only the WebSocket/NIP-11/NIP-86 routes and never exposes `/api/v1`. Point both DNS names at the same server and the API and the relay are fully separated.
+nostrd exposes a **read-only HTTP API** on the same port under `/api/v1`, served by a dedicated database reader thread with its own concurrency limiter, so heavy REST traffic can never stall WebSocket subscribers.
 
 | Endpoint | Description |
 | --- | --- |
-| `GET /api/v1/{npub1...}/{kind}` | Events by author pubkey and kind. The `{kind}` path is mandatory for `npub1`. |
-| `GET /api/v1/{nevent1...}` | A single event by its NIP-19 event id. |
-| `GET /api/v1/{naddr1...}` | Addressable/replaceable events by NIP-19 address (`kind` + author + `d` tag). |
-| `GET /api/v1/{note1...}` | A single event by its NIP-19 note id. |
+| `GET /api/v1/{npub1...}/{kind}` | Events by author pubkey and kind (the `{kind}` path is mandatory for `npub1`) |
+| `GET /api/v1/{nevent1...}` / `GET /api/v1/{note1...}` | A single event by its NIP-19 id |
+| `GET /api/v1/{naddr1...}` | Addressable/replaceable events by NIP-19 address |
 
-Every endpoint returns `200` with a JSON body, unless the identifier is invalid (`400`) or the server is overloaded (`503`):
+Query parameters: `limit`, `offset`, `since`, `until`, `sort`, `search`, `e`, `p`, `t`, `d`. Responses are `{ "events": [...], "count": N, "more": bool }`; `offset` + `more` paginate over the *visible* sequence (NIP-70 protected, NIP-59 gift wraps and NIP-29 private/hidden group content are withheld).
 
-```json
-{ "events": [ { ...event objects... } ], "count": 3, "more": false }
-```
+By default the API is served on every host; set `server.api_host` (e.g. `api_host = "api.example.com"`) to serve it only on that hostname and hide `/api/v1` from every other host.
 
-Query parameters (all optional):
-
-| Parameter | Description |
-| --- | --- |
-| `limit` | Max results (default 100, capped by `limits.api_max_limit`). |
-| `offset` | Skip this many results (pagination; capped by `limits.api_max_offset`). |
-| `since` / `until` | Unix timestamps bounding `created_at`. |
-| `sort` | `asc` or `ascending` for oldest-first (default is newest-first). |
-| `search` | NIP-50 full-text search on event content (length capped by `limits.api_max_search_bytes`). |
-| `e` / `p` / `t` / `d` | Filter on `#e`, `#p`, `#t` or `#d` tags (for `npub1`/`nevent1`/`note1`; the `d` tag of an `naddr1` is taken from the address itself unless overridden). |
-
-Only `GET` is supported; WebSocket upgrade requests to `/api/v1` are rejected with `403`. The API applies the same visibility rules as an anonymous WebSocket connection: NIP-70 protected events, NIP-59 gift wraps and NIP-29 private/hidden group content are withheld. Pagination (`offset` and the `more` flag) is computed over the *visible* sequence, so hidden events between pages do not skip or duplicate rows.
+**Full reference — endpoints, parameters, pagination, errors, status codes: [HTTP REST API reference](docs/API.md).**
 
 ## Commands
 
@@ -144,83 +140,20 @@ Sending `SIGHUP` to the daemon reloads the configuration at runtime: most limits
 
 ## Configuration
 
-Every setting is optional — missing entries fall back to the defaults. `nostrd.toml.example` documents every option with comments. The main sections:
+Every setting is optional — missing entries fall back to the defaults, and `nostrd.toml.example` documents every option with comments. The configuration has six sections:
 
-```toml
-[relay]
-name = "nostrd"                 # relay name (NIP-11)
-description = "..."             # relay description (NIP-11)
-pubkey = ""                     # administrative contact pubkey (NIP-11 "pubkey")
-contact = ""                    # alternative contact (URL or mailto, NIP-11)
-icon = ""                       # relay icon URL (NIP-11)
-private_key = ""                # hex secret key of the relay itself (required for
-                                # NIP-29 group metadata 39000-39005, including the
-                                # 39001 admins / 39002 members snapshots, and NIP-43
-                                # membership events; its pubkey is advertised as the
-                                # NIP-11 "self"; generate with `nostrd genkey`)
-public_url = ""                 # public URL as seen by clients (e.g. "wss://relay.example.com");
-                                # set this behind a TLS-terminating proxy / Cloudflare Tunnel
-enabled_nips = []               # explicit NIP allowlist (empty = all except disabled_nips)
-disabled_nips = []              # NIPs to disable
-
-[server]
-host = "127.0.0.1"              # bind address; "127.0.0.1" = local only (the default),
-                                # "0.0.0.0" = all interfaces
-port = 8080
-api_host = ""                   # hostname dedicated to the REST API; empty =
-                                # API served on every host, next to WebSocket
-management_token = ""           # bearer token for the NIP-86 management API
-admin_pubkey = ""               # or authorize NIP-86 calls with a NIP-98 event
-metrics_enabled = true          # serve Prometheus metrics on GET /metrics
-
-[limits]
-max_connections = 10000
-max_connections_per_ip = 0      # per-source-IP cap on WebSocket connections (0 = off)
-max_ws_message_size = 1048576
-max_subscriptions = 20
-max_limit = 500
-count_limit = 2000              # NIP-45 COUNT cap (results beyond it are "approximate")
-new_pubkey_min_age_secs = 0     # spam defense: reject events from accounts younger
-                                # than this many seconds (0 = off)
-db_queue_msgs = 4096            # overload protection: fail fast when the database
-db_queue_events = 262144        # queue holds more than this much pending work
-buffer_size = 2048              # initial WebSocket read/write buffer per connection
-ws_idle_timeout_secs = 0        # close connections idle this many seconds (0 = off);
-                                # sends periodic PINGs so silent subscribers stay alive
-group_late_publish_secs = 604800  # NIP-29 late-publication window
-api_max_concurrent = 32         # REST API: max concurrent /api/v1 queries (beyond = 503)
-api_max_limit = 500             # REST API: ceiling for the `limit` parameter (0 = off)
-api_max_offset = 10000          # REST API: ceiling for the `offset` parameter (0 = off)
-api_max_search_bytes = 1024     # REST API: ceiling for the `search` parameter (0 = off)
-
-[database]
-path = "./data"
-map_size = 1073741824           # memory map floor (bytes). The map is a sparse
-                                # virtual-address reservation opened at the
-                                # ceiling (map_max_size), so physical memory and
-                                # disk grow only with the data actually stored
-map_max_size = 1099511627776    # map ceiling (bytes); the map is opened at this
-                                # size once and never resized at runtime
-search_index = true             # NIP-50 word index
-purge_interval_secs = 300       # NIP-40 expired-event purge interval
-
-[daemon]
-pid_file = "./nostrd.pid"
-log_file = "./nostrd.log"
-stats_file = "./nostrd.stats.json"
-stats_interval_secs = 5         # interval between stats file writes
-log_max_size_bytes = 52428800   # rotate the log file when it grows past this size (0 = never)
-log_max_files = 5               # rotated log backups to keep
-
-[access]
-blocked_pubkeys = []            # NIP-86 runtime bans/allowlists are persisted in
-allowed_pubkeys = []            # the database and survive restarts; this section
-blocked_kinds = []              # seeds them on the very first run only
-allowed_kinds = []
-blocked_ips = []
-```
+| Section | Purpose |
+| --- | --- |
+| `[relay]` | Identity, URLs (incl. `public_url` for NIP-42/62/98), `private_key`, LiveKit, NIP toggles |
+| `[server]` | Binding, `api_host` split, management API, authentication |
+| `[limits]` | All limits and overload protections (connections, events, search, API bounds) |
+| `[database]` | LMDB storage (paths, memory-map sizes, search index) |
+| `[daemon]` | PID/log/stats files and log rotation |
+| `[access]` | Initial access control lists (NIP-86 manages them at runtime) |
 
 `nostrd check` (and startup) validate the file and warn about common misconfigurations — e.g. an empty `relay.public_url` with a wildcard/loopback bind (which would break NIP-42 AUTH, NIP-62 vanish and NIP-86 NIP-98 auth), a `require_pow` high enough to make mining infeasible, incomplete LiveKit settings, or the `require_auth` + `send_auth_challenge = false` lockout.
+
+**Full reference — every key, its default and its exact behavior, validation rules, SIGHUP reload, full example: [Configuration reference](docs/CONFIGURATION.md).**
 
 ### Anti-abuse limits
 
