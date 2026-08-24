@@ -12,9 +12,18 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  release:
-    name: Build and publish release
-    runs-on: ubuntu-latest
+  build:
+    name: Build (${{ matrix.asset }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: nostrd-linux-x86_64
+          # Native ARM64 runner (GitHub-hosted, public repos).
+          - os: ubuntu-24.04-arm
+            asset: nostrd-linux-aarch64
     steps:
       - uses: actions/checkout@v4
 
@@ -28,12 +37,28 @@ jobs:
       - name: Prepare release assets
         run: |
           mkdir -p dist
-          cp target/release/nostrd dist/nostrd-linux-x86_64
-          chmod +x dist/nostrd-linux-x86_64
-          (cd dist && sha256sum nostrd-linux-x86_64 > nostrd-linux-x86_64.sha256)
-          (cd dist && tar -czf nostrd-linux-x86_64.tar.gz nostrd-linux-x86_64)
+          cp target/release/nostrd "dist/${{ matrix.asset }}"
+          chmod +x "dist/${{ matrix.asset }}"
+          (cd dist && tar -czf "${{ matrix.asset }}.tar.gz" "${{ matrix.asset }}")
+          (cd dist && sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256")
 
-      - name: Create GitHub release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create GitHub release with release notes
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -41,6 +66,10 @@ jobs:
             dist/nostrd-linux-x86_64 \
             dist/nostrd-linux-x86_64.tar.gz \
             dist/nostrd-linux-x86_64.sha256 \
+            dist/nostrd-linux-aarch64 \
+            dist/nostrd-linux-aarch64.tar.gz \
+            dist/nostrd-linux-aarch64.sha256 \
             --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" \
+            --notes "See the commit history for changes in this release." \
             --generate-notes
