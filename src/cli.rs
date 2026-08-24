@@ -267,14 +267,16 @@ impl Cli {
             )));
         }
         let cfg = Config::load(&self.config)?;
+        if let BlossomAction::Allow { pubkey } | BlossomAction::Deny { pubkey } = action
+            && !is_pubkey_or_npub(pubkey)
+        {
+            return Err(Error::Config(format!(
+                "{pubkey:?} is not an npub1... or 64-hex pubkey"
+            )));
+        }
         let mut entries = load_blossom_allow(&cfg)?;
         match action {
             BlossomAction::Allow { pubkey } => {
-                if !is_pubkey_or_npub(pubkey) {
-                    return Err(Error::Config(format!(
-                        "{pubkey:?} is not an npub1... or 64-hex pubkey"
-                    )));
-                }
                 let hex = normalize_pubkey(pubkey);
                 if !entries.iter().any(|e| e == &hex) {
                     entries.push(hex.clone());
@@ -285,11 +287,6 @@ impl Cli {
                 }
             }
             BlossomAction::Deny { pubkey } => {
-                if !is_pubkey_or_npub(pubkey) {
-                    return Err(Error::Config(format!(
-                        "{pubkey:?} is not an npub1... or 64-hex pubkey"
-                    )));
-                }
                 let hex = normalize_pubkey(pubkey);
                 let before = entries.len();
                 entries.retain(|e| e != &hex);
@@ -346,15 +343,17 @@ impl Cli {
             )));
         }
         let cfg = Config::load(&self.config)?;
+        if let RelayAction::Allow { pubkey } | RelayAction::Deny { pubkey } = action
+            && !is_pubkey_or_npub(pubkey)
+        {
+            return Err(Error::Config(format!(
+                "{pubkey:?} is not an npub1... or 64-hex pubkey"
+            )));
+        }
         let (mut deny, mut allow) = load_relay_pubkeys(&cfg)?;
         let mut changed = false;
         match action {
             RelayAction::Allow { pubkey } => {
-                if !is_pubkey_or_npub(pubkey) {
-                    return Err(Error::Config(format!(
-                        "{pubkey:?} is not an npub1... or 64-hex pubkey"
-                    )));
-                }
                 let hex = normalize_pubkey(pubkey);
                 deny.retain(|(p, _)| p != &hex);
                 if !allow.iter().any(|(p, _)| p == &hex) {
@@ -366,11 +365,6 @@ impl Cli {
                 }
             }
             RelayAction::Deny { pubkey } => {
-                if !is_pubkey_or_npub(pubkey) {
-                    return Err(Error::Config(format!(
-                        "{pubkey:?} is not an npub1... or 64-hex pubkey"
-                    )));
-                }
                 let hex = normalize_pubkey(pubkey);
                 allow.retain(|(p, _)| p != &hex);
                 if !deny.iter().any(|(p, _)| p == &hex) {
@@ -633,10 +627,23 @@ fn save_blossom_allow(cfg: &Config, entries: &[String]) -> Result<()> {
 /// (pubkey, reason) pair) from the relay database.
 fn load_relay_pubkeys(cfg: &Config) -> Result<crate::db::store::RelayPubkeyLists> {
     let env = open_db_env(cfg)?;
-    let mut wtxn = env.write_txn()?;
-    let access =
+    // The table is created in its own transaction, committed before the
+    // migration runs (LMDB allows a single writer at a time).
+    {
+        let mut wtxn = env.write_txn()?;
         env.create_database::<heed::types::Bytes, heed::types::Bytes>(&mut wtxn, Some("access"))?;
-    let lists = match access.get(&wtxn, b"relay_pubkeys")? {
+        wtxn.commit()?;
+    }
+    // Same one-time migration the server runs: a CLI write before the
+    // first post-upgrade server start must not lose legacy entries.
+    let rtxn = env.read_txn()?;
+    let access = env
+        .open_database::<heed::types::Bytes, heed::types::Bytes>(&rtxn, Some("access"))?
+        .expect("access table created above");
+    drop(rtxn);
+    crate::db::store::migrate_access_pubkeys(&env, &access)?;
+    let rtxn = env.read_txn()?;
+    let lists = match access.get(&rtxn, b"relay_pubkeys")? {
         Some(raw) => {
             let value: serde_json::Value = serde_json::from_slice(raw)?;
             let deny = serde_json::from_value(value.get("deny").cloned().unwrap_or_default())?;
@@ -645,7 +652,6 @@ fn load_relay_pubkeys(cfg: &Config) -> Result<crate::db::store::RelayPubkeyLists
         }
         None => (Vec::new(), Vec::new()),
     };
-    wtxn.commit()?;
     Ok(lists)
 }
 

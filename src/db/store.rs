@@ -422,42 +422,55 @@ impl Store {
     /// One-time migration for databases written before the pubkey lists
     /// moved out of the `access` blob: when the dedicated `relay_pubkeys`
     /// key is absent but the old blob carries pubkey entries, copy them
-    /// over. Runs once at startup, before any request is served.
+    /// over. Runs at startup and from the CLI commands, before any request
+    /// is served.
     pub(crate) fn migrate_access_pubkeys(&self) -> Result<()> {
-        let rtxn = self.env.read_txn()?;
-        if self.access.get(&rtxn, b"relay_pubkeys")?.is_some() {
-            return Ok(());
-        }
-        let Some(raw) = self.access.get(&rtxn, b"access")? else {
-            return Ok(());
-        };
-        let value: serde_json::Value = serde_json::from_slice(raw)?;
-        let entries = |name: &str| -> Vec<(String, String)> {
-            value
-                .get(name)
-                .and_then(serde_json::Value::as_array)
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(|v| match v {
-                            serde_json::Value::String(s) => Some((s.clone(), String::new())),
-                            serde_json::Value::Array(a) if a.len() >= 2 => Some((
-                                a[0].as_str().unwrap_or("").to_string(),
-                                a[1].as_str().unwrap_or("").to_string(),
-                            )),
-                            _ => None,
-                        })
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
-        let deny = entries("blocked_pubkeys");
-        let allow = entries("allowed_pubkeys");
-        if deny.is_empty() && allow.is_empty() {
-            return Ok(());
-        }
-        self.save_relay_pubkeys(&deny, &allow)
+        migrate_access_pubkeys(&self.env, &self.access)
     }
+}
+
+/// Shared migration used by both the relay server (`Store`) and the CLI
+/// commands (`nostrd relay allow/deny`), which open the environment from
+/// their own process: without it, a CLI write before the first post-upgrade
+/// server start would silently skip the legacy entries.
+pub(crate) fn migrate_access_pubkeys(env: &Env, access: &Database<Bytes, Bytes>) -> Result<()> {
+    let rtxn = env.read_txn()?;
+    if access.get(&rtxn, b"relay_pubkeys")?.is_some() {
+        return Ok(());
+    }
+    let Some(raw) = access.get(&rtxn, b"access")? else {
+        return Ok(());
+    };
+    let value: serde_json::Value = serde_json::from_slice(raw)?;
+    let entries = |name: &str| -> Vec<(String, String)> {
+        value
+            .get(name)
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|v| match v {
+                        serde_json::Value::String(s) => Some((s.clone(), String::new())),
+                        serde_json::Value::Array(a) if a.len() >= 2 => Some((
+                            a[0].as_str().unwrap_or("").to_string(),
+                            a[1].as_str().unwrap_or("").to_string(),
+                        )),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let deny = entries("blocked_pubkeys");
+    let allow = entries("allowed_pubkeys");
+    if deny.is_empty() && allow.is_empty() {
+        return Ok(());
+    }
+    let data = serde_json::to_vec(&serde_json::json!({ "deny": deny, "allow": allow }))?;
+    let mut wtxn = env.write_txn()?;
+    access.put(&mut wtxn, b"relay_pubkeys", &data)?;
+    wtxn.commit()?;
+    Ok(())
 }
 
 // ----- key builders -----
