@@ -36,7 +36,7 @@ The App Platform builds from the repository `Dockerfile` (which downloads the pr
 1. **Connect your GitHub repo** and create an app from it.
 2. **Port**: set the HTTP port to `8080` (the relay listens there).
 3. **Persistent disk**: mount a volume at `/data` (LMDB data lives there — without it, data is lost on every deploy).
-4. **Env**: the `fly/nostrd.toml` baked into the image can be replaced by mounting your own config at `/etc/nostrd/nostrd.toml` (create a fork that copies it, or use a Dockerfile `COPY` in your own repo).
+4. **Env**: the `deploy/nostrd.container.toml` baked into the image can be replaced by mounting your own config at `/etc/nostrd/nostrd.toml` (create a fork that copies it, or use a Dockerfile `COPY` in your own repo).
 5. **TLS**: App Platform provides `https://` automatically for the app domain — set `relay.public_url` accordingly.
 
 ## Both options

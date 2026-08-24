@@ -39,4 +39,4 @@ Cloud Run builds from the repository `Dockerfile` (which downloads the pre-built
 4. **Persistent storage**: attach a **Cloud Run volume (filestore/gcsfuse)** at `/data` — LMDB needs a filesystem, so a GCS FUSE mount at `/data` works for persistence.
 5. **TLS**: Cloud Run provides `https://` automatically — set `relay.public_url = "wss://<service>.a.run.app"` (or your custom domain).
 
-> **Note**: Cloud Run scales to zero by default — for a relay, set **min instances = 1** so it never goes cold. The `fly/nostrd.toml` baked into the image can be replaced by mounting your own `nostrd.toml` at `/etc/nostrd/nostrd.toml`.
+> **Note**: Cloud Run scales to zero by default — for a relay, set **min instances = 1** so it never goes cold. The `deploy/nostrd.container.toml` baked into the image can be replaced by mounting your own `nostrd.toml` at `/etc/nostrd/nostrd.toml`.

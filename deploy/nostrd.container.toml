@@ -1,10 +1,11 @@
-# nostrd configuration for Fly.io — baked into the image at /etc/nostrd/nostrd.toml.
+# nostrd configuration for container deployments (Fly.io, App Platform, ECS,
+# Cloud Run, Container Apps) — baked into the image at /etc/nostrd/nostrd.toml.
 #
-# Edit this file BEFORE `fly deploy` (or mount your own config at
+# Edit this file BEFORE building the image (or mount your own config at
 # /etc/nostrd/nostrd.toml) to set:
 #   - the relay name and description
-#   - `public_url` = "wss://<your-app-name>.fly.dev"  (required for NIP-42/62/98)
-#   - `private_key` = generated with `nostrd genkey` (required for NIP-29 groups)
+#   - `public_url`  (required for NIP-42/62/98)
+#   - `private_key` (required for NIP-29 groups)
 
 [relay]
 name = "nostrd on Fly.io"

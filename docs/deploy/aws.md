@@ -40,7 +40,7 @@ The repository `Dockerfile` downloads the pre-built release binary at build time
 1. Push the image to ECR: `docker buildx build --platform linux/amd64,linux/arm64 -t <account>.dkr.ecr.<region>.amazonaws.com/nostrd .`
 2. Create an ECS service (Fargate, 1 task) with a **mounted EFS volume at `/data`** (LMDB persistence — without it, data is lost on redeploys).
 3. Expose port `8080`; front it with an ALB + ACM certificate for TLS.
-4. The baked `fly/nostrd.toml` config can be overridden by mounting your own `nostrd.toml` at `/etc/nostrd/nostrd.toml` (e.g. a fork that copies it into the image).
+4. The baked `deploy/nostrd.container.toml` config can be overridden by mounting your own `nostrd.toml` at `/etc/nostrd/nostrd.toml` (e.g. a fork that copies it into the image).
 
 ## Elastic IP
 
