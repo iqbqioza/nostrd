@@ -6,7 +6,7 @@ This guide deploys nostrd to [Fly.io](https://fly.io) in a few minutes. The repo
 | --- | --- |
 | `Dockerfile` | Container image — **downloads the pre-built release binary** from the GitHub release assets (x86_64 / aarch64, chosen by the build architecture) and verifies its sha256 checksum. No compilation happens on Fly |
 | `fly.toml` | Fly app configuration: HTTP service on port 8080, health checks, the `/data` volume mount, always-on machines |
-| `fly/nostrd.toml` | The relay configuration baked into the image at `/etc/nostrd/nostrd.toml` |
+| `deploy/nostrd.container.toml` | The relay configuration baked into the image at `/etc/nostrd/nostrd.toml` |
 
 ## Prerequisites
 
@@ -39,7 +39,7 @@ fly volumes create data --size 1 --region <region>
 
 ### 3. Configure the relay
 
-Edit `fly/nostrd.toml` before deploying:
+Edit `deploy/nostrd.container.toml` before deploying:
 
 ```toml
 [relay]
@@ -75,16 +75,16 @@ curl https://<your-app-name>.fly.dev/
 
 ## Scaling and updates
 
-- **Update the relay**: edit `fly/nostrd.toml` and `fly deploy` again — the image always downloads the **latest** GitHub release binary, so an update is a simple redeploy
+- **Update the relay**: edit `deploy/nostrd.container.toml` and `fly deploy` again — the image always downloads the **latest** GitHub release binary, so an update is a simple redeploy
 - **Pin a version**: `docker build --build-arg NOSTRD_VERSION=v0.1.0 ...` or change the `ARG` in the Dockerfile
 - **Scale**: the relay is a single machine by default. `fly machines clone <id>` creates a second machine; both share the volume (Fly volumes support multiple machines in the same region)
 - **Metrics**: Fly collects the `/metrics` endpoint (see `[metrics]` in `fly.toml`) and shows it in the Fly dashboard under Metrics
 
 ## Customizing the configuration
 
-The image reads `/etc/nostrd/nostrd.toml`, baked from `fly/nostrd.toml`. Two ways to customize:
+The image reads `/etc/nostrd/nostrd.toml`, baked from `deploy/nostrd.container.toml`. Two ways to customize:
 
-1. **Edit `fly/nostrd.toml` in the repository** and redeploy (simplest)
+1. **Edit `deploy/nostrd.container.toml` in the repository** and redeploy (simplest)
 2. **Mount your own config**: build a fork of the image that copies your config file over `/etc/nostrd/nostrd.toml`
 
 Every option is documented in the [Configuration reference](../CONFIGURATION.md).

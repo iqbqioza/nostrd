@@ -41,4 +41,4 @@ Container Apps builds from the repository `Dockerfile` (which downloads the pre-
 4. **Persistent storage**: mount an **Azure Storage file share** at `/data` for the LMDB data.
 5. **TLS**: Container Apps provides `https://` on the app URL — set `relay.public_url = "wss://<app>.<region>.azurecontainerapps.io"` (or a custom domain).
 
-> **Note**: set **min replicas = 1** — a relay must never scale to zero. The baked `fly/nostrd.toml` can be replaced by mounting your own `nostrd.toml` at `/etc/nostrd/nostrd.toml`.
+> **Note**: set **min replicas = 1** — a relay must never scale to zero. The baked `deploy/nostrd.container.toml` can be replaced by mounting your own `nostrd.toml` at `/etc/nostrd/nostrd.toml`.

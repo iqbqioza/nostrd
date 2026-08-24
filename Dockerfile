@@ -41,9 +41,9 @@ RUN apt-get update \
     && apt-get purge -y --auto-remove curl \
     && rm -rf /var/lib/apt/lists/*
 
-# The Fly-ready configuration (edit fly/nostrd.toml before deploying to
-# set the relay name, public_url and private_key).
-COPY fly/nostrd.toml /etc/nostrd/nostrd.toml
+# The container configuration template (edit deploy/nostrd.container.toml
+# before building to set the relay name, public_url and private_key).
+COPY deploy/nostrd.container.toml /etc/nostrd/nostrd.toml
 
 # LMDB data lives on the Fly volume mounted at /data (see fly.toml).
 RUN mkdir -p /data /etc/nostrd
