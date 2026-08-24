@@ -152,6 +152,28 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             let _ = reply.send(access);
             false
         }
+        Msg::LoadBlossomAllow { reply } => {
+            let list = match store.load_blossom_allow() {
+                Ok(list) => list,
+                Err(e) => {
+                    db_error(errors, &e);
+                    Vec::new()
+                }
+            };
+            let _ = reply.send(list);
+            false
+        }
+        Msg::LoadRelayPubkeys { reply } => {
+            let lists = match store.load_relay_pubkeys() {
+                Ok(lists) => lists,
+                Err(e) => {
+                    db_error(errors, &e);
+                    (Vec::new(), Vec::new())
+                }
+            };
+            let _ = reply.send(lists);
+            false
+        }
         Msg::FirstSeenStatus { pubkeys, reply } => {
             let rtxn = match store.env.read_txn() {
                 Ok(rtxn) => rtxn,
@@ -355,6 +377,26 @@ pub(crate) fn spawn(
                             // batch first so that ordering is preserved.
                             flush_everything(&store, &thread_errors, &mut batch);
                             match other {
+                                Msg::LoadBlossomAllow { reply } => {
+                                    let list = match store.load_blossom_allow() {
+                                        Ok(list) => list,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            Vec::new()
+                                        }
+                                    };
+                                    let _ = reply.send(list);
+                                }
+                                Msg::LoadRelayPubkeys { reply } => {
+                                    let lists = match store.load_relay_pubkeys() {
+                                        Ok(lists) => lists,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            (Vec::new(), Vec::new())
+                                        }
+                                    };
+                                    let _ = reply.send(lists);
+                                }
                                 Msg::Query {
                                     filters,
                                     limit,
@@ -515,6 +557,12 @@ pub(crate) fn spawn(
                                 }
                                 Msg::SaveAccess { access, reply } => {
                                     if let Err(e) = store.save_access(&access) {
+                                        db_error(&thread_errors, &e);
+                                    }
+                                    let _ = reply.send(());
+                                }
+                                Msg::SaveRelayPubkeys { deny, allow, reply } => {
+                                    if let Err(e) = store.save_relay_pubkeys(&deny, &allow) {
                                         db_error(&thread_errors, &e);
                                     }
                                     let _ = reply.send(());

@@ -11,7 +11,7 @@ A minimal, stable and fast [Nostr](https://github.com/nostr-protocol/nostr) rela
 nostrd is designed around two goals:
 
 - **Never go down.** Overload protection, a dedicated reader thread, panic containment and strict resource bounds keep the relay serving even under sustained abuse, a stalled disk or a memory-constrained host.
-- **Spec-complete.** All relay-side NIPs are implemented and verified against the official specifications (file-storage NIPs excluded by design).
+- **Spec-complete.** All relay-side NIPs are implemented and verified against the official specifications (file-storage NIPs excluded by design, except Blossom via the dedicated file server).
 
 ## Table of contents
 
@@ -53,6 +53,7 @@ The detailed guides live in the [`docs/`](docs/) directory:
 ## Features
 
 - **All relay-side NIPs implemented** — see the [NIP support](#nip-support) table.
+- **Blossom file server** — a media/blob store on its own hostname (like the API): uploads addressed by SHA-256, stored as `bucket/{npub1}/{file}` on local disk or in an S3-compatible bucket (AWS S3 / Cloudflare R2), with NIP-98-style kind-24242 auth, and an optional upload allowlist (`nostrd blossom allow/deny`, persisted in LMDB). Async storage I/O and an in-memory index keep the relay's WebSocket path untouched.
 - **REST API** — a read-only HTTP API at `/api/v1/...` for querying events by `npub1`, `nevent1` or `naddr1`, with its own dedicated database reader thread and concurrency limiter so REST traffic can never stall WebSocket subscribers.
 - **LMDB persistence (via `heed`)** — durable, crash-safe storage; the memory map is a sparse virtual-address reservation opened at its configured ceiling, so it never needs a runtime resize (which would be unsafe with concurrent reader threads) and physical memory stays small.
 - **Overload protection** — the database queue is bounded; when it fills up, new requests fail fast instead of accumulating in memory. Writes that reach the queue always wait for their true outcome, so a queued event can never silently commit after the relay reported a false failure (which would skip its side-effects).
@@ -223,7 +224,7 @@ In addition to the tunables above, a few hard bounds are fixed to keep the relay
 
 ## NIP support
 
-All relay-side NIPs are implemented; client-side NIPs are stored and served as plain events but are deliberately **not** advertised in the NIP-11 document (per the spec). File-storage NIPs (34 git, 94 file metadata, 95/96 HTTP file storage) are excluded by design.
+All relay-side NIPs are implemented; client-side NIPs are stored and served as plain events but are deliberately **not** advertised in the NIP-11 document (per the spec). File-storage NIPs (34 git, 94 file metadata, 95/96 HTTP file storage) are excluded by design — except Blossom, which is provided by the dedicated [Blossom file server](#features).
 
 | NIP | Description |
 | --- | --- |

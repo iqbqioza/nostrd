@@ -82,9 +82,23 @@ stats_interval_secs = 5
 log_max_size_bytes = 52428800
 log_max_files = 5
 
+# Blossom file server (media hosting) — enabled when `host` is set.
+# Files are stored as <local_path>/<npub1...>/<sha256> ("bucket/{npub1}/{file}")
+# or in an S3-compatible bucket (R2) when storage = "s3".
+[blossom]
+host = ""                          # e.g. "media.example.com" (empty = disabled)
+storage = "local"                  # "local" or "s3"
+local_path = "/var/lib/nostrd/images"
+max_upload_bytes = 20971520        # 20 MiB
+restrict_uploads = false            # only allowlisted pubkeys may upload
+s3_endpoint = ""                   # e.g. "https://<account>.r2.cloudflarestorage.com"
+s3_region = "auto"
+s3_bucket = ""
+s3_access_key = ""
+s3_secret_key = ""
+
 [access]
-blocked_pubkeys = []
-allowed_pubkeys = []
+restrict_relay = false   # allow/deny lists are managed via 'nostrd relay allow/deny' (LMDB)
 blocked_kinds = []
 allowed_kinds = []
 blocked_ips = []

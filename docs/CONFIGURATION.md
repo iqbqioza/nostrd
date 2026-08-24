@@ -380,17 +380,25 @@ Every key is optional; a missing key uses the default shown below.
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
-| `blocked_pubkeys` | array | `[]` | Pubkeys whose events are rejected |
-| `allowed_pubkeys` | array | `[]` | **Allowlist** — when non-empty, only these pubkeys may publish |
+| `restrict_relay` | boolean | `false` | When true, only the pubkeys on the allow list may publish |
 | `blocked_kinds` | array of integers | `[]` | Kinds to reject |
 | `allowed_kinds` | array of integers | `[]` | Kind allowlist — when non-empty, only these kinds are accepted |
 | `blocked_ips` | array of strings | `[]` | IP addresses refused at connection time |
 
 ### Key details
 
-**`blocked_pubkeys`** — Pubkeys whose events are rejected with `blocked: pubkey not allowed`. A blocked entry always wins over an allowed one.
+**`restrict_relay`** — The pubkey **allow/deny lists are not config state**: they live in the relay database (LMDB) and are managed at runtime with:
 
-**`allowed_pubkeys`** — The pubkey allowlist. **When non-empty, only the listed pubkeys may publish** — everyone else is rejected. Add entries deliberately; adding the first entry switches the relay into allowlist mode.
+```sh
+nostrd relay allow npub1...      # allow a pubkey to publish (npub1... or hex)
+nostrd relay deny npub1...       # deny a pubkey — its events are always rejected
+nostrd relay list                # show both lists and restrict_relay
+```
+
+- `restrict_relay = true`: **only** the pubkeys on the allow list may publish (everyone else is rejected with `blocked: pubkey not allowed`).
+- `restrict_relay = false` (default): everyone may publish **except** the denied pubkeys — a denied entry always wins, with or without `restrict_relay`.
+- Each `allow`/`deny` writes the database and reloads the running daemon (SIGHUP), so the change applies immediately. NIP-86 (`banpubkey`/`allowpubkey`/...) manages the same lists.
+- Databases from older versions are migrated once at startup: pubkey entries that used to live in the config/`access` blob are copied into the dedicated database key.
 
 **`blocked_kinds`** — Event kinds that are rejected (`blocked: kind not allowed`).
 
@@ -400,16 +408,55 @@ Every key is optional; a missing key uses the default shown below.
 
 ### Behavior notes
 
-- The lists are seeded at startup and then **managed at runtime** through NIP-86. Runtime changes are persisted in the database and survive restarts; once runtime state exists, it takes precedence over the config section.
-- Entries may be plain strings (legacy) or `["value", "reason"]` pairs — both forms are accepted everywhere, including the persisted database state from older versions:
-
-```toml
-blocked_pubkeys = ["aa11..."]                          # legacy form
-blocked_pubkeys = [["aa11...", "spam"]]                # with a reason
-```
-
+- The kinds/IP lists are seeded at startup and then **managed at runtime** through NIP-86. Runtime changes are persisted in the database and survive restarts; once runtime state exists, it takes precedence over the config section.
 - The reason is reported by the NIP-86 list methods (`listbannedpubkeys`, `listblockedips`, ...).
 - `blocked_ips` entries must parse as IP addresses (`nostrd check` validates them).
+
+---
+
+## 8b. `[blossom]` — Blossom file server (media hosting)
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `host` | string | `""` | Hostname dedicated to the Blossom server, e.g. `media.example.com`. Empty = the feature is disabled |
+| `storage` | string | `"local"` | Storage backend: `"local"` or `"s3"` (any S3-compatible service, including Cloudflare R2) |
+| `local_path` | string | `"./data/images"` | Local storage directory: `<local_path>/<npub1...>/<sha256>` |
+| `max_upload_bytes` | integer | `20971520` | Maximum accepted upload size (the `PUT /upload` body limit) |
+| `s3_endpoint` | string | `""` | S3 endpoint, e.g. `https://<account>.r2.cloudflarestorage.com` for R2 |
+| `s3_region` | string | `""` | S3 region (R2 uses `"auto"`) |
+| `s3_bucket` | string | `""` | S3 bucket — the `bucket` of the `bucket/{npub1}/{file}` layout |
+| `s3_access_key` | string | `""` | S3 / R2 access key |
+| `s3_secret_key` | string | `""` | S3 / R2 secret key |
+| `restrict_uploads` | boolean | `false` | When true, only the pubkeys in the Blossom upload allowlist may upload blobs |
+
+### Key details
+
+**`host`** — Works like `server.api_host`: requests whose Host header names this hostname are served only the Blossom routes on the same port, so a single reverse proxy can split `relay.example.com` (relay) from `media.example.com` (files). The root path `/` answers with the Blossom server info document on this host.
+
+**`storage`** — `"local"` keeps files on the server disk; `"s3"` stores objects in an S3-compatible bucket (AWS S3 or Cloudflare R2). Both use the `bucket/{npub1xxx}/{file}` hierarchy: files are content-addressed by their SHA-256 and kept under the uploader's npub directory.
+
+**`max_upload_bytes`** — The HTTP body limit for uploads. Note that `limits.max_ws_message_size` is unrelated (it governs WebSocket events).
+
+**S3 keys** — With `storage = "s3"`, `s3_endpoint`, `s3_bucket`, `s3_access_key` and `s3_secret_key` are required. The endpoint must be the *path-style* form (`https://s3.amazonaws.com` or `https://<account>.r2.cloudflarestorage.com`); the request signing follows AWS Signature Version 4.
+
+**`restrict_uploads`** — When `true`, `PUT /upload` accepts only the pubkeys on the Blossom upload allowlist (everyone else gets `403`). The allowlist itself is **not** part of the config file: it lives in the relay database (LMDB), is loaded at startup and managed at runtime with:
+
+```sh
+nostrd blossom allow npub1...     # add a pubkey (npub1... or hex)
+nostrd blossom deny npub1...     # remove a pubkey
+nostrd blossom list             # show the list and the restrict flag
+```
+
+Each `allow`/`deny` writes the database and reloads the running daemon (SIGHUP), so the change applies immediately.
+
+### Behavior notes
+
+- The feature is completely off when `host` is empty — no routes, no storage directories.
+- Files never touch the LMDB database: uploads, fetches and deletes operate only on the configured storage, so the relay database is never at risk.
+- Storage I/O is asynchronous (`tokio::fs` / the `reqwest` client) and the blob index is an in-memory map warmed at startup by scanning the local directories or listing the bucket — relay and WebSocket performance is unaffected.
+- Only the uploader (the pubkey whose npub directory holds the file) can delete a blob.
+- Uploads and deletes are authorized with Blossom auth events (kind 24242, `t` + `server` tags).
+- The upload allowlist is persisted in the relay database under a fixed key of the existing `access` table — no new LMDB table is created, so databases from older versions stay compatible.
 
 ---
 
@@ -535,8 +582,7 @@ log_max_size_bytes = 52428800
 log_max_files = 5
 
 [access]
-blocked_pubkeys = []
-allowed_pubkeys = []
+restrict_relay = false
 blocked_kinds = []
 allowed_kinds = []
 blocked_ips = []
@@ -552,7 +598,7 @@ blocked_ips = []
 | `host = "127.0.0.1"` left as-is | External clients cannot connect | `host = "0.0.0.0"` |
 | `private_key` unset with NIP-29 enabled | No group metadata (39000-39005) | `nostrd genkey` + `restart` |
 | String without quotes | TOML parse error | `name = "my relay"` |
-| `allowed_pubkeys` non-empty | Everyone else locked out | Only add pubkeys intentionally |
+| `restrict_relay = true` with an empty allow list | Everyone is locked out | `nostrd relay allow <npub>` the intended pubkeys |
 | Changing `private_key`/`api_host` and only SIGHUPing | Change does not apply | Use `nostrd restart` |
 | Values written as floats (`1.5`) or strings (`"8080"`) | Config/parse errors | Use plain integers |
 

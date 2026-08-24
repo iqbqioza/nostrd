@@ -845,16 +845,15 @@ fn access_control_persists_across_reopen() {
             )
             .unwrap();
             let mut access = crate::config::AccessControl::default();
-            access
-                .blocked_pubkeys
-                .push(("aa".repeat(32), String::new()));
             access.allowed_kinds.push(5);
             access
                 .blocked_ips
                 .push(("203.0.113.9".into(), String::new()));
             db.save_access(access.clone()).await;
+            // The pubkey lists live under their own key.
+            db.save_relay_pubkeys(&[("aa".repeat(32), String::new())], &[])
+                .await;
             let loaded = db.load_access().await.expect("persisted access loads");
-            assert_eq!(loaded.blocked_pubkeys, access.blocked_pubkeys);
             assert_eq!(loaded.allowed_kinds, access.allowed_kinds);
             assert_eq!(loaded.blocked_ips, access.blocked_ips);
         }
@@ -870,15 +869,91 @@ fn access_control_persists_across_reopen() {
         )
         .unwrap();
         let loaded = db.load_access().await.expect("persisted access loads");
-        assert_eq!(
-            loaded.blocked_pubkeys,
-            vec![("aa".repeat(32), String::new())]
-        );
         assert_eq!(loaded.allowed_kinds, vec![5]);
         assert_eq!(
             loaded.blocked_ips,
             vec![(String::from("203.0.113.9"), String::new())]
         );
+        // The dedicated pubkey key survives the reopen.
+        let (deny, allow) = db.load_relay_pubkeys().await;
+        assert_eq!(deny, vec![("aa".repeat(32), String::new())]);
+        assert!(allow.is_empty());
+    });
+}
+
+#[test]
+fn legacy_access_blob_pubkeys_migrate_to_dedicated_key() {
+    // Databases written before the pubkey lists moved into their own key
+    // carry them inside the `access` blob. Opening such a database must
+    // migrate them once (the dedicated key then wins).
+    let cfg = config();
+    {
+        // Write the legacy blob directly (the typed writer skips the
+        // pubkey lists now).
+        let dir = &cfg.path;
+        std::fs::create_dir_all(dir).unwrap();
+        // The env must be opened with the same map size as DbClient::open
+        // (LMDB refuses a different map size at reopen).
+        let map_size = cfg.map_max_size.max(cfg.map_size);
+        let env = unsafe {
+            heed::EnvOpenOptions::new()
+                .max_dbs(cfg.max_dbs.max(16))
+                .max_readers(cfg.max_readers.max(8))
+                .map_size(map_size)
+                .open(dir)
+                .unwrap()
+        };
+        let mut wtxn = env.write_txn().unwrap();
+        let access = env
+            .create_database::<heed::types::Bytes, heed::types::Bytes>(&mut wtxn, Some("access"))
+            .unwrap();
+        let blob = serde_json::json!({
+            "blocked_pubkeys": [["bb".repeat(32), "spam"]],
+            "allowed_pubkeys": ["aa".repeat(32)],
+            "blocked_kinds": [],
+            "allowed_kinds": [],
+            "blocked_ips": [],
+        });
+        access
+            .put(
+                &mut wtxn,
+                b"access",
+                serde_json::to_vec(&blob).unwrap().as_slice(),
+            )
+            .unwrap();
+        wtxn.commit().unwrap();
+    }
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // DbClient::open runs the one-time migration.
+        let db = DbClient::open(
+            &cfg,
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
+        let (deny, allow) = db.load_relay_pubkeys().await;
+        assert_eq!(deny, vec![("bb".repeat(32), "spam".to_string())]);
+        assert_eq!(allow, vec![("aa".repeat(32), String::new())]);
+        // The migration is idempotent: reopening does not double entries.
+        drop(db);
+        let db = DbClient::open(
+            &cfg,
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
+        let (deny, allow) = db.load_relay_pubkeys().await;
+        assert_eq!(deny.len(), 1);
+        assert_eq!(allow.len(), 1);
     });
 }
 

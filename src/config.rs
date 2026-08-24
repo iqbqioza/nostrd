@@ -14,8 +14,9 @@ pub const DEFAULT_CONFIG: &str = "nostrd.toml";
 /// deliberately not advertised (NIP-11: "Client-side NIPs SHOULD NOT be
 /// advertised"): NIP-28 explicitly "imposes no additional requirements on
 /// relays", so it is not listed. File-storage NIPs (34/94/95/96) are
-/// excluded per the project rules. NIP-33 was merged into NIP-01 but
-/// remains advertised for clients that check it.
+/// excluded per the project rules (Blossom is provided separately by the
+/// `[blossom]` file server). NIP-33 was merged into NIP-01 but remains
+/// advertised for clients that check it.
 pub const RELAY_NIPS: &[u16] = &[
     1, 9, 11, 13, 26, 29, 33, 40, 42, 43, 45, 50, 62, 67, 70, 77, 86, 98,
 ];
@@ -31,6 +32,62 @@ pub struct Config {
     /// Initial access control lists (NIP-86 bans/allowlists), seeded at
     /// startup so they survive restarts.
     pub access: AccessControl,
+    /// Blossom file server (media hosting) settings.
+    pub blossom: BlossomConfig,
+}
+
+/// Blossom (BUD-01/02) file server configuration.
+///
+/// The feature is active when `host` is non-empty: requests whose Host
+/// header matches it are served only the Blossom routes (like
+/// `server.api_host` for the REST API), so the media server and the relay
+/// live on the same port behind one reverse proxy.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BlossomConfig {
+    /// Hostname dedicated to the Blossom server (e.g. `media.example.com`).
+    /// Empty = the feature is disabled.
+    pub host: String,
+    /// Storage backend: `"local"` (files under `local_path`) or `"s3"`
+    /// (any S3-compatible service, including Cloudflare R2).
+    pub storage: String,
+    /// Directory for local storage. Files are kept as
+    /// `<local_path>/<npub1...>/<sha256>` (the `bucket/{npub1}/{file}`
+    /// hierarchy on disk).
+    pub local_path: PathBuf,
+    /// Maximum accepted upload size in bytes (the HTTP body limit for
+    /// `PUT /upload`).
+    pub max_upload_bytes: usize,
+    /// S3 endpoint (e.g. `https://<account>.r2.cloudflarestorage.com` for
+    /// Cloudflare R2, `https://s3.amazonaws.com` for AWS).
+    pub s3_endpoint: String,
+    /// S3 region (Cloudflare R2 uses `"auto"`).
+    pub s3_region: String,
+    /// S3 bucket name — the `bucket` of the `bucket/{npub1}/{file}` layout.
+    pub s3_bucket: String,
+    pub s3_access_key: String,
+    pub s3_secret_key: String,
+    /// When true, only the pubkeys in the Blossom upload allowlist may
+    /// upload blobs. The allowlist itself lives in the relay database
+    /// (LMDB), managed with `nostrd blossom allow/deny`.
+    pub restrict_uploads: bool,
+}
+
+impl Default for BlossomConfig {
+    fn default() -> Self {
+        BlossomConfig {
+            host: String::new(),
+            storage: "local".into(),
+            local_path: PathBuf::from("./data/images"),
+            max_upload_bytes: 20 * 1024 * 1024,
+            s3_endpoint: String::new(),
+            s3_region: String::new(),
+            s3_bucket: String::new(),
+            s3_access_key: String::new(),
+            s3_secret_key: String::new(),
+            restrict_uploads: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -396,12 +453,6 @@ impl Config {
         };
         hex32(&self.relay.pubkey, "relay.pubkey")?;
         hex32(&self.server.admin_pubkey, "server.admin_pubkey")?;
-        for (pk, _) in &self.access.blocked_pubkeys {
-            hex32(pk, "access.blocked_pubkeys")?;
-        }
-        for (pk, _) in &self.access.allowed_pubkeys {
-            hex32(pk, "access.allowed_pubkeys")?;
-        }
 
         // Secret key: must be a valid secp256k1 secret key when set.
         if !self.relay.private_key.is_empty() {
@@ -554,25 +605,84 @@ impl Config {
                  are not generated at group creation; run 'nostrd genkey' to set a key"
             );
         }
+
+        // Blossom file server: the storage backend must be known, and S3
+        // storage needs its credentials. The feature is opt-in via `host`.
+        let b = &self.blossom;
+        if !b.host.trim().is_empty() {
+            if b.max_upload_bytes == 0 {
+                return Err(Error::Config(
+                    "blossom.max_upload_bytes must be at least 1".into(),
+                ));
+            }
+            match b.storage.as_str() {
+                "local" => {
+                    if b.local_path.as_os_str().is_empty() {
+                        return Err(Error::Config("blossom.local_path must not be empty".into()));
+                    }
+                }
+                "s3" => {
+                    if b.s3_endpoint.trim().is_empty()
+                        || b.s3_bucket.trim().is_empty()
+                        || b.s3_access_key.trim().is_empty()
+                        || b.s3_secret_key.trim().is_empty()
+                    {
+                        return Err(Error::Config(
+                            "blossom.storage = \"s3\" requires s3_endpoint, s3_bucket, \
+                             s3_access_key and s3_secret_key"
+                                .into(),
+                        ));
+                    }
+                }
+                other => {
+                    return Err(Error::Config(format!(
+                        "blossom.storage must be \"local\" or \"s3\", got {other:?}"
+                    )));
+                }
+            }
+        }
         Ok(())
     }
 }
 
-// Blocked/allowed lists live in the runtime config that NIP-86 can mutate.
+/// Whether a string is a 64-hex pubkey or a parseable `npub1...`.
+/// Shared with the CLI (`nostrd blossom allow/deny`).
+pub(crate) fn is_pubkey_or_npub(value: &str) -> bool {
+    if value.len() == 64 && hex::decode(value).map(|b| b.len() == 32).unwrap_or(false) {
+        return true;
+    }
+    if value.starts_with("npub1")
+        && crate::nips::nip19::parse_nip19(value)
+            .is_ok_and(|e| matches!(e, crate::nips::nip19::Nip19Entity::Pubkey(_)))
+    {
+        return true;
+    }
+    false
+}
+
+// The pubkey allow/deny lists are runtime state managed via
+// `nostrd relay allow/deny` and NIP-86, persisted in the relay database
+// (LMDB) — not in the config file (see `restrict_relay`). The fields stay
+// in this struct for the in-memory checks but are excluded from both the
+// TOML `[access]` section and the persisted JSON.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AccessControl {
     /// (pubkey, reason) pairs; the reason is reported by NIP-86
-    /// `listbannedpubkeys`.
-    #[serde(deserialize_with = "de_access_entries")]
+    /// `listbannedpubkeys`. Persisted in LMDB under `relay_pubkeys`.
+    #[serde(skip)]
     pub blocked_pubkeys: Vec<(String, String)>,
-    #[serde(deserialize_with = "de_access_entries")]
+    #[serde(skip)]
     pub allowed_pubkeys: Vec<(String, String)>,
     pub blocked_kinds: Vec<u64>,
     pub allowed_kinds: Vec<u64>,
     /// (ip, reason) pairs, reported by NIP-86 `listblockedips`.
     #[serde(deserialize_with = "de_access_entries")]
     pub blocked_ips: Vec<(String, String)>,
+    /// When true, only the pubkeys on the allow list (`nostrd relay allow`)
+    /// may publish. When false (default), everyone except the denied
+    /// pubkeys may publish.
+    pub restrict_relay: bool,
 }
 
 /// Deserializes an access list that accepts both the current format —
@@ -604,10 +714,12 @@ where
 
 impl AccessControl {
     pub fn allows_pubkey(&self, pubkey: &str) -> bool {
+        // A denied pubkey is always rejected — even when restrict_relay
+        // is off (the default: everyone else may publish).
         if self.blocked_pubkeys.iter().any(|(p, _)| p == pubkey) {
             return false;
         }
-        self.allowed_pubkeys.is_empty() || self.allowed_pubkeys.iter().any(|(p, _)| p == pubkey)
+        !self.restrict_relay || self.allowed_pubkeys.iter().any(|(p, _)| p == pubkey)
     }
 
     pub fn allows_kind(&self, kind: u64) -> bool {
@@ -852,11 +964,25 @@ fn warn_unknown_fields(raw: &str) {
         (
             "access",
             &[
-                "blocked_pubkeys",
-                "allowed_pubkeys",
                 "blocked_kinds",
                 "allowed_kinds",
                 "blocked_ips",
+                "restrict_relay",
+            ],
+        ),
+        (
+            "blossom",
+            &[
+                "host",
+                "storage",
+                "local_path",
+                "max_upload_bytes",
+                "s3_endpoint",
+                "s3_region",
+                "s3_bucket",
+                "s3_access_key",
+                "s3_secret_key",
+                "restrict_uploads",
             ],
         ),
     ];
@@ -891,6 +1017,16 @@ fn warn_unknown_fields(raw: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blossom_allowlist_pubkey_validation() {
+        assert!(is_pubkey_or_npub(&"a".repeat(64)));
+        assert!(is_pubkey_or_npub(
+            "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6"
+        ));
+        assert!(!is_pubkey_or_npub("not-a-pubkey"));
+        assert!(!is_pubkey_or_npub(&"a".repeat(63)));
+    }
 
     #[test]
     fn default_config_roundtrip() {
@@ -960,17 +1096,21 @@ mod tests {
             blocked_kinds: vec![],
             allowed_kinds: vec![],
             blocked_ips: vec![("203.0.113.9".into(), String::new())],
+            restrict_relay: false,
         };
         let json = serde_json::to_string(&legacy).unwrap();
         // Simulate the pre-reason persisted document.
         let old_json = r#"{"blocked_pubkeys":["REPL"],"allowed_pubkeys":[],"blocked_kinds":[],"allowed_kinds":[],"blocked_ips":["203.0.113.9"]}"#;
         let old_json = old_json.replace("REPL", &"aa".repeat(32));
         let parsed: AccessControl = serde_json::from_str(&old_json).expect("legacy JSON reads");
-        assert_eq!(parsed.blocked_pubkeys[0].0, "aa".repeat(32));
-        assert_eq!(
-            parsed.blocked_pubkeys[0].1, "",
-            "legacy entries get an empty reason"
+        // The pubkey lists are skipped from the config/blob and now live in
+        // the database under their own key (migrated at startup); reading
+        // the legacy document must still succeed, dropping the entries.
+        assert!(
+            parsed.blocked_pubkeys.is_empty(),
+            "pubkey lists are not config state"
         );
+        assert!(parsed.allowed_pubkeys.is_empty());
         assert_eq!(parsed.blocked_ips[0].0, "203.0.113.9");
         // The current format round-trips with its reasons.
         let with_reason = AccessControl {
@@ -979,11 +1119,33 @@ mod tests {
         };
         let raw = serde_json::to_string(&with_reason).unwrap();
         let parsed: AccessControl = serde_json::from_str(&raw).unwrap();
-        assert_eq!(
-            parsed.blocked_pubkeys[0],
-            ("bb".repeat(32), "spam".to_string())
-        );
+        // Serialization skips the pubkey lists: they live in LMDB.
+        assert!(parsed.blocked_pubkeys.is_empty());
+        assert!(parsed.allowed_pubkeys.is_empty());
         let _ = json;
+    }
+
+    #[test]
+    fn allows_pubkey_respects_restrict_relay_and_deny() {
+        let a = "aa".repeat(32);
+        let b = "bb".repeat(32);
+        let mut access = AccessControl::default();
+        // Default (restrict_relay = false): everyone may publish.
+        assert!(access.allows_pubkey(&a));
+        assert!(access.allows_pubkey(&b));
+        // A denied pubkey is rejected even without restrict_relay.
+        access.blocked_pubkeys.push((b.clone(), String::new()));
+        assert!(access.allows_pubkey(&a));
+        assert!(!access.allows_pubkey(&b));
+        // restrict_relay = true: only the allow list may publish.
+        access.restrict_relay = true;
+        assert!(
+            !access.allows_pubkey(&a),
+            "empty allow list locks everyone out"
+        );
+        access.allowed_pubkeys.push((a.clone(), String::new()));
+        assert!(access.allows_pubkey(&a));
+        assert!(!access.allows_pubkey(&b), "denied wins even when allowed");
     }
 
     #[test]
@@ -1029,9 +1191,6 @@ mod tests {
     #[test]
     fn validation_rejects_bad_access_entries() {
         let mut cfg = Config::default();
-        cfg.access.blocked_pubkeys = vec![("not-hex".into(), String::new())];
-        assert!(cfg.validate().is_err(), "blocked pubkeys must be hex");
-        cfg.access.blocked_pubkeys.clear();
         cfg.access.blocked_ips = vec![("not-an-ip".into(), String::new())];
         assert!(cfg.validate().is_err(), "blocked IPs must parse");
     }

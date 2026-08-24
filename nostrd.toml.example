@@ -78,7 +78,8 @@ livekit_api_secret = ""
 enabled_nips = []
 
 # NIPs to disable (behavior off and not advertised). File-storage NIPs
-# (34 git, 94 file metadata, 96 HTTP storage) are never implemented.
+# (34 git, 94 file metadata, 95/96 HTTP storage) are never implemented
+# (except Blossom, which is provided by the dedicated [blossom] file server).
 disabled_nips = []
 
 # -----------------------------------------------------------------------------
@@ -331,12 +332,29 @@ log_max_files = 5
 # restarts; this section only seeds the initial state when no runtime state
 # exists yet. A SIGHUP reload does not overwrite the runtime lists.
 # -----------------------------------------------------------------------------
-[access]
-# Pubkeys whose events are rejected ("blocked: pubkey not allowed").
-blocked_pubkeys = []
 
-# When non-empty, only these pubkeys may publish (empty = allow all).
-allowed_pubkeys = []
+
+# Blossom file server (media hosting). Active when `host` is set: requests
+# with this Host header are served only the Blossom routes (like
+# server.api_host for the REST API).
+[blossom]
+host = ""                          # e.g. "media.example.com" (empty = disabled)
+storage = "local"                  # "local" or "s3" (Cloudflare R2 is S3-compatible)
+local_path = "./data/images"       # local storage: <local_path>/<npub1...>/<sha256>
+max_upload_bytes = 20971520        # 20 MiB max upload size
+restrict_uploads = false            # only allowlisted pubkeys may upload
+                                    # (list managed via 'nostrd blossom allow/deny')
+s3_endpoint = ""                   # e.g. "https://<account>.r2.cloudflarestorage.com"
+s3_region = "auto"                 # R2 uses "auto"; AWS uses e.g. "us-east-1"
+s3_bucket = ""                     # the "bucket" of bucket/{npub1}/{file}
+s3_access_key = ""
+s3_secret_key = ""
+[access]
+# true = only allow-listed pubkeys may publish. The allow/deny lists are
+# NOT config keys: they live in the relay database (LMDB) and are managed
+# with `nostrd relay allow/deny`. A denied pubkey is always rejected, even
+# with restrict_relay = false.
+restrict_relay = false
 
 # Event kinds rejected at publish time.
 blocked_kinds = []

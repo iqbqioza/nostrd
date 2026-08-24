@@ -12,6 +12,10 @@ use heed::{Database, Env, EnvOpenOptions};
 use tokio::sync::oneshot;
 
 use super::{PutOutcome, db_error};
+
+/// The relay pubkey access lists: (deny, allow), each a (pubkey, reason)
+/// pair. Shared by the CLI, the database layer and the access checks.
+pub(crate) type RelayPubkeyLists = (Vec<(String, String)>, Vec<(String, String)>);
 use crate::config::DatabaseConfig;
 use crate::error::Result;
 use crate::event::Event;
@@ -374,6 +378,85 @@ impl Store {
             return Ok(None);
         };
         Ok(Some(serde_json::from_slice(raw)?))
+    }
+
+    /// Loads the persisted Blossom upload allowlist (empty when none).
+    /// The list is written by the CLI commands (`nostrd blossom allow/deny`),
+    /// which open the same environment from their own process.
+    pub(crate) fn load_blossom_allow(&self) -> Result<Vec<String>> {
+        let rtxn = self.env.read_txn()?;
+        let Some(raw) = self.access.get(&rtxn, b"blossom_allow")? else {
+            return Ok(Vec::new());
+        };
+        Ok(serde_json::from_slice(raw)?)
+    }
+
+    /// Persists the relay pubkey access lists ((pubkey, reason) pairs for
+    /// the deny and allow lists) under a single fixed key, so the CLI
+    /// commands (`nostrd relay allow/deny`) and the running server share
+    /// one source of truth without touching the config file.
+    pub(crate) fn save_relay_pubkeys(
+        &self,
+        deny: &[(String, String)],
+        allow: &[(String, String)],
+    ) -> Result<()> {
+        let data = serde_json::to_vec(&serde_json::json!({ "deny": deny, "allow": allow }))?;
+        let mut wtxn = self.env.write_txn()?;
+        self.access.put(&mut wtxn, b"relay_pubkeys", &data)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Loads the persisted relay pubkey access lists ((deny, allow)).
+    pub(crate) fn load_relay_pubkeys(&self) -> Result<RelayPubkeyLists> {
+        let rtxn = self.env.read_txn()?;
+        let Some(raw) = self.access.get(&rtxn, b"relay_pubkeys")? else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+        let value: serde_json::Value = serde_json::from_slice(raw)?;
+        let deny = serde_json::from_value(value.get("deny").cloned().unwrap_or_default())?;
+        let allow = serde_json::from_value(value.get("allow").cloned().unwrap_or_default())?;
+        Ok((deny, allow))
+    }
+
+    /// One-time migration for databases written before the pubkey lists
+    /// moved out of the `access` blob: when the dedicated `relay_pubkeys`
+    /// key is absent but the old blob carries pubkey entries, copy them
+    /// over. Runs once at startup, before any request is served.
+    pub(crate) fn migrate_access_pubkeys(&self) -> Result<()> {
+        let rtxn = self.env.read_txn()?;
+        if self.access.get(&rtxn, b"relay_pubkeys")?.is_some() {
+            return Ok(());
+        }
+        let Some(raw) = self.access.get(&rtxn, b"access")? else {
+            return Ok(());
+        };
+        let value: serde_json::Value = serde_json::from_slice(raw)?;
+        let entries = |name: &str| -> Vec<(String, String)> {
+            value
+                .get(name)
+                .and_then(serde_json::Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|v| match v {
+                            serde_json::Value::String(s) => Some((s.clone(), String::new())),
+                            serde_json::Value::Array(a) if a.len() >= 2 => Some((
+                                a[0].as_str().unwrap_or("").to_string(),
+                                a[1].as_str().unwrap_or("").to_string(),
+                            )),
+                            _ => None,
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let deny = entries("blocked_pubkeys");
+        let allow = entries("allowed_pubkeys");
+        if deny.is_empty() && allow.is_empty() {
+            return Ok(());
+        }
+        self.save_relay_pubkeys(&deny, &allow)
     }
 }
 

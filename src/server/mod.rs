@@ -3,6 +3,7 @@
 //! reload) and the NIP-29 LiveKit integration in [`livekit`].
 
 mod api;
+pub(crate) mod blossom;
 mod livekit;
 
 use std::path::{Path, PathBuf};
@@ -108,8 +109,12 @@ async fn bind_listener(addr: &(String, u16), label: &str) -> Result<TcpListener>
 }
 
 /// The relay's HTTP router: the WebSocket/NIP-11/NIP-86 endpoint, health
-/// and stats routes, and the NIP-29 LiveKit endpoints when configured.
-async fn build_router(relay: &Arc<Relay>) -> Router {
+/// and stats routes, the NIP-29 LiveKit endpoints and the Blossom file
+/// server when configured.
+async fn build_router(
+    relay: &Arc<Relay>,
+    blossom_state: Option<Arc<blossom::BlossomState>>,
+) -> Router {
     let api_routes = Router::new()
         .route("/{identifier}", get(api_handler))
         .route("/{identifier}/{kind}", get(api_kind_handler))
@@ -130,16 +135,28 @@ async fn build_router(relay: &Arc<Relay>) -> Router {
             .route("/.well-known/nip29/livekit", get(livekit_supported))
             .route("/.well-known/nip29/livekit/{group}", get(livekit_token));
     }
-    // When `server.api_host` is set, the REST API and the WebSocket relay
-    // are split by Host header on the same port: the API host serves only
-    // `/api/v1` (and the health check), everything else is served only on
-    // every other host. Without it the API stays on all hosts.
-    let api_host = cfg.server.api_host.trim().to_ascii_lowercase();
+    // The Blossom routes are reachable only on the Blossom host (the host
+    // split middleware gates them; the root `/` route stays with the relay
+    // and is answered with the Blossom server info by `ws_handler` when the
+    // Host names the Blossom host).
+    let (api_host, blossom_host) = {
+        let cfg = relay.config.read().await;
+        (
+            cfg.server.api_host.trim().to_ascii_lowercase(),
+            cfg.blossom.host.trim().to_ascii_lowercase(),
+        )
+    };
+    if blossom_state.is_some() {
+        app = app.merge(blossom::routes(relay).await);
+    }
     drop(cfg);
-    if !api_host.is_empty() {
+    if !api_host.is_empty() || !blossom_host.is_empty() {
+        let api_host = api_host.clone();
+        let blossom_host = blossom_host.clone();
         app = app.layer(axum::middleware::from_fn(move |req, next| {
             let api_host = api_host.clone();
-            async move { host_split(&api_host, req, next).await }
+            let blossom_host = blossom_host.clone();
+            async move { host_split(&api_host, &blossom_host, req, next).await }
         }));
     }
     app.layer(axum::middleware::from_fn(cors_middleware))
@@ -160,16 +177,16 @@ fn host_header_host(header: &str) -> &str {
     }
 }
 
-/// Returns `true` when the request's Host header names `api_host`
+/// Returns `true` when the request's Host header names `expected`
 /// (ignoring case, any `:port` suffix and IPv6 literal brackets).
-fn host_is_api(api_host: &str, request: &Request) -> bool {
+fn host_matches(expected: &str, request: &Request) -> bool {
     request
         .headers()
         .get(axum::http::header::HOST)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|h| {
             let host = host_header_host(h).to_ascii_lowercase();
-            let expected = api_host
+            let expected = expected
                 .trim()
                 .trim_start_matches('[')
                 .trim_end_matches(']')
@@ -178,18 +195,27 @@ fn host_is_api(api_host: &str, request: &Request) -> bool {
         })
 }
 
-/// Splits the API from the relay by Host header: the configured API host
-/// only serves `/api/v1` and `/health`; every other host never serves
-/// `/api/v1`. Anything else gets a 404, so a wrong hostname cannot reach
-/// the other side.
-async fn host_split(api_host: &str, request: Request, next: Next) -> Response {
-    let is_api_host = host_is_api(api_host, &request);
-    let is_api_path = request.uri().path().starts_with("/api/v1");
-    let is_health = request.uri().path() == "/health";
-    let is_metrics = request.uri().path() == "/metrics";
-    match (is_api_host, is_api_path || is_health || is_metrics) {
-        (true, true) | (false, false) => next.run(request).await,
-        _ => StatusCode::NOT_FOUND.into_response(),
+/// Splits the API, the Blossom file server and the relay by Host header:
+/// the configured `api_host` serves only `/api/v1`, `/health` and
+/// `/metrics`; the configured `blossom.host` serves only the Blossom
+/// routes; every other host serves only the relay endpoints. Anything else
+/// gets a 404, so a wrong hostname cannot reach the other side.
+async fn host_split(api_host: &str, blossom_host: &str, request: Request, next: Next) -> Response {
+    let is_api = !api_host.is_empty() && host_matches(api_host, &request);
+    let is_blossom = !blossom_host.is_empty() && host_matches(blossom_host, &request);
+    let is_relay = !is_api && !is_blossom;
+    let path = request.uri().path();
+    let api_path = path.starts_with("/api/v1") || path == "/health" || path == "/metrics";
+    // The root `/` is dispatched by the WS handler (relay info or Blossom
+    // server info), so it must pass through on the Blossom host too.
+    let blossom_path = blossom::is_blossom_path(path) || (is_blossom && path == "/");
+    if (is_api && api_path)
+        || (is_blossom && blossom_path)
+        || (is_relay && !api_path && !blossom_path)
+    {
+        next.run(request).await
+    } else {
+        StatusCode::NOT_FOUND.into_response()
     }
 }
 
@@ -234,7 +260,9 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-    let app = build_router(&relay).await;
+    let blossom_state = blossom::build_state(&relay.config.read().await.clone(), &relay).await;
+    *relay.blossom.write().await = blossom_state.clone();
+    let app = build_router(&relay, blossom_state).await;
 
     let bind_addr = {
         let cfg = relay.config.read().await;
@@ -285,7 +313,7 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
     tasks.push(tokio::spawn(signal_handler(shutdown_tx.clone())));
     tasks.push(tokio::spawn(reload_handler(
         config_path,
-        relay.config.clone(),
+        relay.clone(),
         relay.db.clone(),
         relay.api_limit.clone(),
         shutdown_rx.clone(),
@@ -410,6 +438,33 @@ async fn ws_handler(State(relay): State<Arc<Relay>>, request: Request) -> Respon
     {
         return StatusCode::FORBIDDEN.into_response();
     }
+    // The Blossom server shares the root `/` route with the relay: when
+    // the request Host names the Blossom host, the root path is answered
+    // with the Blossom server info instead of the NIP-11 document (and
+    // WebSocket upgrades are refused there by the host split).
+    let cfg = relay.config.read().await;
+    if !cfg.blossom.host.trim().is_empty() && blossom::host_is_blossom(&cfg.blossom.host, &request)
+    {
+        if is_websocket_request(request.headers()) {
+            return StatusCode::NOT_FOUND.into_response();
+        }
+        let info = json!({
+            "name": format!("nostrd Blossom ({})", cfg.blossom.host.trim()),
+            "supported_nips": [],
+            "supported_file_hashes": ["sha256"],
+            "tos_url": null,
+            "payment_required": false,
+            "max_file_size": cfg.blossom.max_upload_bytes,
+            "storage": cfg.blossom.storage,
+        });
+        let mut response = Json(info).into_response();
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/json"),
+        );
+        return response;
+    }
+    drop(cfg);
     if !is_websocket_request(request.headers()) {
         // Not a WebSocket handshake: serve the NIP-11 info document.
         let cfg = relay.config.read().await;
@@ -577,11 +632,12 @@ async fn signal_handler(shutdown: watch::Sender<bool>) {
 
 async fn reload_handler(
     config_path: PathBuf,
-    config: Arc<tokio::sync::RwLock<Config>>,
+    relay: Arc<Relay>,
     db: DbClient,
     api_limit: Arc<crate::relay::ApiLimiter>,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    let config = relay.config.clone();
     let mut hangup = match signal(SignalKind::hangup()) {
         Ok(s) => s,
         Err(e) => {
@@ -640,6 +696,33 @@ async fn reload_handler(
                             ),
                             ("relay.enabled_nips", old.relay.enabled_nips != new_config.relay.enabled_nips),
                             ("relay.disabled_nips", old.relay.disabled_nips != new_config.relay.disabled_nips),
+                            (
+                                "blossom.host",
+                                old.blossom.host != new_config.blossom.host,
+                            ),
+                            (
+                                "blossom.storage",
+                                old.blossom.storage != new_config.blossom.storage,
+                            ),
+                            (
+                                "blossom.local_path",
+                                old.blossom.local_path != new_config.blossom.local_path,
+                            ),
+                            (
+                                "blossom.max_upload_bytes",
+                                old.blossom.max_upload_bytes
+                                    != new_config.blossom.max_upload_bytes,
+                            ),
+                            (
+                                "blossom.s3_*",
+                                old.blossom.s3_endpoint != new_config.blossom.s3_endpoint
+                                    || old.blossom.s3_region != new_config.blossom.s3_region
+                                    || old.blossom.s3_bucket != new_config.blossom.s3_bucket
+                                    || old.blossom.s3_access_key
+                                        != new_config.blossom.s3_access_key
+                                    || old.blossom.s3_secret_key
+                                        != new_config.blossom.s3_secret_key,
+                            ),
                         ];
                         for (name, changed) in static_routes {
                             if changed {
@@ -655,6 +738,23 @@ async fn reload_handler(
                     }
                     Err(e) => error!("config reload failed: {e}"),
                 }
+                // The Blossom upload allowlist lives in the database: the
+                // CLI (`nostrd blossom allow/deny`) writes it there and signals
+                // SIGHUP, so re-read it here independently of the config
+                // file (which may be untouched).
+                let list = relay.db.load_blossom_allow().await;
+                *relay.blossom_allow.write().await = list;
+                info!("Blossom upload allowlist reloaded from the database");
+                // The relay pubkey allow/deny lists are also database state
+                // (`nostrd relay allow/deny`): re-read them into the live
+                // access control.
+                let (deny, allow) = relay.db.load_relay_pubkeys().await;
+                let mut access = relay.access.write().await;
+                access.blocked_pubkeys = deny;
+                access.allowed_pubkeys = allow;
+                // `restrict_relay` is config-owned: apply the reloaded flag.
+                access.restrict_relay = relay.config.read().await.access.restrict_relay;
+                info!("relay pubkey access lists reloaded from the database");
             }
             _ = shutdown.changed() => break,
         }
@@ -677,8 +777,11 @@ mod tests {
 
     #[test]
     fn host_is_api_matches_exact_host() {
-        assert!(host_is_api("api.example.com", &req("api.example.com", "/")));
-        assert!(!host_is_api(
+        assert!(host_matches(
+            "api.example.com",
+            &req("api.example.com", "/")
+        ));
+        assert!(!host_matches(
             "api.example.com",
             &req("relay.example.com", "/")
         ));
@@ -686,12 +789,15 @@ mod tests {
 
     #[test]
     fn host_is_api_ignores_port_and_case() {
-        assert!(host_is_api(
+        assert!(host_matches(
             "api.example.com",
             &req("api.example.com:8080", "/")
         ));
-        assert!(host_is_api("api.example.com", &req("API.EXAMPLE.COM", "/")));
-        assert!(!host_is_api(
+        assert!(host_matches(
+            "api.example.com",
+            &req("API.EXAMPLE.COM", "/")
+        ));
+        assert!(!host_matches(
             "api.example.com",
             &req("notapi.example.com", "/")
         ));
@@ -700,24 +806,24 @@ mod tests {
     #[test]
     fn host_is_api_rejects_missing_host() {
         let bare = Request::builder().uri("/").body(Body::empty()).unwrap();
-        assert!(!host_is_api("api.example.com", &bare));
+        assert!(!host_matches("api.example.com", &bare));
     }
 
     #[test]
     fn host_is_api_handles_ipv6_literals() {
         // Bracket form with and without a port.
-        assert!(host_is_api("::1", &req("[::1]:8080", "/")));
-        assert!(host_is_api("[::1]", &req("[::1]:8080", "/")));
-        assert!(host_is_api("::1", &req("[::1]", "/")));
+        assert!(host_matches("::1", &req("[::1]:8080", "/")));
+        assert!(host_matches("[::1]", &req("[::1]:8080", "/")));
+        assert!(host_matches("::1", &req("[::1]", "/")));
         // A different IPv6 address does not match.
-        assert!(!host_is_api("::1", &req("[::2]:8080", "/")));
+        assert!(!host_matches("::1", &req("[::2]:8080", "/")));
         // IPv4-mapped IPv6 literals work too.
-        assert!(host_is_api(
+        assert!(host_matches(
             "::ffff:192.0.2.1",
             &req("[::ffff:192.0.2.1]:8080", "/")
         ));
         // IPv6 with a zone identifier (link-local) still matches.
-        assert!(host_is_api(
+        assert!(host_matches(
             "fe80::1%eth0",
             &req("[fe80::1%eth0]:8080", "/")
         ));

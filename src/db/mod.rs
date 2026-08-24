@@ -10,7 +10,7 @@
 
 mod removal;
 mod scan;
-mod store;
+pub(crate) mod store;
 #[cfg(test)]
 mod tests;
 mod threads;
@@ -163,6 +163,20 @@ enum Msg {
     LoadAccess {
         reply: oneshot::Sender<Option<crate::config::AccessControl>>,
     },
+    /// Loads the persisted Blossom upload allowlist.
+    LoadBlossomAllow {
+        reply: oneshot::Sender<Vec<String>>,
+    },
+    /// Loads the persisted relay pubkey access lists (deny, allow).
+    LoadRelayPubkeys {
+        reply: oneshot::Sender<crate::db::store::RelayPubkeyLists>,
+    },
+    /// Persists the relay pubkey access lists (deny, allow).
+    SaveRelayPubkeys {
+        deny: Vec<(String, String)>,
+        allow: Vec<(String, String)>,
+        reply: oneshot::Sender<()>,
+    },
     PurgeExpired {
         now: u64,
         reply: oneshot::Sender<usize>,
@@ -225,6 +239,10 @@ impl DbClient {
     ) -> Result<DbClient> {
         let expiry = Arc::new(std::sync::atomic::AtomicBool::new(expiry_enabled));
         let store = Store::open(cfg, Arc::clone(&expiry), max_indexed_words)?;
+        // One-time migration: databases written before the pubkey lists
+        // moved into their own key still carry them inside the `access`
+        // blob — copy them over so existing bans/allowlists survive.
+        store.migrate_access_pubkeys()?;
         let threads = threads::spawn(
             store,
             expiry,
@@ -599,9 +617,31 @@ impl DbClient {
             .await;
     }
 
+    /// Persists the relay pubkey access lists ((pubkey, reason) pairs for
+    /// the deny and allow lists) under their dedicated LMDB key.
+    pub async fn save_relay_pubkeys(&self, deny: &[(String, String)], allow: &[(String, String)]) {
+        let deny = deny.to_vec();
+        let allow = allow.to_vec();
+        let _ = self
+            .request_write(|reply| Msg::SaveRelayPubkeys { deny, allow, reply })
+            .await;
+    }
+
     /// Loads the persisted access control lists, if any.
     pub async fn load_access(&self) -> Option<crate::config::AccessControl> {
         self.request_read(|reply| Msg::LoadAccess { reply }).await
+    }
+
+    /// Loads the persisted Blossom upload allowlist.
+    pub async fn load_blossom_allow(&self) -> Vec<String> {
+        self.request_read(|reply| Msg::LoadBlossomAllow { reply })
+            .await
+    }
+
+    /// Loads the persisted relay pubkey access lists (deny, allow).
+    pub async fn load_relay_pubkeys(&self) -> crate::db::store::RelayPubkeyLists {
+        self.request_read(|reply| Msg::LoadRelayPubkeys { reply })
+            .await
     }
 
     pub async fn purge_expired(&self, now: u64) -> usize {

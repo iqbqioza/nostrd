@@ -132,26 +132,6 @@ fn jwt_hs256(secret: &str, claims: &serde_json::Value) -> Result<String> {
     let header = b64url(br#"{"alg":"HS256","typ":"JWT"}"#);
     let payload = b64url(serde_json::to_string(claims)?.as_bytes());
     let signing_input = format!("{header}.{payload}");
-    let mac = hmac_sha256(secret.as_bytes(), signing_input.as_bytes());
+    let mac = crate::util::hmac_sha256(secret.as_bytes(), signing_input.as_bytes());
     Ok(format!("{signing_input}.{}", b64url(&mac)))
-}
-
-/// HMAC-SHA256 (RFC 2104), implemented locally to avoid extra dependencies.
-fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    const BLOCK: usize = 64;
-    let mut key = key.to_vec();
-    if key.len() > BLOCK {
-        key = Sha256::digest(&key).to_vec();
-    }
-    key.resize(BLOCK, 0);
-    let mut ipad = [0x36u8; BLOCK];
-    let mut opad = [0x5cu8; BLOCK];
-    for (i, b) in key.iter().enumerate() {
-        ipad[i] ^= b;
-        opad[i] ^= b;
-    }
-    let inner = Sha256::digest([ipad.as_slice(), data].concat());
-    let outer = Sha256::digest([opad.as_slice(), inner.as_slice()].concat());
-    outer.into()
 }
