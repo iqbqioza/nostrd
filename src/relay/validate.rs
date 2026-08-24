@@ -35,15 +35,30 @@ impl super::Relay {
         authed: &[String],
         known_prefixes: Option<&std::collections::HashSet<Vec<u8>>>,
     ) -> Precheck {
-        if let Err(reason) = self.validate(cfg, access, event, now, authed) {
+        // Structural and signature validation first: the vanish detection
+        // below must only ever run on a properly signed event authored by
+        // the vanished pubkey (an unverified event claiming a foreign
+        // pubkey must not trigger the deletion of that pubkey).
+        if let Err(reason) = self.validate_base(cfg, event, now, authed) {
             return Precheck::Reject(reason);
         }
         // NIP-62: request to vanish — delete everything by this pubkey.
+        // The spec requires the relay to honor the request "regardless of
+        // the user's status", so it is detected *before* the access-control
+        // checks: a blocked or restricted pubkey must still be able to
+        // vanish.
         if cfg.nip_enabled(62)
             && nip62::is_vanish(event)
             && nip62::targets_us(event, &cfg.relay_identity())
         {
             return Precheck::Vanish;
+        }
+        // Access control: blocked/allowlisted pubkeys and kinds.
+        if !access.allows_pubkey(&event.pubkey) {
+            return Precheck::Reject("blocked: pubkey not allowed".into());
+        }
+        if !access.allows_kind(event.kind) {
+            return Precheck::Reject("blocked: kind not allowed".into());
         }
         // NIP-43: join requests carry an invite code, which this relay
         // never issues; every claim therefore fails (NIP-43 mandates an
@@ -110,10 +125,13 @@ impl super::Relay {
 }
 
 impl super::Relay {
-    pub(crate) fn validate(
+    /// Base structural, limit and signature validation (no access-control
+    /// checks — those run in [`super::Relay::precheck`] *after* the NIP-62
+    /// vanish detection, so that a blocked or restricted pubkey can still
+    /// request to vanish).
+    pub(crate) fn validate_base(
         &self,
         cfg: &Config,
-        access: &AccessControl,
         event: &Event,
         now: u64,
         authed: &[String],
@@ -173,13 +191,6 @@ impl super::Relay {
                 .any(|t| t.iter().any(|v| contains_secret_key(v)));
         if leaks_secret {
             return Err("mute: event contains secret key material".into());
-        }
-
-        if !access.allows_pubkey(&event.pubkey) {
-            return Err("blocked: pubkey not allowed".into());
-        }
-        if !access.allows_kind(event.kind) {
-            return Err("blocked: kind not allowed".into());
         }
 
         nip01::verify(event, self.secp())
@@ -295,4 +306,100 @@ pub(crate) fn contains_secret_key(text: &str) -> bool {
         i += 1;
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::Relay;
+    use crate::config::{AccessControl, Config};
+    use crate::event::Event;
+    use crate::util::unix_now;
+    use secp256k1::{Keypair, Secp256k1, XOnlyPublicKey};
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    fn signed(kind: u64, tags: Vec<Vec<String>>) -> Event {
+        let secp = Secp256k1::new();
+        let keypair = Keypair::from_seckey_slice(&secp, &[3u8; 32]).unwrap();
+        let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
+        let mut ev = Event {
+            id: String::new(),
+            pubkey,
+            created_at: unix_now(),
+            kind,
+            tags,
+            content: String::new(),
+            sig: String::new(),
+        };
+        ev.id = crate::nips::nip01::compute_id(&ev);
+        let id = ev.id_bytes().unwrap();
+        ev.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+        ev
+    }
+
+    #[test]
+    fn vanished_pubkey_remains_visible_to_its_own_pubkey() {}
+
+    #[test]
+    fn blocked_pubkey_can_still_vanish() {
+        // NIP-62: the relay MUST honor a vanish request "regardless of the
+        // user's status" — a blocked pubkey must still be able to vanish.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut cfg = Config::default();
+            cfg.database.path = std::env::temp_dir().join("nostrd-vanish-test");
+            let _ = std::fs::remove_dir_all(&cfg.database.path);
+            let db = crate::db::DbClient::open(
+                &cfg.database,
+                true,
+                Arc::new(Default::default()),
+                0,
+                128,
+                4096,
+                262144,
+            )
+            .unwrap();
+            let config = Arc::new(RwLock::new(cfg));
+            let stats = crate::stats::Stats::new();
+            let relay = Relay::new(
+                config,
+                db,
+                stats,
+                "",
+                crate::relay::LiveBusConfig {
+                    buffer: 1024,
+                    batch_interval_ms: 10,
+                    batch_size: 64,
+                },
+            )
+            .await;
+            let relay = Arc::new(relay);
+
+            // The vanish event's pubkey is blocked: the vanish must still win.
+            let mut access = AccessControl::default();
+            let vanish = signed(62, vec![vec!["relay".into(), "127.0.0.1:8080".into()]]);
+            access
+                .blocked_pubkeys
+                .push((vanish.pubkey.clone(), String::new()));
+            let cfg = relay.config.read().await;
+            let out = relay
+                .precheck(&cfg, &access, &vanish, unix_now(), &[], None)
+                .await;
+            assert!(
+                matches!(out, super::Precheck::Vanish),
+                "a blocked pubkey's vanish request must be honored"
+            );
+
+            // A blocked pubkey's *regular* event is still rejected.
+            let note = signed(1, vec![]);
+            let out = relay
+                .precheck(&cfg, &access, &note, unix_now(), &[], None)
+                .await;
+            assert!(
+                matches!(out, super::Precheck::Reject(_)),
+                "a blocked pubkey's regular events stay blocked"
+            );
+            relay.db.shutdown();
+        });
+    }
 }
