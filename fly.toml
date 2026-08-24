@@ -1,0 +1,38 @@
+# fly.toml — template for deploying nostrd to Fly.io.
+#
+# Quick start (see docs/DEPLOYMENT.md for the full guide):
+#   1. fly launch --no-deploy --name <app-name>
+#   2. fly volumes create data --size 1 --region <region>
+#   3. set the relay name / public_url / private_key in fly/nostrd.toml
+#   4. fly deploy
+#
+# app = the app name (required, must be unique on Fly). Set it with
+#       `fly launch --name <name>` or edit this line.
+app = "nostrd"
+primary_region = "nrt"   # change to your preferred region
+
+[build]
+
+[mounts]
+  source = "data"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  # A relay must stay reachable at all times: never let Fly stop the
+  # machine during idle periods.
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [http_service.checks]
+    [http_service.checks.health]
+      path = "/health"
+      interval = "30s"
+      timeout = "5s"
+      grace_period = "15s"
+
+[metrics]
+  port = 9091
+  path = "/metrics"
