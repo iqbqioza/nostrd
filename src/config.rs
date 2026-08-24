@@ -477,6 +477,22 @@ impl Config {
                 "server.management_port must differ from server.port".into(),
             ));
         }
+        // `server.api_host` and `blossom.host` split the same port by Host
+        // header: the same hostname for both would make the relay's
+        // WebSocket endpoint unreachable on it.
+        if !self.server.api_host.trim().is_empty()
+            && !self.blossom.host.trim().is_empty()
+            && self
+                .server
+                .api_host
+                .trim()
+                .trim_matches(['[', ']'])
+                .eq_ignore_ascii_case(self.blossom.host.trim().trim_matches(['[', ']']))
+        {
+            return Err(Error::Config(
+                "server.api_host and blossom.host must be different hostnames".into(),
+            ));
+        }
 
         // Blocked IPs must parse as IP addresses.
         for (ip, _) in &self.access.blocked_ips {

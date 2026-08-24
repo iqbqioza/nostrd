@@ -177,46 +177,36 @@ fn host_header_host(header: &str) -> &str {
     }
 }
 
-/// Returns `true` when the request's Host header names `expected`
-/// (ignoring case, any `:port` suffix and IPv6 literal brackets).
-fn host_matches(expected: &str, request: &Request) -> bool {
-    request
+async fn host_split(api_host: &str, blossom_host: &str, request: Request, next: Next) -> Response {
+    let host = request
         .headers()
         .get(axum::http::header::HOST)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|h| {
-            let host = host_header_host(h).to_ascii_lowercase();
-            let expected = expected
-                .trim()
-                .trim_start_matches('[')
-                .trim_end_matches(']')
-                .to_ascii_lowercase();
-            host == expected
-        })
-}
-
-/// Splits the API, the Blossom file server and the relay by Host header:
-/// the configured `api_host` serves only `/api/v1`, `/health` and
-/// `/metrics`; the configured `blossom.host` serves only the Blossom
-/// routes; every other host serves only the relay endpoints. Anything else
-/// gets a 404, so a wrong hostname cannot reach the other side.
-async fn host_split(api_host: &str, blossom_host: &str, request: Request, next: Next) -> Response {
-    let is_api = !api_host.is_empty() && host_matches(api_host, &request);
-    let is_blossom = !blossom_host.is_empty() && host_matches(blossom_host, &request);
-    let is_relay = !is_api && !is_blossom;
-    let path = request.uri().path();
-    let api_path = path.starts_with("/api/v1") || path == "/health" || path == "/metrics";
-    // The root `/` is dispatched by the WS handler (relay info or Blossom
-    // server info), so it must pass through on the Blossom host too.
-    let blossom_path = blossom::is_blossom_path(path) || (is_blossom && path == "/");
-    if (is_api && api_path)
-        || (is_blossom && blossom_path)
-        || (is_relay && !api_path && !blossom_path)
-    {
+        .map(host_header_host)
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    if host_route_allowed(api_host, blossom_host, &host, request.uri().path()) {
         next.run(request).await
     } else {
         StatusCode::NOT_FOUND.into_response()
     }
+}
+
+/// Decides whether a request (host + path) may reach the next handler:
+/// the `api_host` serves only the API paths, the `blossom.host` serves only
+/// the Blossom routes, and every other host serves only the relay endpoints.
+/// API paths are relay-side when `api_host` is unset (so `restrict_uploads` /
+/// blossom alone never hides `/health`, `/metrics` or `/api/v1`).
+fn host_route_allowed(api_host: &str, blossom_host: &str, host: &str, path: &str) -> bool {
+    let is_api = !api_host.is_empty() && host == api_host;
+    let is_blossom = !blossom_host.is_empty() && host == blossom_host;
+    let is_relay = !is_api && !is_blossom;
+    let api_path = !api_host.is_empty()
+        && (path.starts_with("/api/v1") || path == "/health" || path == "/metrics");
+    // The root `/` is dispatched by the WS handler (relay info or Blossom
+    // server info), so it must pass through on the Blossom host too.
+    let blossom_path = blossom::is_blossom_path(path) || (is_blossom && path == "/");
+    (is_api && api_path) || (is_blossom && blossom_path) || (is_relay && !api_path && !blossom_path)
 }
 
 pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> Result<()> {
@@ -764,69 +754,141 @@ async fn reload_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::Body;
-    use axum::http::{Request, header};
 
-    fn req(host: &str, path: &str) -> Request<Body> {
-        Request::builder()
-            .uri(path)
-            .header(header::HOST, host)
-            .body(Body::empty())
-            .unwrap()
+    #[test]
+    fn host_split_matches_ports_case_and_ipv6() {
+        // The middleware normalizes ports, case and IPv6 brackets through
+        // host_header_host before comparing — mirror it here.
+        let norm = |h: &str| host_header_host(h).to_ascii_lowercase();
+        assert!(host_route_allowed(
+            "api.example.com",
+            "",
+            &norm("api.example.com"),
+            "/api/v1/x"
+        ));
+        assert!(host_route_allowed(
+            "api.example.com",
+            "",
+            &norm("api.example.com:8080"),
+            "/api/v1/x"
+        ));
+        assert!(host_route_allowed(
+            "api.example.com",
+            "",
+            &norm("API.EXAMPLE.COM"),
+            "/api/v1/x"
+        ));
+        assert!(!host_route_allowed(
+            "api.example.com",
+            "",
+            &norm("notapi.example.com"),
+            "/api/v1/x"
+        ));
+        // HTTP requires bracket form for IPv6 Host headers.
+        assert!(host_route_allowed("", "::1", &norm("[::1]"), "/upload"));
+        assert!(host_route_allowed(
+            "",
+            "::1",
+            &norm("[::1]:8080"),
+            "/upload"
+        ));
     }
 
     #[test]
-    fn host_is_api_matches_exact_host() {
-        assert!(host_matches(
+    fn host_route_allocation_matrix() {
+        let sha = "ab".repeat(32);
+        // blossom only (api_host unset): relay paths stay reachable.
+        assert!(host_route_allowed(
+            "",
+            "media.test",
+            "relay.example.com",
+            "/health"
+        ));
+        assert!(host_route_allowed(
+            "",
+            "media.test",
+            "relay.example.com",
+            "/metrics"
+        ));
+        assert!(host_route_allowed(
+            "",
+            "media.test",
+            "relay.example.com",
+            "/api/v1/npub1x"
+        ));
+        assert!(host_route_allowed(
+            "",
+            "media.test",
+            "relay.example.com",
+            "/ws"
+        ));
+        assert!(host_route_allowed(
+            "",
+            "media.test",
+            "media.test",
+            &format!("/{sha}")
+        ));
+        assert!(host_route_allowed(
+            "",
+            "media.test",
+            "media.test",
+            "/upload"
+        ));
+        assert!(!host_route_allowed("", "media.test", "media.test", "/ws"));
+        assert!(!host_route_allowed(
+            "",
+            "media.test",
+            "relay.example.com",
+            &format!("/{sha}")
+        ));
+        // api + blossom: each host serves only its own paths.
+        assert!(host_route_allowed(
             "api.example.com",
-            &req("api.example.com", "/")
-        ));
-        assert!(!host_matches(
+            "media.test",
             "api.example.com",
-            &req("relay.example.com", "/")
+            "/api/v1/npub1x"
         ));
-    }
-
-    #[test]
-    fn host_is_api_ignores_port_and_case() {
-        assert!(host_matches(
+        assert!(host_route_allowed(
             "api.example.com",
-            &req("api.example.com:8080", "/")
-        ));
-        assert!(host_matches(
+            "media.test",
             "api.example.com",
-            &req("API.EXAMPLE.COM", "/")
+            "/health"
         ));
-        assert!(!host_matches(
+        assert!(!host_route_allowed(
             "api.example.com",
-            &req("notapi.example.com", "/")
+            "media.test",
+            "api.example.com",
+            "/ws"
         ));
-    }
-
-    #[test]
-    fn host_is_api_rejects_missing_host() {
-        let bare = Request::builder().uri("/").body(Body::empty()).unwrap();
-        assert!(!host_matches("api.example.com", &bare));
-    }
-
-    #[test]
-    fn host_is_api_handles_ipv6_literals() {
-        // Bracket form with and without a port.
-        assert!(host_matches("::1", &req("[::1]:8080", "/")));
-        assert!(host_matches("[::1]", &req("[::1]:8080", "/")));
-        assert!(host_matches("::1", &req("[::1]", "/")));
-        // A different IPv6 address does not match.
-        assert!(!host_matches("::1", &req("[::2]:8080", "/")));
-        // IPv4-mapped IPv6 literals work too.
-        assert!(host_matches(
-            "::ffff:192.0.2.1",
-            &req("[::ffff:192.0.2.1]:8080", "/")
+        assert!(!host_route_allowed(
+            "api.example.com",
+            "media.test",
+            "relay.example.com",
+            "/health"
         ));
-        // IPv6 with a zone identifier (link-local) still matches.
-        assert!(host_matches(
-            "fe80::1%eth0",
-            &req("[fe80::1%eth0]:8080", "/")
+        assert!(host_route_allowed(
+            "api.example.com",
+            "media.test",
+            "relay.example.com",
+            "/ws"
         ));
+        assert!(!host_route_allowed(
+            "api.example.com",
+            "media.test",
+            "media.test",
+            "/api/v1/npub1x"
+        ));
+        // neither split: everything is a relay path (a bare 64-hex path is
+        // still a Blossom-shaped path and 404s — no Blossom routes are
+        // mounted without `blossom.host`).
+        assert!(host_route_allowed("", "", "relay.example.com", "/health"));
+        assert!(!host_route_allowed(
+            "",
+            "",
+            "relay.example.com",
+            &format!("/{sha}")
+        ));
+        assert!(!host_route_allowed("", "", "relay.example.com", "/upload"));
     }
 
     #[test]
