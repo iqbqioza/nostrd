@@ -12,11 +12,12 @@ pub const DEFAULT_CONFIG: &str = "nostrd.toml";
 /// NIPs with relay-side behaviour implemented by this relay, as advertised
 /// in the NIP-11 document. NIPs whose behaviour is purely client-side are
 /// deliberately not advertised (NIP-11: "Client-side NIPs SHOULD NOT be
-/// advertised"), and file-storage NIPs (34/94/95/96) are excluded per the
-/// project rules. NIP-33 was merged into NIP-01 but remains advertised for
-/// clients that check it.
+/// advertised"): NIP-28 explicitly "imposes no additional requirements on
+/// relays", so it is not listed. File-storage NIPs (34/94/95/96) are
+/// excluded per the project rules. NIP-33 was merged into NIP-01 but
+/// remains advertised for clients that check it.
 pub const RELAY_NIPS: &[u16] = &[
-    1, 9, 11, 13, 26, 28, 29, 33, 40, 42, 43, 45, 50, 62, 67, 70, 77, 86, 98,
+    1, 9, 11, 13, 26, 29, 33, 40, 42, 43, 45, 50, 62, 67, 70, 77, 86, 98,
 ];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -914,8 +915,9 @@ mod tests {
         ] {
             assert!(nips.contains(&n), "NIP-{n} must be advertised");
         }
-        // Client-side NIPs must not be advertised (NIP-11).
-        for n in [2, 3, 5, 17, 19, 32, 51, 65, 68, 99] {
+        // Client-side NIPs must not be advertised (NIP-11). NIP-28
+        // explicitly "imposes no additional requirements on relays".
+        for n in [2, 3, 5, 17, 19, 28, 32, 51, 65, 68, 99] {
             assert!(
                 !nips.contains(&n),
                 "client-side NIP-{n} must not be advertised"

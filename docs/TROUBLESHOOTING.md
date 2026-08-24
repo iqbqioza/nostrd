@@ -287,6 +287,18 @@ Common causes:
 
 ---
 
+
+### 4-9. NIP-98 auth events are accepted with a different scheme or port
+
+The NIP-98 spec says the `u` tag must be *exactly* the same as the absolute request URL. nostrd deliberately tolerates two differences:
+
+- **scheme**: `wss://` / `https://` (and `ws://` / `http://`, including the `nostr+` variants) are treated as equivalent — this keeps NIP-98 auth working behind TLS-terminating proxies, which see `http` on their side while the client signs `https`
+- **default ports**: a `u` tag without a port is accepted when the relay listens on port 80 or 443
+
+The host, path and query must still match exactly, so the tolerance cannot be used to authorize a different resource.
+
+---
+
 ## 5. Database and Disk
 
 ### 5-1. `database map is full: increase database.map_max_size`

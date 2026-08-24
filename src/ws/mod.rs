@@ -953,4 +953,35 @@ mod tests {
             conn.relay.db.shutdown();
         });
     }
+
+    #[test]
+    fn deletion_without_targets_is_rejected() {
+        // NIP-09: a deletion request (kind 5) is defined as having one or
+        // more `e`/`a` tags; one without targets is rejected.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            let bare = signed_note(conn.relay.secp(), "delete nothing", now, vec![]);
+            let mut bare = bare;
+            bare.kind = 5;
+            bare.id = crate::nips::nip01::compute_id(&bare);
+            conn.queue_event_value(bare.clone()).await;
+            conn.flush_pending_events().await;
+            let msgs = outgoing_json(&conn);
+            let ok = msgs
+                .iter()
+                .find(|m| m[0] == "OK" && m[1] == bare.id)
+                .expect("an OK reply is sent");
+            assert_eq!(ok[2], false);
+            assert!(
+                ok[3]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("deletion request must reference"),
+                "the reason must explain the rejection"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
 }

@@ -36,8 +36,19 @@ pub fn tokenize(text: &str) -> Vec<String> {
 }
 
 /// Search terms derived from a filter's `search` value.
+///
+/// NIP-50: a query string may contain `key:value` pairs (two words
+/// separated by a colon); these are extensions and relays SHOULD ignore
+/// the ones they do not support. Such tokens are dropped from the query so
+/// that e.g. `include:spam` does not match events containing the words
+/// "include" or "spam".
 pub fn terms(search: &str) -> Vec<String> {
-    tokenize(search)
+    let without_extensions: String = search
+        .split_whitespace()
+        .filter(|token| !token.contains(':'))
+        .collect::<Vec<&str>>()
+        .join(" ");
+    tokenize(&without_extensions)
 }
 
 /// Whether any of `terms` appears in `content` as a whole word.
@@ -71,6 +82,19 @@ mod tests {
     #[test]
     fn terms_lowercase() {
         assert_eq!(terms("Rust Nostr"), vec!["rust", "nostr"]);
+    }
+
+    #[test]
+    fn key_value_extensions_are_ignored() {
+        // NIP-50: `key:value` pairs are extensions; unsupported ones are
+        // dropped instead of being matched as ordinary words.
+        assert_eq!(terms("include:spam"), Vec::<String>::new());
+        assert_eq!(terms("nostr include:spam"), vec!["nostr"]);
+        assert_eq!(terms("domain:example.com rust"), vec!["rust"]);
+        // A colon inside a larger token is an extension too.
+        assert_eq!(terms("a:b:c"), Vec::<String>::new());
+        // Normal queries are untouched.
+        assert_eq!(terms("best nostr apps"), vec!["best", "nostr", "apps"]);
     }
 
     #[test]
