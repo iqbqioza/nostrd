@@ -15,20 +15,33 @@
 #
 # The downloaded binary is verified against the release's sha256 checksum.
 
-set -euo pipefail
+set -eu
 
 REPO="iqbqioza/nostrd"
 VERSION="${VERSION:-}"          # empty = latest release
 INSTALL_DIR="${INSTALL_DIR:-}"  # empty = auto-detect (see below)
 FORCE=0
 
+usage() {
+  cat <<'EOF'
+install.sh — download and install the nostrd relay server.
+
+Usage:
+  ./install.sh                         install the latest release
+  VERSION=v0.1.0 ./install.sh          install a specific release
+  INSTALL_DIR=/usr/local/bin sudo ./install.sh   system-wide install
+  ./install.sh --force                 overwrite without asking
+
+One-liner (no clone needed):
+  curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrd/main/install.sh | sh
+  curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrd/main/install.sh | sh -s -- --force
+EOF
+}
+
 for arg in "$@"; do
   case "$arg" in
     -f|--force) FORCE=1 ;;
-    -h|--help)
-      sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
-      exit 0
-      ;;
+    -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $arg" >&2; exit 1 ;;
   esac
 done
@@ -90,7 +103,8 @@ if [ -e "$TARGET" ]; then
   if [ "$FORCE" -eq 1 ]; then
     echo "overwriting $TARGET (--force)"
   elif [ -t 0 ]; then
-    read -r -p "nostrd already exists at $TARGET. Overwrite it? [y/N] " answer
+    printf "nostrd already exists at %s. Overwrite it? [y/N] " "$TARGET"
+    read -r answer
     case "$answer" in
       y | Y | yes | Yes | YES) echo "overwriting $TARGET" ;;
       *) echo "aborted: $TARGET unchanged" >&2; exit 1 ;;
