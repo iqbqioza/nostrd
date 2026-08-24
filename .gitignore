@@ -1,4 +1,5 @@
 /target
 *.mdb
 nostrd.toml
+!fly/nostrd.toml
 nostrd.stats.json

@@ -18,6 +18,7 @@ nostrd is designed around two goals:
 - [Documentation](#documentation)
 - [Features](#features)
 - [Install (pre-built binary)](#install-pre-built-binary)
+- [Deploying to Fly.io](#deploying-to-flyio)
 - [Requirements](#requirements)
 - [Build](#build)
 - [Quick start](#quick-start)
@@ -41,6 +42,7 @@ The detailed guides live in the [`docs/`](docs/) directory:
 | [Configuration reference](docs/CONFIGURATION.md) | Every `nostrd.toml` option with its default and exact behavior, validation rules, SIGHUP reload, full example |
 | [HTTP REST API reference](docs/API.md) | `/api/v1` endpoints, query parameters, pagination, errors, status codes |
 | [Troubleshooting](docs/TROUBLESHOOTING.md) | Common errors and their step-by-step fixes |
+| [Deploying to Fly.io](docs/DEPLOYMENT.md) | Deploy the pre-built release binary to Fly.io in four steps |
 
 ## Features
 
@@ -80,6 +82,18 @@ curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrd/main/install.sh | s
 ```
 
 The script picks the first of `~/.local/bin`, `~/bin` and `~/.cargo/bin` that is already on `PATH` (falling back to `~/.local/bin`, which it then tells you how to add to `PATH`). If `nostrd` already exists at the install location it asks for confirmation before overwriting. The install directory can be overridden with the `INSTALL_DIR` environment variable.
+
+## Deploying to Fly.io
+
+nostrd ships a ready-made [Fly.io](https://fly.io) template: the `Dockerfile` downloads the **pre-built release binary** from the GitHub release assets (no compilation on Fly), `fly.toml` wires up the HTTP service, health checks and a persistent volume, and `fly/nostrd.toml` is the baked-in configuration.
+
+```sh
+fly launch --no-deploy --name <app-name> --region <region>
+fly volumes create data --size 1 --region <region>
+fly deploy
+```
+
+Full guide: [Deploying to Fly.io](docs/DEPLOYMENT.md).
 
 ## Requirements
 
