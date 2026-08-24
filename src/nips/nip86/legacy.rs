@@ -52,6 +52,9 @@ pub(crate) fn router(relay: Arc<Relay>, shutdown_tx: watch::Sender<bool>) -> Rou
         }))
 }
 
+// The `Err` variant is an axum `Response` (a framework type that is not
+// worth boxing): the lint would not improve anything here.
+#[allow(clippy::result_large_err)]
 async fn check_auth(
     headers: &HeaderMap,
     state: &AdminState,
