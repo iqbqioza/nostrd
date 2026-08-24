@@ -266,7 +266,7 @@ impl Cli {
                 self.config.display()
             )));
         }
-        let cfg = Config::load(&self.config)?;
+        let cfg = self.load_config()?;
         if let BlossomAction::Allow { pubkey } | BlossomAction::Deny { pubkey } = action
             && !is_pubkey_or_npub(pubkey)
         {
@@ -342,7 +342,7 @@ impl Cli {
                 self.config.display()
             )));
         }
-        let cfg = Config::load(&self.config)?;
+        let cfg = self.load_config()?;
         if let RelayAction::Allow { pubkey } | RelayAction::Deny { pubkey } = action
             && !is_pubkey_or_npub(pubkey)
         {

@@ -477,6 +477,22 @@ impl Config {
                 "server.management_port must differ from server.port".into(),
             ));
         }
+        // Host split hostnames must be bare hostnames: a scheme, path or
+        // port in the config would never match a request Host header and
+        // silently hide the split routes (or, worse, the whole API).
+        for (name, value) in [
+            ("server.api_host", self.server.api_host.as_str()),
+            ("blossom.host", self.blossom.host.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                continue;
+            }
+            if value.contains('/') || bare_host_has_port(value.trim()) {
+                return Err(Error::Config(format!(
+                    "{name} must be a bare hostname (no scheme, port or path), got {value:?}"
+                )));
+            }
+        }
         // `server.api_host` and `blossom.host` split the same port by Host
         // header: the same hostname for both would make the relay's
         // WebSocket endpoint unreachable on it.
@@ -659,6 +675,12 @@ impl Config {
         }
         Ok(())
     }
+}
+
+/// Whether a bare hostname contains a `:` outside IPv6 brackets (i.e. a
+/// port). `[::1]` and `::1` are fine, `media.example.com:8080` is not.
+fn bare_host_has_port(host: &str) -> bool {
+    host.contains(':') && !host.starts_with('[')
 }
 
 /// Whether a string is a 64-hex pubkey or a parseable `npub1...`.
