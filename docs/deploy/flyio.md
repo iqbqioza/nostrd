@@ -87,7 +87,7 @@ The image reads `/etc/nostrd/nostrd.toml`, baked from `fly/nostrd.toml`. Two way
 1. **Edit `fly/nostrd.toml` in the repository** and redeploy (simplest)
 2. **Mount your own config**: build a fork of the image that copies your config file over `/etc/nostrd/nostrd.toml`
 
-Every option is documented in the [Configuration reference](CONFIGURATION.md).
+Every option is documented in the [Configuration reference](../CONFIGURATION.md).
 
 ## Notes
 

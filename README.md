@@ -18,7 +18,13 @@ nostrd is designed around two goals:
 - [Documentation](#documentation)
 - [Features](#features)
 - [Install (pre-built binary)](#install-pre-built-binary)
-- [Deploying to Fly.io](#deploying-to-flyio)
+- [Deployment](#deployment)
+  - [Fly.io](docs/deploy/flyio.md)
+  - [Digital Ocean](docs/deploy/digitalocean.md)
+  - [AWS](docs/deploy/aws.md)
+  - [Google Cloud](docs/deploy/gcp.md)
+  - [Azure](docs/deploy/azure.md)
+  - [Any VPS](docs/deploy/vps.md)
 - [Requirements](#requirements)
 - [Build](#build)
 - [Quick start](#quick-start)
@@ -42,7 +48,7 @@ The detailed guides live in the [`docs/`](docs/) directory:
 | [Configuration reference](docs/CONFIGURATION.md) | Every `nostrd.toml` option with its default and exact behavior, validation rules, SIGHUP reload, full example |
 | [HTTP REST API reference](docs/API.md) | `/api/v1` endpoints, query parameters, pagination, errors, status codes |
 | [Troubleshooting](docs/TROUBLESHOOTING.md) | Common errors and their step-by-step fixes |
-| [Deploying to Fly.io](docs/DEPLOYMENT.md) | Deploy the pre-built release binary to Fly.io in four steps |
+| [Deployment guides](docs/deploy/README.md) | Deploy the pre-built release binary to Fly.io, Digital Ocean, AWS, GCP, Azure or any VPS |
 
 ## Features
 
@@ -83,17 +89,52 @@ curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrd/main/install.sh | s
 
 The script picks the first of `~/.local/bin`, `~/bin` and `~/.cargo/bin` that is already on `PATH` (falling back to `~/.local/bin`, which it then tells you how to add to `PATH`). If `nostrd` already exists at the install location it asks for confirmation before overwriting. The install directory can be overridden with the `INSTALL_DIR` environment variable.
 
-## Deploying to Fly.io
+## Deployment
 
-nostrd ships a ready-made [Fly.io](https://fly.io) template: the `Dockerfile` downloads the **pre-built release binary** from the GitHub release assets (no compilation on Fly), `fly.toml` wires up the HTTP service, health checks and a persistent volume, and `fly/nostrd.toml` is the baked-in configuration.
+nostrd ships pre-built binaries for x86_64 and aarch64 (GitHub release assets) and a container image that downloads them — no compilation anywhere. Deployment guides are available for:
 
-```sh
-fly launch --no-deploy --name <app-name> --region <region>
-fly volumes create data --size 1 --region <region>
-fly deploy
-```
+| Platform | Guide |
+| --- | --- |
+| Fly.io | [docs/deploy/flyio.md](docs/deploy/flyio.md) — four-step deploy with a persistent volume |
+| Digital Ocean | [docs/deploy/digitalocean.md](docs/deploy/digitalocean.md) — Droplet or App Platform |
+| AWS | [docs/deploy/aws.md](docs/deploy/aws.md) — EC2, Lightsail or ECS/Fargate |
+| Google Cloud | [docs/deploy/gcp.md](docs/deploy/gcp.md) — Compute Engine or Cloud Run |
+| Azure | [docs/deploy/azure.md](docs/deploy/azure.md) — VM or Container Apps |
+| Any VPS | [docs/deploy/vps.md](docs/deploy/vps.md) — systemd service behind nginx/Caddy |
 
-Full guide: [Deploying to Fly.io](docs/DEPLOYMENT.md).
+The VM guides share one pattern: `install.sh` → the `deploy/nostrd.toml` template → the `deploy/nostrd.service` systemd unit → open port 8080 → TLS proxy in front. Overview: [docs/deploy/README.md](docs/deploy/README.md).
+
+### Registering the relay as a systemd service (VMs)
+
+The repository ships a hardened unit at `deploy/nostrd.service` (it runs `nostrd start --foreground` and restarts the relay on failure):
+
+1. **Fetch the config template and edit it** (no repository clone needed):
+
+   ```sh
+   sudo mkdir -p /etc/nostrd
+   sudo curl -fsSL -o /etc/nostrd/nostrd.toml \
+     https://raw.githubusercontent.com/iqbqioza/nostrd/main/deploy/nostrd.toml
+   sudo nano /etc/nostrd/nostrd.toml        # set name, public_url, private_key
+   ```
+
+2. **Fetch the unit and start it**:
+
+   ```sh
+   sudo curl -fsSL -o /etc/systemd/system/nostrd.service \
+     https://raw.githubusercontent.com/iqbqioza/nostrd/main/deploy/nostrd.service
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now nostrd
+   ```
+
+3. **Check it**:
+
+   ```sh
+   sudo systemctl status nostrd             # active (running)
+   curl http://localhost:8080/health        # {"status":"ok"}
+   journalctl -u nostrd -f                  # logs
+   ```
+
+The unit restarts the relay automatically on crashes and on boot. `sudo systemctl restart nostrd` applies config changes.
 
 ## Requirements
 
