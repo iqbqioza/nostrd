@@ -1,0 +1,46 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build and publish release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p dist
+          cp target/release/nostrd dist/nostrd-linux-x86_64
+          chmod +x dist/nostrd-linux-x86_64
+          (cd dist && sha256sum nostrd-linux-x86_64 > nostrd-linux-x86_64.sha256)
+          (cd dist && tar -czf nostrd-linux-x86_64.tar.gz nostrd-linux-x86_64)
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            dist/nostrd-linux-x86_64 \
+            dist/nostrd-linux-x86_64.tar.gz \
+            dist/nostrd-linux-x86_64.sha256 \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes
