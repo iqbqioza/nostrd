@@ -21,6 +21,31 @@ nostrd is designed around two goals:
 - **Everything configurable** via `nostrd.toml` — no compile-time options.
 - **Works behind TLS-terminating proxies** (nginx, Caddy, Cloudflare Tunnel): WebSocket upgrades are honored via `X-Forwarded-Proto`.
 
+## Install (pre-built binary)
+
+The GitHub Actions release workflow builds `nostrd` for **x86_64** and **aarch64** and attaches both binaries (plus checksums) to every release. The `install.sh` script downloads the right one, verifies its sha256 checksum and installs it into a directory on `PATH`.
+
+The fastest way — **one-liner, no clone needed**:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrd/main/install.sh | sh
+```
+
+Or download and run it manually (useful to inspect the script first, or to pass options):
+
+```sh
+curl -fsSL -o install.sh https://raw.githubusercontent.com/iqbqioza/nostrd/main/install.sh
+chmod +x install.sh
+./install.sh                       # latest release, into ~/.local/bin (no sudo needed)
+
+VERSION=v0.1.0-alpha-01 ./install.sh            # a specific release
+INSTALL_DIR=/usr/local/bin sudo ./install.sh    # system-wide (requires sudo)
+./install.sh --force                            # overwrite without asking
+curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrd/main/install.sh | sh -s -- --force
+```
+
+The script picks the first of `~/.local/bin`, `~/bin` and `~/.cargo/bin` that is already on `PATH` (falling back to `~/.local/bin`, which it then tells you how to add to `PATH`). If `nostrd` already exists at the install location it asks for confirmation before overwriting. The install directory can be overridden with the `INSTALL_DIR` environment variable.
+
 ## Requirements
 
 - Linux / macOS / other Unix-like OS (daemonization uses the `daemonize` crate)
