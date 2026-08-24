@@ -102,24 +102,26 @@ nostrd ships pre-built binaries for x86_64 and aarch64 (GitHub release assets) a
 | Azure | [docs/deploy/azure.md](docs/deploy/azure.md) — VM or Container Apps |
 | Any VPS | [docs/deploy/vps.md](docs/deploy/vps.md) — systemd service behind nginx/Caddy |
 
-The VM guides share one pattern: `install.sh` → `fly/nostrd.toml` → the `deploy/nostrd.service` systemd unit → open port 8080 → TLS proxy in front. Overview: [docs/deploy/README.md](docs/deploy/README.md).
+The VM guides share one pattern: `install.sh` → the `deploy/nostrd.toml` template → the `deploy/nostrd.service` systemd unit → open port 8080 → TLS proxy in front. Overview: [docs/deploy/README.md](docs/deploy/README.md).
 
 ### Registering the relay as a systemd service (VMs)
 
 The repository ships a hardened unit at `deploy/nostrd.service` (it runs `nostrd start --foreground` and restarts the relay on failure):
 
-1. **Create the config** (once):
+1. **Fetch the config template and edit it** (no repository clone needed):
 
    ```sh
    sudo mkdir -p /etc/nostrd
-   sudo cp fly/nostrd.toml /etc/nostrd/nostrd.toml
+   sudo curl -fsSL -o /etc/nostrd/nostrd.toml \
+     https://raw.githubusercontent.com/iqbqioza/nostrd/main/deploy/nostrd.toml
    sudo nano /etc/nostrd/nostrd.toml        # set name, public_url, private_key
    ```
 
-2. **Install and start the unit**:
+2. **Fetch the unit and start it**:
 
    ```sh
-   sudo cp deploy/nostrd.service /etc/systemd/system/nostrd.service
+   sudo curl -fsSL -o /etc/systemd/system/nostrd.service \
+     https://raw.githubusercontent.com/iqbqioza/nostrd/main/deploy/nostrd.service
    sudo systemctl daemon-reload
    sudo systemctl enable --now nostrd
    ```

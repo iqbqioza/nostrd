@@ -19,13 +19,15 @@ All the VM guides (Digital Ocean, AWS EC2, GCP, Azure, any VPS) follow the same 
 # 1. Install the latest release binary (no sudo needed for the install itself)
 curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrd/main/install.sh | sh
 
-# 2. Create a config file for your server and edit it
+# 2. Fetch the config template and edit it (no repository clone needed)
 sudo mkdir -p /etc/nostrd
-sudo cp fly/nostrd.toml /etc/nostrd/nostrd.toml     # from the repository
+sudo curl -fsSL -o /etc/nostrd/nostrd.toml \
+  https://raw.githubusercontent.com/iqbqioza/nostrd/main/deploy/nostrd.toml
 sudo nano /etc/nostrd/nostrd.toml                   # set name, public_url, private_key
 
-# 3. Run as a systemd service (template: deploy/nostrd.service)
-sudo cp deploy/nostrd.service /etc/systemd/system/nostrd.service
+# 3. Fetch the systemd unit and start the service
+sudo curl -fsSL -o /etc/systemd/system/nostrd.service \
+  https://raw.githubusercontent.com/iqbqioza/nostrd/main/deploy/nostrd.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now nostrd
 

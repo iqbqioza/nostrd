@@ -12,9 +12,11 @@ Options: **EC2** (VM, recommended), **Lightsail** (simpler VM), or **ECS/Fargate
 ssh -i your-key.pem ec2-user@<public-ip>        # Ubuntu: ubuntu@<public-ip>
 curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrd/main/install.sh | sh
 sudo mkdir -p /etc/nostrd
-sudo cp fly/nostrd.toml /etc/nostrd/nostrd.toml   # from the repository
+sudo curl -fsSL -o /etc/nostrd/nostrd.toml \
+  https://raw.githubusercontent.com/iqbqioza/nostrd/main/deploy/nostrd.toml
 sudo nano /etc/nostrd/nostrd.toml                 # set name, public_url, private_key
-sudo cp deploy/nostrd.service /etc/systemd/system/nostrd.service
+sudo curl -fsSL -o /etc/systemd/system/nostrd.service \
+  https://raw.githubusercontent.com/iqbqioza/nostrd/main/deploy/nostrd.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now nostrd
 ```

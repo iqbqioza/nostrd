@@ -11,9 +11,11 @@ Two options: a **Droplet** (VM, simplest) or the **App Platform** (containers).
 ssh root@<droplet-ip>
 curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrd/main/install.sh | sh
 sudo mkdir -p /etc/nostrd
-sudo cp fly/nostrd.toml /etc/nostrd/nostrd.toml   # from the repository
+sudo curl -fsSL -o /etc/nostrd/nostrd.toml \
+  https://raw.githubusercontent.com/iqbqioza/nostrd/main/deploy/nostrd.toml
 sudo nano /etc/nostrd/nostrd.toml                 # set name, public_url, private_key
-sudo cp deploy/nostrd.service /etc/systemd/system/nostrd.service
+sudo curl -fsSL -o /etc/systemd/system/nostrd.service \
+  https://raw.githubusercontent.com/iqbqioza/nostrd/main/deploy/nostrd.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now nostrd
 ```

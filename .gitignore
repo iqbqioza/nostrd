@@ -2,4 +2,5 @@
 *.mdb
 nostrd.toml
 !fly/nostrd.toml
+!deploy/nostrd.toml
 nostrd.stats.json

@@ -13,14 +13,12 @@ nostrd --version
 
 ## 2. Create a configuration
 
+Fetch the template (no repository clone needed) and edit it:
+
 ```sh
 sudo mkdir -p /etc/nostrd
-```
-
-Copy the template from the repository and edit it:
-
-```sh
-sudo cp fly/nostrd.toml /etc/nostrd/nostrd.toml
+sudo curl -fsSL -o /etc/nostrd/nostrd.toml \
+  https://raw.githubusercontent.com/iqbqioza/nostrd/main/deploy/nostrd.toml
 sudo nano /etc/nostrd/nostrd.toml
 ```
 
@@ -47,10 +45,11 @@ nostrd --config /tmp/nostrd-genkey.toml init && nostrd --config /tmp/nostrd-genk
 
 ## 3. Run as a systemd service
 
-The repository ships a hardened unit at `deploy/nostrd.service`:
+Fetch the hardened unit (no repository clone needed) and start it:
 
 ```sh
-sudo cp deploy/nostrd.service /etc/systemd/system/nostrd.service
+sudo curl -fsSL -o /etc/systemd/system/nostrd.service \
+  https://raw.githubusercontent.com/iqbqioza/nostrd/main/deploy/nostrd.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now nostrd
 sudo systemctl status nostrd
@@ -127,7 +126,7 @@ sudo systemctl start nostrd
 ## Updates
 
 ```sh
-# install.sh overwrites the binary in place (it asks for confirmation)
-./install.sh
+# the one-liner overwrites the existing binary (it asks for confirmation)
+curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrd/main/install.sh | sh
 sudo systemctl restart nostrd
 ```
