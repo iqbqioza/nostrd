@@ -15,6 +15,7 @@ This page collects the errors you are most likely to meet while running nostrd, 
 1. [Cannot Start](#1-cannot-start)
 2. [Cannot Connect / Behaves Strangely](#2-cannot-connect--behaves-strangely)
 3. [Errors When Publishing](#3-errors-when-publishing)
+3b. [Blossom File Server](#3b-blossom-file-server)
 4. [Search, Groups, Auth](#4-search-groups-auth)
 5. [Database and Disk](#5-database-and-disk)
 6. [Daemon Operation](#6-daemon-operation)
@@ -220,6 +221,24 @@ Possible causes:
 Group posts have a time limit (`group_late_publish_secs`, default 7 days). Older events are rejected with `invalid: event is too old for this group`.
 
 ---
+
+## 3b. Blossom File Server
+
+### 3b-1. Upload fails with `401`
+
+The upload authorization event (kind 24242) was rejected. Check that the client's `server` tag names exactly the configured `blossom.host` (hostname only, no scheme/path), that the token's `expiration` tag is in the future, and that the signing key is the uploader's own.
+
+### 3b-2. Upload fails with `403`
+
+`blossom.restrict_uploads = true` is set and the pubkey is not on the allowlist — add it with `nostrd blossom allow npub1...` (the daemon reloads automatically). If the list looks wrong, `nostrd blossom list` shows it.
+
+### 3b-3. `GET /` on the media host serves the NIP-11 document instead of the Blossom server info
+
+The request did not reach the relay with the Blossom Host header. Point `media.example.com` (or whatever `blossom.host` is set to) at the same port in the reverse proxy, then `nostrd restart`.
+
+### 3b-4. A blob 404s right after upload
+
+The file is content-addressed by its SHA-256: fetch it via the exact hash returned in the upload response (`/<sha256>` or `/<sha256>.<ext>`). A mismatch means the client requested a different hash than the bytes it sent.
 
 ## 4. Search, Groups, Auth
 

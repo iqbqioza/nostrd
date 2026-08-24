@@ -111,6 +111,32 @@ relay.example.com {
 }
 ```
 
+**Serving the Blossom media host too**: when `blossom.host = "media.example.com"` is set, that hostname must also reach the same port — the relay splits the hosts internally (like `server.api_host`). Add a second server block / site for it:
+
+```nginx
+# nginx
+server {
+    listen 443 ssl;
+    server_name media.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/media.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/media.example.com/privkey.pem;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+```
+
+```caddy
+# Caddy
+media.example.com {
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
 Make sure `relay.public_url` in the config matches `wss://relay.example.com`.
 
 ## 6. Backups

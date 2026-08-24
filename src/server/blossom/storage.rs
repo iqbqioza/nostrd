@@ -365,11 +365,19 @@ impl S3Store {
     }
 
     async fn delete(&self, npub: &str, sha256: &str) -> Result<bool> {
+        // The blob is removed before the meta (like the local backend): a
+        // crash in between leaves a meta without a blob, which the index
+        // can still resolve and a later delete cleans up — never an
+        // invisible orphan blob.
+        let existed = self
+            .client
+            .delete_object(&format!("{npub}/{sha256}"))
+            .await?;
         let _ = self
             .client
             .delete_object(&self.meta_key(npub, sha256))
             .await?;
-        self.client.delete_object(&format!("{npub}/{sha256}")).await
+        Ok(existed)
     }
 
     /// Warms the index by listing the bucket and reading the meta objects.
@@ -400,5 +408,112 @@ impl S3Store {
             }
         }
         Ok(index)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn store(tmp: &str) -> BlobStore {
+        let dir =
+            std::env::temp_dir().join(format!("nostrd-blossom-test-{tmp}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        BlobStore::new("local", &dir, None).await.unwrap()
+    }
+
+    fn pk(i: u8) -> String {
+        format!("{:02x}", i).repeat(32)
+    }
+
+    #[tokio::test]
+    async fn multi_owner_put_find_list_delete() {
+        let s = store("multi").await;
+        let a = pk(1);
+        let b = pk(2);
+        let sha = "ab".repeat(32);
+        let bytes = b"hello blossom";
+
+        let da = s.put(&a, &sha, bytes, "text/plain").await.unwrap();
+        assert_eq!(da.pubkey, a);
+        // Same bytes by another pubkey: both become owners.
+        let db = s.put(&b, &sha, bytes, "text/plain").await.unwrap();
+        assert_eq!(db.pubkey, b);
+
+        assert_eq!(s.find(&sha).await.unwrap().pubkey, a);
+        assert!(s.has(&a, &sha).await);
+        assert!(s.has(&b, &sha).await);
+        assert!(!s.has(&pk(3), &sha).await);
+        assert_eq!(s.list(&a).await.len(), 1);
+        assert_eq!(s.list(&b).await.len(), 1);
+        assert_eq!(s.list(&pk(3)).await.len(), 0);
+
+        // The content reads back under either owner.
+        let npub_a = npub_of(&a);
+        let npub_b = npub_of(&b);
+        assert_eq!(s.read(&npub_a, &sha).await.unwrap().unwrap(), bytes);
+        assert_eq!(s.read(&npub_b, &sha).await.unwrap().unwrap(), bytes);
+
+        // One owner deletes: the other owner's copy survives.
+        assert!(s.delete(&b, &sha).await.unwrap());
+        assert!(s.find(&sha).await.is_some());
+        assert!(s.read(&npub_a, &sha).await.unwrap().is_some());
+        assert!(s.read(&npub_b, &sha).await.unwrap().is_none());
+        assert!(!s.has(&b, &sha).await);
+        assert!(s.has(&a, &sha).await);
+        assert_eq!(s.list(&a).await.len(), 1);
+        assert_eq!(s.list(&b).await.len(), 0);
+
+        // The last owner's delete removes the index entry.
+        assert!(s.delete(&a, &sha).await.unwrap());
+        assert!(s.find(&sha).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn scan_rebuilds_multi_owner_index() {
+        let dir =
+            std::env::temp_dir().join(format!("nostrd-blossom-test-scan-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        {
+            let s = BlobStore::new("local", &dir, None).await.unwrap();
+            let sha = "cd".repeat(32);
+            s.put(&pk(1), &sha, b"x", "image/png").await.unwrap();
+            s.put(&pk(2), &sha, b"x", "image/png").await.unwrap();
+            let sha2 = "ef".repeat(32);
+            s.put(&pk(1), &sha2, b"y", "text/plain").await.unwrap();
+        }
+        // Reopening rescans the directory: both owners and both files come
+        // back (the scan reads every owner's meta).
+        let s = BlobStore::new("local", &dir, None).await.unwrap();
+        let sha = "cd".repeat(32);
+        assert_eq!(s.find(&sha).await.unwrap().pubkey, pk(1));
+        assert!(s.has(&pk(1), &sha).await);
+        assert!(s.has(&pk(2), &sha).await);
+        assert_eq!(s.list(&pk(1)).await.len(), 2);
+        assert_eq!(s.list(&pk(2)).await.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn delete_missing_file_heals_index() {
+        let dir =
+            std::env::temp_dir().join(format!("nostrd-blossom-test-heal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = BlobStore::new("local", &dir, None).await.unwrap();
+        let sha = "11".repeat(32);
+        s.put(&pk(9), &sha, b"z", "text/plain").await.unwrap();
+        // Simulate a crash after the blob write was lost: the meta remains.
+        // Deleting still cleans the descriptor up.
+        assert!(s.delete(&pk(9), &sha).await.unwrap());
+        assert!(s.find(&sha).await.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn npub_of_roundtrip() {
+        let hex = pk(7);
+        let npub = npub_of(&hex);
+        assert!(npub.starts_with("npub1"));
+        assert_eq!(npub_of(&hex), npub, "stable");
     }
 }

@@ -29,6 +29,7 @@ nostrd is designed around two goals:
 - [Build](#build)
 - [Quick start](#quick-start)
 - [REST API](#rest-api)
+- [Blossom file server (media hosting)](#blossom-file-server-media-hosting)
 - [Commands](#commands)
 - [Configuration](#configuration)
   - [Anti-abuse limits](#anti-abuse-limits)
@@ -44,7 +45,7 @@ The detailed guides live in the [`docs/`](docs/) directory:
 
 | Document | Contents |
 | --- | --- |
-| [Manual](docs/MANUAL.md) | Installation, configuration, operation, NIP support, NIP-29 groups, LiveKit, logs and statistics |
+| [Manual](docs/MANUAL.md) | Installation, configuration, operation, NIP support, NIP-29 groups, LiveKit, the Blossom file server, logs and statistics |
 | [Configuration reference](docs/CONFIGURATION.md) | Every `nostrd.toml` option with its default and exact behavior, validation rules, SIGHUP reload, full example |
 | [HTTP REST API reference](docs/API.md) | `/api/v1` endpoints, query parameters, pagination, errors, status codes |
 | [Troubleshooting](docs/TROUBLESHOOTING.md) | Common errors and their step-by-step fixes |
@@ -181,6 +182,37 @@ By default the API is served on every host; set `server.api_host` (e.g. `api_hos
 
 **Full reference — endpoints, parameters, pagination, errors, status codes: [HTTP REST API reference](docs/API.md).**
 
+## Blossom file server (media hosting)
+
+nostrd doubles as a [Blossom](https://github.com/hzrd149/blossom) blob server on a dedicated hostname: clients upload files addressed by their SHA-256, and the relay serves them back — with `bucket/{npub1}/{file}` storage on local disk or in an S3-compatible bucket (AWS S3 / Cloudflare R2).
+
+```toml
+[blossom]
+host = "media.example.com"          # this Host header serves only the Blossom routes
+storage = "local"                   # "local" or "s3" (Cloudflare R2 is S3-compatible)
+local_path = "./data/images"        # <local_path>/<npub1...>/<sha256>
+# storage = "s3" + s3_endpoint / s3_region / s3_bucket / s3_access_key / s3_secret_key
+restrict_uploads = false            # true = only allow-listed pubkeys may upload
+```
+
+| Endpoint | Description |
+| --- | --- |
+| `GET /` | Blossom server info (on the Blossom host) |
+| `GET` / `HEAD` `/<sha256>[.ext]` | Fetch / probe a blob |
+| `PUT /upload` | Upload a blob (kind-24242 auth) |
+| `GET /list/<pubkey>` | Blobs uploaded by a pubkey |
+| `DELETE /<sha256>` | Delete a blob (uploader only) |
+
+The upload allowlist is managed in the relay database (LMDB), independent from the relay's own allow/deny lists:
+
+```sh
+nostrd blossom allow npub1...       # allow a pubkey to upload
+nostrd blossom deny npub1...        # revoke a pubkey
+nostrd blossom list
+```
+
+**Full guide: [Blossom chapter of the manual](docs/MANUAL.md#11-blossom-file-server-media-hosting).**
+
 ## Commands
 
 | Command | Description |
@@ -248,6 +280,7 @@ All relay-side NIPs are implemented; client-side NIPs are stored and served as p
 | [77](https://github.com/nostr-protocol/nips/blob/master/77.md) | Negentropy syncing (NEG-OPEN/MSG/CLOSE) |
 | [86](https://github.com/nostr-protocol/nips/blob/master/86.md) | Relay management API (JSON-RPC) |
 | [98](https://github.com/nostr-protocol/nips/blob/master/98.md) | HTTP auth (kind 27235) |
+| [Blossom](https://github.com/hzrd149/blossom) (BUD-01/02) | File server — SHA-256-addressed uploads (kind-24242 auth), served on the `[blossom]` hostname (see [above](#blossom-file-server-media-hosting)) |
 
 ## Architecture notes
 

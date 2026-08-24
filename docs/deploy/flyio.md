@@ -94,3 +94,4 @@ Every option is documented in the [Configuration reference](../CONFIGURATION.md)
 - **Always-on by design**: `auto_stop_machines = false` in `fly.toml` — a relay must never be stopped during idle periods
 - The container runs the relay in **foreground mode** (`nostrd start --foreground`); logs go to stdout/stderr and are collected by Fly
 - TLS is terminated by Fly; the relay itself serves plain WebSocket on port 8080
+- **Blossom media host**: to serve the Blossom server too, set `blossom.host = "media.example.com"` in the config, add `media.example.com` as an **additional hostname** of the same Fly app (fly.toml `[[services]] http_options.allowed_http_hostnames` or `fly hostnames`), and add the `media.` TLS certificate in the Fly dashboard — the relay splits the hosts internally (like `server.api_host`)
