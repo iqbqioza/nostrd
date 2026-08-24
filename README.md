@@ -1,11 +1,31 @@
 # nostrd
 
+[![CI](https://github.com/iqbqioza/nostrd/actions/workflows/ci.yml/badge.svg)](https://github.com/iqbqioza/nostrd/actions/workflows/ci.yml)
+[![Release](https://github.com/iqbqioza/nostrd/actions/workflows/release.yml/badge.svg)](https://github.com/iqbqioza/nostrd/actions/workflows/release.yml)
+
 A minimal, stable and fast [Nostr](https://github.com/nostr-protocol/nostr) relay server written in Rust.
 
 nostrd is designed around two goals:
 
 - **Never go down.** Overload protection, a dedicated reader thread, panic containment and strict resource bounds keep the relay serving even under sustained abuse, a stalled disk or a memory-constrained host.
 - **Spec-complete.** All relay-side NIPs are implemented and verified against the official specifications (file-storage NIPs excluded by design).
+
+## Table of contents
+
+- [Features](#features)
+- [Install (pre-built binary)](#install-pre-built-binary)
+- [Requirements](#requirements)
+- [Build](#build)
+- [Quick start](#quick-start)
+- [REST API](#rest-api)
+- [Commands](#commands)
+- [Configuration](#configuration)
+  - [Anti-abuse limits](#anti-abuse-limits)
+- [NIP support](#nip-support)
+- [Architecture notes](#architecture-notes)
+- [Performance](#performance)
+- [Repository layout](#repository-layout)
+- [License](#license)
 
 ## Features
 
