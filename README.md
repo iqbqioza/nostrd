@@ -3,6 +3,9 @@
 [![CI](https://github.com/iqbqioza/nostrd/actions/workflows/ci.yml/badge.svg)](https://github.com/iqbqioza/nostrd/actions/workflows/ci.yml)
 [![Release](https://github.com/iqbqioza/nostrd/actions/workflows/release.yml/badge.svg)](https://github.com/iqbqioza/nostrd/actions/workflows/release.yml)
 
+> [!NOTE]
+> This project is maintained by an individual who also operates the public relay at **wss://relay.damustr.com**. If nostrd has been useful to you, a small sponsorship or tip would be a wonderful encouragement and helps keep the project going. For larger sponsorships, please reach out through the contact details on the [@iqbqioza](https://github.com/iqbqioza) profile.
+
 A minimal, stable and fast [Nostr](https://github.com/nostr-protocol/nostr) relay server written in Rust.
 
 nostrd is designed around two goals:
