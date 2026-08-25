@@ -1,29 +1,23 @@
 //! Blossom blob storage: the `bucket/{npub1xxx}/{file}` layout on local
 //! disk or in an S3-compatible bucket (AWS S3 / Cloudflare R2).
 //!
-//! Files are content-addressed by their SHA-256 and stored under the
-//! uploader's npub directory. An in-memory index (`sha256 → descriptors`,
-//! one per uploader of the same bytes) is warmed at startup (scanning the
-//! local directories or listing the bucket) and kept in sync at runtime,
-//! so `GET /<sha256>` resolves in O(1) without scanning directories on
-//! every request. The multi-owner list lets every uploader of identical
-//! content manage their own copy independently.
+//! The sha256 → owner mapping is **persisted in the relay database**
+//! (LMDB, the `blossom` table): an upload writes the mapping first, and a
+//! lookup reads it straight from LMDB — no in-memory index and no startup
+//! scan, so lookups survive restarts, memory stays bounded and startup is
+//! independent of the storage size. The blobs themselves are files in
+//! `bucket/{npub1xxx}/{file}`; the multi-owner mapping lets every uploader
+//! of identical content manage their own copy independently.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use tokio::sync::Mutex;
-
+use crate::db::DbClient;
 use crate::error::Result;
 
 use super::s3::S3Client;
 
-/// The in-memory index: sha256 → one descriptor per uploader.
-type Index = HashMap<String, Vec<Descriptor>>;
-
 /// Metadata of a stored blob (the Blossom `BlobDescriptor` fields).
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone)]
 pub(crate) struct Descriptor {
     pub sha256: String,
     pub size: u64,
@@ -35,61 +29,45 @@ pub(crate) struct Descriptor {
 
 impl Descriptor {
     pub(crate) fn npub(&self) -> String {
-        crate::nips::nip19::bech32m_encode("npub", &hex::decode(&self.pubkey).unwrap_or_default())
-            .unwrap_or_else(|_| self.pubkey.clone())
+        npub_of(&self.pubkey)
     }
 }
 
-/// The storage backend, chosen by `blossom.storage`.
-pub(crate) enum BlobStore {
+/// The file storage backend, chosen by `blossom.storage`.
+enum Storage {
     Local(LocalStore),
     S3(S3Store),
 }
 
+/// Blob storage: the LMDB-persisted mapping plus the file backend.
+pub(crate) struct BlobStore {
+    storage: Storage,
+    db: DbClient,
+}
+
 impl BlobStore {
-    /// Creates the store and warms the in-memory index from existing files.
     pub(crate) async fn new(
         storage: &str,
         local_path: &Path,
         s3: Option<S3Config>,
+        db: DbClient,
     ) -> Result<BlobStore> {
-        let (store, index) = match storage {
-            "local" => {
-                let store = LocalStore::new(local_path).await?;
-                let index = store.scan().await?;
-                (BlobStore::Local(store), index)
-            }
-            "s3" => {
-                let cfg = s3.expect("s3 config validated by Config::validate");
-                let store = S3Store::new(cfg).await?;
-                let index = store.scan().await?;
-                (BlobStore::S3(store), index)
-            }
+        let storage = match storage {
+            "local" => Storage::Local(LocalStore::new(local_path).await?),
+            "s3" => Storage::S3(
+                S3Store::new(s3.expect("s3 config validated by Config::validate")).await?,
+            ),
             other => {
                 return Err(crate::error::Error::Config(format!(
                     "unsupported blossom storage backend {other:?}"
                 )));
             }
         };
-        Ok(store.with_index(index))
+        Ok(BlobStore { storage, db })
     }
 
-    fn with_index(self, index: Index) -> BlobStore {
-        let index = Arc::new(Mutex::new(index));
-        match self {
-            BlobStore::Local(mut s) => {
-                s.index = Arc::clone(&index);
-                BlobStore::Local(s)
-            }
-            BlobStore::S3(mut s) => {
-                s.index = Arc::clone(&index);
-                BlobStore::S3(s)
-            }
-        }
-    }
-
-    /// Stores a blob under `npub_dir/<sha256>` and records it in the index.
-    /// `pubkey` is the uploader's hex pubkey.
+    /// Stores a blob: the LMDB mapping first (so a crash leaves a healable
+    /// state — a mapping without a file can be deleted), then the file.
     pub(crate) async fn put(
         &self,
         pubkey: &str,
@@ -97,95 +75,107 @@ impl BlobStore {
         bytes: &[u8],
         mime: &str,
     ) -> Result<Descriptor> {
-        let npub = npub_of(pubkey);
         let uploaded = crate::util::unix_now() as i64;
-        match self {
-            BlobStore::Local(s) => s.put(&npub, sha256, bytes, mime, uploaded).await?,
-            BlobStore::S3(s) => s.put(&npub, sha256, bytes, mime, uploaded).await?,
+        self.db
+            .blossom_add_owner(sha256, mime, bytes.len() as u64, uploaded, pubkey)
+            .await;
+        let npub = npub_of(pubkey);
+        match &self.storage {
+            Storage::Local(s) => s.put(&npub, sha256, bytes, mime, uploaded).await?,
+            Storage::S3(s) => s.put(&npub, sha256, bytes, mime, uploaded).await?,
         }
-        let descriptor = Descriptor {
+        Ok(Descriptor {
             sha256: sha256.to_string(),
             size: bytes.len() as u64,
             mime: mime.to_string(),
             uploaded,
             pubkey: pubkey.to_string(),
-        };
-        // Content-addressed: identical bytes uploaded again (by the same
-        // or another pubkey) keep every uploader's descriptor, so each
-        // owner can manage their own copy.
-        let mut index = self.index().lock().await;
-        let owners = index.entry(sha256.to_string()).or_default();
-        if !owners.iter().any(|d| d.pubkey == pubkey) {
-            owners.push(descriptor.clone());
-        }
-        Ok(descriptor)
+        })
     }
 
-    /// Resolves a blob by its sha256 (O(1) via the index).
+    /// Resolves a blob by its sha256 straight from LMDB.
     pub(crate) async fn find(&self, sha256: &str) -> Option<Descriptor> {
-        self.index()
-            .lock()
-            .await
-            .get(sha256)
-            .and_then(|owners| owners.first())
-            .cloned()
+        let meta = self.db.blossom_load(sha256).await?;
+        Some(Descriptor {
+            sha256: meta.sha256,
+            size: meta.size,
+            mime: meta.mime,
+            uploaded: meta.uploaded,
+            pubkey: meta.owners.into_iter().next()?,
+        })
     }
 
     /// Whether `pubkey` has uploaded this blob.
     pub(crate) async fn has(&self, pubkey: &str, sha256: &str) -> bool {
-        self.index()
-            .lock()
+        self.db
+            .blossom_load(sha256)
             .await
-            .get(sha256)
-            .is_some_and(|owners| owners.iter().any(|d| d.pubkey == pubkey))
+            .is_some_and(|meta| meta.owners.iter().any(|o| o == pubkey))
     }
 
     /// Reads the blob's bytes. `npub` comes from the resolved descriptor.
     pub(crate) async fn read(&self, npub: &str, sha256: &str) -> Result<Option<Vec<u8>>> {
-        match self {
-            BlobStore::Local(s) => s.read(npub, sha256).await,
-            BlobStore::S3(s) => s.read(npub, sha256).await,
+        match &self.storage {
+            Storage::Local(s) => s.read(npub, sha256).await,
+            Storage::S3(s) => s.read(npub, sha256).await,
         }
     }
 
-    /// Deletes the requester's copy of a blob: the file under their npub
-    /// directory and their descriptor in the index. Other uploaders of the
-    /// same bytes keep their own copies.
+    /// Deletes the requester's copy: the file under their npub directory
+    /// (blob first, so a crash leaves a healable state) and their entry in
+    /// the LMDB mapping. Other uploaders of the same bytes keep theirs.
     pub(crate) async fn delete(&self, pubkey: &str, sha256: &str) -> Result<bool> {
         let npub = npub_of(pubkey);
-        let existed = match self {
-            BlobStore::Local(s) => s.delete(&npub, sha256).await?,
-            BlobStore::S3(s) => s.delete(&npub, sha256).await?,
+        let existed = match &self.storage {
+            Storage::Local(s) => s.delete(&npub, sha256).await?,
+            Storage::S3(s) => s.delete(&npub, sha256).await?,
         };
-        let mut index = self.index().lock().await;
-        if let Some(owners) = index.get_mut(sha256) {
-            owners.retain(|d| d.pubkey != pubkey);
-            if owners.is_empty() {
-                index.remove(sha256);
-            }
-        }
+        self.db.blossom_remove_owner(sha256, pubkey).await;
         Ok(existed)
     }
 
-    /// All blobs uploaded by `pubkey` (hex).
-    pub(crate) async fn list(&self, pubkey: &str) -> Vec<Descriptor> {
-        let npub = npub_of(pubkey);
-        self.index()
-            .lock()
-            .await
-            .values()
-            .flat_map(|owners| owners.iter())
-            .filter(|d| d.npub() == npub)
-            .cloned()
-            .collect()
+    /// One-time automatic migration: rebuilds the sha→owner mapping from
+    /// blobs stored before the mapping existed (local files or bucket
+    /// objects). Runs in the background at startup; the marker key makes
+    /// it idempotent, so later restarts skip it instantly.
+    pub(crate) async fn auto_migrate_legacy(&self) -> Result<usize> {
+        if self.db.blossom_migration_done().await {
+            return Ok(0);
+        }
+        let entries = match &self.storage {
+            Storage::Local(s) => s.scan_legacy().await?,
+            Storage::S3(s) => s.scan_legacy().await?,
+        };
+        let count = entries.len();
+        self.db.blossom_add_mappings(entries).await;
+        self.db.mark_blossom_migration().await;
+        Ok(count)
     }
 
-    fn index(&self) -> &Mutex<Index> {
-        match self {
-            BlobStore::Local(s) => &s.index,
-            BlobStore::S3(s) => &s.index,
+    /// All blobs uploaded by `pubkey` (hex), via the persisted reverse
+    /// index.
+    pub(crate) async fn list(&self, pubkey: &str) -> Vec<Descriptor> {
+        let mut out = Vec::new();
+        for sha in self.db.blossom_list(pubkey).await {
+            if let Some(desc) = self.find(&sha).await {
+                out.push(desc);
+            }
         }
+        out
     }
+}
+
+/// Derives the uploader's hex pubkey from an npub directory name.
+/// Shared with the CLI migration (`nostrd blossom migrate`).
+pub(crate) fn npub_from_dir(dir: &Path) -> std::result::Result<String, ()> {
+    let name = dir.file_name().and_then(|n| n.to_str()).ok_or(())?;
+    if let Ok(crate::nips::nip19::Nip19Entity::Pubkey(pk)) = crate::nips::nip19::parse_nip19(name) {
+        return Ok(hex::encode(pk));
+    }
+    if name.len() == 64 && hex::decode(name).is_ok() {
+        return Ok(name.to_string());
+    }
+    Err(())
 }
 
 fn npub_of(pubkey: &str) -> String {
@@ -198,9 +188,8 @@ fn npub_of(pubkey: &str) -> String {
 
 // ----- local storage --------------------------------------------------------
 
-pub(crate) struct LocalStore {
+struct LocalStore {
     root: PathBuf,
-    index: Arc<Mutex<Index>>,
 }
 
 impl LocalStore {
@@ -208,7 +197,6 @@ impl LocalStore {
         tokio::fs::create_dir_all(root).await?;
         Ok(LocalStore {
             root: root.to_path_buf(),
-            index: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -216,26 +204,16 @@ impl LocalStore {
         self.root.join(npub).join(sha256)
     }
 
-    fn meta_path(&self, npub: &str, sha256: &str) -> PathBuf {
-        self.root.join(npub).join(format!("{sha256}.meta.json"))
-    }
-
     async fn put(
         &self,
         npub: &str,
         sha256: &str,
         bytes: &[u8],
-        mime: &str,
-        uploaded: i64,
+        _mime: &str,
+        _uploaded: i64,
     ) -> Result<()> {
         let dir = self.root.join(npub);
         tokio::fs::create_dir_all(&dir).await?;
-        // Write the meta first, then the blob, so a crash never leaves a
-        // blob without its descriptor.
-        let meta = serde_json::to_vec(&serde_json::json!({
-            "sha256": sha256, "size": bytes.len(), "mime": mime, "uploaded": uploaded,
-        }))?;
-        tokio::fs::write(self.meta_path(npub, sha256), meta).await?;
         tokio::fs::write(self.blob_path(npub, sha256), bytes).await?;
         Ok(())
     }
@@ -252,20 +230,26 @@ impl LocalStore {
         let path = self.blob_path(npub, sha256);
         let existed = tokio::fs::try_exists(&path).await.unwrap_or(false);
         let _ = tokio::fs::remove_file(&path).await;
-        let _ = tokio::fs::remove_file(self.meta_path(npub, sha256)).await;
         Ok(existed)
     }
 
-    /// Warms the index by scanning `<root>/<npub>/<sha256>.meta.json`.
-    async fn scan(&self) -> Result<Index> {
-        let mut index = Index::new();
+    /// Scans `<root>/<npub>/<sha>.meta.json` for the legacy migration.
+    async fn scan_legacy(&self) -> Result<Vec<(String, String, u64, i64, String)>> {
+        let mut out = Vec::new();
+        // Metas take precedence: a sha found via its meta is not derived
+        // again from the raw blob.
+        let mut via_meta: Vec<String> = Vec::new();
         let mut dirs = tokio::fs::read_dir(&self.root).await?;
         while let Some(entry) = dirs.next_entry().await? {
-            let npub_dir = entry.path();
-            let Ok(pubkey) = npub_from_dir(&npub_dir) else {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let Ok(pubkey) = npub_from_dir(&dir) else {
                 continue;
             };
-            let mut files = match tokio::fs::read_dir(&npub_dir).await {
+            // Pass 1: legacy meta files carry the full descriptor.
+            let mut files = match tokio::fs::read_dir(&dir).await {
                 Ok(f) => f,
                 Err(_) => continue,
             };
@@ -277,31 +261,49 @@ impl LocalStore {
                 if let Ok(raw) = tokio::fs::read(file.path()).await
                     && let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&raw)
                 {
-                    index.entry(sha.to_string()).or_default().push(Descriptor {
-                        sha256: sha.to_string(),
-                        size: meta["size"].as_u64().unwrap_or(0),
-                        mime: meta["mime"].as_str().unwrap_or("").to_string(),
-                        uploaded: meta["uploaded"].as_i64().unwrap_or(0),
-                        pubkey: pubkey.clone(),
-                    });
+                    out.push((
+                        sha.to_string(),
+                        meta["mime"].as_str().unwrap_or("").to_string(),
+                        meta["size"].as_u64().unwrap_or(0),
+                        meta["uploaded"].as_i64().unwrap_or(0),
+                        pubkey.clone(),
+                    ));
+                    via_meta.push(sha.to_string());
                 }
             }
+            // Pass 2: blobs without a meta (written after the metadata
+            // moved to LMDB) are derived from the file itself.
+            let mut files = match tokio::fs::read_dir(&dir).await {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            while let Some(file) = files.next_entry().await? {
+                let name = file.file_name().to_string_lossy().into_owned();
+                if name.len() != 64 || hex::decode(&name).is_err() || via_meta.contains(&name) {
+                    continue;
+                }
+                let (size, uploaded) = match tokio::fs::metadata(file.path()).await {
+                    Ok(meta) => (
+                        meta.len(),
+                        meta.modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                            .map(|d| d.as_secs() as i64)
+                            .unwrap_or(0),
+                    ),
+                    Err(_) => continue,
+                };
+                out.push((
+                    name,
+                    "application/octet-stream".to_string(),
+                    size,
+                    uploaded,
+                    pubkey.clone(),
+                ));
+            }
         }
-        Ok(index)
+        Ok(out)
     }
-}
-
-/// Derives the uploader's hex pubkey from an npub directory name.
-fn npub_from_dir(dir: &Path) -> std::result::Result<String, ()> {
-    let name = dir.file_name().and_then(|n| n.to_str()).ok_or(())?;
-    if let Ok(crate::nips::nip19::Nip19Entity::Pubkey(pk)) = crate::nips::nip19::parse_nip19(name) {
-        return Ok(hex::encode(pk));
-    }
-    // A directory named with a plain hex pubkey is also accepted.
-    if name.len() == 64 && hex::decode(name).is_ok() {
-        return Ok(name.to_string());
-    }
-    Err(())
 }
 
 // ----- S3 / R2 storage ------------------------------------------------------
@@ -314,9 +316,8 @@ pub(crate) struct S3Config {
     pub secret_key: String,
 }
 
-pub(crate) struct S3Store {
+struct S3Store {
     client: S3Client,
-    index: Arc<Mutex<Index>>,
 }
 
 impl S3Store {
@@ -329,12 +330,7 @@ impl S3Store {
                 &cfg.access_key,
                 &cfg.secret_key,
             ),
-            index: Arc::new(Mutex::new(HashMap::new())),
         })
-    }
-
-    fn meta_key(&self, npub: &str, sha256: &str) -> String {
-        format!("{npub}/{sha256}.meta.json")
     }
 
     async fn put(
@@ -343,18 +339,11 @@ impl S3Store {
         sha256: &str,
         bytes: &[u8],
         mime: &str,
-        uploaded: i64,
+        _uploaded: i64,
     ) -> Result<()> {
-        let meta = serde_json::to_vec(&serde_json::json!({
-            "sha256": sha256, "size": bytes.len(), "mime": mime, "uploaded": uploaded,
-        }))?;
-        self.client
-            .put_object(&self.meta_key(npub, sha256), &meta, "application/json")
-            .await?;
         self.client
             .put_object(&format!("{npub}/{sha256}"), bytes, mime)
-            .await?;
-        Ok(())
+            .await
     }
 
     async fn read(&self, npub: &str, sha256: &str) -> Result<Option<Vec<u8>>> {
@@ -365,49 +354,71 @@ impl S3Store {
     }
 
     async fn delete(&self, npub: &str, sha256: &str) -> Result<bool> {
-        // The blob is removed before the meta (like the local backend): a
-        // crash in between leaves a meta without a blob, which the index
-        // can still resolve and a later delete cleans up — never an
-        // invisible orphan blob.
+        // The blob is removed first: a crash in between leaves the LMDB
+        // mapping (a later delete cleans it up), never an invisible
+        // orphan object.
         let existed = self
             .client
             .delete_object(&format!("{npub}/{sha256}"))
             .await?;
-        let _ = self
-            .client
-            .delete_object(&self.meta_key(npub, sha256))
-            .await?;
         Ok(existed)
     }
 
-    /// Warms the index by listing the bucket and reading the meta objects.
-    async fn scan(&self) -> Result<Index> {
-        let mut index = Index::new();
-        let entries = self.client.list_objects("").await?;
-        for (key, _, _) in entries {
-            let Some(meta) = key.strip_suffix(".meta.json") else {
-                continue;
-            };
-            let (npub, sha) = match meta.split_once('/') {
-                Some((n, s)) => (n, s),
+    /// Lists the bucket and fetches the meta objects (bounded parallelism)
+    /// for the legacy migration.
+    async fn scan_legacy(&self) -> Result<Vec<(String, String, u64, i64, String)>> {
+        let keys = self.client.list_keys("").await?;
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
+        let mut tasks = tokio::task::JoinSet::new();
+        for key in keys {
+            let client = self.client.clone();
+            let semaphore = std::sync::Arc::clone(&semaphore);
+            tasks.spawn(async move {
+                let _permit = semaphore.acquire().await;
+                let raw = client.get_object(&key).await;
+                (key, raw)
+            });
+        }
+        let mut out = Vec::new();
+        while let Some(Ok((key, raw))) = tasks.join_next().await {
+            let (npub, file) = match key.split_once('/') {
+                Some((n, f)) => (n, f),
                 None => continue,
             };
             let Ok(pubkey) = npub_from_dir(std::path::Path::new(npub)) else {
                 continue;
             };
-            if let Ok(Some(raw)) = self.client.get_object(&key).await
-                && let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&raw)
-            {
-                index.entry(sha.to_string()).or_default().push(Descriptor {
-                    sha256: sha.to_string(),
-                    size: meta["size"].as_u64().unwrap_or(0),
-                    mime: meta["mime"].as_str().unwrap_or("").to_string(),
-                    uploaded: meta["uploaded"].as_i64().unwrap_or(0),
+            if let Some(sha) = file.strip_suffix(".meta.json") {
+                // Legacy meta objects carry the full descriptor.
+                if let Ok(Some(raw)) = raw
+                    && let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&raw)
+                {
+                    out.push((
+                        sha.to_string(),
+                        meta["mime"].as_str().unwrap_or("").to_string(),
+                        meta["size"].as_u64().unwrap_or(0),
+                        meta["uploaded"].as_i64().unwrap_or(0),
+                        pubkey,
+                    ));
+                }
+                continue;
+            }
+            // Blobs without a meta (metadata moved to LMDB): the size is
+            // read from the object; mime falls back to octet-stream.
+            if file.len() != 64 || hex::decode(file).is_err() {
+                continue;
+            }
+            if let Ok(Some(raw)) = raw {
+                out.push((
+                    file.to_string(),
+                    "application/octet-stream".to_string(),
+                    raw.len() as u64,
+                    0,
                     pubkey,
-                });
+                ));
             }
         }
-        Ok(index)
+        Ok(out)
     }
 }
 
@@ -415,20 +426,44 @@ impl S3Store {
 mod tests {
     use super::*;
 
-    async fn store(tmp: &str) -> BlobStore {
-        let dir =
-            std::env::temp_dir().join(format!("nostrd-blossom-test-{tmp}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        BlobStore::new("local", &dir, None).await.unwrap()
-    }
-
     fn pk(i: u8) -> String {
         format!("{:02x}", i).repeat(32)
     }
 
+    async fn db(tmp: &str) -> (DbClient, std::path::PathBuf) {
+        let cfg = crate::config::DatabaseConfig {
+            path: std::env::temp_dir().join(format!(
+                "nostrd-blossom-store-test-{tmp}-{}",
+                std::process::id()
+            )),
+            ..Default::default()
+        };
+        let _ = std::fs::remove_dir_all(&cfg.path);
+        let db = DbClient::open(
+            &cfg,
+            false,
+            std::sync::Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
+        (db, cfg.path)
+    }
+
+    async fn store(tmp: &str) -> (BlobStore, std::path::PathBuf) {
+        let (db, db_path) = db(tmp).await;
+        let dir =
+            std::env::temp_dir().join(format!("nostrd-blossom-test-{tmp}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = BlobStore::new("local", &dir, None, db).await.unwrap();
+        (s, db_path)
+    }
+
     #[tokio::test]
     async fn multi_owner_put_find_list_delete() {
-        let s = store("multi").await;
+        let (s, _db_path) = store("multi").await;
         let a = pk(1);
         let b = pk(2);
         let sha = "ab".repeat(32);
@@ -448,7 +483,6 @@ mod tests {
         assert_eq!(s.list(&b).await.len(), 1);
         assert_eq!(s.list(&pk(3)).await.len(), 0);
 
-        // The content reads back under either owner.
         let npub_a = npub_of(&a);
         let npub_b = npub_of(&b);
         assert_eq!(s.read(&npub_a, &sha).await.unwrap().unwrap(), bytes);
@@ -464,27 +498,41 @@ mod tests {
         assert_eq!(s.list(&a).await.len(), 1);
         assert_eq!(s.list(&b).await.len(), 0);
 
-        // The last owner's delete removes the index entry.
+        // The last owner's delete removes the mapping.
         assert!(s.delete(&a, &sha).await.unwrap());
         assert!(s.find(&sha).await.is_none());
     }
 
     #[tokio::test]
-    async fn scan_rebuilds_multi_owner_index() {
+    async fn mapping_survives_reopen() {
+        // The mapping lives in LMDB: a reopened store (new process, no
+        // scan, no index) resolves everything.
+        let (db, db_path) = db("reopen").await;
         let dir =
-            std::env::temp_dir().join(format!("nostrd-blossom-test-scan-{}", std::process::id()));
+            std::env::temp_dir().join(format!("nostrd-blossom-test-reopen-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         {
-            let s = BlobStore::new("local", &dir, None).await.unwrap();
+            let s = BlobStore::new("local", &dir, None, db).await.unwrap();
             let sha = "cd".repeat(32);
             s.put(&pk(1), &sha, b"x", "image/png").await.unwrap();
             s.put(&pk(2), &sha, b"x", "image/png").await.unwrap();
             let sha2 = "ef".repeat(32);
             s.put(&pk(1), &sha2, b"y", "text/plain").await.unwrap();
         }
-        // Reopening rescans the directory: both owners and both files come
-        // back (the scan reads every owner's meta).
-        let s = BlobStore::new("local", &dir, None).await.unwrap();
+        let db = DbClient::open(
+            &crate::config::DatabaseConfig {
+                path: db_path,
+                ..Default::default()
+            },
+            false,
+            std::sync::Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
+        let s = BlobStore::new("local", &dir, None, db).await.unwrap();
         let sha = "cd".repeat(32);
         assert_eq!(s.find(&sha).await.unwrap().pubkey, pk(1));
         assert!(s.has(&pk(1), &sha).await);
@@ -494,26 +542,45 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[tokio::test]
-    async fn delete_missing_file_heals_index() {
-        let dir =
-            std::env::temp_dir().join(format!("nostrd-blossom-test-heal-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let s = BlobStore::new("local", &dir, None).await.unwrap();
-        let sha = "11".repeat(32);
-        s.put(&pk(9), &sha, b"z", "text/plain").await.unwrap();
-        // Simulate a crash after the blob write was lost: the meta remains.
-        // Deleting still cleans the descriptor up.
-        assert!(s.delete(&pk(9), &sha).await.unwrap());
-        assert!(s.find(&sha).await.is_none());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     #[test]
     fn npub_of_roundtrip() {
         let hex = pk(7);
         let npub = npub_of(&hex);
         assert!(npub.starts_with("npub1"));
         assert_eq!(npub_of(&hex), npub, "stable");
+    }
+}
+
+#[cfg(test)]
+mod scan_debug {
+    use super::*;
+
+    #[tokio::test]
+    async fn scan_legacy_finds_legacy_files() {
+        let dir =
+            std::env::temp_dir().join(format!("nostrd-blossom-scan-debug-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // The directory name comes from the same npub_of() the uploads use
+        // (bech32m) — never handcraft a checksum in the test.
+        let npub = npub_of(&"01".repeat(32));
+        let npub_dir = dir.join(&npub);
+        std::fs::create_dir_all(&npub_dir).unwrap();
+        std::fs::write(
+            npub_dir.join("34f66c6a736a7ee87f5f908bbc48e651f94bcdc4c5d3006dbaa4d8fa5fa4cf5a"),
+            b"x",
+        )
+        .unwrap();
+        std::fs::write(
+            npub_dir.join("34f66c6a736a7ee87f5f908bbc48e651f94bcdc4c5d3006dbaa4d8fa5fa4cf5a.meta.json"),
+            br#"{"sha256":"34f66c6a736a7ee87f5f908bbc48e651f94bcdc4c5d3006dbaa4d8fa5fa4cf5a","size":1,"mime":"image/png","uploaded":1787000000}"#,
+        ).unwrap();
+        assert!(
+            npub_from_dir(&npub_dir).is_ok(),
+            "npub_from_dir must accept the bech32m npub"
+        );
+        let s = LocalStore::new(&dir).await.unwrap();
+        let entries = s.scan_legacy().await.unwrap();
+        assert_eq!(entries.len(), 1, "scan must find the legacy meta");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

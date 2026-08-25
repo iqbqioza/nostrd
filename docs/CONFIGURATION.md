@@ -342,6 +342,15 @@ Every key is optional; a missing key uses the default shown below.
 - `map_size` must not exceed `map_max_size` (`nostrd check` rejects the combination).
 - Search semantics are the same with or without the index: whole-word matching (see the troubleshooting guide).
 
+### Upgrades are automatic and instant
+
+- **Tables**: every LMDB table is opened-or-created at startup (`create_database`) — a database written by an older version simply gets its missing tables added instantly, with the existing data untouched (verified by the schema-upgrade test: an ancient DB with only the `events` table boots with events, access control and the Blossom mapping all working).
+- **Columns** (keys within a table): keyed entries are dynamic — no migration needed.
+- **Data migrations** run automatically once, at startup:
+  - access pubkey lists moved into their dedicated key (legacy `access` blob → `relay_pubkeys`),
+  - the Blossom sha→owner mapping rebuilt from legacy files (marker key, skipped on later restarts).
+- The startup log reports `database ready at ... (14 tables, map ... MiB)` and the migration checks.
+
 ---
 
 ## 7. `[daemon]` — daemon settings
@@ -429,6 +438,7 @@ nostrd relay list                # show both lists and restrict_relay
 | `s3_secret_key` | string | `""` | S3 / R2 secret key |
 | `restrict_uploads` | boolean | `false` | When true, only the pubkeys in the Blossom upload allowlist may upload blobs |
 
+
 ### Key details
 
 **`host`** — Works like `server.api_host`: requests whose Host header names this hostname are served only the Blossom routes on the same port, so a single reverse proxy can split `relay.example.com` (relay) from `media.example.com` (files). The root path `/` answers with the Blossom server info document on this host.
@@ -453,7 +463,9 @@ Each `allow`/`deny` writes the database and reloads the running daemon (SIGHUP),
 
 - The feature is completely off when `host` is empty — no routes, no storage directories.
 - Files never touch the LMDB database: uploads, fetches and deletes operate only on the configured storage, so the relay database is never at risk.
-- Storage I/O is asynchronous (`tokio::fs` / the `reqwest` client) and the blob index is an in-memory map warmed at startup by scanning the local directories or listing the bucket — relay and WebSocket performance is unaffected.
+- Storage I/O is asynchronous (`tokio::fs` / the `reqwest` client) — relay and WebSocket performance is unaffected.
+- The sha256 → owner mapping is persisted in the relay database (LMDB): no in-memory index and no startup scan, so lookups survive restarts and memory stays bounded. Uploads write the mapping first (a crash leaves a healable state); deleting a blob removes its mapping.
+- **Automatic one-time migration**: at startup the relay checks whether the `blossom` mapping table exists (created instantly if missing) and whether the legacy migration already ran (marker key). If not, it scans the storage in the background (local directories / bucket objects, with or without the legacy `.meta.json` files) and rebuilds the mapping — the relay starts immediately and existing blobs become reachable as the migration completes. Later restarts skip it.
 - Only the uploader (the pubkey whose npub directory holds the file) can delete a blob.
 - Uploads and deletes are authorized with Blossom auth events (kind 24242, `t` + `server` tags).
 - The upload allowlist is persisted in the relay database under a fixed key of the existing `access` table — no new LMDB table is created, so databases from older versions stay compatible.
@@ -470,6 +482,8 @@ Each `allow`/`deny` writes the database and reloads the running daemon (SIGHUP),
 | `private_key` must be a valid secp256k1 secret key | `relay.private_key is not a valid secp256k1 secret key` |
 | `port` must be 1–65535 | `server.port must be between 1 and 65535` |
 | `management_port` must differ from `port` | `server.management_port must differ from server.port` |
+| `api_host` / `blossom.host` must be bare hostnames | `server.api_host must be a bare hostname (no scheme, port or path), got "https://..."` |
+| `api_host` must differ from `blossom.host` | `server.api_host and blossom.host must be different hostnames` |
 | blocked IPs must parse | `access.blocked_ips contains an invalid IP address: "..."` |
 | `map_size` ≤ `map_max_size` | `database.map_size must not exceed database.map_max_size` |
 | Core limits must be ≥ 1 | `limits.max_connections must be at least 1 (got 0)` |

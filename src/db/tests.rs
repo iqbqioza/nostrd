@@ -882,6 +882,74 @@ fn access_control_persists_across_reopen() {
 }
 
 #[test]
+fn schema_upgrade_creates_missing_tables_instantly() {
+    // Simulates an ancient database that only has the `events` table (all
+    // other tables were added by later versions). Opening it must create
+    // every missing table instantly and non-destructively: events, the
+    // access control and the Blossom mapping all keep working.
+    let cfg = config();
+    std::fs::create_dir_all(&cfg.path).unwrap();
+    {
+        let env = unsafe {
+            heed::EnvOpenOptions::new()
+                .max_dbs(32)
+                .max_readers(cfg.max_readers.max(8))
+                .map_size(cfg.map_max_size.max(cfg.map_size))
+                .open(&cfg.path)
+                .unwrap()
+        };
+        let mut wtxn = env.write_txn().unwrap();
+        env.create_database::<heed::types::Bytes, heed::types::Bytes>(&mut wtxn, Some("events"))
+            .unwrap();
+        wtxn.commit().unwrap();
+    }
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let db = DbClient::open(
+            &cfg,
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
+        // Events work (the events table was reused).
+        let now = 1_700_000_000;
+        let e = event(1, "upgrade", now, vec![]);
+        assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
+        let f: Filter = serde_json::from_value(serde_json::json!({"ids": [e.id]})).unwrap();
+        let (found, _) = db.query(vec![f], 10, now).await;
+        assert_eq!(found.len(), 1);
+        // Access control works (access table + the relay pubkeys key).
+        let mut access = crate::config::AccessControl::default();
+        access
+            .blocked_ips
+            .push(("203.0.113.9".into(), String::new()));
+        db.save_access(access).await;
+        db.save_relay_pubkeys(&[("aa".repeat(32), String::new())], &[])
+            .await;
+        let loaded = db.load_access().await.unwrap();
+        assert_eq!(loaded.blocked_ips[0].0, "203.0.113.9");
+        let (deny, _) = db.load_relay_pubkeys().await;
+        assert_eq!(deny[0].0, "aa".repeat(32));
+        // The Blossom mapping works (blossom table + migration marker).
+        db.blossom_add_owner(
+            &"bb".repeat(32),
+            "image/png",
+            3,
+            now as i64,
+            &"cc".repeat(32),
+        )
+        .await;
+        let meta = db.blossom_load(&"bb".repeat(32)).await.unwrap();
+        assert_eq!(meta.owners.len(), 1);
+        assert!(!db.blossom_migration_done().await);
+    });
+}
+
+#[test]
 fn legacy_access_blob_pubkeys_migrate_to_dedicated_key() {
     // Databases written before the pubkey lists moved into their own key
     // carry them inside the `access` blob. Opening such a database must

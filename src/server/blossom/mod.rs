@@ -28,8 +28,8 @@ use crate::util::unix_now;
 
 use storage::BlobStore;
 
-mod s3;
-mod storage;
+pub(crate) mod s3;
+pub(crate) mod storage;
 
 /// State shared by the Blossom handlers.
 pub(crate) struct BlossomState {
@@ -148,6 +148,26 @@ async fn upload_allowed(relay: &Relay, pubkey: &str) -> Result<(), ()> {
     if allowed { Ok(()) } else { Err(()) }
 }
 
+/// Normalizes the `server` tag of a Blossom auth event for comparison
+/// with `blossom.host`: strips the scheme and any path, IPv6 literals keep
+/// their bracket contents (colons are part of the host), and a DNS/IPv4
+/// `:port` suffix is removed.
+fn auth_server_host(server: &str) -> String {
+    let host_part = server
+        .strip_prefix("https://")
+        .or_else(|| server.strip_prefix("http://"))
+        .unwrap_or(server)
+        .split('/')
+        .next()
+        .unwrap_or(server);
+    let host = if let Some(rest) = host_part.strip_prefix('[') {
+        rest.split(']').next().unwrap_or(rest)
+    } else {
+        host_part.split(':').next().unwrap_or(host_part)
+    };
+    host.to_ascii_lowercase()
+}
+
 /// Validates and normalizes the client-sent Content-Type: only the media
 /// type (the part before any `;` parameter) is kept, and it must be a
 /// well-formed `type/subtype` token pair. Anything else falls back to
@@ -208,23 +228,26 @@ async fn verify_auth(
     if !tags(&event, "t").any(|t| t == verb) {
         return None;
     }
-    // The `expiration` tag (BUD-11): when present it must be in the future.
+    // The `expiration` tag (BUD-11): when present it must be a unix
+    // timestamp in the future — an unparseable value is rejected too.
     if let Some(exp) = tags(&event, "expiration").next()
-        && exp.parse::<u64>().is_ok_and(|e| e <= now)
+        && exp.parse::<u64>().map(|e| e <= now).unwrap_or(true)
     {
         return None;
     }
-    // The `server` tag (when present) must name our host.
+    // The `server` tag (when present) must name our host. The tag may
+    // carry a scheme and a path; IPv6 hosts use brackets (`[::1]`), whose
+    // colons must not be mistaken for a port separator.
     if let Some(server) = tags(&event, "server").next() {
-        let host = state.host.to_ascii_lowercase();
-        let tag_host = server
-            .strip_prefix("https://")
-            .or_else(|| server.strip_prefix("http://"))
-            .unwrap_or(server)
-            .split(['/', ':'])
-            .next()
-            .unwrap_or(server)
+        // The state keeps the configured host for URL building (IPv6 keeps
+        // its brackets there); the comparison uses the normalized form.
+        let host = state
+            .host
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
             .to_ascii_lowercase();
+        let tag_host = auth_server_host(server);
         if tag_host != host {
             return None;
         }
@@ -443,11 +466,34 @@ pub(crate) async fn build_state(cfg: &Config, _relay: &Relay) -> Option<Arc<Blos
     } else {
         None
     };
-    match BlobStore::new(&cfg.blossom.storage, &cfg.blossom.local_path, s3).await {
-        Ok(store) => Some(Arc::new(BlossomState {
-            store,
-            host: cfg.blossom.host.clone(),
-        })),
+    match BlobStore::new(
+        &cfg.blossom.storage,
+        &cfg.blossom.local_path,
+        s3,
+        _relay.db.clone(),
+    )
+    .await
+    {
+        Ok(store) => {
+            let state = Arc::new(BlossomState {
+                store,
+                host: cfg.blossom.host.clone(),
+            });
+            // One-time automatic migration of legacy blobs (storage files
+            // that predate the LMDB mapping), in the background so the
+            // relay starts instantly.
+            let state_for_migration = Arc::clone(&state);
+            tokio::spawn(async move {
+                match state_for_migration.store.auto_migrate_legacy().await {
+                    Ok(n) if n > 0 => {
+                        log::info!("Blossom legacy migration: mapped {n} existing blob(s)")
+                    }
+                    Ok(_) => {}
+                    Err(e) => log::warn!("Blossom legacy migration failed: {e}"),
+                }
+            });
+            Some(state)
+        }
         Err(e) => {
             log::error!("blossom storage failed to initialize: {e}");
             None
@@ -480,6 +526,27 @@ pub(crate) fn host_is_blossom(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auth_server_host_normalization() {
+        assert_eq!(auth_server_host("media.example.com"), "media.example.com");
+        assert_eq!(
+            auth_server_host("media.example.com:8080"),
+            "media.example.com"
+        );
+        assert_eq!(
+            auth_server_host("https://media.example.com"),
+            "media.example.com"
+        );
+        assert_eq!(
+            auth_server_host("https://media.example.com/path"),
+            "media.example.com"
+        );
+        assert_eq!(auth_server_host("[::1]"), "::1");
+        assert_eq!(auth_server_host("[::1]:8080"), "::1");
+        assert_eq!(auth_server_host("http://[::1]/upload"), "::1");
+        assert_eq!(auth_server_host("MEDIA.EXAMPLE.COM"), "media.example.com");
+    }
 
     #[test]
     fn mime_sanitization() {

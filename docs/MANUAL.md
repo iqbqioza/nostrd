@@ -458,6 +458,8 @@ host = "media.example.com"          # required — enables the feature
 storage = "local"                   # "local" or "s3"
 local_path = "./data/images"        # local storage root
 max_upload_bytes = 20971520         # 20 MiB
+restrict_uploads = false            # only allow-listed pubkeys may upload
+
 
 # For S3 / Cloudflare R2:
 s3_endpoint = "https://<account>.r2.cloudflarestorage.com"
@@ -533,7 +535,9 @@ Uploads from unlisted pubkeys are rejected with `403`. The list survives restart
 
 - Files are served with `ETag`, `Cache-Control: immutable` and the stored content type.
 - Blobs never touch the relay database; the relay's WebSocket / REST API performance is unaffected.
-- Restarting the relay re-warms the blob index from the storage, so existing files keep working.
+- The sha256 → owner mapping is persisted in the relay database (LMDB): the relay restarts instantly, lookups read the mapping directly from the database (no in-memory index, no startup scan), and existing files keep working.
+- **Automatic migration**: on the first start after an upgrade, the relay rebuilds the mapping from blobs stored by older versions (a background scan — the table itself is created instantly, and later restarts skip the migration via a marker). No manual step is needed.
+- **All database upgrades are automatic**: every LMDB table is opened-or-created at startup (instant, non-destructive), and the one-time data migrations (access lists, Blossom mapping) run by themselves — see [CONFIGURATION.md](CONFIGURATION.md#upgrades-are-automatic-and-instant).
 
 ---
 

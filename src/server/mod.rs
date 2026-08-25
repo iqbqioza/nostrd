@@ -142,8 +142,8 @@ async fn build_router(
     let (api_host, blossom_host) = {
         let cfg = relay.config.read().await;
         (
-            cfg.server.api_host.trim().to_ascii_lowercase(),
-            cfg.blossom.host.trim().to_ascii_lowercase(),
+            normalize_host(&cfg.server.api_host),
+            normalize_host(&cfg.blossom.host),
         )
     };
     if blossom_state.is_some() {
@@ -161,6 +161,16 @@ async fn build_router(
     }
     app.layer(axum::middleware::from_fn(cors_middleware))
         .with_state(relay.clone())
+}
+
+/// Normalizes a configured split hostname (api_host / blossom.host):
+/// lowercase, with IPv6 brackets stripped so it compares equal to the
+/// normalized request Host (`[::1]` -> `::1`).
+fn normalize_host(host: &str) -> String {
+    host.trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase()
 }
 
 /// The host part of an HTTP Host header value: strips an IPv6 literal's

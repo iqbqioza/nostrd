@@ -8,6 +8,7 @@
 
 use crate::error::Result;
 
+#[derive(Clone)]
 pub(crate) struct S3Client {
     endpoint: String,
     region: String,
@@ -16,9 +17,6 @@ pub(crate) struct S3Client {
     secret_key: String,
     http: reqwest::Client,
 }
-
-/// A list entry: (key, size, last_modified_unix).
-pub(crate) type ListEntry = (String, u64, i64);
 
 impl S3Client {
     pub(crate) fn new(
@@ -206,9 +204,10 @@ impl S3Client {
         Ok(status.is_success() || status == reqwest::StatusCode::NOT_FOUND)
     }
 
-    /// `ListObjectsV2` for a prefix; returns (key, size, last_modified_unix).
-    pub(crate) async fn list_objects(&self, prefix: &str) -> Result<Vec<ListEntry>> {
-        let mut entries = Vec::new();
+    /// `ListObjectsV2` for a prefix; returns the object keys. Used by the
+    /// one-time migration (`nostrd blossom migrate`).
+    pub(crate) async fn list_keys(&self, prefix: &str) -> Result<Vec<String>> {
+        let mut keys = Vec::new();
         let mut token = String::new();
         loop {
             let query = format!(
@@ -227,13 +226,15 @@ impl S3Client {
                 )));
             }
             let xml = String::from_utf8_lossy(&bytes);
-            let new_entries = parse_list_objects(&xml);
-            for (key, size, last) in new_entries {
-                if !key.starts_with(prefix) {
-                    continue;
+            for block in xml.split("<Contents>").skip(1) {
+                let Some(end) = block.find("</Contents>") else {
+                    break;
+                };
+                let block = &block[..end];
+                let key = extract_tag(block, "Key");
+                if !key.is_empty() {
+                    keys.push(key.to_string());
                 }
-                let last = iso8601_to_unix(&last).unwrap_or(0);
-                entries.push((key, size, last));
             }
             token = extract_tag(&xml, "NextContinuationToken")
                 .trim()
@@ -242,7 +243,22 @@ impl S3Client {
                 break;
             }
         }
-        Ok(entries)
+        Ok(keys)
+    }
+}
+
+fn extract_tag<'a>(xml: &'a str, tag: &str) -> &'a str {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    match xml.find(&open) {
+        Some(start) => {
+            let rest = &xml[start + open.len()..];
+            match rest.find(&close) {
+                Some(end) => &rest[..end],
+                None => "",
+            }
+        }
+        None => "",
     }
 }
 
@@ -302,66 +318,6 @@ fn sign_v4(secret_key: &str, date: &str, region: &str, string_to_sign: &str) -> 
     ))
 }
 
-/// Parses `<Contents>` entries of a ListObjectsV2 response
-/// (key, size, raw LastModified string).
-fn parse_list_objects(xml: &str) -> Vec<(String, u64, String)> {
-    let mut out = Vec::new();
-    for block in xml.split("<Contents>").skip(1) {
-        let Some(end) = block.find("</Contents>") else {
-            break;
-        };
-        let block = &block[..end];
-        let key = extract_tag(block, "Key").to_string();
-        let size = extract_tag(block, "Size");
-        let last = extract_tag(block, "LastModified").trim().to_string();
-        if key.is_empty() {
-            continue;
-        }
-        out.push((key, size.trim().parse().unwrap_or(0), last));
-    }
-    out
-}
-
-fn extract_tag<'a>(xml: &'a str, tag: &str) -> &'a str {
-    let open = format!("<{tag}>");
-    let close = format!("</{tag}>");
-    match xml.find(&open) {
-        Some(start) => {
-            let rest = &xml[start + open.len()..];
-            match rest.find(&close) {
-                Some(end) => &rest[..end],
-                None => "",
-            }
-        }
-        None => "",
-    }
-}
-
-/// Best-effort parse of an ISO-8601 timestamp as returned by
-/// `ListObjectsV2` (`2026-01-02T03:04:05.000Z`) into unix seconds.
-fn iso8601_to_unix(value: &str) -> Option<i64> {
-    let value = value.trim();
-    if value.len() < 19 || value.as_bytes().get(4) != Some(&b'-') {
-        return None;
-    }
-    let year: i64 = value[0..4].parse().ok()?;
-    let month: i32 = value[5..7].parse().ok()?;
-    let day: i32 = value[8..10].parse().ok()?;
-    let hour: i64 = value[11..13].parse().ok()?;
-    let minute: i64 = value[14..16].parse().ok()?;
-    let second: i64 = value[17..19].parse().ok()?;
-    if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || hour > 23
-        || minute > 59
-        || second > 61
-    {
-        return None;
-    }
-    let days = crate::logging::days_from_civil(year, month, day);
-    Some(days * 86_400 + hour * 3600 + minute * 60 + second)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -408,28 +364,6 @@ mod tests {
     #[test]
     fn percent_encode_preserves_safe_chars() {
         assert_eq!(percent_encode("npub1abc/-_~/"), "npub1abc%2F-_~%2F");
-    }
-
-    #[test]
-    fn list_objects_parses_contents() {
-        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
-<ListBucketResult>
-  <Contents>
-    <Key>npub1x/test.meta.json</Key>
-    <Size>123</Size>
-    <LastModified>2026-01-02T03:04:05.000Z</LastModified>
-  </Contents>
-  <Contents>
-    <Key>npub1x/blob</Key>
-    <Size>27</Size>
-    <LastModified>2026-01-02T03:04:05.000Z</LastModified>
-  </Contents>
-</ListBucketResult>"#;
-        let parsed = parse_list_objects(xml);
-        assert_eq!(parsed.len(), 2);
-        assert_eq!(parsed[0].0, "npub1x/test.meta.json");
-        assert_eq!(parsed[0].1, 123);
-        assert!(iso8601_to_unix(&parsed[0].2).is_some_and(|t| t > 1_700_000_000));
     }
 }
 
