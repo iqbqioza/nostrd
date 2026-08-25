@@ -12,7 +12,7 @@
 > [!NOTE]
 > This project is maintained by an individual in their spare time. If you'd like to show your support, please consider a tip via Lightning or Bitcoin.
 >
-> **Lightning address:** thank.you@iqbqioza.com
+> **Lightning address:** thanks@iqbqioza.com
 >
 > **Bitcoin:** 13LUTf5tBXAv2TyEiKHpg9kVWtgiYz3ZYs
 >
