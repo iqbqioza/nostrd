@@ -392,6 +392,10 @@ impl Config {
         self.daemon.pid_file = abs(self.daemon.pid_file.clone());
         self.daemon.log_file = abs(self.daemon.log_file.clone());
         self.daemon.stats_file = abs(self.daemon.stats_file.clone());
+        // The daemon runs with CWD "/" (see the daemonize step): a
+        // relative Blossom storage path must be anchored to the config
+        // directory, or the blobs would land in the root filesystem.
+        self.blossom.local_path = abs(self.blossom.local_path.clone());
     }
 
     /// The set of NIPs this relay claims to support (NIP-11).
@@ -1064,6 +1068,28 @@ mod tests {
         ));
         assert!(!is_pubkey_or_npub("not-a-pubkey"));
         assert!(!is_pubkey_or_npub(&"a".repeat(63)));
+    }
+
+    #[test]
+    fn absolutize_paths_anchors_blossom_storage() {
+        let mut cfg = Config::default();
+        cfg.blossom.local_path = PathBuf::from("./data/images");
+        cfg.database.path = PathBuf::from("./data");
+        let dir = std::env::temp_dir().join("nostrd-abs-test");
+        let _ = std::fs::create_dir_all(&dir);
+        let cfg_path = dir.join("nostrd.toml");
+        cfg.absolutize_paths(&cfg_path);
+        assert!(
+            cfg.blossom.local_path.is_absolute(),
+            "blossom path is anchored"
+        );
+        assert_eq!(
+            cfg.blossom.local_path,
+            dir.join("data/images"),
+            "relative blossom path resolves against the config directory"
+        );
+        assert_eq!(cfg.database.path, dir.join("data"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
