@@ -238,15 +238,25 @@ impl S3Client {
                     keys.push((key.to_string(), size));
                 }
             }
-            token = extract_tag(&xml, "NextContinuationToken")
-                .trim()
-                .to_string();
+            token = xml_unescape(extract_tag(&xml, "NextContinuationToken").trim());
             if token.is_empty() {
                 break;
             }
         }
         Ok(keys)
     }
+}
+
+/// Undoes the XML entity escaping of the ListObjectsV2 response: a
+/// continuation token containing `&`, `<` etc. would otherwise be sent
+/// back corrupted and break pagination.
+fn xml_unescape(value: &str) -> String {
+    value
+        .replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
 }
 
 fn extract_tag<'a>(xml: &'a str, tag: &str) -> &'a str {
@@ -352,6 +362,14 @@ mod tests {
         // path-style (`/bucket/key`), computed with the documented chain.
         let expected_prefix = "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;range;x-amz-content-sha256;x-amz-date, Signature=819484c483cfb97d16522b1ac156f87e61677cc8f1f2545c799650ef178f4aa8";
         assert_eq!(authorization, expected_prefix);
+    }
+
+    #[test]
+    fn xml_unescape_entities() {
+        assert_eq!(xml_unescape("a&amp;b"), "a&b");
+        assert_eq!(xml_unescape("a&b"), "a&b", "plain text passes through");
+        assert_eq!(xml_unescape("&lt;&gt;&quot;&#39;"), "<>\"'");
+        assert_eq!(xml_unescape("normal-token-123"), "normal-token-123");
     }
 
     #[test]
