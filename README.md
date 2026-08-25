@@ -10,9 +10,18 @@
 </p>
 
 > [!NOTE]
-> This project is maintained by an individual who also operates the public relay at **wss://relay.damustr.com**. If nostrd has been useful to you, a small sponsorship or tip would be a wonderful encouragement and helps keep the project going. For larger sponsorships, please reach out through the contact details on the [@iqbqioza](https://github.com/iqbqioza) profile.
+> This project is maintained by an individual in their spare time. If you'd like to show your support, please consider a tip via Lightning or Bitcoin.
+>
+> **Lightning address:** thank.you@iqbqioza.com
+>
+> **Bitcoin:** 13LUTf5tBXAv2TyEiKHpg9kVWtgiYz3ZYs
+>
+> **Bitcoin (SegWit):** bc1qttlc8m9gsh24xxqys26gaz2mtgfzw7s7770am6
 
-A minimal, stable and fast [Nostr](https://github.com/nostr-protocol/nostr) relay server written in Rust.
+> [!TIP]
+> This project's relay is running live at **wss://relay.damustr.com**.
+
+**All in one Nostr relay server written in Rust. Blazing fast by Design. Lean by Nature. Powerful by Default.**
 
 nostrd is designed around two goals:
 
