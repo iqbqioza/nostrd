@@ -177,14 +177,15 @@ enum Msg {
         allow: Vec<(String, String)>,
         reply: oneshot::Sender<()>,
     },
-    /// Adds an owner to a Blossom blob's persisted metadata (atomic).
+    /// Adds an owner to a Blossom blob's persisted metadata (atomic);
+    /// the reply carries whether the commit succeeded.
     BlossomAddOwner {
         sha256: String,
         mime: String,
         size: u64,
         uploaded: i64,
         pubkey: String,
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<bool>,
     },
     /// Loads a Blossom blob's persisted metadata.
     BlossomLoad {
@@ -684,7 +685,8 @@ impl DbClient {
             .await
     }
 
-    /// Adds an owner to a Blossom blob's persisted metadata.
+    /// Adds an owner to a Blossom blob's persisted metadata. Returns
+    /// whether the commit succeeded.
     pub async fn blossom_add_owner(
         &self,
         sha256: &str,
@@ -692,17 +694,16 @@ impl DbClient {
         size: u64,
         uploaded: i64,
         pubkey: &str,
-    ) {
-        let _ = self
-            .request_write(|reply| Msg::BlossomAddOwner {
-                sha256: sha256.to_string(),
-                mime: mime.to_string(),
-                size,
-                uploaded,
-                pubkey: pubkey.to_string(),
-                reply,
-            })
-            .await;
+    ) -> bool {
+        self.request_write(|reply| Msg::BlossomAddOwner {
+            sha256: sha256.to_string(),
+            mime: mime.to_string(),
+            size,
+            uploaded,
+            pubkey: pubkey.to_string(),
+            reply,
+        })
+        .await
     }
 
     /// Loads a Blossom blob's persisted metadata.

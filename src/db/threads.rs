@@ -638,12 +638,20 @@ pub(crate) fn spawn(
                                     pubkey,
                                     reply,
                                 } => {
-                                    if let Err(e) = store.add_blossom_mapping(
-                                        &sha256, &mime, size, uploaded, &pubkey,
-                                    ) {
-                                        db_error(&thread_errors, &e);
+                                    let ok = store
+                                        .add_blossom_mapping(
+                                            &sha256, &mime, size, uploaded, &pubkey,
+                                        )
+                                        .is_ok();
+                                    if !ok {
+                                        db_error(
+                                            &thread_errors,
+                                            &crate::error::Error::Other(
+                                                "blossom mapping write failed".into(),
+                                            ),
+                                        );
                                     }
-                                    let _ = reply.send(());
+                                    let _ = reply.send(ok);
                                 }
                                 Msg::BlossomRemoveOwner {
                                     sha256,

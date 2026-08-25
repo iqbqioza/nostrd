@@ -76,9 +76,17 @@ impl BlobStore {
         mime: &str,
     ) -> Result<Descriptor> {
         let uploaded = crate::util::unix_now() as i64;
-        self.db
+        // The mapping must land first: without it the file would be an
+        // unreachable orphan. Abort the upload when the commit fails.
+        if !self
+            .db
             .blossom_add_owner(sha256, mime, bytes.len() as u64, uploaded, pubkey)
-            .await;
+            .await
+        {
+            return Err(crate::error::Error::Other(
+                "blossom mapping write failed".into(),
+            ));
+        }
         let npub = npub_of(pubkey);
         match &self.storage {
             Storage::Local(s) => s.put(&npub, sha256, bytes, mime, uploaded).await?,
