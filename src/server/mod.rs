@@ -86,7 +86,8 @@ fn add_cors_headers(headers: &mut HeaderMap) {
     );
     headers.insert(
         axum::http::header::ACCESS_CONTROL_ALLOW_METHODS,
-        HeaderValue::from_static("GET, POST, OPTIONS"),
+        // PUT/DELETE are used by the Blossom file server (upload / delete).
+        HeaderValue::from_static("GET, POST, PUT, DELETE, HEAD, OPTIONS"),
     );
     headers.insert(
         axum::http::header::ACCESS_CONTROL_ALLOW_HEADERS,
