@@ -91,7 +91,8 @@ fn add_cors_headers(headers: &mut HeaderMap) {
     );
     headers.insert(
         axum::http::header::ACCESS_CONTROL_ALLOW_HEADERS,
-        HeaderValue::from_static("Authorization, Content-Type, Accept"),
+        // X-SHA-256 is the optional preflight hash header of BUD-02.
+        HeaderValue::from_static("Authorization, Content-Type, Accept, X-SHA-256"),
     );
     headers.insert(
         axum::http::header::ACCESS_CONTROL_MAX_AGE,
