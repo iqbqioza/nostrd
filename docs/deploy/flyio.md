@@ -76,7 +76,7 @@ curl https://<your-app-name>.fly.dev/
 ## Scaling and updates
 
 - **Update the relay**: edit `deploy/nostrd.container.toml` and `fly deploy` again — the image always downloads the **latest** GitHub release binary, so an update is a simple redeploy
-- **Pin a version**: `docker build --build-arg NOSTRD_VERSION=v0.1.0 ...` or change the `ARG` in the Dockerfile
+- **Pin a version**: `docker build --build-arg NOSTRD_VERSION=v0.1.1 ...` or change the `ARG` in the Dockerfile
 - **Scale**: the relay is a single machine by default. `fly machines clone <id>` creates a second machine; both share the volume (Fly volumes support multiple machines in the same region)
 - **Metrics**: Fly collects the `/metrics` endpoint (see `[metrics]` in `fly.toml`) and shows it in the Fly dashboard under Metrics
 
@@ -94,3 +94,4 @@ Every option is documented in the [Configuration reference](../CONFIGURATION.md)
 - **Always-on by design**: `auto_stop_machines = false` in `fly.toml` — a relay must never be stopped during idle periods
 - The container runs the relay in **foreground mode** (`nostrd start --foreground`); logs go to stdout/stderr and are collected by Fly
 - TLS is terminated by Fly; the relay itself serves plain WebSocket on port 8080
+- **Blossom media host**: to serve the Blossom server too, set `blossom.host = "media.example.com"` in the config, add `media.example.com` as an **additional hostname** of the same Fly app (fly.toml `[[services]] http_options.allowed_http_hostnames` or `fly hostnames`), and add the `media.` TLS certificate in the Fly dashboard — the relay splits the hosts internally (like `server.api_host`)

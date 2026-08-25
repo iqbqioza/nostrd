@@ -10,7 +10,7 @@
 
 mod removal;
 mod scan;
-mod store;
+pub(crate) mod store;
 #[cfg(test)]
 mod tests;
 mod threads;
@@ -163,6 +163,60 @@ enum Msg {
     LoadAccess {
         reply: oneshot::Sender<Option<crate::config::AccessControl>>,
     },
+    /// Loads the persisted Blossom upload allowlist.
+    LoadBlossomAllow {
+        reply: oneshot::Sender<Vec<String>>,
+    },
+    /// Loads the persisted relay pubkey access lists (deny, allow).
+    LoadRelayPubkeys {
+        reply: oneshot::Sender<crate::db::store::RelayPubkeyLists>,
+    },
+    /// Persists the relay pubkey access lists (deny, allow).
+    SaveRelayPubkeys {
+        deny: Vec<(String, String)>,
+        allow: Vec<(String, String)>,
+        reply: oneshot::Sender<()>,
+    },
+    /// Adds an owner to a Blossom blob's persisted metadata (atomic);
+    /// the reply carries whether the commit succeeded.
+    BlossomAddOwner {
+        sha256: String,
+        mime: String,
+        size: u64,
+        uploaded: i64,
+        pubkey: String,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Loads a Blossom blob's persisted metadata.
+    BlossomLoad {
+        sha256: String,
+        reply: oneshot::Sender<Option<crate::db::store::BlossomMeta>>,
+    },
+    /// Removes one owner from a Blossom blob's persisted metadata.
+    BlossomRemoveOwner {
+        sha256: String,
+        pubkey: String,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Lists the blob hashes uploaded by a pubkey (reverse index).
+    BlossomList {
+        pubkey: String,
+        reply: oneshot::Sender<Vec<String>>,
+    },
+    /// Adds many Blossom mappings in one transaction (auto-migration);
+    /// the reply carries whether the commit succeeded.
+    BlossomAddMappings {
+        entries: Vec<(String, String, u64, i64, String)>,
+        reply: oneshot::Sender<bool>,
+    },
+    /// Whether the one-time legacy migration already ran.
+    BlossomMigrationDone {
+        reply: oneshot::Sender<bool>,
+    },
+    /// Marks the one-time legacy migration as done.
+    BlossomMarkMigration {
+        reply: oneshot::Sender<()>,
+    },
     PurgeExpired {
         now: u64,
         reply: oneshot::Sender<usize>,
@@ -225,6 +279,11 @@ impl DbClient {
     ) -> Result<DbClient> {
         let expiry = Arc::new(std::sync::atomic::AtomicBool::new(expiry_enabled));
         let store = Store::open(cfg, Arc::clone(&expiry), max_indexed_words)?;
+        // One-time migration: databases written before the pubkey lists
+        // moved into their own key still carry them inside the `access`
+        // blob — copy them over so existing bans/allowlists survive.
+        store.migrate_access_pubkeys()?;
+        log::info!("access control migration check complete");
         let threads = threads::spawn(
             store,
             expiry,
@@ -599,9 +658,103 @@ impl DbClient {
             .await;
     }
 
+    /// Persists the relay pubkey access lists ((pubkey, reason) pairs for
+    /// the deny and allow lists) under their dedicated LMDB key.
+    pub async fn save_relay_pubkeys(&self, deny: &[(String, String)], allow: &[(String, String)]) {
+        let deny = deny.to_vec();
+        let allow = allow.to_vec();
+        let _ = self
+            .request_write(|reply| Msg::SaveRelayPubkeys { deny, allow, reply })
+            .await;
+    }
+
     /// Loads the persisted access control lists, if any.
     pub async fn load_access(&self) -> Option<crate::config::AccessControl> {
         self.request_read(|reply| Msg::LoadAccess { reply }).await
+    }
+
+    /// Loads the persisted Blossom upload allowlist.
+    pub async fn load_blossom_allow(&self) -> Vec<String> {
+        self.request_read(|reply| Msg::LoadBlossomAllow { reply })
+            .await
+    }
+
+    /// Loads the persisted relay pubkey access lists (deny, allow).
+    pub async fn load_relay_pubkeys(&self) -> crate::db::store::RelayPubkeyLists {
+        self.request_read(|reply| Msg::LoadRelayPubkeys { reply })
+            .await
+    }
+
+    /// Adds an owner to a Blossom blob's persisted metadata. Returns
+    /// whether the commit succeeded.
+    pub async fn blossom_add_owner(
+        &self,
+        sha256: &str,
+        mime: &str,
+        size: u64,
+        uploaded: i64,
+        pubkey: &str,
+    ) -> bool {
+        self.request_write(|reply| Msg::BlossomAddOwner {
+            sha256: sha256.to_string(),
+            mime: mime.to_string(),
+            size,
+            uploaded,
+            pubkey: pubkey.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    /// Loads a Blossom blob's persisted metadata.
+    pub async fn blossom_load(&self, sha256: &str) -> Option<crate::db::store::BlossomMeta> {
+        self.request_read(|reply| Msg::BlossomLoad {
+            sha256: sha256.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    /// Removes one owner from a Blossom blob's persisted metadata.
+    pub async fn blossom_remove_owner(&self, sha256: &str, pubkey: &str) -> bool {
+        self.request_write(|reply| Msg::BlossomRemoveOwner {
+            sha256: sha256.to_string(),
+            pubkey: pubkey.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    /// Lists the blob hashes uploaded by a pubkey.
+    pub async fn blossom_list(&self, pubkey: &str) -> Vec<String> {
+        self.request_read(|reply| Msg::BlossomList {
+            pubkey: pubkey.to_string(),
+            reply,
+        })
+        .await
+    }
+
+    /// Adds many Blossom mappings in one transaction (auto-migration).
+    /// Returns whether the commit succeeded.
+    pub async fn blossom_add_mappings(
+        &self,
+        entries: Vec<(String, String, u64, i64, String)>,
+    ) -> bool {
+        self.request_write(|reply| Msg::BlossomAddMappings { entries, reply })
+            .await
+    }
+
+    /// Whether the one-time legacy migration already ran.
+    pub async fn blossom_migration_done(&self) -> bool {
+        self.request_read(|reply| Msg::BlossomMigrationDone { reply })
+            .await
+    }
+
+    /// Marks the one-time legacy migration as done.
+    pub async fn mark_blossom_migration(&self) {
+        let _ = self
+            .request_write(|reply| Msg::BlossomMarkMigration { reply })
+            .await;
     }
 
     pub async fn purge_expired(&self, now: u64) -> usize {

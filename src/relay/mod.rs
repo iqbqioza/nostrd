@@ -62,6 +62,12 @@ pub struct Relay {
     /// Strictly monotonic stamp for relay-generated events: see
     /// [`StampClock`].
     stamps: StampClock,
+    /// The Blossom file server state (when configured), so its handlers can
+    /// share the relay's state.
+    pub blossom: Arc<tokio::sync::RwLock<Option<Arc<crate::server::blossom::BlossomState>>>>,
+    /// The Blossom upload allowlist (normalized hex pubkeys), loaded from
+    /// the relay database at startup and refreshed on SIGHUP.
+    pub blossom_allow: Arc<tokio::sync::RwLock<Vec<String>>>,
 }
 
 /// Issues strictly increasing timestamps for relay-generated events.
@@ -201,11 +207,23 @@ impl Relay {
         let api_max_concurrent = config.read().await.limits.api_max_concurrent;
         // Seed the access control: the persisted runtime state wins, so NIP-86
         // bans/allowlists survive restarts; the config `access` section seeds
-        // the very first run only (when no runtime state exists yet).
-        let access = match db.load_access().await {
+        // the very first run only (when no runtime state exists yet). The
+        // pubkey allow/deny lists live in the relay database (LMDB),
+        // managed with `nostrd relay allow/deny` — never in the config.
+        let mut access = match db.load_access().await {
             Some(access) => access,
             None => config.read().await.access.clone(),
         };
+        // `restrict_relay` is config-owned: an older persisted blob (which
+        // predates the flag) would otherwise silently override it with the
+        // serde default `false`.
+        access.restrict_relay = config.read().await.access.restrict_relay;
+        let (deny, allow) = db.load_relay_pubkeys().await;
+        access.blocked_pubkeys = deny;
+        access.allowed_pubkeys = allow;
+        // The Blossom upload allowlist is stored in the relay database and
+        // loaded into memory at startup (and refreshed on SIGHUP).
+        let blossom_allow = db.load_blossom_allow().await;
         Relay {
             config: Arc::clone(&config),
             access: Arc::new(RwLock::new(access)),
@@ -225,6 +243,8 @@ impl Relay {
             secp,
             config_path: Arc::new(tokio::sync::RwLock::new(None)),
             stamps: StampClock::new(),
+            blossom: Arc::new(tokio::sync::RwLock::new(None)),
+            blossom_allow: Arc::new(tokio::sync::RwLock::new(blossom_allow)),
         }
     }
 
@@ -298,7 +318,12 @@ impl Relay {
     /// `access` write lock before awaiting this.
     pub async fn persist_access(&self) {
         let access = self.access.read().await.clone();
+        let deny = access.blocked_pubkeys.clone();
+        let allow = access.allowed_pubkeys.clone();
         self.db.save_access(access).await;
+        // The pubkey lists are excluded from the `access` blob: keep them
+        // in their own LMDB key so the CLI and NIP-86 share one source.
+        self.db.save_relay_pubkeys(&deny, &allow).await;
     }
 
     /// Registers a new WebSocket connection from `ip` if it does not exceed

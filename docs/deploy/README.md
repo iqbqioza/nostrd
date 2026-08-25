@@ -35,6 +35,8 @@ sudo systemctl enable --now nostrd
 curl http://localhost:8080/health
 ```
 
+**Blossom media host**: if `blossom.host` is set, point that hostname at the same port in the TLS proxy too (see the [vps guide](vps.md) for nginx/Caddy blocks).
+
 For VMs, the relay itself serves plain WebSocket on port 8080; a reverse proxy (nginx/Caddy) or the provider's TLS termination in front of it provides `wss://` — nostrd honors `X-Forwarded-Proto`, so it works behind any TLS-terminating proxy.
 
 ## Configuring the relay

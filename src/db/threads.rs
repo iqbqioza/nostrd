@@ -152,6 +152,61 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             let _ = reply.send(access);
             false
         }
+        Msg::LoadBlossomAllow { reply } => {
+            let list = match store.load_blossom_allow() {
+                Ok(list) => list,
+                Err(e) => {
+                    db_error(errors, &e);
+                    Vec::new()
+                }
+            };
+            let _ = reply.send(list);
+            false
+        }
+        Msg::LoadRelayPubkeys { reply } => {
+            let lists = match store.load_relay_pubkeys() {
+                Ok(lists) => lists,
+                Err(e) => {
+                    db_error(errors, &e);
+                    (Vec::new(), Vec::new())
+                }
+            };
+            let _ = reply.send(lists);
+            false
+        }
+        Msg::BlossomLoad { sha256, reply } => {
+            let meta = match store.load_blossom_mapping(&sha256) {
+                Ok(meta) => meta,
+                Err(e) => {
+                    db_error(errors, &e);
+                    None
+                }
+            };
+            let _ = reply.send(meta);
+            false
+        }
+        Msg::BlossomList { pubkey, reply } => {
+            let shas = match store.list_blossom_shas(&pubkey) {
+                Ok(shas) => shas,
+                Err(e) => {
+                    db_error(errors, &e);
+                    Vec::new()
+                }
+            };
+            let _ = reply.send(shas);
+            false
+        }
+        Msg::BlossomMigrationDone { reply } => {
+            let done = match store.blossom_migration_done() {
+                Ok(done) => done,
+                Err(e) => {
+                    db_error(errors, &e);
+                    false
+                }
+            };
+            let _ = reply.send(done);
+            false
+        }
         Msg::FirstSeenStatus { pubkeys, reply } => {
             let rtxn = match store.env.read_txn() {
                 Ok(rtxn) => rtxn,
@@ -355,6 +410,56 @@ pub(crate) fn spawn(
                             // batch first so that ordering is preserved.
                             flush_everything(&store, &thread_errors, &mut batch);
                             match other {
+                                Msg::BlossomMigrationDone { reply } => {
+                                    let done = match store.blossom_migration_done() {
+                                        Ok(done) => done,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            false
+                                        }
+                                    };
+                                    let _ = reply.send(done);
+                                }
+                                Msg::BlossomLoad { sha256, reply } => {
+                                    let meta = match store.load_blossom_mapping(&sha256) {
+                                        Ok(meta) => meta,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            None
+                                        }
+                                    };
+                                    let _ = reply.send(meta);
+                                }
+                                Msg::BlossomList { pubkey, reply } => {
+                                    let shas = match store.list_blossom_shas(&pubkey) {
+                                        Ok(shas) => shas,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            Vec::new()
+                                        }
+                                    };
+                                    let _ = reply.send(shas);
+                                }
+                                Msg::LoadBlossomAllow { reply } => {
+                                    let list = match store.load_blossom_allow() {
+                                        Ok(list) => list,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            Vec::new()
+                                        }
+                                    };
+                                    let _ = reply.send(list);
+                                }
+                                Msg::LoadRelayPubkeys { reply } => {
+                                    let lists = match store.load_relay_pubkeys() {
+                                        Ok(lists) => lists,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            (Vec::new(), Vec::new())
+                                        }
+                                    };
+                                    let _ = reply.send(lists);
+                                }
                                 Msg::Query {
                                     filters,
                                     limit,
@@ -515,6 +620,68 @@ pub(crate) fn spawn(
                                 }
                                 Msg::SaveAccess { access, reply } => {
                                     if let Err(e) = store.save_access(&access) {
+                                        db_error(&thread_errors, &e);
+                                    }
+                                    let _ = reply.send(());
+                                }
+                                Msg::SaveRelayPubkeys { deny, allow, reply } => {
+                                    if let Err(e) = store.save_relay_pubkeys(&deny, &allow) {
+                                        db_error(&thread_errors, &e);
+                                    }
+                                    let _ = reply.send(());
+                                }
+                                Msg::BlossomAddOwner {
+                                    sha256,
+                                    mime,
+                                    size,
+                                    uploaded,
+                                    pubkey,
+                                    reply,
+                                } => {
+                                    let ok = store
+                                        .add_blossom_mapping(
+                                            &sha256, &mime, size, uploaded, &pubkey,
+                                        )
+                                        .is_ok();
+                                    if !ok {
+                                        db_error(
+                                            &thread_errors,
+                                            &crate::error::Error::Other(
+                                                "blossom mapping write failed".into(),
+                                            ),
+                                        );
+                                    }
+                                    let _ = reply.send(ok);
+                                }
+                                Msg::BlossomRemoveOwner {
+                                    sha256,
+                                    pubkey,
+                                    reply,
+                                } => {
+                                    let removed = match store.remove_blossom_owner(&sha256, &pubkey)
+                                    {
+                                        Ok(removed) => removed,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            false
+                                        }
+                                    };
+                                    let _ = reply.send(removed);
+                                }
+                                Msg::BlossomAddMappings { entries, reply } => {
+                                    let ok = store.add_blossom_mappings(&entries).is_ok();
+                                    if !ok {
+                                        db_error(
+                                            &thread_errors,
+                                            &crate::error::Error::Other(
+                                                "blossom migration batch failed".into(),
+                                            ),
+                                        );
+                                    }
+                                    let _ = reply.send(ok);
+                                }
+                                Msg::BlossomMarkMigration { reply } => {
+                                    if let Err(e) = store.mark_blossom_migration() {
                                         db_error(&thread_errors, &e);
                                     }
                                     let _ = reply.send(());

@@ -14,9 +14,10 @@ This manual explains every feature of **nostrd**, a Nostr relay server, step by 
 8. [Supported NIPs](#8-supported-nips)
 9. [NIP-29 Groups](#9-nip-29-groups)
 10. [LiveKit (Audio/Video Rooms)](#10-livekit-audiovideo-rooms)
-11. [Logs and Statistics](#11-logs-and-statistics)
-12. [Reloading Configuration (SIGHUP)](#12-reloading-configuration-sighup)
-13. [When You Are Stuck](#13-when-you-are-stuck)
+11. [Blossom File Server (Media Hosting)](#11-blossom-file-server-media-hosting)
+12. [Logs and Statistics](#12-logs-and-statistics)
+13. [Reloading Configuration (SIGHUP)](#13-reloading-configuration-sighup)
+14. [When You Are Stuck](#14-when-you-are-stuck)
 
 ---
 
@@ -28,7 +29,7 @@ Key features:
 
 - **Simple and stable**: written in Rust; a single binary does everything
 - **Fast storage and search**: LMDB database with a full-text search index
-- **Broad NIP support**: 19 NIPs implemented, including deletion, proof-of-work, delegation, groups, search, and a management API
+- **Broad NIP support**: 20 NIPs implemented (plus the Blossom file server), including deletion, proof-of-work, delegation, groups, search, and a management API
 - **Easy to operate**: daemon mode, log rotation, hot configuration reload, statistics output, a REST API, and Prometheus metrics
 
 ---
@@ -185,13 +186,12 @@ To generate a secret key, use the `nostrd genkey` command (see [5. Command Refer
 
 | Option | Description |
 | --- | --- |
-| `blocked_pubkeys` | Public keys whose posts are rejected |
-| `allowed_pubkeys` | **Allowlist**. When non-empty, only these pubkeys may post |
+| `restrict_relay` | `true` = only allow-listed pubkeys may post (the lists are managed at runtime, see below) |
 | `blocked_kinds` | Event kinds to reject |
 | `allowed_kinds` | Kind allowlist. When non-empty, only these kinds are accepted |
 | `blocked_ips` | IP addresses to refuse connections from |
 
-> **Note**: Adding even one entry to `allowed_pubkeys` switches the relay into allowlist mode — everyone else is locked out. Be careful not to lock yourself out unintentionally.
+> **Note**: The pubkey allow/deny lists are **not** config keys — they live in the relay database and are managed with `nostrd relay allow/deny` (see [Section 7](#7-nip-86-management-api) / the blossom-style CLI). A denied pubkey is always rejected when **publishing**, even with `restrict_relay = false`. **Reading is never restricted**: querying, subscribing and the REST API stay open to everyone.
 
 ---
 
@@ -374,12 +374,15 @@ If `server.management_port` is set, the legacy REST endpoints are available at `
 | 43 | Relay access metadata (roles) |
 | 45 | Counting results (COUNT / HyperLogLog) |
 | 50 | Search capability (full-text, relevance-ordered) |
+| 59 | Gift wrap (recipient-only serving) |
 | 62 | Request to vanish |
 | 67 | EOSE completeness hint |
 | 70 | Protected events |
 | 77 | Negentropy syncing |
 | 86 | Relay management API |
 | 98 | HTTP auth |
+
+Blossom (BUD-01/02) is not a NIP and is **not** advertised in the NIP-11 document: it is served as a separate file server on the `[blossom]` hostname (see [Section 11](#11-blossom-file-server-media-hosting)), with its own kind-24242 upload authorization.
 
 ---
 
@@ -443,7 +446,102 @@ curl -i http://127.0.0.1:8080/.well-known/nip29/livekit
 
 ---
 
-## 11. Logs and Statistics
+## 11. Blossom File Server (Media Hosting)
+
+nostrd can act as a [Blossom](https://github.com/hzrd149/blossom) blob server: clients upload files addressed by their SHA-256 hash, and the relay serves them back. Like the REST API, the Blossom server lives on a dedicated hostname on the same port.
+
+### 11.1 Configuration
+
+```toml
+[blossom]
+host = "media.example.com"          # required — enables the feature
+storage = "local"                   # "local" or "s3"
+local_path = "./data/images"        # local storage root
+max_upload_bytes = 20971520         # 20 MiB
+restrict_uploads = false            # only allow-listed pubkeys may upload
+
+
+# For S3 / Cloudflare R2:
+s3_endpoint = "https://<account>.r2.cloudflarestorage.com"
+s3_region = "auto"
+s3_bucket = "nostr-media"
+s3_access_key = "..."
+s3_secret_key = "..."
+```
+
+Point `media.example.com` (and only that hostname) at the same port in your reverse proxy, then restart (`nostrd restart`). `GET /` on that host answers with the Blossom server info document.
+
+### 11.2 Storage layout
+
+Both backends use the `bucket/{npub1xxx}/{file}` hierarchy: every upload is stored under the uploader's npub directory, keyed by the file's SHA-256.
+
+- **local**: `<local_path>/<npub1...>/<sha256>` (plus a `<sha256>.meta.json` descriptor)
+- **s3 / R2**: objects `<npub1...>/<sha256>` in the configured bucket
+
+### 11.3 Endpoints
+
+| Method | Path | Auth | Description |
+| --- | --- | --- | --- |
+| `GET` | `/` | — | Blossom server info |
+| `GET` / `HEAD` | `/<sha256>[.ext]` | — | Fetch / probe a blob (`.ext` is advisory) |
+| `PUT` | `/upload` | kind 24242 (`t=upload`) | Upload a blob; returns 201 + the descriptor |
+| `GET` | `/list/<pubkey>` | — | Blobs uploaded by a pubkey (hex) |
+| `DELETE` | `/<sha256>` | kind 24242 (`t=delete`, `x=<sha256>`) | Delete a blob (uploader only) |
+
+Uploads and deletes authenticate with a Nostr auth event (kind 24242, `server` tag naming the Blossom host), sent as `Authorization: Nostr <base64>`.
+
+The descriptor `url` includes the MIME-derived extension (e.g. `https://media.example.com/<sha256>.png`), like the Blossom spec's examples. The extension is advisory: the file is served by its hash alone, and `/<sha256>.<ext>` (any extension) resolves to the same blob.
+
+### 11.4 Example
+
+```bash
+# Server info
+curl https://media.example.com/
+
+# Upload (auth event from your Blossom client, e.g. via `nak` or the nostr-tools blossom helper)
+curl -X PUT -H "Authorization: Nostr <auth>" -H "Content-Type: image/png" --data-binary @photo.png https://media.example.com/upload
+
+# Fetch
+curl https://media.example.com/<sha256>
+
+# List the uploads of a pubkey
+curl https://media.example.com/list/<pubkey-hex>
+
+# Delete (auth event with t=delete and x=<sha256>)
+curl -X DELETE -H "Authorization: Nostr <auth>" https://media.example.com/<sha256>
+```
+
+### 11.5 Restricting uploads to an allowlist
+
+Set `restrict_uploads = true` in the `[blossom]` section to allow only listed pubkeys to upload:
+
+```toml
+[blossom]
+host = "media.example.com"
+restrict_uploads = true
+```
+
+The allowlist itself is **not** stored in the config file — it lives in the relay database (LMDB) and is managed with dedicated commands (no restart needed; the running daemon is reloaded automatically):
+
+```sh
+nostrd blossom allow npub1...          # allow a pubkey (npub1... or hex)
+nostrd blossom deny npub1...          # revoke a pubkey
+nostrd blossom list                  # show the list and restrict_uploads
+```
+
+Uploads from unlisted pubkeys are rejected with `403`. The list survives restarts and is shared with the running daemon via a database reload (SIGHUP). It is stored under a fixed key of the existing `access` table — no new LMDB table is created, so databases from older versions remain compatible.
+
+### 11.6 Notes
+
+- Files are served with `ETag`, `Cache-Control: immutable` and the stored content type.
+- Blobs never touch the relay database; the relay's WebSocket / REST API performance is unaffected.
+- The sha256 → owner mapping is persisted in the relay database (LMDB): the relay restarts instantly, lookups read the mapping directly from the database (no in-memory index, no startup scan), and existing files keep working.
+- **Automatic migration**: on the first start after an upgrade, the relay rebuilds the mapping from blobs stored by older versions (a background scan — the table itself is created instantly, and later restarts skip the migration via a marker). No manual step is needed.
+- **All database upgrades are automatic**: every LMDB table is opened-or-created at startup (instant, non-destructive), and the one-time data migrations (access lists, Blossom mapping) run by themselves — see [CONFIGURATION.md](CONFIGURATION.md#upgrades-are-automatic-and-instant).
+
+---
+
+## 12. Logs and Statistics
 
 ### Logs
 
@@ -480,7 +578,7 @@ Available when `metrics_enabled = true`.
 
 ---
 
-## 12. Reloading Configuration (SIGHUP)
+## 13. Reloading Configuration (SIGHUP)
 
 After editing the config file, reload it without a restart:
 
@@ -494,6 +592,6 @@ Settings that require a **restart**: `private_key`, `api_host`, `metrics_enabled
 
 ---
 
-## 13. When You Are Stuck
+## 14. When You Are Stuck
 
 See [Troubleshooting (TROUBLESHOOTING.md)](TROUBLESHOOTING.md) for common errors and their fixes.

@@ -49,6 +49,41 @@ pub enum Command {
     Stats,
     /// Validate nostrd.toml and exit.
     Check,
+    /// Manage the Blossom upload allowlist (npub1... or hex pubkeys).
+    #[command(name = "blossom")]
+    Blossom {
+        #[command(subcommand)]
+        action: BlossomAction,
+    },
+    /// Manage the relay pubkey allow/deny lists (npub1... or hex pubkeys).
+    #[command(name = "relay")]
+    Relay {
+        #[command(subcommand)]
+        action: RelayAction,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BlossomAction {
+    /// Allow a pubkey to upload (add to the Blossom upload allowlist) and
+    /// reload the daemon.
+    Allow { pubkey: String },
+    /// Deny a pubkey again (remove from the Blossom upload allowlist).
+    Deny { pubkey: String },
+    /// Show the current Blossom upload allowlist.
+    List,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RelayAction {
+    /// Allow a pubkey to publish (add to the relay allow list) and reload
+    /// the daemon. Takes effect when `restrict_relay = true`.
+    Allow { pubkey: String },
+    /// Deny a pubkey (add to the deny list): its events are always
+    /// rejected, even without `restrict_relay`.
+    Deny { pubkey: String },
+    /// Show the relay allow/deny lists and `restrict_relay`.
+    List,
 }
 
 impl Cli {
@@ -57,7 +92,7 @@ impl Cli {
     /// the daemon child continues; the caller then starts the async runtime
     /// and calls [`Cli::serve`].
     pub fn prepare(&mut self) -> Result<()> {
-        match self.command {
+        match &self.command {
             Command::Init => return init_config(&self.config),
             Command::GenKey => return self.genkey(),
             Command::Check => {
@@ -69,6 +104,8 @@ impl Cli {
             Command::Stop => return self.stop(),
             Command::Stats => return self.stats(),
             Command::Start { foreground: true } => return Ok(()),
+            Command::Blossom { action } => return self.blossom_allowlist(action),
+            Command::Relay { action } => return self.relay_access(action),
             _ => {}
         }
 
@@ -215,6 +252,169 @@ impl Cli {
         let raw = std::fs::read_to_string(&cfg.daemon.stats_file)?;
         let value: serde_json::Value = serde_json::from_str(&raw)?;
         print_line(&serde_json::to_string_pretty(&value)?);
+        Ok(())
+    }
+
+    /// `nostrd blossom allow/deny/list`: manages the Blossom upload allowlist.
+    /// The list lives in the relay database (LMDB) — never the config file —
+    /// so it survives restarts and is shared with the running daemon. The
+    /// daemon is reloaded via SIGHUP so changes apply without a restart.
+    fn blossom_allowlist(&self, action: &BlossomAction) -> Result<()> {
+        if !self.config.exists() {
+            return Err(Error::Config(format!(
+                "{} not found; run 'nostrd init' first",
+                self.config.display()
+            )));
+        }
+        let cfg = self.load_config()?;
+        if let BlossomAction::Allow { pubkey } | BlossomAction::Deny { pubkey } = action
+            && !is_pubkey_or_npub(pubkey)
+        {
+            return Err(Error::Config(format!(
+                "{pubkey:?} is not an npub1... or 64-hex pubkey"
+            )));
+        }
+        let mut entries = load_blossom_allow(&cfg)?;
+        match action {
+            BlossomAction::Allow { pubkey } => {
+                let hex = normalize_pubkey(pubkey);
+                if !entries.iter().any(|e| e == &hex) {
+                    entries.push(hex.clone());
+                    save_blossom_allow(&cfg, &entries)?;
+                    print_line(&format!("allowed {hex} to upload (added to the allowlist)"));
+                } else {
+                    print_line(&format!("{hex} is already allowed"));
+                }
+            }
+            BlossomAction::Deny { pubkey } => {
+                let hex = normalize_pubkey(pubkey);
+                let before = entries.len();
+                entries.retain(|e| e != &hex);
+                if entries.len() != before {
+                    save_blossom_allow(&cfg, &entries)?;
+                    print_line(&format!("denied {hex} (removed from the allowlist)"));
+                } else {
+                    print_line(&format!("{hex} was not in the allowlist"));
+                }
+            }
+            BlossomAction::List => {
+                if entries.is_empty() {
+                    print_line("the Blossom upload allowlist is empty");
+                } else {
+                    for entry in &entries {
+                        print_line(entry);
+                    }
+                }
+                print_line(&format!(
+                    "restrict_uploads = {}",
+                    cfg.blossom.restrict_uploads
+                ));
+                return Ok(());
+            }
+        }
+        // Reload the running daemon so the new list applies immediately.
+        match running_pid(&cfg.daemon.pid_file) {
+            Some(pid) => {
+                let ret = unsafe { libc::kill(pid as i32, libc::SIGHUP) };
+                if ret == 0 {
+                    print_line(&format!("the running daemon (pid {pid}) was reloaded"));
+                } else {
+                    print_line(
+                        "warning: could not signal the running daemon; run 'nostrd restart' to apply",
+                    );
+                }
+            }
+            None => {
+                print_line("no daemon is running; the change applies on the next start");
+            }
+        }
+        Ok(())
+    }
+
+    /// `nostrd relay allow/deny/list`: manages the relay pubkey allow/deny
+    /// lists. They live in the relay database (LMDB) — never the config
+    /// file — and the daemon is reloaded via SIGHUP so changes apply
+    /// immediately.
+    fn relay_access(&self, action: &RelayAction) -> Result<()> {
+        if !self.config.exists() {
+            return Err(Error::Config(format!(
+                "{} not found; run 'nostrd init' first",
+                self.config.display()
+            )));
+        }
+        let cfg = self.load_config()?;
+        if let RelayAction::Allow { pubkey } | RelayAction::Deny { pubkey } = action
+            && !is_pubkey_or_npub(pubkey)
+        {
+            return Err(Error::Config(format!(
+                "{pubkey:?} is not an npub1... or 64-hex pubkey"
+            )));
+        }
+        let (mut deny, mut allow) = load_relay_pubkeys(&cfg)?;
+        let mut changed = false;
+        match action {
+            RelayAction::Allow { pubkey } => {
+                let hex = normalize_pubkey(pubkey);
+                deny.retain(|(p, _)| p != &hex);
+                if !allow.iter().any(|(p, _)| p == &hex) {
+                    allow.push((hex.clone(), String::new()));
+                    changed = true;
+                    print_line(&format!("allowed {hex} to publish"));
+                } else {
+                    print_line(&format!("{hex} is already allowed"));
+                }
+            }
+            RelayAction::Deny { pubkey } => {
+                let hex = normalize_pubkey(pubkey);
+                allow.retain(|(p, _)| p != &hex);
+                if !deny.iter().any(|(p, _)| p == &hex) {
+                    deny.push((hex.clone(), String::new()));
+                    changed = true;
+                    print_line(&format!("denied {hex}: its events are now rejected"));
+                } else {
+                    print_line(&format!("{hex} is already denied"));
+                }
+            }
+            RelayAction::List => {
+                print_line("allow list:");
+                if allow.is_empty() {
+                    print_line("  (empty)");
+                } else {
+                    for (p, _) in &allow {
+                        print_line(&format!("  {p}"));
+                    }
+                }
+                print_line("deny list:");
+                if deny.is_empty() {
+                    print_line("  (empty)");
+                } else {
+                    for (p, _) in &deny {
+                        print_line(&format!("  {p}"));
+                    }
+                }
+                print_line(&format!("restrict_relay = {}", cfg.access.restrict_relay));
+                return Ok(());
+            }
+        }
+        if changed {
+            save_relay_pubkeys(&cfg, &deny, &allow)?;
+        }
+        // Reload the running daemon so the new lists apply immediately.
+        match running_pid(&cfg.daemon.pid_file) {
+            Some(pid) => {
+                let ret = unsafe { libc::kill(pid as i32, libc::SIGHUP) };
+                if ret == 0 {
+                    print_line(&format!("the running daemon (pid {pid}) was reloaded"));
+                } else {
+                    print_line(
+                        "warning: could not signal the running daemon; run 'nostrd restart' to apply",
+                    );
+                }
+            }
+            None => {
+                print_line("no daemon is running; the change applies on the next start");
+            }
+        }
         Ok(())
     }
 
@@ -366,6 +566,129 @@ fn running_pid(pid_file: &Path) -> Option<u32> {
         return None;
     }
     if process_alive(pid) { Some(pid) } else { None }
+}
+
+/// Opens the relay database environment for a short-lived CLI access
+/// (read/write of the Blossom allowlist key). The map is opened at the
+/// same size ceiling as the daemon, so the existing database is never
+/// touched with incompatible settings.
+fn open_db_env(cfg: &Config) -> Result<heed::Env> {
+    // The server creates the database directory at startup; the CLI
+    // commands must be able to run on a fresh install too (e.g. before
+    // the first start).
+    std::fs::create_dir_all(&cfg.database.path)?;
+    let mut map_size = (cfg.database.map_max_size as u64)
+        .max(cfg.database.map_size as u64)
+        .max(16 * 1024 * 1024);
+    if usize::BITS < 64 {
+        map_size = map_size.min(2u64 * 1024 * 1024 * 1024);
+    }
+    // SAFETY: the env is closed when the returned handle drops, before the
+    // process exits.
+    let env = unsafe {
+        heed::EnvOpenOptions::new()
+            .max_dbs(cfg.database.max_dbs.max(16))
+            .max_readers(cfg.database.max_readers.max(8))
+            .map_size(map_size as usize)
+            .open(&cfg.database.path)?
+    };
+    Ok(env)
+}
+
+/// Loads the persisted Blossom upload allowlist (hex pubkeys).
+fn load_blossom_allow(cfg: &Config) -> Result<Vec<String>> {
+    let env = open_db_env(cfg)?;
+    // `create_database` opens an existing table or creates a missing one,
+    // exactly like the relay server does at startup — old databases that
+    // predate the table must keep working.
+    let mut wtxn = env.write_txn()?;
+    let access =
+        env.create_database::<heed::types::Bytes, heed::types::Bytes>(&mut wtxn, Some("access"))?;
+    let list = match access.get(&wtxn, b"blossom_allow")? {
+        Some(raw) => serde_json::from_slice(raw)?,
+        None => Vec::new(),
+    };
+    wtxn.commit()?;
+    Ok(list)
+}
+
+/// Persists the Blossom upload allowlist (hex pubkeys).
+fn save_blossom_allow(cfg: &Config, entries: &[String]) -> Result<()> {
+    let env = open_db_env(cfg)?;
+    let mut wtxn = env.write_txn()?;
+    let access =
+        env.create_database::<heed::types::Bytes, heed::types::Bytes>(&mut wtxn, Some("access"))?;
+    access.put(&mut wtxn, b"blossom_allow", &serde_json::to_vec(entries)?)?;
+    wtxn.commit()?;
+    Ok(())
+}
+
+/// Loads the persisted relay pubkey access lists ((deny, allow), each a
+/// (pubkey, reason) pair) from the relay database.
+fn load_relay_pubkeys(cfg: &Config) -> Result<crate::db::store::RelayPubkeyLists> {
+    let env = open_db_env(cfg)?;
+    // The table is created in its own transaction, committed before the
+    // migration runs (LMDB allows a single writer at a time).
+    {
+        let mut wtxn = env.write_txn()?;
+        env.create_database::<heed::types::Bytes, heed::types::Bytes>(&mut wtxn, Some("access"))?;
+        wtxn.commit()?;
+    }
+    // Same one-time migration the server runs: a CLI write before the
+    // first post-upgrade server start must not lose legacy entries.
+    let rtxn = env.read_txn()?;
+    let access = env
+        .open_database::<heed::types::Bytes, heed::types::Bytes>(&rtxn, Some("access"))?
+        .expect("access table created above");
+    drop(rtxn);
+    crate::db::store::migrate_access_pubkeys(&env, &access)?;
+    let rtxn = env.read_txn()?;
+    let lists = match access.get(&rtxn, b"relay_pubkeys")? {
+        Some(raw) => {
+            let value: serde_json::Value = serde_json::from_slice(raw)?;
+            let deny = serde_json::from_value(value.get("deny").cloned().unwrap_or_default())?;
+            let allow = serde_json::from_value(value.get("allow").cloned().unwrap_or_default())?;
+            (deny, allow)
+        }
+        None => (Vec::new(), Vec::new()),
+    };
+    Ok(lists)
+}
+
+/// Persists the relay pubkey access lists ((deny, allow), (pubkey, reason)
+/// pairs) in the relay database.
+fn save_relay_pubkeys(
+    cfg: &Config,
+    deny: &[(String, String)],
+    allow: &[(String, String)],
+) -> Result<()> {
+    let env = open_db_env(cfg)?;
+    let mut wtxn = env.write_txn()?;
+    let access =
+        env.create_database::<heed::types::Bytes, heed::types::Bytes>(&mut wtxn, Some("access"))?;
+    let data = serde_json::to_vec(&serde_json::json!({ "deny": deny, "allow": allow }))?;
+    access.put(&mut wtxn, b"relay_pubkeys", &data)?;
+    wtxn.commit()?;
+    Ok(())
+}
+
+/// Normalizes an npub1... or 64-hex pubkey into its lowercase hex form.
+fn normalize_pubkey(value: &str) -> String {
+    if value.len() == 64 {
+        return value.to_ascii_lowercase();
+    }
+    crate::nips::nip19::parse_nip19(value)
+        .ok()
+        .and_then(|e| match e {
+            crate::nips::nip19::Nip19Entity::Pubkey(pk) => Some(hex::encode(pk)),
+            _ => None,
+        })
+        .unwrap_or_else(|| value.to_ascii_lowercase())
+}
+
+/// Whether a string is a 64-hex pubkey or a parseable `npub1...`.
+fn is_pubkey_or_npub(value: &str) -> bool {
+    crate::config::is_pubkey_or_npub(value)
 }
 
 /// Checks whether a process is alive with `kill(pid, 0)`. On Linux the

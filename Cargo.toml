@@ -1,6 +1,6 @@
 [package]
 name = "nostrd"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A minimal and stable Nostr relay server"
 license = "MIT"
@@ -21,8 +21,11 @@ log = "0.4"
 secp256k1 = { version = "0.30", features = ["std", "hashes"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
+# S3/R2 (Cloudflare R2 is S3-compatible) storage for the Blossom file server;
+# rustls provides the TLS the S3 API requires.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 sha2 = "0.10"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync", "fs"] }
 toml = "0.8"
 
 # Release build tuning: full LTO across all crates, single codegen unit and

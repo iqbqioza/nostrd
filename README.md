@@ -1,17 +1,32 @@
 # nostrd
 
-[![CI](https://github.com/iqbqioza/nostrd/actions/workflows/ci.yml/badge.svg)](https://github.com/iqbqioza/nostrd/actions/workflows/ci.yml)
-[![Release](https://github.com/iqbqioza/nostrd/actions/workflows/release.yml/badge.svg)](https://github.com/iqbqioza/nostrd/actions/workflows/release.yml)
+<p align="center">
+  <img src="docs/images/nostrd-banner.png" alt="nostrd — a minimal and stable Nostr relay server" width="100%">
+</p>
+
+<p align="center">
+  <a href="https://github.com/iqbqioza/nostrd/actions/workflows/ci.yml"><img src="https://github.com/iqbqioza/nostrd/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/iqbqioza/nostrd/actions/workflows/release.yml"><img src="https://github.com/iqbqioza/nostrd/actions/workflows/release.yml/badge.svg" alt="Release"></a>
+</p>
 
 > [!NOTE]
-> This project is maintained by an individual who also operates the public relay at **wss://relay.damustr.com**. If nostrd has been useful to you, a small sponsorship or tip would be a wonderful encouragement and helps keep the project going. For larger sponsorships, please reach out through the contact details on the [@iqbqioza](https://github.com/iqbqioza) profile.
+> This project is maintained by an individual in their spare time. If you'd like to show your support, please consider a tip via Lightning or Bitcoin.
+>
+> **Lightning address:** thanks@iqbqioza.com
+>
+> **Bitcoin:** 13LUTf5tBXAv2TyEiKHpg9kVWtgiYz3ZYs
+>
+> **Bitcoin (SegWit):** bc1qttlc8m9gsh24xxqys26gaz2mtgfzw7s7770am6
 
-A minimal, stable and fast [Nostr](https://github.com/nostr-protocol/nostr) relay server written in Rust.
+> [!TIP]
+> This project's relay is running live at **wss://relay.damustr.com**.
+
+**All in one Nostr relay server written in Rust. Blazing fast by Design. Lean by Nature. Powerful by Default.**
 
 nostrd is designed around two goals:
 
 - **Never go down.** Overload protection, a dedicated reader thread, panic containment and strict resource bounds keep the relay serving even under sustained abuse, a stalled disk or a memory-constrained host.
-- **Spec-complete.** All relay-side NIPs are implemented and verified against the official specifications (file-storage NIPs excluded by design).
+- **Spec-complete.** All relay-side NIPs are implemented and verified against the official specifications (file-storage NIPs excluded by design, except Blossom via the dedicated file server).
 
 ## Table of contents
 
@@ -29,6 +44,7 @@ nostrd is designed around two goals:
 - [Build](#build)
 - [Quick start](#quick-start)
 - [REST API](#rest-api)
+- [Blossom file server (media hosting)](#blossom-file-server-media-hosting)
 - [Commands](#commands)
 - [Configuration](#configuration)
   - [Anti-abuse limits](#anti-abuse-limits)
@@ -44,7 +60,7 @@ The detailed guides live in the [`docs/`](docs/) directory:
 
 | Document | Contents |
 | --- | --- |
-| [Manual](docs/MANUAL.md) | Installation, configuration, operation, NIP support, NIP-29 groups, LiveKit, logs and statistics |
+| [Manual](docs/MANUAL.md) | Installation, configuration, operation, NIP support, NIP-29 groups, LiveKit, the Blossom file server, logs and statistics |
 | [Configuration reference](docs/CONFIGURATION.md) | Every `nostrd.toml` option with its default and exact behavior, validation rules, SIGHUP reload, full example |
 | [HTTP REST API reference](docs/API.md) | `/api/v1` endpoints, query parameters, pagination, errors, status codes |
 | [Troubleshooting](docs/TROUBLESHOOTING.md) | Common errors and their step-by-step fixes |
@@ -53,6 +69,7 @@ The detailed guides live in the [`docs/`](docs/) directory:
 ## Features
 
 - **All relay-side NIPs implemented** — see the [NIP support](#nip-support) table.
+- **Blossom file server** — a media/blob store on its own hostname (like the API): uploads addressed by SHA-256, stored as `bucket/{npub1}/{file}` on local disk or in an S3-compatible bucket (AWS S3 / Cloudflare R2), with NIP-98-style kind-24242 auth, and an optional upload allowlist (`nostrd blossom allow/deny`, persisted in LMDB). Async storage I/O and an LMDB-persisted sha→owner mapping (no in-memory index) keep the relay's WebSocket path untouched.
 - **REST API** — a read-only HTTP API at `/api/v1/...` for querying events by `npub1`, `nevent1` or `naddr1`, with its own dedicated database reader thread and concurrency limiter so REST traffic can never stall WebSocket subscribers.
 - **LMDB persistence (via `heed`)** — durable, crash-safe storage; the memory map is a sparse virtual-address reservation opened at its configured ceiling, so it never needs a runtime resize (which would be unsafe with concurrent reader threads) and physical memory stays small.
 - **Overload protection** — the database queue is bounded; when it fills up, new requests fail fast instead of accumulating in memory. Writes that reach the queue always wait for their true outcome, so a queued event can never silently commit after the relay reported a false failure (which would skip its side-effects).
@@ -81,7 +98,7 @@ curl -fsSL -o install.sh https://raw.githubusercontent.com/iqbqioza/nostrd/main/
 chmod +x install.sh
 ./install.sh                       # latest release, into ~/.local/bin (no sudo needed)
 
-VERSION=v0.1.0-alpha-01 ./install.sh            # a specific release
+VERSION=v0.1.1 ./install.sh            # a specific release
 INSTALL_DIR=/usr/local/bin sudo ./install.sh    # system-wide (requires sudo)
 ./install.sh --force                            # overwrite without asking
 curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrd/main/install.sh | sh -s -- --force
@@ -180,6 +197,37 @@ By default the API is served on every host; set `server.api_host` (e.g. `api_hos
 
 **Full reference — endpoints, parameters, pagination, errors, status codes: [HTTP REST API reference](docs/API.md).**
 
+## Blossom file server (media hosting)
+
+nostrd doubles as a [Blossom](https://github.com/hzrd149/blossom) blob server on a dedicated hostname: clients upload files addressed by their SHA-256, and the relay serves them back — with `bucket/{npub1}/{file}` storage on local disk or in an S3-compatible bucket (AWS S3 / Cloudflare R2).
+
+```toml
+[blossom]
+host = "media.example.com"          # this Host header serves only the Blossom routes
+storage = "local"                   # "local" or "s3" (Cloudflare R2 is S3-compatible)
+local_path = "./data/images"        # <local_path>/<npub1...>/<sha256>
+# storage = "s3" + s3_endpoint / s3_region / s3_bucket / s3_access_key / s3_secret_key
+restrict_uploads = false            # true = only allow-listed pubkeys may upload
+```
+
+| Endpoint | Description |
+| --- | --- |
+| `GET /` | Blossom server info (on the Blossom host) |
+| `GET` / `HEAD` `/<sha256>[.ext]` | Fetch / probe a blob |
+| `PUT /upload` | Upload a blob (kind-24242 auth) |
+| `GET /list/<pubkey>` | Blobs uploaded by a pubkey |
+| `DELETE /<sha256>` | Delete a blob (uploader only) |
+
+The upload allowlist is managed in the relay database (LMDB), independent from the relay's own allow/deny lists:
+
+```sh
+nostrd blossom allow npub1...       # allow a pubkey to upload
+nostrd blossom deny npub1...        # revoke a pubkey
+nostrd blossom list
+```
+
+**Full guide: [Blossom chapter of the manual](docs/MANUAL.md#11-blossom-file-server-media-hosting).**
+
 ## Commands
 
 | Command | Description |
@@ -223,7 +271,7 @@ In addition to the tunables above, a few hard bounds are fixed to keep the relay
 
 ## NIP support
 
-All relay-side NIPs are implemented; client-side NIPs are stored and served as plain events but are deliberately **not** advertised in the NIP-11 document (per the spec). File-storage NIPs (34 git, 94 file metadata, 95/96 HTTP file storage) are excluded by design.
+All relay-side NIPs are implemented; client-side NIPs are stored and served as plain events but are deliberately **not** advertised in the NIP-11 document (per the spec). File-storage NIPs (34 git, 94 file metadata, 95/96 HTTP file storage) are excluded by design — except Blossom, which is provided by the dedicated [Blossom file server](#features).
 
 | NIP | Description |
 | --- | --- |
@@ -247,6 +295,7 @@ All relay-side NIPs are implemented; client-side NIPs are stored and served as p
 | [77](https://github.com/nostr-protocol/nips/blob/master/77.md) | Negentropy syncing (NEG-OPEN/MSG/CLOSE) |
 | [86](https://github.com/nostr-protocol/nips/blob/master/86.md) | Relay management API (JSON-RPC) |
 | [98](https://github.com/nostr-protocol/nips/blob/master/98.md) | HTTP auth (kind 27235) |
+| [Blossom](https://github.com/hzrd149/blossom) (BUD-01/02) | File server — SHA-256-addressed uploads (kind-24242 auth), served on the `[blossom]` hostname (see [above](#blossom-file-server-media-hosting)) |
 
 ## Architecture notes
 

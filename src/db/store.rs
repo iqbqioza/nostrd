@@ -12,6 +12,22 @@ use heed::{Database, Env, EnvOpenOptions};
 use tokio::sync::oneshot;
 
 use super::{PutOutcome, db_error};
+
+/// The relay pubkey access lists: (deny, allow), each a (pubkey, reason)
+/// pair. Shared by the CLI, the database layer and the access checks.
+pub(crate) type RelayPubkeyLists = (Vec<(String, String)>, Vec<(String, String)>);
+
+/// A blob's persisted metadata: the sha256 → owners mapping that lets
+/// Blossom resolve a hash without any in-memory index.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct BlossomMeta {
+    pub sha256: String,
+    pub size: u64,
+    pub mime: String,
+    pub uploaded: i64,
+    /// Uploaders' hex pubkeys, in upload order.
+    pub owners: Vec<String>,
+}
 use crate::config::DatabaseConfig;
 use crate::error::Result;
 use crate::event::Event;
@@ -30,6 +46,9 @@ pub(crate) const VANISH: &str = "vanish";
 pub(crate) const BANNED: &str = "banned";
 pub(crate) const FIRST_SEEN: &str = "first_seen";
 pub(crate) const ACCESS: &str = "access";
+/// sha256 → blob metadata (mime/size/uploaded/owners) plus the per-owner
+/// reverse index, persisted so Blossom lookups need no in-memory index.
+pub(crate) const BLOSSOM: &str = "blossom";
 pub(crate) const CREATED_LEN: usize = 8;
 pub(crate) const ID_LEN: usize = 32;
 pub(crate) const TAG_VALUE_MAX: usize = 1024;
@@ -203,6 +222,7 @@ pub(crate) struct Store {
     /// Serialized access control lists (NIP-86 runtime bans/allowlists), kept
     /// under a single fixed key so they survive restarts.
     pub(crate) access: Database<Bytes, Bytes>,
+    pub(crate) blossom: Database<Bytes, Bytes>,
     /// NIP-40 expiration handling is only active when the NIP is enabled.
     /// Shared with the relay so that a config reload can toggle it at runtime.
     pub(crate) expiry_enabled: Arc<std::sync::atomic::AtomicBool>,
@@ -269,7 +289,14 @@ impl Store {
         let banned = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(BANNED))?;
         let first_seen = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(FIRST_SEEN))?;
         let access = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(ACCESS))?;
+        let blossom = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(BLOSSOM))?;
         wtxn.commit()?;
+        log::info!(
+            "database ready at {} ({} tables, map {} MiB)",
+            cfg.path.display(),
+            14,
+            map_size / (1024 * 1024)
+        );
 
         Ok(Store {
             env,
@@ -286,6 +313,7 @@ impl Store {
             banned,
             first_seen,
             access,
+            blossom,
             expiry_enabled,
             max_indexed_words: max_indexed_words.max(1),
             map_max_size,
@@ -350,6 +378,7 @@ impl Store {
             banned: self.banned,
             first_seen: self.first_seen,
             access: self.access,
+            blossom: self.blossom,
             expiry_enabled: Arc::clone(&self.expiry_enabled),
             max_indexed_words: self.max_indexed_words,
             map_max_size: self.map_max_size,
@@ -375,6 +404,245 @@ impl Store {
         };
         Ok(Some(serde_json::from_slice(raw)?))
     }
+
+    /// Loads the persisted Blossom upload allowlist (empty when none).
+    /// The list is written by the CLI commands (`nostrd blossom allow/deny`),
+    /// which open the same environment from their own process.
+    pub(crate) fn load_blossom_allow(&self) -> Result<Vec<String>> {
+        let rtxn = self.env.read_txn()?;
+        let Some(raw) = self.access.get(&rtxn, b"blossom_allow")? else {
+            return Ok(Vec::new());
+        };
+        Ok(serde_json::from_slice(raw)?)
+    }
+
+    /// Persists a blob's metadata and adds an owner to it, atomically:
+    /// the `sha:<sha>` entry holds mime/size/uploaded/owners and each owner
+    /// gets a `own:<pubkey-hex>:<sha>` reverse key for `/list`.
+    pub(crate) fn add_blossom_mapping(
+        &self,
+        sha256: &str,
+        mime: &str,
+        size: u64,
+        uploaded: i64,
+        pubkey: &str,
+    ) -> Result<()> {
+        let mut wtxn = self.env.write_txn()?;
+        let key = format!("sha:{sha256}");
+        let existing: Option<BlossomMeta> = match self.blossom.get(&wtxn, key.as_bytes())? {
+            Some(raw) => serde_json::from_slice(raw).ok(),
+            None => None,
+        };
+        let mut meta = existing.unwrap_or_else(|| BlossomMeta {
+            sha256: sha256.to_string(),
+            size,
+            mime: mime.to_string(),
+            uploaded,
+            owners: Vec::new(),
+        });
+        if !meta.owners.iter().any(|o| o == pubkey) {
+            meta.owners.push(pubkey.to_string());
+        }
+        self.blossom
+            .put(&mut wtxn, key.as_bytes(), &serde_json::to_vec(&meta)?)?;
+        self.blossom
+            .put(&mut wtxn, format!("own:{pubkey}:{sha256}").as_bytes(), b"")?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Adds many owners to the mapping in one transaction (used by the
+    /// one-time automatic migration).
+    pub(crate) fn add_blossom_mappings(
+        &self,
+        entries: &[(String, String, u64, i64, String)],
+    ) -> Result<()> {
+        let mut wtxn = self.env.write_txn()?;
+        for (sha256, mime, size, uploaded, pubkey) in entries {
+            let key = format!("sha:{sha256}");
+            if let Some(raw) = self.blossom.get(&wtxn, key.as_bytes())? {
+                // Legacy multi-owner blobs appear once per npub directory:
+                // merge the owner into the existing mapping instead of
+                // dropping it.
+                if let Ok(meta) = serde_json::from_slice::<BlossomMeta>(raw)
+                    && !meta.owners.iter().any(|o| o == pubkey)
+                {
+                    let mut meta = meta;
+                    meta.owners.push(pubkey.clone());
+                    self.blossom
+                        .put(&mut wtxn, key.as_bytes(), &serde_json::to_vec(&meta)?)?;
+                    self.blossom.put(
+                        &mut wtxn,
+                        format!("own:{pubkey}:{sha256}").as_bytes(),
+                        b"",
+                    )?;
+                }
+                continue;
+            }
+            self.blossom.put(
+                &mut wtxn,
+                key.as_bytes(),
+                &serde_json::to_vec(&BlossomMeta {
+                    sha256: sha256.clone(),
+                    size: *size,
+                    mime: mime.clone(),
+                    uploaded: *uploaded,
+                    owners: vec![pubkey.clone()],
+                })?,
+            )?;
+            self.blossom
+                .put(&mut wtxn, format!("own:{pubkey}:{sha256}").as_bytes(), b"")?;
+        }
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Whether the one-time legacy migration already ran (marker key).
+    pub(crate) fn blossom_migration_done(&self) -> Result<bool> {
+        let rtxn = self.env.read_txn()?;
+        Ok(self.blossom.get(&rtxn, b"migrated")?.is_some())
+    }
+
+    /// Marks the one-time legacy migration as done.
+    pub(crate) fn mark_blossom_migration(&self) -> Result<()> {
+        let mut wtxn = self.env.write_txn()?;
+        self.blossom.put(&mut wtxn, b"migrated", b"")?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Loads a blob's metadata (None when unknown).
+    pub(crate) fn load_blossom_mapping(&self, sha256: &str) -> Result<Option<BlossomMeta>> {
+        let rtxn = self.env.read_txn()?;
+        let key = format!("sha:{sha256}");
+        let Some(raw) = self.blossom.get(&rtxn, key.as_bytes())? else {
+            return Ok(None);
+        };
+        Ok(serde_json::from_slice(raw).ok())
+    }
+
+    /// Removes one owner from a blob's metadata and its reverse key.
+    /// Returns whether the blob had this owner.
+    pub(crate) fn remove_blossom_owner(&self, sha256: &str, pubkey: &str) -> Result<bool> {
+        let mut wtxn = self.env.write_txn()?;
+        let key = format!("sha:{sha256}");
+        let Some(raw) = self.blossom.get(&wtxn, key.as_bytes())? else {
+            return Ok(false);
+        };
+        let Some(mut meta) = serde_json::from_slice::<BlossomMeta>(raw).ok() else {
+            return Ok(false);
+        };
+        let before = meta.owners.len();
+        meta.owners.retain(|o| o != pubkey);
+        if meta.owners.len() == before {
+            return Ok(false);
+        }
+        self.blossom
+            .delete(&mut wtxn, format!("own:{pubkey}:{sha256}").as_bytes())?;
+        self.blossom.delete(&mut wtxn, key.as_bytes())?;
+        if !meta.owners.is_empty() {
+            self.blossom
+                .put(&mut wtxn, key.as_bytes(), &serde_json::to_vec(&meta)?)?;
+        }
+        wtxn.commit()?;
+        Ok(true)
+    }
+
+    /// Every blob hash uploaded by a pubkey (hex), via the reverse index.
+    pub(crate) fn list_blossom_shas(&self, pubkey: &str) -> Result<Vec<String>> {
+        let rtxn = self.env.read_txn()?;
+        let prefix = format!("own:{pubkey}:");
+        let mut out = Vec::new();
+        let mut iter = self.blossom.prefix_iter(&rtxn, prefix.as_bytes())?;
+        while let Some((key, _)) = iter.next().transpose()? {
+            let key = String::from_utf8_lossy(key);
+            if let Some(sha) = key.strip_prefix(&prefix) {
+                out.push(sha.to_string());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Persists the relay pubkey access lists ((pubkey, reason) pairs for
+    /// the deny and allow lists) under a single fixed key, so the CLI
+    /// commands (`nostrd relay allow/deny`) and the running server share
+    /// one source of truth without touching the config file.
+    pub(crate) fn save_relay_pubkeys(
+        &self,
+        deny: &[(String, String)],
+        allow: &[(String, String)],
+    ) -> Result<()> {
+        let data = serde_json::to_vec(&serde_json::json!({ "deny": deny, "allow": allow }))?;
+        let mut wtxn = self.env.write_txn()?;
+        self.access.put(&mut wtxn, b"relay_pubkeys", &data)?;
+        wtxn.commit()?;
+        Ok(())
+    }
+
+    /// Loads the persisted relay pubkey access lists ((deny, allow)).
+    pub(crate) fn load_relay_pubkeys(&self) -> Result<RelayPubkeyLists> {
+        let rtxn = self.env.read_txn()?;
+        let Some(raw) = self.access.get(&rtxn, b"relay_pubkeys")? else {
+            return Ok((Vec::new(), Vec::new()));
+        };
+        let value: serde_json::Value = serde_json::from_slice(raw)?;
+        let deny = serde_json::from_value(value.get("deny").cloned().unwrap_or_default())?;
+        let allow = serde_json::from_value(value.get("allow").cloned().unwrap_or_default())?;
+        Ok((deny, allow))
+    }
+
+    /// One-time migration for databases written before the pubkey lists
+    /// moved out of the `access` blob: when the dedicated `relay_pubkeys`
+    /// key is absent but the old blob carries pubkey entries, copy them
+    /// over. Runs at startup and from the CLI commands, before any request
+    /// is served.
+    pub(crate) fn migrate_access_pubkeys(&self) -> Result<()> {
+        migrate_access_pubkeys(&self.env, &self.access)
+    }
+}
+
+/// Shared migration used by both the relay server (`Store`) and the CLI
+/// commands (`nostrd relay allow/deny`), which open the environment from
+/// their own process: without it, a CLI write before the first post-upgrade
+/// server start would silently skip the legacy entries.
+pub(crate) fn migrate_access_pubkeys(env: &Env, access: &Database<Bytes, Bytes>) -> Result<()> {
+    let rtxn = env.read_txn()?;
+    if access.get(&rtxn, b"relay_pubkeys")?.is_some() {
+        return Ok(());
+    }
+    let Some(raw) = access.get(&rtxn, b"access")? else {
+        return Ok(());
+    };
+    let value: serde_json::Value = serde_json::from_slice(raw)?;
+    let entries = |name: &str| -> Vec<(String, String)> {
+        value
+            .get(name)
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|v| match v {
+                        serde_json::Value::String(s) => Some((s.clone(), String::new())),
+                        serde_json::Value::Array(a) if a.len() >= 2 => Some((
+                            a[0].as_str().unwrap_or("").to_string(),
+                            a[1].as_str().unwrap_or("").to_string(),
+                        )),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let deny = entries("blocked_pubkeys");
+    let allow = entries("allowed_pubkeys");
+    if deny.is_empty() && allow.is_empty() {
+        return Ok(());
+    }
+    let data = serde_json::to_vec(&serde_json::json!({ "deny": deny, "allow": allow }))?;
+    let mut wtxn = env.write_txn()?;
+    access.put(&mut wtxn, b"relay_pubkeys", &data)?;
+    wtxn.commit()?;
+    Ok(())
 }
 
 // ----- key builders -----

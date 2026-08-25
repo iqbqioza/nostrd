@@ -189,7 +189,8 @@ fn utc_format(secs: u64) -> String {
 }
 
 /// Convert a day count since 1970-01-01 to a civil date (Gregorian).
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
+/// Made `pub(crate)` for the S3 client (SigV4 timestamps).
+pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
