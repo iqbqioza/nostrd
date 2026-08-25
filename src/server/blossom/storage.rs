@@ -147,7 +147,19 @@ impl BlobStore {
             Storage::S3(s) => s.scan_legacy().await?,
         };
         let count = entries.len();
-        self.db.blossom_add_mappings(entries).await;
+        // The writes are chunked: a legacy store with hundreds of
+        // thousands of blobs must not hold one giant LMDB write
+        // transaction (which would block the relay's event writes for the
+        // whole duration of the migration).
+        for chunk in entries.chunks(5000) {
+            if !self.db.blossom_add_mappings(chunk.to_vec()).await {
+                // The marker is not set: the migration retries on the next
+                // startup (the failed chunk may need a bigger map).
+                return Err(crate::error::Error::Other(
+                    "blossom migration write failed; will retry on the next start".into(),
+                ));
+            }
+        }
         self.db.mark_blossom_migration().await;
         Ok(count)
     }

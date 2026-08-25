@@ -661,10 +661,16 @@ pub(crate) fn spawn(
                                     let _ = reply.send(removed);
                                 }
                                 Msg::BlossomAddMappings { entries, reply } => {
-                                    if let Err(e) = store.add_blossom_mappings(&entries) {
-                                        db_error(&thread_errors, &e);
+                                    let ok = store.add_blossom_mappings(&entries).is_ok();
+                                    if !ok {
+                                        db_error(
+                                            &thread_errors,
+                                            &crate::error::Error::Other(
+                                                "blossom migration batch failed".into(),
+                                            ),
+                                        );
                                     }
-                                    let _ = reply.send(());
+                                    let _ = reply.send(ok);
                                 }
                                 Msg::BlossomMarkMigration { reply } => {
                                     if let Err(e) = store.mark_blossom_migration() {

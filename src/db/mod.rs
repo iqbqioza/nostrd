@@ -202,10 +202,11 @@ enum Msg {
         pubkey: String,
         reply: oneshot::Sender<Vec<String>>,
     },
-    /// Adds many Blossom mappings in one transaction (auto-migration).
+    /// Adds many Blossom mappings in one transaction (auto-migration);
+    /// the reply carries whether the commit succeeded.
     BlossomAddMappings {
         entries: Vec<(String, String, u64, i64, String)>,
-        reply: oneshot::Sender<()>,
+        reply: oneshot::Sender<bool>,
     },
     /// Whether the one-time legacy migration already ran.
     BlossomMigrationDone {
@@ -733,10 +734,13 @@ impl DbClient {
     }
 
     /// Adds many Blossom mappings in one transaction (auto-migration).
-    pub async fn blossom_add_mappings(&self, entries: Vec<(String, String, u64, i64, String)>) {
-        let _ = self
-            .request_write(|reply| Msg::BlossomAddMappings { entries, reply })
-            .await;
+    /// Returns whether the commit succeeded.
+    pub async fn blossom_add_mappings(
+        &self,
+        entries: Vec<(String, String, u64, i64, String)>,
+    ) -> bool {
+        self.request_write(|reply| Msg::BlossomAddMappings { entries, reply })
+            .await
     }
 
     /// Whether the one-time legacy migration already ran.
