@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path as AxPath, State};
+use axum::extract::{DefaultBodyLimit, Path as AxPath, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, put};
@@ -204,8 +204,11 @@ async fn verify_auth(
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Nostr "))?;
-    let raw = base64::engine::general_purpose::STANDARD
+    // BUD-11: the token is Base64url without padding. Accept both the
+    // spec encoding and the padded standard variant for leniency.
+    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(encoded)
+        .or_else(|_| base64::engine::general_purpose::STANDARD.decode(encoded))
         .ok()?;
     let event: crate::event::Event = serde_json::from_slice(&raw).ok()?;
     if event.kind != 24242 {
@@ -356,11 +359,18 @@ async fn upload(State(relay): State<Arc<Relay>>, headers: HeaderMap, body: Bytes
         use sha2::{Digest, Sha256};
         hex::encode(Sha256::digest(&body))
     };
+    // BUD-02: 201 for a newly stored blob, 200 when it already exists.
+    let existed = state.store.find(&sha).await.is_some();
     match state.store.put(&pubkey, &sha, &body, &mime).await {
         Ok(desc) => {
             let url = format!("https://{}/{sha}{}", state.host, ext_of(&desc.mime));
+            let status = if existed {
+                StatusCode::OK
+            } else {
+                StatusCode::CREATED
+            };
             (
-                StatusCode::CREATED,
+                status,
                 [(axum::http::header::CONTENT_TYPE, "application/json")],
                 serde_json::to_string(&json!({
                     "sha256": desc.sha256,
@@ -380,15 +390,38 @@ async fn upload(State(relay): State<Arc<Relay>>, headers: HeaderMap, body: Bytes
     }
 }
 
-/// `GET /list/<pubkey>` — blobs uploaded by a pubkey (hex).
-async fn list(State(relay): State<Arc<Relay>>, AxPath(pubkey): AxPath<String>) -> Response {
+/// `GET /list/<pubkey>` — blobs uploaded by a pubkey (hex), sorted by
+/// `uploaded` descending, with BUD-12 cursor-based pagination
+/// (`cursor` = the sha256 of the last entry of the previous page,
+/// `limit` = the maximum number of results).
+async fn list(
+    State(relay): State<Arc<Relay>>,
+    AxPath(pubkey): AxPath<String>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Response {
     let Some(state) = state_of(&relay).await else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "blossom not initialized");
     };
     if !is_pubkey(&pubkey) {
         return error(StatusCode::BAD_REQUEST, "invalid pubkey");
     }
-    let blobs = state.store.list(&pubkey).await;
+    let cursor = params
+        .get("cursor")
+        .map(String::as_str)
+        .filter(|c| is_pubkey(c));
+    let limit = params.get("limit").and_then(|v| v.parse::<usize>().ok());
+    let mut blobs = state.store.list(&pubkey).await;
+    // BUD-12: sorted by `uploaded` descending; the page starts after the
+    // cursor and never includes it.
+    blobs.sort_by_key(|d| std::cmp::Reverse(d.uploaded));
+    if let Some(cursor) = cursor
+        && let Some(pos) = blobs.iter().position(|d| d.sha256 == cursor)
+    {
+        blobs.drain(..=pos);
+    }
+    if let Some(limit) = limit {
+        blobs.truncate(limit);
+    }
     let items: Vec<Value> = blobs
         .into_iter()
         .map(|d| {

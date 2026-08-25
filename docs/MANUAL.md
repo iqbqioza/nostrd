@@ -485,8 +485,11 @@ Both backends use the `bucket/{npub1xxx}/{file}` hierarchy: every upload is stor
 | `GET` | `/` | — | Blossom server info |
 | `GET` / `HEAD` | `/<sha256>[.ext]` | — | Fetch / probe a blob (`.ext` is advisory) |
 | `PUT` | `/upload` | kind 24242 (`t=upload`) | Upload a blob; returns 201 + the descriptor |
-| `GET` | `/list/<pubkey>` | — | Blobs uploaded by a pubkey (hex) |
+| `GET` | `/list/<pubkey>` | — | Blobs uploaded by a pubkey (hex), sorted by `uploaded` descending; supports `cursor` (the sha256 of the last entry of the previous page) and `limit` |
 | `DELETE` | `/<sha256>` | kind 24242 (`t=delete`, `x=<sha256>`) | Delete a blob (uploader only) |
+
+- `PUT /upload` returns **201** when the blob was newly stored and **200** when it already exists (BUD-02).
+- Authorization tokens are accepted in the spec's **Base64url (no padding)** form and in the padded standard form (BUD-11).
 
 Uploads and deletes authenticate with a Nostr auth event (kind 24242, `server` tag naming the Blossom host), sent as `Authorization: Nostr <base64>`.
 
