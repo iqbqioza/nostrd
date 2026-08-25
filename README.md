@@ -1,7 +1,13 @@
 # nostrd
 
-[![CI](https://github.com/iqbqioza/nostrd/actions/workflows/ci.yml/badge.svg)](https://github.com/iqbqioza/nostrd/actions/workflows/ci.yml)
-[![Release](https://github.com/iqbqioza/nostrd/actions/workflows/release.yml/badge.svg)](https://github.com/iqbqioza/nostrd/actions/workflows/release.yml)
+<p align="center">
+  <img src="docs/images/nostrd-banner.png" alt="nostrd — a minimal and stable Nostr relay server" width="100%">
+</p>
+
+<p align="center">
+  <a href="https://github.com/iqbqioza/nostrd/actions/workflows/ci.yml"><img src="https://github.com/iqbqioza/nostrd/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/iqbqioza/nostrd/actions/workflows/release.yml"><img src="https://github.com/iqbqioza/nostrd/actions/workflows/release.yml/badge.svg" alt="Release"></a>
+</p>
 
 > [!NOTE]
 > This project is maintained by an individual who also operates the public relay at **wss://relay.damustr.com**. If nostrd has been useful to you, a small sponsorship or tip would be a wonderful encouragement and helps keep the project going. For larger sponsorships, please reach out through the contact details on the [@iqbqioza](https://github.com/iqbqioza) profile.
