@@ -103,9 +103,17 @@ fn add_cors_headers(headers: &mut HeaderMap) {
 /// Binds a TCP listener on `addr` and logs the given label with the
 /// address, turning a bind failure into a configuration error.
 async fn bind_listener(addr: &(String, u16), label: &str) -> Result<TcpListener> {
-    let listener = TcpListener::bind(addr)
-        .await
-        .map_err(|e| Error::Config(format!("cannot bind to {}:{}: {e}", addr.0, addr.1)))?;
+    let listener = match TcpListener::bind(addr).await {
+        Ok(listener) => listener,
+        // Log through the logger too: in daemon mode the process stderr
+        // goes to /dev/null, so a bind failure (e.g. the port is already
+        // in use by another instance) would otherwise be invisible.
+        Err(e) => {
+            let msg = format!("cannot bind to {}:{}: {e}", addr.0, addr.1);
+            log::error!("{msg}");
+            return Err(Error::Config(msg));
+        }
+    };
     info!("{label}{}:{}", addr.0, addr.1);
     Ok(listener)
 }

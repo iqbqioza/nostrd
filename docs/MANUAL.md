@@ -15,6 +15,7 @@ This manual explains every feature of **nostrd**, a Nostr relay server, step by 
 9. [NIP-29 Groups](#9-nip-29-groups)
 10. [LiveKit (Audio/Video Rooms)](#10-livekit-audiovideo-rooms)
 11. [Blossom File Server (Media Hosting)](#11-blossom-file-server-media-hosting)
+11b. [Running Multiple Instances](#11b-running-multiple-instances)
 12. [Logs and Statistics](#12-logs-and-statistics)
 13. [Reloading Configuration (SIGHUP)](#13-reloading-configuration-sighup)
 14. [When You Are Stuck](#14-when-you-are-stuck)
@@ -543,6 +544,47 @@ Uploads from unlisted pubkeys are rejected with `403`. The list survives restart
 - **All database upgrades are automatic**: every LMDB table is opened-or-created at startup (instant, non-destructive), and the one-time data migrations (access lists, Blossom mapping) run by themselves — see [CONFIGURATION.md](CONFIGURATION.md#upgrades-are-automatic-and-instant).
 
 ---
+
+## 11b. Running Multiple Instances
+
+nostrd supports several independent relays on one server (different ports). Each instance needs its **own**:
+
+- `server.port` — the listen port
+- `[daemon] pid_file` / `log_file` / `stats_file` — **shared values make the second instance refuse to start with `already running`**
+- `database.path` — an independent database per instance
+- `api_host` / `blossom.host` — a distinct hostname per instance when the host split is used
+
+Example:
+
+```toml
+# /etc/nostrd/a.toml — instance A
+[server]
+port = 8080
+
+[database]
+path = "/var/lib/nostrd-a"
+
+[daemon]
+pid_file = "/var/run/nostrd-a.pid"
+log_file = "/var/log/nostrd-a.log"
+stats_file = "/var/lib/nostrd-a/stats.json"
+```
+
+```toml
+# /etc/nostrd/b.toml — instance B
+[server]
+port = 8081
+
+[database]
+path = "/var/lib/nostrd-b"
+
+[daemon]
+pid_file = "/var/run/nostrd-b.pid"
+log_file = "/var/log/nostrd-b.log"
+stats_file = "/var/lib/nostrd-b/stats.json"
+```
+
+Each instance is managed with its own config: `nostrd --config /etc/nostrd/a.toml start` etc.
 
 ## 12. Logs and Statistics
 
