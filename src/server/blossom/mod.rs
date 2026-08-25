@@ -173,7 +173,7 @@ fn auth_server_host(server: &str) -> String {
 /// well-formed `type/subtype` token pair. Anything else falls back to
 /// `application/octet-stream`, so a hostile header can never reach a
 /// response header (which would make the response builder panic).
-fn sanitize_mime(raw: &str) -> String {
+pub(crate) fn sanitize_mime(raw: &str) -> String {
     let media = raw
         .split(';')
         .next()

@@ -166,7 +166,7 @@ impl BlobStore {
 }
 
 /// Derives the uploader's hex pubkey from an npub directory name.
-/// Shared with the CLI migration (`nostrd blossom migrate`).
+/// Shared with the automatic legacy migration.
 pub(crate) fn npub_from_dir(dir: &Path) -> std::result::Result<String, ()> {
     let name = dir.file_name().and_then(|n| n.to_str()).ok_or(())?;
     if let Ok(crate::nips::nip19::Nip19Entity::Pubkey(pk)) = crate::nips::nip19::parse_nip19(name) {
@@ -263,7 +263,7 @@ impl LocalStore {
                 {
                     out.push((
                         sha.to_string(),
-                        meta["mime"].as_str().unwrap_or("").to_string(),
+                        crate::server::blossom::sanitize_mime(meta["mime"].as_str().unwrap_or("")),
                         meta["size"].as_u64().unwrap_or(0),
                         meta["uploaded"].as_i64().unwrap_or(0),
                         pubkey.clone(),
@@ -419,7 +419,7 @@ impl S3Store {
             {
                 out.push((
                     sha.to_string(),
-                    meta["mime"].as_str().unwrap_or("").to_string(),
+                    crate::server::blossom::sanitize_mime(meta["mime"].as_str().unwrap_or("")),
                     meta["size"].as_u64().unwrap_or(0),
                     meta["uploaded"].as_i64().unwrap_or(0),
                     pubkey,
