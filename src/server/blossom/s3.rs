@@ -204,9 +204,10 @@ impl S3Client {
         Ok(status.is_success() || status == reqwest::StatusCode::NOT_FOUND)
     }
 
-    /// `ListObjectsV2` for a prefix; returns the object keys. Used by the
-    /// one-time migration (`nostrd blossom migrate`).
-    pub(crate) async fn list_keys(&self, prefix: &str) -> Result<Vec<String>> {
+    /// `ListObjectsV2` for a prefix; returns (key, size). Used by the
+    /// one-time automatic migration, which needs the blob sizes without
+    /// downloading the objects.
+    pub(crate) async fn list_keys(&self, prefix: &str) -> Result<Vec<(String, u64)>> {
         let mut keys = Vec::new();
         let mut token = String::new();
         loop {
@@ -233,7 +234,8 @@ impl S3Client {
                 let block = &block[..end];
                 let key = extract_tag(block, "Key");
                 if !key.is_empty() {
-                    keys.push(key.to_string());
+                    let size = extract_tag(block, "Size").trim().parse().unwrap_or(0);
+                    keys.push((key.to_string(), size));
                 }
             }
             token = extract_tag(&xml, "NextContinuationToken")

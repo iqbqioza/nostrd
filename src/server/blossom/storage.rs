@@ -237,8 +237,8 @@ impl LocalStore {
     async fn scan_legacy(&self) -> Result<Vec<(String, String, u64, i64, String)>> {
         let mut out = Vec::new();
         // Metas take precedence: a sha found via its meta is not derived
-        // again from the raw blob.
-        let mut via_meta: Vec<String> = Vec::new();
+        // again from the raw blob. A set keeps this O(n) for big stores.
+        let mut via_meta: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut dirs = tokio::fs::read_dir(&self.root).await?;
         while let Some(entry) = dirs.next_entry().await? {
             let dir = entry.path();
@@ -268,7 +268,7 @@ impl LocalStore {
                         meta["uploaded"].as_i64().unwrap_or(0),
                         pubkey.clone(),
                     ));
-                    via_meta.push(sha.to_string());
+                    via_meta.insert(sha.to_string());
                 }
             }
             // Pass 2: blobs without a meta (written after the metadata
@@ -368,19 +368,14 @@ impl S3Store {
     /// for the legacy migration.
     async fn scan_legacy(&self) -> Result<Vec<(String, String, u64, i64, String)>> {
         let keys = self.client.list_keys("").await?;
+        // Only the legacy meta objects are fetched (small): the sizes of
+        // the blob objects come straight from the listing, so a bucket
+        // with many blobs is not downloaded during the migration.
+        let mut out = Vec::new();
+        let mut via_meta: std::collections::HashSet<String> = std::collections::HashSet::new();
         let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
         let mut tasks = tokio::task::JoinSet::new();
-        for key in keys {
-            let client = self.client.clone();
-            let semaphore = std::sync::Arc::clone(&semaphore);
-            tasks.spawn(async move {
-                let _permit = semaphore.acquire().await;
-                let raw = client.get_object(&key).await;
-                (key, raw)
-            });
-        }
-        let mut out = Vec::new();
-        while let Some(Ok((key, raw))) = tasks.join_next().await {
+        for (key, size) in keys {
             let (npub, file) = match key.split_once('/') {
                 Some((n, f)) => (n, f),
                 None => continue,
@@ -389,35 +384,50 @@ impl S3Store {
                 continue;
             };
             if let Some(sha) = file.strip_suffix(".meta.json") {
-                // Legacy meta objects carry the full descriptor.
-                if let Ok(Some(raw)) = raw
-                    && let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&raw)
-                {
-                    out.push((
-                        sha.to_string(),
-                        meta["mime"].as_str().unwrap_or("").to_string(),
-                        meta["size"].as_u64().unwrap_or(0),
-                        meta["uploaded"].as_i64().unwrap_or(0),
-                        pubkey,
-                    ));
-                }
+                via_meta.insert(sha.to_string());
+                let client = self.client.clone();
+                let semaphore = std::sync::Arc::clone(&semaphore);
+                tasks.spawn(async move {
+                    let _permit = semaphore.acquire().await;
+                    let raw = client.get_object(&key).await;
+                    (key, pubkey, raw)
+                });
                 continue;
             }
-            // Blobs without a meta (metadata moved to LMDB): the size is
-            // read from the object; mime falls back to octet-stream.
-            if file.len() != 64 || hex::decode(file).is_err() {
-                continue;
-            }
-            if let Ok(Some(raw)) = raw {
+            // Blobs without a meta (metadata moved to LMDB): the size
+            // comes from the listing; mime falls back to octet-stream.
+            if file.len() == 64 && hex::decode(file).is_ok() {
                 out.push((
                     file.to_string(),
                     "application/octet-stream".to_string(),
-                    raw.len() as u64,
+                    size,
                     0,
                     pubkey,
                 ));
             }
         }
+        while let Some(Ok((key, pubkey, raw))) = tasks.join_next().await {
+            let Some(sha) = key
+                .strip_suffix(".meta.json")
+                .and_then(|k| k.split_once('/'))
+                .map(|(_, f)| f)
+            else {
+                continue;
+            };
+            if let Ok(Some(raw)) = raw
+                && let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&raw)
+            {
+                out.push((
+                    sha.to_string(),
+                    meta["mime"].as_str().unwrap_or("").to_string(),
+                    meta["size"].as_u64().unwrap_or(0),
+                    meta["uploaded"].as_i64().unwrap_or(0),
+                    pubkey,
+                ));
+            }
+        }
+        // The derived entries must not duplicate meta-backed ones.
+        out.retain(|(sha, _, _, _, _)| !via_meta.contains(sha));
         Ok(out)
     }
 }
@@ -540,6 +550,42 @@ mod tests {
         assert_eq!(s.list(&pk(1)).await.len(), 2);
         assert_eq!(s.list(&pk(2)).await.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn auto_migration_merges_multi_owner_blobs() {
+        let (db, db_path) = db("mig2").await;
+        let dir =
+            std::env::temp_dir().join(format!("nostrd-blossom-test-mig2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // レガシー: 同一 blob が 2 つの npub ディレクトリに存在（メタあり）
+        let sha = "dd".repeat(32);
+        for pk in [pk(1), pk(2)] {
+            let npub = npub_of(&pk);
+            let npub_dir = dir.join(&npub);
+            std::fs::create_dir_all(&npub_dir).unwrap();
+            std::fs::write(npub_dir.join(&sha), b"x").unwrap();
+            std::fs::write(
+                npub_dir.join(format!("{sha}.meta.json")),
+                br#"{"sha256":"dddd","size":1,"mime":"image/png","uploaded":1787000000}"#,
+            )
+            .unwrap();
+        }
+        let s = BlobStore::new("local", &dir, None, db).await.unwrap();
+        let migrated = s.auto_migrate_legacy().await.unwrap();
+        assert_eq!(migrated, 2, "both owners are mapped");
+        assert!(s.has(&pk(1), &sha).await);
+        assert!(
+            s.has(&pk(2), &sha).await,
+            "second owner survives the migration"
+        );
+        assert_eq!(s.list(&pk(1)).await.len(), 1);
+        assert_eq!(s.list(&pk(2)).await.len(), 1);
+        // 一人削除してももう一人は残る
+        assert!(s.delete(&pk(1), &sha).await.unwrap());
+        assert!(s.find(&sha).await.is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = db_path;
     }
 
     #[test]

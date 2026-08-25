@@ -460,7 +460,23 @@ impl Store {
         let mut wtxn = self.env.write_txn()?;
         for (sha256, mime, size, uploaded, pubkey) in entries {
             let key = format!("sha:{sha256}");
-            if self.blossom.get(&wtxn, key.as_bytes())?.is_some() {
+            if let Some(raw) = self.blossom.get(&wtxn, key.as_bytes())? {
+                // Legacy multi-owner blobs appear once per npub directory:
+                // merge the owner into the existing mapping instead of
+                // dropping it.
+                if let Ok(meta) = serde_json::from_slice::<BlossomMeta>(raw)
+                    && !meta.owners.iter().any(|o| o == pubkey)
+                {
+                    let mut meta = meta;
+                    meta.owners.push(pubkey.clone());
+                    self.blossom
+                        .put(&mut wtxn, key.as_bytes(), &serde_json::to_vec(&meta)?)?;
+                    self.blossom.put(
+                        &mut wtxn,
+                        format!("own:{pubkey}:{sha256}").as_bytes(),
+                        b"",
+                    )?;
+                }
                 continue;
             }
             self.blossom.put(
