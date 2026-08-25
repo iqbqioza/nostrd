@@ -191,7 +191,7 @@ To generate a secret key, use the `nostrd genkey` command (see [5. Command Refer
 | `allowed_kinds` | Kind allowlist. When non-empty, only these kinds are accepted |
 | `blocked_ips` | IP addresses to refuse connections from |
 
-> **Note**: The pubkey allow/deny lists are **not** config keys — they live in the relay database and are managed with `nostrd relay allow/deny` (see [Section 7](#7-nip-86-management-api) / the blossom-style CLI). A denied pubkey is always rejected, even with `restrict_relay = false`.
+> **Note**: The pubkey allow/deny lists are **not** config keys — they live in the relay database and are managed with `nostrd relay allow/deny` (see [Section 7](#7-nip-86-management-api) / the blossom-style CLI). A denied pubkey is always rejected when **publishing**, even with `restrict_relay = false`. **Reading is never restricted**: querying, subscribing and the REST API stay open to everyone.
 
 ---
 

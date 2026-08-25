@@ -406,6 +406,7 @@ nostrd relay list                # show both lists and restrict_relay
 
 - `restrict_relay = true`: **only** the pubkeys on the allow list may publish (everyone else is rejected with `blocked: pubkey not allowed`).
 - `restrict_relay = false` (default): everyone may publish **except** the denied pubkeys — a denied entry always wins, with or without `restrict_relay`.
+- **The restriction is write-only**: reading is never limited — any client may query/subscribe, fetch via the REST API and browse the NIP-11 document, regardless of the allow/deny lists.
 - Each `allow`/`deny` writes the database and reloads the running daemon (SIGHUP), so the change applies immediately. NIP-86 (`banpubkey`/`allowpubkey`/...) manages the same lists.
 - Databases from older versions are migrated once at startup: pubkey entries that used to live in the config/`access` blob are copied into the dedicated database key.
 
