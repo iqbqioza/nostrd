@@ -612,6 +612,90 @@ fn nip28_channel_queries_use_e_tag_index() {
 }
 
 #[test]
+fn nip22_comments_are_stored_and_served() {
+    // NIP-22 (kind 1111) comments are regular events: stored like any other
+    // kind and served through the `#e` threading index (the lowercase parent
+    // tags) as well as through the single-letter root-scope tags (`E`, `K`).
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let root = event(1, "root", now, vec![vec!["t".into(), "discussion".into()]]);
+        assert_eq!(db.put(root.clone(), now).await, PutOutcome::Stored);
+        let comment = event(
+            1111,
+            "great note",
+            now - 1,
+            vec![
+                vec!["E".into(), root.id.clone()],
+                vec!["K".into(), "1".into()],
+                vec!["P".into(), root.pubkey.clone()],
+                vec!["e".into(), root.id.clone()],
+                vec!["k".into(), "1".into()],
+                vec!["p".into(), root.pubkey.clone()],
+            ],
+        );
+        assert_eq!(db.put(comment.clone(), now).await, PutOutcome::Stored);
+        let reply = event(
+            1111,
+            "and this is a reply",
+            now - 2,
+            vec![
+                vec!["E".into(), root.id.clone()],
+                vec!["K".into(), "1".into()],
+                vec!["e".into(), comment.id.clone()],
+                vec!["k".into(), "1111".into()],
+                vec!["p".into(), comment.pubkey.clone()],
+            ],
+        );
+        assert_eq!(db.put(reply.clone(), now).await, PutOutcome::Stored);
+
+        let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [1111]})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 2, "comments are served by their kind");
+
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"kinds": [1111], "#e": [root.id]})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(
+            res.len(),
+            1,
+            "only the direct comment threads to the root via #e"
+        );
+        let f: Filter = serde_json::from_value(serde_json::json!({
+            "kinds": [1111], "#e": [comment.id]
+        }))
+        .unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 1, "the reply threads to the comment via #e");
+
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"kinds": [1111], "#E": [root.id]})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 2, "root-scope E tags are indexed");
+        let f: Filter = serde_json::from_value(serde_json::json!({"#K": ["1"]})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 2, "root-scope K tags are indexed");
+
+        let f: Filter = serde_json::from_value(serde_json::json!({
+            "kinds": [1111], "authors": [root.pubkey]
+        }))
+        .unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 2, "comments are served by author");
+    });
+}
+
+#[test]
 fn overlong_index_components_do_not_poison_the_batch() {
     // LMDB rejects keys >= 512 bytes with MDB_BAD_VALSIZE. A tag value or
     // content word long enough to produce such a key used to abort the whole

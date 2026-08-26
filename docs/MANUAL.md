@@ -30,7 +30,7 @@ Key features:
 
 - **Simple and stable**: written in Rust; a single binary does everything
 - **Fast storage and search**: LMDB database with a full-text search index
-- **Broad NIP support**: 20 NIPs implemented (plus the Blossom file server), including deletion, proof-of-work, delegation, groups, search, and a management API
+- **Broad NIP support**: 21 NIPs implemented (plus the Blossom file server), including deletion, proof-of-work, delegation, groups, search, and a management API
 - **Easy to operate**: daemon mode, log rotation, hot configuration reload, statistics output, a REST API, and Prometheus metrics
 
 ---
@@ -366,6 +366,7 @@ If `server.management_port` is set, the legacy REST endpoints are available at `
 | 9 | Event deletion |
 | 11 | Relay information document |
 | 13 | Proof of work |
+| 22 | Comments (kind 1111, threaded via the `#e` index) |
 | 26 | Delegated event signing |
 | 28 | Public chat |
 | 29 | Relay-based groups |
