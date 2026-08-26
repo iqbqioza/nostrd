@@ -696,6 +696,65 @@ fn nip22_comments_are_stored_and_served() {
 }
 
 #[test]
+fn nip_a3_payto_targets_are_replaceable() {
+    // NIP-A3 (kind 10133) payment targets are replaceable events: the latest
+    // per pubkey wins, and the multi-letter `payto` tag is queryable through
+    // the full-scan fallback (single-letter tags are the only indexed ones).
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let v1 = event(
+            10133,
+            "",
+            now - 1,
+            vec![
+                vec!["payto".into(), "bitcoin".into(), "bc1q...".into()],
+                vec![
+                    "payto".into(),
+                    "lightning".into(),
+                    "user@example.com".into(),
+                ],
+            ],
+        );
+        assert_eq!(db.put(v1.clone(), now).await, PutOutcome::Stored);
+        // A newer event by the same author replaces the previous one.
+        let v2 = event(
+            10133,
+            "",
+            now,
+            vec![vec!["payto".into(), "nano".into(), "nano_...".into()]],
+        );
+        assert_eq!(db.put(v2.clone(), now).await, PutOutcome::Replaced);
+
+        let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [10133]})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 1, "only the latest payment target event is kept");
+        assert_eq!(res[0].id, v2.id);
+
+        let f: Filter = serde_json::from_value(serde_json::json!({"#payto": ["bitcoin"]})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert!(res.is_empty(), "replaced payto values are gone");
+        let f: Filter = serde_json::from_value(serde_json::json!({"#payto": ["nano"]})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(
+            res.len(),
+            1,
+            "multi-letter payto tags match via the full scan"
+        );
+    });
+}
+
+#[test]
 fn overlong_index_components_do_not_poison_the_batch() {
     // LMDB rejects keys >= 512 bytes with MDB_BAD_VALSIZE. A tag value or
     // content word long enough to produce such a key used to abort the whole
