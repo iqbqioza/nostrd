@@ -354,4 +354,9 @@ src/
 
 ## License
 
-MIT
+This project is licensed under the [MIT License](LICENSE).
+
+Copyright (c) 2026 iqbqioza
+
+You are free to use, copy, modify, merge, publish, distribute, sublicense and
+sell copies of the software, subject to the license terms.
