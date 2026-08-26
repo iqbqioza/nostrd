@@ -296,6 +296,7 @@ All relay-side NIPs are implemented; client-side NIPs are stored and served as p
 | [77](https://github.com/nostr-protocol/nips/blob/master/77.md) | Negentropy syncing (NEG-OPEN/MSG/CLOSE) |
 | [86](https://github.com/nostr-protocol/nips/blob/master/86.md) | Relay management API (JSON-RPC) |
 | [98](https://github.com/nostr-protocol/nips/blob/master/98.md) | HTTP auth (kind 27235) |
+| [A3](https://github.com/nostr-protocol/nips/blob/master/A3.md) | Payment targets (kind 10133, replaceable — the latest per pubkey is kept; `payto` tags are queryable via the full scan) |
 | [Blossom](https://github.com/hzrd149/blossom) (BUD-01/02) | File server — SHA-256-addressed uploads (kind-24242 auth), served on the `[blossom]` hostname (see [above](#blossom-file-server-media-hosting)) |
 
 ## Architecture notes
