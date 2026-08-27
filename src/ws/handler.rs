@@ -85,9 +85,109 @@ impl super::Conn {
     /// Queues an already-parsed event for batched acceptance.
     pub(crate) async fn queue_event_value(&mut self, event: Event) {
         self.relay.stats.bump(&self.relay.stats.events_received, 1);
+        // Path-specific write policy (nostrd): `/inbox` and `/outbox` are
+        // restricted endpoints — see `write_policy_reason`.
+        if let Some(reason) = self.write_policy_reason(&event).await {
+            self.send_ok(&event.id, false, &reason);
+            return;
+        }
         self.pending_events.push(event);
         if self.pending_events.len() >= EVENT_BATCH {
             self.flush_pending_events().await;
+        }
+    }
+
+    /// The write policy of the endpoint this connection is on:
+    /// `/outbox` accepts only events authored by the NIP-42-authenticated
+    /// pubkey of this connection (`server.outbox_write_policy = "any"`) or
+    /// only events authored by the relay's own pubkey (`"relay"`); `/inbox`
+    /// accepts only events carrying a `p` tag — any recipient
+    /// (`server.inbox_write_policy = "any"`) or the relay itself
+    /// (`"relay"`). Every other path is unrestricted.
+    pub(crate) async fn write_policy_reason(&self, event: &Event) -> Option<String> {
+        // Clone the connection data so the future does not hold `&self`
+        // across the config await (the connection task's future must be
+        // `Send`).
+        let path = self.path.clone();
+        let authed = self.authed_pubkeys.clone();
+        let relay = self.relay.clone();
+        match path.as_str() {
+            "/outbox" => {
+                let policy = relay
+                    .config
+                    .read()
+                    .await
+                    .server
+                    .outbox_write_policy
+                    .trim()
+                    .to_string();
+                match policy.as_str() {
+                    "relay" => {
+                        let Some(relay_pk) = relay.relay_pubkey() else {
+                            return Some(
+                                "restricted: the relay has no identity key for /outbox writes"
+                                    .into(),
+                            );
+                        };
+                        if event.pubkey != relay_pk {
+                            return Some(
+                                "restricted: /outbox accepts only events authored by the relay"
+                                    .into(),
+                            );
+                        }
+                        None
+                    }
+                    _ => {
+                        if !authed.contains(&event.pubkey) {
+                            return Some(
+                                "restricted: /outbox accepts only your own NIP-42-authenticated events"
+                                    .into(),
+                            );
+                        }
+                        None
+                    }
+                }
+            }
+            "/inbox" => {
+                let policy = relay
+                    .config
+                    .read()
+                    .await
+                    .server
+                    .inbox_write_policy
+                    .trim()
+                    .to_string();
+                let relay_pk = relay.relay_pubkey();
+                match policy.as_str() {
+                    "relay" => {
+                        let Some(relay_pk) = relay_pk else {
+                            return Some(
+                                "restricted: the relay has no identity key for /inbox writes"
+                                    .into(),
+                            );
+                        };
+                        let addressed_to_relay = event
+                            .tags
+                            .iter()
+                            .any(|t| t.len() >= 2 && t[0] == "p" && t[1] == relay_pk);
+                        if !addressed_to_relay {
+                            return Some(
+                                "restricted: /inbox accepts only events addressed to the relay"
+                                    .into(),
+                            );
+                        }
+                    }
+                    _ => {
+                        if !event.tags.iter().any(|t| t.len() >= 2 && t[0] == "p") {
+                            return Some(
+                                "restricted: /inbox accepts only events carrying a p tag".into(),
+                            );
+                        }
+                    }
+                }
+                None
+            }
+            _ => None,
         }
     }
 
@@ -180,7 +280,15 @@ impl super::Conn {
 
         let mut filters = Vec::new();
         for f in &rest[1..] {
-            match serde_json::from_value::<Filter>(f.clone()) {
+            let mut f = f.clone();
+            // nostrd inbox/outbox keys expand into `#p`/`authors`; an invalid
+            // value makes the whole subscription invalid like any other
+            // malformed filter field.
+            if crate::filter::rewrite_inbox_outbox(&mut f).is_err() {
+                self.send_closed(sub_id, "invalid: invalid filter");
+                return;
+            }
+            match serde_json::from_value::<Filter>(f) {
                 Ok(filter) => filters.push(filter),
                 Err(_) => {
                     self.send_closed(sub_id, "invalid: invalid filter");
@@ -397,7 +505,12 @@ impl super::Conn {
         }
         let mut filters = Vec::new();
         for f in &rest[1..] {
-            match serde_json::from_value::<Filter>(f.clone()) {
+            let mut f = f.clone();
+            if crate::filter::rewrite_inbox_outbox(&mut f).is_err() {
+                self.send_closed(sub_id, "invalid: invalid filter");
+                return;
+            }
+            match serde_json::from_value::<Filter>(f) {
                 Ok(filter) => filters.push(filter),
                 Err(_) => {
                     self.send_closed(sub_id, "invalid: invalid filter");

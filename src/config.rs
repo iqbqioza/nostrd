@@ -138,6 +138,25 @@ pub struct ServerConfig {
     /// the API host when one is configured; without `api_host` the metrics
     /// are public on every host.
     pub metrics_enabled: bool,
+    /// Which paths serve the WebSocket endpoint (and the NIP-11 document):
+    /// `root` (default) serves `/`, `/ws` and `/ws/`; `inbox-outbox` serves
+    /// only `/inbox` and `/outbox`; `all` serves all of them. The inbox and
+    /// outbox paths let a relay advertise distinct endpoints for the
+    /// inbox/outbox routing model (e.g. `wss://relay.example.com/inbox`).
+    pub ws_paths: String,
+    /// Write policy for events published through `/inbox` (only enforced
+    /// when the path is served): `any` accepts events carrying at least
+    /// one `p` tag (addressed to anyone); `relay` accepts only events that
+    /// `p`-tag the relay's own pubkey (which requires `relay.private_key`).
+    /// Events published through `/outbox` always require NIP-42 auth and
+    /// must be authored by the authenticated pubkey.
+    pub inbox_write_policy: String,
+    /// Write policy for events published through `/outbox` (only enforced
+    /// when the path is served): `any` accepts events authored by any
+    /// NIP-42-authenticated pubkey of the connection; `relay` accepts only
+    /// events authored by the relay's own pubkey (which requires
+    /// `relay.private_key`), making `/outbox` a pure relay outbox.
+    pub outbox_write_policy: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -283,6 +302,9 @@ impl Default for ServerConfig {
             require_auth: false,
             send_auth_challenge: true,
             metrics_enabled: true,
+            ws_paths: "root".into(),
+            inbox_write_policy: "any".into(),
+            outbox_write_policy: "any".into(),
         }
     }
 }
@@ -475,6 +497,27 @@ impl Config {
             return Err(Error::Config(
                 "server.port must be between 1 and 65535".into(),
             ));
+        }
+        // WebSocket path selection.
+        if !matches!(self.server.ws_paths.trim(), "root" | "inbox-outbox" | "all") {
+            return Err(Error::Config(format!(
+                "server.ws_paths must be \"root\", \"inbox-outbox\" or \"all\", got {:?}",
+                self.server.ws_paths
+            )));
+        }
+        // Inbox write policy.
+        if !matches!(self.server.inbox_write_policy.trim(), "any" | "relay") {
+            return Err(Error::Config(format!(
+                "server.inbox_write_policy must be \"any\" or \"relay\", got {:?}",
+                self.server.inbox_write_policy
+            )));
+        }
+        // Outbox write policy.
+        if !matches!(self.server.outbox_write_policy.trim(), "any" | "relay") {
+            return Err(Error::Config(format!(
+                "server.outbox_write_policy must be \"any\" or \"relay\", got {:?}",
+                self.server.outbox_write_policy
+            )));
         }
         if self.server.management_port > 0 && self.server.management_port == self.server.port {
             return Err(Error::Config(
@@ -1249,6 +1292,54 @@ mod tests {
         assert!(
             cfg.validate().is_err(),
             "map_size must not exceed map_max_size"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_bad_ws_paths() {
+        let mut cfg = Config::default();
+        assert!(cfg.validate().is_ok(), "default ws_paths is valid");
+        for value in ["root", "inbox-outbox", "all"] {
+            cfg.server.ws_paths = value.into();
+            assert!(cfg.validate().is_ok(), "{value} must be valid");
+        }
+        cfg.server.ws_paths = "inbox".into();
+        assert!(cfg.validate().is_err(), "unknown ws_paths must be rejected");
+    }
+
+    #[test]
+    fn validation_rejects_bad_inbox_write_policy() {
+        let mut cfg = Config::default();
+        assert!(
+            cfg.validate().is_ok(),
+            "default inbox_write_policy is valid"
+        );
+        for value in ["any", "relay"] {
+            cfg.server.inbox_write_policy = value.into();
+            assert!(cfg.validate().is_ok(), "{value} must be valid");
+        }
+        cfg.server.inbox_write_policy = "any_p".into();
+        assert!(
+            cfg.validate().is_err(),
+            "unknown inbox_write_policy must be rejected"
+        );
+    }
+
+    #[test]
+    fn validation_rejects_bad_outbox_write_policy() {
+        let mut cfg = Config::default();
+        assert!(
+            cfg.validate().is_ok(),
+            "default outbox_write_policy is valid"
+        );
+        for value in ["any", "relay"] {
+            cfg.server.outbox_write_policy = value.into();
+            assert!(cfg.validate().is_ok(), "{value} must be valid");
+        }
+        cfg.server.outbox_write_policy = "any_p".into();
+        assert!(
+            cfg.validate().is_err(),
+            "unknown outbox_write_policy must be rejected"
         );
     }
 

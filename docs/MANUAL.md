@@ -117,6 +117,9 @@ To generate a secret key, use the `nostrd genkey` command (see [5. Command Refer
 | `host` | Bind address (`0.0.0.0` for all interfaces) | `127.0.0.1` |
 | `port` | Port number | `8080` |
 | `api_host` | Hostname dedicated to the REST API. When set, only requests with this Host header can use the API (e.g. separate `api.example.com` and `relay.example.com` on the same port) | empty |
+| `ws_paths` | Which paths serve the WebSocket endpoint (and the NIP-11 document): `root` (`/` only), `inbox-outbox` (only `/inbox` and `/outbox`), or `all` | `root` |
+| `inbox_write_policy` | Write policy for `/inbox`: `any` (the event must carry a `p` tag) or `relay` (the event must `p`-tag the relay's own pubkey) | `any` |
+| `outbox_write_policy` | Write policy for `/outbox`: `any` (the event must be authored by the connection's NIP-42-authenticated pubkey) or `relay` (only the relay's own events) | `any` |
 | `management_port` | Legacy management port (0 = disabled) | `0` |
 | `management_host` | Bind address for the management port | `127.0.0.1` |
 | `management_token` | Bearer token for the management API | empty |
@@ -249,7 +252,7 @@ After editing the config file, a **SIGHUP** reloads it without a full restart:
 kill -HUP $(cat nostrd.pid)
 ```
 
-> Some settings are fixed at startup and are **not** changed by a reload (`api_host`, `metrics_enabled`, LiveKit settings, `private_key`, ...). Use `restart` for those; the log warns you when this applies.
+> Some settings are fixed at startup and are **not** changed by a reload (`api_host`, `ws_paths`, `metrics_enabled`, LiveKit settings, `private_key`, ...). Use `restart` for those; the log warns you when this applies.
 
 ---
 
@@ -266,6 +269,22 @@ All commands accept `--config <path>` (default: `nostrd.toml`).
 | `nostrd stop` | Stop the running daemon |
 | `nostrd restart` | Stop and start again (re-reads the config) |
 | `nostrd stats` | Show live statistics |
+
+### Inbox/outbox subscription filters
+
+nostrd extends the REQ filter syntax with two convenience keys for the inbox/outbox routing model (a nostrd extension — not part of any NIP):
+
+- `"outbox": "<pubkey>"` — expands to `"authors": ["<pubkey>"]`: only events **authored by** the pubkey (stored and live).
+- `"inbox": "<pubkey>"` — expands to `"#p": ["<pubkey>"]`: only events **addressed to** the pubkey (mentions, replies, zaps and DMs that `p`-tag it).
+
+Values may be 64-hex pubkeys or `npub1...` codes, or arrays of either; an existing `authors`/`#p` key is merged. Both keys work for stored queries, live delivery and `COUNT`, and combine with every other filter field. An invalid pubkey rejects the subscription like any malformed filter:
+
+```jsonc
+["REQ", "my-feed", {"outbox": "npub1..."}]
+["REQ", "mentions", {"inbox": "npub1...", "kinds": [1, 7]}]
+```
+
+The inbox/outbox endpoints are also write-restricted: `/outbox` accepts only events authored by the connection's NIP-42-authenticated pubkey (`server.outbox_write_policy = "any"`) or only the relay's own events (`"relay"`); `/inbox` accepts only events carrying a `p` tag (any recipient, or the relay itself with `server.inbox_write_policy = "relay"`).
 
 ---
 

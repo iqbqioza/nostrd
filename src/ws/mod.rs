@@ -28,6 +28,9 @@ pub(crate) const EVENT_BATCH: usize = 64;
 
 pub struct Conn {
     pub(crate) relay: Arc<Relay>,
+    /// The WebSocket endpoint path this connection was established on
+    /// (`/`, `/inbox` or `/outbox`); drives the path-specific write policy.
+    pub(crate) path: String,
     /// Outgoing messages awaiting a TCP write, drained by the connection
     /// loop after every select iteration.
     pub(crate) outgoing: std::collections::VecDeque<Message>,
@@ -215,6 +218,7 @@ pub async fn handle_connection(
     mut socket: WebSocket,
     relay: Arc<Relay>,
     peer_ip: std::net::IpAddr,
+    path: String,
 ) {
     let active = relay
         .stats
@@ -279,6 +283,7 @@ pub async fn handle_connection(
 
     let mut conn = Conn {
         relay,
+        path,
         outgoing: std::collections::VecDeque::new(),
         out_bytes: 0,
         out_queue_bytes,
@@ -541,6 +546,29 @@ mod tests {
         ev
     }
 
+    /// Like [`signed_note`] but with a distinct author per seed byte.
+    fn signed_note_seeded(
+        secp: &Secp256k1<secp256k1::All>,
+        seed: u8,
+        content: &str,
+        created: u64,
+        tags: Vec<Vec<String>>,
+    ) -> Event {
+        let keypair = Keypair::from_seckey_slice(secp, &[seed; 32]).unwrap();
+        let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
+        let mut ev = Event {
+            id: String::new(),
+            pubkey,
+            created_at: created,
+            kind: 1,
+            tags,
+            content: content.into(),
+            sig: String::new(),
+        };
+        sign(&mut ev, &keypair, secp).unwrap();
+        ev
+    }
+
     fn signed_auth(secp: &Secp256k1<secp256k1::All>, challenge: &str, created: u64) -> Event {
         let keypair = Keypair::from_seckey_slice(secp, &[2u8; 32]).unwrap();
         let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
@@ -563,6 +591,10 @@ mod tests {
     }
 
     async fn build_conn() -> Conn {
+        build_conn_with("").await
+    }
+
+    async fn build_conn_with(private_key: &str) -> Conn {
         let mut cfg = Config::default();
         cfg.database.path = temp_db_path();
         let db = crate::db::DbClient::open(
@@ -581,7 +613,7 @@ mod tests {
             config,
             db,
             stats,
-            "",
+            private_key,
             LiveBusConfig {
                 buffer: 1024,
                 batch_interval_ms: 10,
@@ -601,6 +633,7 @@ mod tests {
         };
         Conn {
             relay,
+            path: "/".into(),
             outgoing: std::collections::VecDeque::new(),
             out_bytes: 0,
             out_queue_bytes,
@@ -685,6 +718,90 @@ mod tests {
     }
 
     #[test]
+    fn req_inbox_outbox_filters() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            let secp = conn.relay.secp();
+            let alice_pk = XOnlyPublicKey::from_keypair(
+                &Keypair::from_seckey_slice(secp, &[1u8; 32]).unwrap(),
+            )
+            .0
+            .to_string();
+            let bob_pk = XOnlyPublicKey::from_keypair(
+                &Keypair::from_seckey_slice(secp, &[2u8; 32]).unwrap(),
+            )
+            .0
+            .to_string();
+            let alice_plain = signed_note_seeded(secp, 1, "alice plain", now, vec![]);
+            let alice_to_bob = signed_note_seeded(
+                secp,
+                1,
+                "alice to bob",
+                now - 1,
+                vec![vec!["p".into(), bob_pk.clone()]],
+            );
+            let bob_to_alice = signed_note_seeded(
+                secp,
+                2,
+                "bob to alice",
+                now - 2,
+                vec![vec!["p".into(), alice_pk.clone()]],
+            );
+            for e in [&alice_plain, &alice_to_bob, &bob_to_alice] {
+                conn.relay.db.put(e.clone(), now).await;
+            }
+
+            // outbox: only the events authored by the pubkey.
+            conn.handle_req(&[json!("o"), json!({"outbox": alice_pk})])
+                .await;
+            let contents: Vec<String> = outgoing_json(&conn)
+                .iter()
+                .filter(|m| m[0] == "EVENT" && m[1] == "o")
+                .map(|m| m[2]["content"].as_str().unwrap().to_string())
+                .collect();
+            assert!(contents.contains(&"alice plain".to_string()));
+            assert!(contents.contains(&"alice to bob".to_string()));
+            assert!(
+                !contents.contains(&"bob to alice".to_string()),
+                "outbox must not return other authors"
+            );
+
+            // inbox: only the events addressed to the pubkey (#p tag).
+            conn.handle_req(&[json!("i"), json!({"inbox": alice_pk})])
+                .await;
+            let contents: Vec<String> = outgoing_json(&conn)
+                .iter()
+                .filter(|m| m[0] == "EVENT" && m[1] == "i")
+                .map(|m| m[2]["content"].as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(contents, vec!["bob to alice".to_string()]);
+
+            // Combined: events by Bob addressed to Alice.
+            conn.handle_req(&[json!("io"), json!({"outbox": bob_pk, "inbox": alice_pk})])
+                .await;
+            let contents: Vec<String> = outgoing_json(&conn)
+                .iter()
+                .filter(|m| m[0] == "EVENT" && m[1] == "io")
+                .map(|m| m[2]["content"].as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(contents, vec!["bob to alice".to_string()]);
+
+            // An invalid pubkey rejects the whole subscription.
+            conn.handle_req(&[json!("bad"), json!({"outbox": "not-a-pubkey"})])
+                .await;
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "CLOSED" && m[1] == "bad"),
+                "an invalid outbox value must reject the subscription"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn auth_grants_protected_event_visibility() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -740,6 +857,152 @@ mod tests {
                 count[2]["count"].as_u64(),
                 Some(1),
                 "protected events are not counted for anonymous"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn inbox_outbox_write_policies() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let now = unix_now();
+            let some_pk = "cc".repeat(32);
+
+            // /inbox with the default "any" policy: a p tag is required.
+            let mut conn = build_conn().await;
+            conn.path = "/inbox".into();
+            let secp = conn.relay.secp();
+            let addressed = signed_note_seeded(
+                secp,
+                1,
+                "addressed",
+                now,
+                vec![vec!["p".into(), some_pk.clone()]],
+            );
+            let plain = signed_note_seeded(secp, 1, "plain", now - 1, vec![]);
+            conn.queue_event_value(addressed.clone()).await;
+            conn.queue_event_value(plain.clone()).await;
+            conn.flush_pending_events().await;
+            let msgs = outgoing_json(&conn);
+            let ok_of = |id: &str| {
+                msgs.iter()
+                    .find(|m| m[0] == "OK" && m[1] == id)
+                    .cloned()
+                    .unwrap()
+            };
+            assert_eq!(
+                ok_of(&addressed.id)[2],
+                true,
+                "a p-tagged event is accepted"
+            );
+            assert_eq!(ok_of(&plain.id)[2], false, "an untagged event is rejected");
+            assert!(
+                ok_of(&plain.id)[3]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("restricted"),
+                "the rejection is machine-readable"
+            );
+            conn.relay.db.shutdown();
+
+            // /inbox with the "relay" policy: only events p-tagging the
+            // relay's own pubkey are accepted.
+            let mut conn = build_conn_with(&hex::encode([7u8; 32])).await;
+            conn.path = "/inbox".into();
+            conn.relay.config.write().await.server.inbox_write_policy = "relay".into();
+            let relay_pk = conn.relay.relay_pubkey().unwrap();
+            let secp = conn.relay.secp();
+            let to_relay =
+                signed_note_seeded(secp, 1, "to relay", now, vec![vec!["p".into(), relay_pk]]);
+            let to_other = signed_note_seeded(
+                secp,
+                1,
+                "to other",
+                now - 1,
+                vec![vec!["p".into(), some_pk]],
+            );
+            conn.queue_event_value(to_relay.clone()).await;
+            conn.queue_event_value(to_other.clone()).await;
+            conn.flush_pending_events().await;
+            let msgs = outgoing_json(&conn);
+            let ok_of = |id: &str| {
+                msgs.iter()
+                    .find(|m| m[0] == "OK" && m[1] == id)
+                    .cloned()
+                    .unwrap()
+            };
+            assert_eq!(ok_of(&to_relay.id)[2], true);
+            assert_eq!(ok_of(&to_other.id)[2], false);
+            conn.relay.db.shutdown();
+
+            // /outbox: NIP-42 auth is required and the event must be the
+            // authenticated user's own.
+            let mut conn = build_conn().await;
+            conn.path = "/outbox".into();
+            let secp = conn.relay.secp().clone();
+            let mine = signed_note_seeded(&secp, 2, "mine", now, vec![]);
+            let others = signed_note_seeded(&secp, 1, "theirs", now - 1, vec![]);
+            conn.queue_event_value(mine.clone()).await;
+            conn.flush_pending_events().await;
+            let msgs = outgoing_json(&conn);
+            assert!(
+                msgs.iter()
+                    .any(|m| m[0] == "OK" && m[1] == mine.id && m[2] == false),
+                "unauthenticated writes are rejected"
+            );
+            // Authenticate as the key-2 author and retry.
+            conn.outgoing.clear();
+            let auth = signed_auth(&secp, "test-challenge", now);
+            conn.handle_auth(&[serde_json::to_value(&auth).unwrap()])
+                .await;
+            assert!(conn.is_authed());
+            conn.queue_event_value(mine.clone()).await;
+            conn.queue_event_value(others.clone()).await;
+            conn.flush_pending_events().await;
+            let msgs = outgoing_json(&conn);
+            let ok_of = |id: &str| {
+                msgs.iter()
+                    .find(|m| m[0] == "OK" && m[1] == id)
+                    .cloned()
+                    .unwrap()
+            };
+            assert_eq!(ok_of(&mine.id)[2], true, "own authed events are accepted");
+            assert_eq!(
+                ok_of(&others.id)[2],
+                false,
+                "another author's event is rejected"
+            );
+            conn.relay.db.shutdown();
+
+            // /outbox with the "relay" policy: only the relay's own events.
+            let mut conn = build_conn_with(&hex::encode([7u8; 32])).await;
+            conn.path = "/outbox".into();
+            conn.relay.config.write().await.server.outbox_write_policy = "relay".into();
+            let relay_pk = conn.relay.relay_pubkey().unwrap();
+            let secp = conn.relay.secp().clone();
+            let relay_event = signed_note_seeded(&secp, 7, "relay event", now, vec![]);
+            let user_event = signed_note_seeded(&secp, 1, "user event", now - 1, vec![]);
+            assert_eq!(relay_event.pubkey, relay_pk, "seed 7 is the relay key");
+            conn.queue_event_value(relay_event.clone()).await;
+            conn.queue_event_value(user_event.clone()).await;
+            conn.flush_pending_events().await;
+            let msgs = outgoing_json(&conn);
+            let ok_of = |id: &str| {
+                msgs.iter()
+                    .find(|m| m[0] == "OK" && m[1] == id)
+                    .cloned()
+                    .unwrap()
+            };
+            assert_eq!(
+                ok_of(&relay_event.id)[2],
+                true,
+                "the relay's own event is accepted without auth"
+            );
+            assert_eq!(
+                ok_of(&user_event.id)[2],
+                false,
+                "another author's event is rejected in relay mode"
             );
             conn.relay.db.shutdown();
         });

@@ -129,13 +129,24 @@ async fn build_router(
         .route("/{identifier}", get(api_handler))
         .route("/{identifier}/{kind}", get(api_kind_handler))
         .layer(axum::middleware::from_fn(reject_ws_upgrade));
+    // `server.ws_paths` selects which paths serve the WebSocket/NIP-11/NIP-86
+    // endpoint: the default root paths, the inbox/outbox paths only, or all
+    // of them. The inbox and outbox paths give the relay distinct endpoints
+    // for the inbox/outbox routing model.
+    let ws_paths = relay.config.read().await.server.ws_paths.trim().to_string();
     let mut app = Router::new()
-        .route("/", get(ws_handler).post(nip86::rpc_handler))
-        .route("/ws", get(ws_handler).post(nip86::rpc_handler))
-        .route("/ws/", get(ws_handler))
         .route("/health", get(health_handler))
         .route("/relay/stats", get(stats_handler))
         .nest("/api/v1", api_routes);
+    // In `inbox-outbox` mode the root is not a WebSocket endpoint: it only
+    // answers the Blossom server-info document on the Blossom host (every
+    // other host gets a 404).
+    if ws_paths == "inbox-outbox" {
+        app = app.route("/", get(root_inbox_outbox));
+    }
+    for path in ws_paths_for(&ws_paths) {
+        app = app.route(*path, get(ws_handler).post(nip86::rpc_handler));
+    }
     let cfg = relay.config.read().await;
     if cfg.server.metrics_enabled {
         app = app.route("/metrics", get(metrics_handler));
@@ -171,6 +182,18 @@ async fn build_router(
     }
     app.layer(axum::middleware::from_fn(cors_middleware))
         .with_state(relay.clone())
+}
+
+/// The paths serving the WebSocket/NIP-11/NIP-86 endpoint for a
+/// `server.ws_paths` value. Unknown values fall back to the default root
+/// path (the config validation rejects them, but the router must stay
+/// safe even on an unvalidated reload path).
+fn ws_paths_for(mode: &str) -> &'static [&'static str] {
+    match mode {
+        "inbox-outbox" => &["/inbox", "/outbox"],
+        "all" => &["/", "/inbox", "/outbox"],
+        _ => &["/"],
+    }
 }
 
 /// Normalizes a configured split hostname (api_host / blossom.host):
@@ -428,6 +451,81 @@ async fn reject_ws_upgrade(request: Request, next: Next) -> Response {
     next.run(request).await
 }
 
+/// The Blossom server-info document (BUD-01) when the request Host names
+/// the configured Blossom host; `None` otherwise. Used by the shared root
+/// route and by the dedicated root route of the `inbox-outbox` mode, so
+/// the info document stays available on the Blossom host whatever the
+/// WebSocket path selection is. Takes the Host header value (not the whole
+/// request) so the future never borrows the request across the await.
+async fn blossom_root_info(
+    relay: Arc<Relay>,
+    host_header: Option<&str>,
+    is_websocket: bool,
+) -> Option<Response> {
+    let cfg = relay.config.read().await;
+    if cfg.blossom.host.trim().is_empty()
+        || !blossom::host_is_blossom(&cfg.blossom.host, host_header)
+    {
+        return None;
+    }
+    // WebSocket upgrades are never accepted on the Blossom host's root.
+    if is_websocket {
+        return Some(StatusCode::NOT_FOUND.into_response());
+    }
+    let info = json!({
+        "name": format!("nostrd Blossom ({})", cfg.blossom.host.trim()),
+        "supported_nips": [],
+        "supported_file_hashes": ["sha256"],
+        "tos_url": null,
+        "payment_required": false,
+        "max_file_size": cfg.blossom.max_upload_bytes,
+        "storage": cfg.blossom.storage,
+    });
+    let mut response = Json(info).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("application/json"),
+    );
+    Some(response)
+}
+
+/// The NIP-11 relay information document, served with `application/nostr+json`
+/// when the client asked for it.
+async fn nip11_doc(relay: Arc<Relay>, wants_nostr_json: bool) -> Response {
+    let cfg = relay.config.read().await;
+    let body = Json(relay_info(
+        &cfg,
+        &relay.stats,
+        relay.relay_pubkey().as_deref(),
+    ));
+    let mut response = body.into_response();
+    if wants_nostr_json {
+        response.headers_mut().insert(
+            axum::http::header::CONTENT_TYPE,
+            axum::http::HeaderValue::from_static("application/nostr+json"),
+        );
+    }
+    response
+}
+
+/// The root path in `ws_paths = "inbox-outbox"` mode: only the Blossom
+/// server-info answer is served (on the Blossom host); every other request
+/// gets a 404, keeping the relay's WebSocket endpoint and the NIP-11
+/// document exclusive to `/inbox` and `/outbox`.
+async fn root_inbox_outbox(State(relay): State<Arc<Relay>>, request: Request) -> Response {
+    let host_header = request
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok());
+    if is_websocket_request(request.headers()) {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    match blossom_root_info(relay, host_header, false).await {
+        Some(response) => response,
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 /// Serves the WebSocket endpoint and the NIP-11 document on the same URI:
 /// valid WebSocket handshakes are upgraded, plain HTTP requests (GET with
 /// no upgrade headers) receive the relay information document, per NIP-11
@@ -452,53 +550,29 @@ async fn ws_handler(State(relay): State<Arc<Relay>>, request: Request) -> Respon
     // the request Host names the Blossom host, the root path is answered
     // with the Blossom server info instead of the NIP-11 document (and
     // WebSocket upgrades are refused there by the host split).
-    let cfg = relay.config.read().await;
-    if !cfg.blossom.host.trim().is_empty() && blossom::host_is_blossom(&cfg.blossom.host, &request)
+    let host_header = request
+        .headers()
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok());
+    if let Some(response) = blossom_root_info(
+        relay.clone(),
+        host_header,
+        is_websocket_request(request.headers()),
+    )
+    .await
     {
-        if is_websocket_request(request.headers()) {
-            return StatusCode::NOT_FOUND.into_response();
-        }
-        let info = json!({
-            "name": format!("nostrd Blossom ({})", cfg.blossom.host.trim()),
-            "supported_nips": [],
-            "supported_file_hashes": ["sha256"],
-            "tos_url": null,
-            "payment_required": false,
-            "max_file_size": cfg.blossom.max_upload_bytes,
-            "storage": cfg.blossom.storage,
-        });
-        let mut response = Json(info).into_response();
-        response.headers_mut().insert(
-            axum::http::header::CONTENT_TYPE,
-            axum::http::HeaderValue::from_static("application/json"),
-        );
         return response;
     }
-    drop(cfg);
     if !is_websocket_request(request.headers()) {
         // Not a WebSocket handshake: serve the NIP-11 info document.
-        let cfg = relay.config.read().await;
-        let body = Json(relay_info(
-            &cfg,
-            &relay.stats,
-            relay.relay_pubkey().as_deref(),
-        ));
-        let mut response = body.into_response();
-        // Serve with the NIP-11 media type when the client asked for it;
-        // some clients only accept `application/nostr+json`.
         let wants_nostr_json = request
             .headers()
             .get(axum::http::header::ACCEPT)
             .and_then(|v| v.to_str().ok())
             .is_some_and(|a| a.contains("application/nostr+json"));
-        if wants_nostr_json {
-            response.headers_mut().insert(
-                axum::http::header::CONTENT_TYPE,
-                axum::http::HeaderValue::from_static("application/nostr+json"),
-            );
-        }
-        return response;
+        return nip11_doc(relay.clone(), wants_nostr_json).await;
     }
+    let path = request.uri().path().to_string();
     let (mut parts, _) = request.into_parts();
     let peer_ip = parts
         .extensions
@@ -538,6 +612,7 @@ async fn ws_handler(State(relay): State<Arc<Relay>>, request: Request) -> Respon
                         socket,
                         relay,
                         peer_ip.unwrap_or_else(|| "0.0.0.0".parse().unwrap()),
+                        path,
                     )
                 })
                 .into_response()
@@ -774,6 +849,22 @@ async fn reload_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ws_paths_for_selects_endpoints() {
+        assert_eq!(ws_paths_for("root"), &["/"]);
+        assert_eq!(ws_paths_for("inbox-outbox"), &["/inbox", "/outbox"]);
+        assert_eq!(
+            ws_paths_for("all"),
+            &["/", "/inbox", "/outbox"],
+            "all serves the root and the inbox/outbox paths"
+        );
+        assert_eq!(
+            ws_paths_for("anything-else"),
+            &["/"],
+            "unknown values fall back to the root path"
+        );
+    }
 
     #[test]
     fn host_split_matches_ports_case_and_ipv6() {
