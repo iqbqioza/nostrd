@@ -19,7 +19,7 @@ use crate::nips::{nip29, nip62, nip70};
 use crate::relay::Relay;
 use crate::util::unix_now;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct ApiParams {
     pub limit: Option<usize>,
     pub since: Option<u64>,
@@ -294,6 +294,199 @@ pub async fn api_kind_handler(
     }
 }
 
+/// `GET /api/v1/{identifier}/{kind}/monthly`
+///
+/// Per-month event counts for a pubkey + kind, e.g.
+/// `GET /api/v1/npub1.../1/monthly` returns `{"months": [{"month": "2026-08",
+/// "count": 4}], "total": 4}` so a frontend can render "2026-08(4)". `since`
+/// and `until` bound the range (unix seconds); without them the whole period
+/// is covered, from the earliest stored event of that author and kind to
+/// now. Every month in the range is reported (zero-filled), oldest first,
+/// at most 1200 months. A month whose count hit the collection limit is
+/// flagged `"approximate": true` (NIP-45 semantics).
+pub async fn api_monthly_handler(
+    State(relay): State<Arc<Relay>>,
+    Path((identifier, kind)): Path<(String, u64)>,
+    Query(params): Query<ApiParams>,
+) -> (StatusCode, Json<Value>) {
+    let entity = match nip19::parse_nip19(&identifier) {
+        Ok(e) => e,
+        Err(e) => {
+            return error_response(StatusCode::BAD_REQUEST, &format!("invalid identifier: {e}"));
+        }
+    };
+    let Nip19Entity::Pubkey(pk) = entity else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "the monthly endpoint requires an npub1 identifier",
+        );
+    };
+    let hex_pk = hex::encode(pk);
+
+    // Bounded month range: without `since` the range spans the whole period
+    // (from the earliest stored event of this author and kind); an explicit
+    // range must not exceed 1200 months (100 years) of count queries.
+    let now = unix_now();
+    let until = params.until.unwrap_or(now);
+    let since = match params.since {
+        Some(s) => s,
+        None => {
+            // The whole period: probe the oldest stored event. The probe is
+            // a single ascending scan capped at one row.
+            let probe: Filter = serde_json::from_value(json!({
+                "authors": [hex_pk],
+                "kinds": [kind],
+            }))
+            .expect("static filter");
+            let (events, _) = relay.db.api_query(vec![probe], 1, now, true).await;
+            match events.first() {
+                Some(e) => e.created_at,
+                None => {
+                    // No events at all: an empty range, reported as such.
+                    return (StatusCode::OK, Json(json!({ "months": [], "total": 0 })));
+                }
+            }
+        }
+    };
+    let months = month_range(since, until);
+    if months.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "until must not be earlier than since",
+        );
+    }
+    if months.len() > 1200 {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "the requested range exceeds 1200 months",
+        );
+    }
+
+    let Some(_permit) = relay.api_limit.try_acquire() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "server is busy, try again shortly" })),
+        );
+    };
+    let count_limit = relay.config.read().await.limits.count_limit;
+
+    let mut month_counts = Vec::with_capacity(months.len());
+    let mut total = 0u64;
+    for (y, m) in months {
+        let start = month_start(y, m);
+        let end = month_start_of_next(y, m);
+        let filter: Filter = serde_json::from_value(json!({
+            "authors": [hex_pk],
+            "kinds": [kind],
+            "since": start,
+            "until": end.saturating_sub(1),
+        }))
+        .expect("static filter");
+        let (events, more) = relay.db.count(vec![filter], count_limit, now).await;
+        // The same visibility rules as the unauthenticated API: protected
+        // events, gift wraps and private/hidden group content are withheld.
+        let has_group_events = events.iter().any(nip29::is_group_event);
+        let groups = if has_group_events {
+            Some(relay.groups.read().await)
+        } else {
+            None
+        };
+        let count = events
+            .iter()
+            .filter(|e| {
+                !nip70::is_protected(e)
+                    && (e.kind != nip62::GIFT_WRAP_KIND)
+                    && groups.as_deref().is_none_or(|g| g.visible_to(e, None))
+            })
+            .count();
+        drop(groups);
+        total += count as u64;
+        month_counts.push(json!({
+            "month": format!("{y:04}-{m:02}"),
+            "count": count,
+            "approximate": more,
+        }));
+    }
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "months": month_counts,
+            "total": total,
+        })),
+    )
+}
+
+/// `(year, month)` of a unix timestamp.
+fn month_of(ts: u64) -> (i64, u32) {
+    let (y, m, _) = civil_from_days((ts / 86400) as i64);
+    (y, m)
+}
+
+/// The unix timestamp of the first second of `(year, month)`.
+fn month_start(y: i64, m: u32) -> u64 {
+    (days_from_civil(y, m, 1) * 86400) as u64
+}
+
+/// The first second of the month following `(year, month)`.
+fn month_start_of_next(y: i64, m: u32) -> u64 {
+    if m == 12 {
+        month_start(y + 1, 1)
+    } else {
+        month_start(y, m + 1)
+    }
+}
+
+/// The months covered by `[since, until]`, oldest first.
+fn month_range(since: u64, until: u64) -> Vec<(i64, u32)> {
+    if until < since {
+        return Vec::new();
+    }
+    let (sy, sm) = month_of(since);
+    let (ey, em) = month_of(until);
+    let mut out = Vec::new();
+    let mut y = sy;
+    let mut m = sm;
+    loop {
+        out.push((y, m));
+        if (y, m) == (ey, em) {
+            break;
+        }
+        if m == 12 {
+            y += 1;
+            m = 1;
+        } else {
+            m += 1;
+        }
+    }
+    out
+}
+
+/// Days since 1970-01-01 for a civil date (Howard Hinnant's algorithm,
+/// no time-library dependency).
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) as i64 + 2) / 5 + d as i64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// Civil date `(year, month, day)` for days since 1970-01-01.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
 async fn query_and_respond(
     relay: &Arc<Relay>,
     filters: Vec<Filter>,
@@ -494,6 +687,122 @@ mod tests {
                 "V2 must not be lost or repeated"
             );
             assert_eq!(resp["more"], false);
+
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn month_arithmetic_roundtrips() {
+        // 2026-08-01T00:00:00Z
+        assert_eq!(month_start(2026, 8), 1_785_542_400);
+        assert_eq!(month_start_of_next(2026, 8), 1_788_220_800, "2026-09-01");
+        assert_eq!(month_start_of_next(2026, 12), month_start(2027, 1));
+        let (y, m, d) = civil_from_days(0);
+        assert_eq!((y, m, d), (1970, 1, 1));
+        let (y, m, d) = civil_from_days((1_785_542_400 / 86400) as i64);
+        assert_eq!((y, m, d), (2026, 8, 1));
+        let months = month_range(
+            month_start(2026, 8),
+            month_start_of_next(2026, 10).saturating_sub(1),
+        );
+        assert_eq!(months, vec![(2026, 8), (2026, 9), (2026, 10)]);
+        assert!(month_range(1_800_000_000, 1_700_000_000).is_empty());
+    }
+
+    #[test]
+    fn monthly_counts_group_events_by_month() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay().await;
+            let secp = relay.secp();
+            let pk = XOnlyPublicKey::from_keypair(
+                &Keypair::from_seckey_slice(secp, &[1u8; 32]).unwrap(),
+            )
+            .0
+            .to_string();
+            let npub = crate::nips::nip19::bech32m_encode("npub", &hex::decode(&pk).unwrap())
+                .expect("npub encoding");
+
+            // Two events in August 2026, one in September.
+            let aug1 = 1_785_542_400u64;
+            let e1 = signed_note(relay.secp(), "aug-1", aug1 + 100, vec![]);
+            let e2 = signed_note(relay.secp(), "aug-2", aug1 + 200, vec![]);
+            let e3 = signed_note(relay.secp(), "sep-1", aug1 + 31 * 86400 + 100, vec![]);
+            for e in [&e1, &e2, &e3] {
+                assert_eq!(
+                    relay.db.put(e.clone(), aug1 + 31 * 86400).await,
+                    crate::db::PutOutcome::Stored
+                );
+            }
+
+            let (code, Json(resp)) = api_monthly_handler(
+                State(relay.clone()),
+                Path((npub.clone(), 1u64)),
+                Query(ApiParams {
+                    since: Some(aug1),
+                    until: Some(aug1 + 31 * 86400 + 100),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK);
+            let months = resp["months"].as_array().unwrap();
+            assert_eq!(months.len(), 2, "August and September");
+            assert_eq!(months[0]["month"], "2026-08");
+            assert_eq!(months[0]["count"], 2);
+            assert_eq!(months[1]["month"], "2026-09");
+            assert_eq!(months[1]["count"], 1);
+            assert_eq!(resp["total"], 3);
+
+            // Zero-filled months: an empty range still reports every month.
+            let (_, Json(resp)) = api_monthly_handler(
+                State(relay.clone()),
+                Path((npub.clone(), 1u64)),
+                Query(ApiParams {
+                    since: Some(aug1 - 31 * 86400),
+                    until: Some(aug1 + 60),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            let months = resp["months"].as_array().unwrap();
+            assert_eq!(months.len(), 2);
+            assert_eq!(months[0]["month"], "2026-07");
+            assert_eq!(months[0]["count"], 0);
+            assert_eq!(months[1]["count"], 2);
+
+            // until < since is rejected.
+            let (code, _) = api_monthly_handler(
+                State(relay.clone()),
+                Path(("npub1x".into(), 1u64)),
+                Query(ApiParams {
+                    since: Some(aug1 + 10),
+                    until: Some(aug1),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            assert_eq!(code, StatusCode::BAD_REQUEST);
+
+            // Without since/until the whole period is covered: from the
+            // earliest stored event's month to the current one.
+            let (_, Json(resp)) = api_monthly_handler(
+                State(relay.clone()),
+                Path((npub.clone(), 1u64)),
+                Query(ApiParams::default()),
+            )
+            .await;
+            let months = resp["months"].as_array().unwrap();
+            assert_eq!(
+                months[0]["month"], "2026-08",
+                "starts at the earliest event"
+            );
+            assert_eq!(months[0]["count"], 2);
+            assert_eq!(
+                resp["total"], 2,
+                "the range ends at now (September is in the future)"
+            );
 
             relay.db.shutdown();
         });

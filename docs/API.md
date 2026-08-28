@@ -27,6 +27,25 @@ http://<host>:<port>/api/v1/{identifier}
 http://<host>:<port>/api/v1/{identifier}/{kind}
 ```
 
+### Monthly counts
+
+`GET /api/v1/{npub1...}/{kind}/monthly` returns per-month event counts for an author's events of a kind, so a frontend can render e.g. `2026-08(4)`:
+
+```json
+{
+  "months": [
+    { "month": "2026-08", "count": 4, "approximate": false },
+    { "month": "2026-09", "count": 0, "approximate": false }
+  ],
+  "total": 4
+}
+```
+
+- `since` / `until` bound the range (unix seconds); without them the **whole period** is covered, from the earliest stored event of that author and kind to now (an author with no events returns an empty list).
+- Every month in the range is reported, zero-filled, oldest first; the range is capped at **1200 months** (exceeding it returns `400`, as does `until < since`).
+- `approximate: true` marks a month whose count hit the collection limit (`limits.count_limit`), mirroring NIP-45.
+- The same visibility rules as the rest of the API apply (protected events, gift wraps and private/hidden group content are withheld).
+
 ### `server.api_host` (host-based routing)
 
 When `server.api_host` is configured (e.g. `api.example.com`), the API and the WebSocket relay are split by the **Host header**:

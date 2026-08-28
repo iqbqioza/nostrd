@@ -188,6 +188,7 @@ nostrd exposes a **read-only HTTP API** on the same port under `/api/v1`, served
 | Endpoint | Description |
 | --- | --- |
 | `GET /api/v1/{npub1...}/{kind}` | Events by author pubkey and kind (the `{kind}` path is mandatory for `npub1`) |
+| `GET /api/v1/{npub1...}/{kind}/monthly` | Per-month event counts for a pubkey + kind (`{"months": [{"month": "2026-08", "count": 4}], "total": 4}` — zero-filled; the whole period by default, bounded by `since`/`until`, at most 1200 months; `approximate: true` when a month hit the collection limit) |
 | `GET /api/v1/{nevent1...}` / `GET /api/v1/{note1...}` | A single event by its NIP-19 id |
 | `GET /api/v1/{naddr1...}` | Addressable/replaceable events by NIP-19 address |
 

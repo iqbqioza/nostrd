@@ -36,7 +36,7 @@ use crate::relay::Relay;
 use crate::stats::Stats;
 use crate::util::unix_now;
 use crate::ws::handle_connection;
-use api::{api_handler, api_kind_handler};
+use api::{api_handler, api_kind_handler, api_monthly_handler};
 use axum::serve::ListenerExt;
 use livekit::{livekit_supported, livekit_token};
 
@@ -128,6 +128,7 @@ async fn build_router(
     let api_routes = Router::new()
         .route("/{identifier}", get(api_handler))
         .route("/{identifier}/{kind}", get(api_kind_handler))
+        .route("/{identifier}/{kind}/monthly", get(api_monthly_handler))
         .layer(axum::middleware::from_fn(reject_ws_upgrade));
     // `server.ws_paths` selects which paths serve the WebSocket/NIP-11/NIP-86
     // endpoint: the default root paths, the inbox/outbox paths only, or all

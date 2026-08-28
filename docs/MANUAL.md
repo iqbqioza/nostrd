@@ -310,6 +310,10 @@ curl "http://127.0.0.1:8080/api/v1/npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3ev
 # => {"events":[...],"count":N,"more":false}
 ```
 
+### Monthly counts
+
+`GET /api/v1/{npub1...}/{kind}/monthly` returns per-month event counts (`{"months": [{"month": "2026-08", "count": 4, "approximate": false}], "total": 4}`) for a pubkey + kind, zero-filled over the `since`/`until` range (default: the whole period, from the earliest stored event to now; at most 1200 months).
+
 ### Query parameters
 
 | Parameter | Description |
