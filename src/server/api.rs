@@ -31,6 +31,14 @@ pub struct ApiParams {
     pub d: Option<String>,
     pub sort: Option<String>,
     pub offset: Option<usize>,
+    /// Exclude events carrying the tag (absence filter): `no_p=true` drops
+    /// every event with a `p` tag (mentions, replies, DMs), `no_e` drops
+    /// events with an `e` tag (replies), `no_t` and `no_d` likewise. The
+    /// exclusion applies before pagination, like the visibility rules.
+    pub no_p: Option<bool>,
+    pub no_e: Option<bool>,
+    pub no_t: Option<bool>,
+    pub no_d: Option<bool>,
 }
 
 #[derive(Debug, Serialize)]
@@ -77,6 +85,26 @@ fn bound_params(params: &mut ApiParams, cfg: &Config) -> Result<(), (StatusCode,
         ));
     }
     Ok(())
+}
+
+/// The tag names excluded by the `no_p`/`no_e`/`no_t`/`no_d` parameters
+/// (absence filters: events carrying the tag are dropped before
+/// pagination).
+fn excluded_tags(params: &ApiParams) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    if params.no_p.unwrap_or(false) {
+        out.push("p");
+    }
+    if params.no_e.unwrap_or(false) {
+        out.push("e");
+    }
+    if params.no_t.unwrap_or(false) {
+        out.push("t");
+    }
+    if params.no_d.unwrap_or(false) {
+        out.push("d");
+    }
+    out
 }
 
 fn apply_params(mut filter: Filter, params: &ApiParams) -> Filter {
@@ -143,12 +171,14 @@ pub async fn api_handler(
                 },
                 &params,
             );
+            let no_tags = excluded_tags(&params);
             query_and_respond(
                 &relay,
                 vec![filter],
                 1,
                 params.offset,
                 sort_ascending(&params.sort),
+                &no_tags,
             )
             .await
         }
@@ -161,12 +191,14 @@ pub async fn api_handler(
                 },
                 &params,
             );
+            let no_tags = excluded_tags(&params);
             query_and_respond(
                 &relay,
                 vec![filter],
                 1,
                 params.offset,
                 sort_ascending(&params.sort),
+                &no_tags,
             )
             .await
         }
@@ -192,12 +224,14 @@ pub async fn api_handler(
             let d_value = params.d.as_deref().unwrap_or(&d_tag);
             filter.tags.insert("#d".to_string(), json!(d_value));
             filter = apply_params(filter, &params);
+            let no_tags = excluded_tags(&params);
             query_and_respond(
                 &relay,
                 vec![filter],
                 limit,
                 params.offset,
                 sort_ascending(&params.sort),
+                &no_tags,
             )
             .await
         }
@@ -242,12 +276,14 @@ pub async fn api_kind_handler(
                 },
                 &params,
             );
+            let no_tags = excluded_tags(&params);
             query_and_respond(
                 &relay,
                 vec![filter],
                 limit,
                 params.offset,
                 sort_ascending(&params.sort),
+                &no_tags,
             )
             .await
         }
@@ -264,6 +300,7 @@ async fn query_and_respond(
     max_limit: usize,
     offset: Option<usize>,
     ascending: bool,
+    no_tags: &[&str],
 ) -> (StatusCode, Json<Value>) {
     // Concurrency limiter: at most `api_max_concurrent` `/api/v1` queries
     // run at once. When saturated, the request fails fast with 503 so a
@@ -318,6 +355,9 @@ async fn query_and_respond(
             !nip70::is_protected(e)
                 && (e.kind != nip62::GIFT_WRAP_KIND)
                 && groups.as_deref().is_none_or(|g| g.visible_to(e, None))
+                && !no_tags
+                    .iter()
+                    .any(|name| e.tags.iter().any(|t| t.len() >= 2 && t[0] == *name))
         })
         .collect();
     drop(groups);
@@ -437,7 +477,7 @@ mod tests {
             // Page 1: the hidden event must not consume a slot; V1 and V2 both
             // arrive, and more pages exist.
             let (code, Json(resp)) =
-                query_and_respond(&relay, filters.clone(), 2, Some(0), false).await;
+                query_and_respond(&relay, filters.clone(), 2, Some(0), false, &[]).await;
             assert_eq!(code, StatusCode::OK);
             let events = resp["events"].as_array().unwrap();
             assert_eq!(events.len(), 2, "hidden event must not consume the page");
@@ -446,7 +486,7 @@ mod tests {
             assert_eq!(resp["more"], true);
 
             // Page 2 (offset 2 over visible): V3, and no more pages.
-            let (_, Json(resp)) = query_and_respond(&relay, filters, 2, Some(2), false).await;
+            let (_, Json(resp)) = query_and_respond(&relay, filters, 2, Some(2), false, &[]).await;
             let events = resp["events"].as_array().unwrap();
             assert_eq!(events.len(), 1);
             assert_eq!(
@@ -454,6 +494,83 @@ mod tests {
                 "V2 must not be lost or repeated"
             );
             assert_eq!(resp["more"], false);
+
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn no_tag_filters_exclude_mention_events() {
+        // `no_p=true` is the "top-level posts only" filter: events carrying
+        // a `p` tag (mentions, replies, DMs) are dropped before pagination,
+        // so excluded events do not consume limit slots or offset steps.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay().await;
+            let now = unix_now();
+            let plain = signed_note(relay.secp(), "top-level", now, vec![]);
+            let mention = signed_note(
+                relay.secp(),
+                "mention",
+                now - 1,
+                vec![vec!["p".into(), "aa".repeat(32)]],
+            );
+            let reply = signed_note(
+                relay.secp(),
+                "reply",
+                now - 2,
+                vec![vec!["e".into(), "bb".repeat(32)]],
+            );
+            for e in [&plain, &mention, &reply] {
+                assert_eq!(
+                    relay.db.put(e.clone(), now).await,
+                    crate::db::PutOutcome::Stored
+                );
+            }
+            let filters: Vec<Filter> =
+                serde_json::from_value(serde_json::json!([{"kinds": [1]}])).unwrap();
+
+            // Without exclusion: all three events.
+            let (code, Json(resp)) =
+                query_and_respond(&relay, filters.clone(), 10, Some(0), false, &[]).await;
+            assert_eq!(code, StatusCode::OK);
+            assert_eq!(resp["events"].as_array().unwrap().len(), 3);
+
+            // no_p: the mention is dropped, the reply stays.
+            let (_, Json(resp)) =
+                query_and_respond(&relay, filters.clone(), 10, Some(0), false, &["p"]).await;
+            let contents: Vec<String> = resp["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["content"].as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(contents, vec!["top-level".to_string(), "reply".to_string()]);
+
+            // no_e: the reply is dropped, the mention stays.
+            let (_, Json(resp)) =
+                query_and_respond(&relay, filters.clone(), 10, Some(0), false, &["e"]).await;
+            let contents: Vec<String> = resp["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["content"].as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(
+                contents,
+                vec!["top-level".to_string(), "mention".to_string()]
+            );
+
+            // no_p + no_e: only the top-level post remains.
+            let (_, Json(resp)) =
+                query_and_respond(&relay, filters, 10, Some(0), false, &["p", "e"]).await;
+            let contents: Vec<String> = resp["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["content"].as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(contents, vec!["top-level".to_string()]);
 
             relay.db.shutdown();
         });

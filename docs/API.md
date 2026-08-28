@@ -85,6 +85,12 @@ All parameters are optional and passed as URL query strings.
 | `p` | string | Require a `p` tag with this value |
 | `t` | string | Require a `t` tag with this value |
 | `d` | string | Require a `d` tag with this value. For `naddr1...` the address's own `d` is used unless `d` is given (which overrides it) |
+| `no_p` | boolean | Exclude events carrying a `p` tag (mentions, replies, DMs — `no_p=true` is a "top-level posts only" filter) |
+| `no_e` | boolean | Exclude events carrying an `e` tag (replies) |
+| `no_t` | boolean | Exclude events carrying a `t` tag (hashtags) |
+| `no_d` | boolean | Exclude events carrying a `d` tag (addressable events) |
+
+> **Exclusion note**: `no_*` filters are applied before pagination, like the visibility rules — excluded events never consume `limit` slots or offset steps. Multiple exclusions combine (e.g. `no_p=true&no_e=true` keeps only top-level posts).
 
 > **Search note**: like the WebSocket path, search matches **whole words** — `search=ru` does not match the word "rust". When NIP-50 is disabled, `search` is silently ignored.
 

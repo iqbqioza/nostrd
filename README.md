@@ -191,7 +191,7 @@ nostrd exposes a **read-only HTTP API** on the same port under `/api/v1`, served
 | `GET /api/v1/{nevent1...}` / `GET /api/v1/{note1...}` | A single event by its NIP-19 id |
 | `GET /api/v1/{naddr1...}` | Addressable/replaceable events by NIP-19 address |
 
-Query parameters: `limit`, `offset`, `since`, `until`, `sort`, `search`, `e`, `p`, `t`, `d`. Responses are `{ "events": [...], "count": N, "more": bool }`; `offset` + `more` paginate over the *visible* sequence (NIP-70 protected, NIP-59 gift wraps and NIP-29 private/hidden group content are withheld).
+Query parameters: `limit`, `offset`, `since`, `until`, `sort`, `search`, `e`, `p`, `t`, `d`, plus the absence filters `no_p`/`no_e`/`no_t`/`no_d` (exclude events carrying that tag, e.g. `no_p=true` for top-level posts only). Responses are `{ "events": [...], "count": N, "more": bool }`; `offset` + `more` paginate over the *visible* sequence (NIP-70 protected, NIP-59 gift wraps and NIP-29 private/hidden group content are withheld).
 
 By default the API is served on every host; set `server.api_host` (e.g. `api_host = "api.example.com"`) to serve it only on that hostname and hide `/api/v1` from every other host.
 

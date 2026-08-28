@@ -661,3 +661,5 @@ Settings that require a **restart**: `private_key`, `api_host`, `metrics_enabled
 ## 14. When You Are Stuck
 
 See [Troubleshooting (TROUBLESHOOTING.md)](TROUBLESHOOTING.md) for common errors and their fixes.
+
+Absence filters: `no_p`, `no_e`, `no_t` and `no_d` exclude events carrying that tag before pagination (e.g. `no_p=true` keeps only top-level posts — mentions, replies and DMs are dropped).
