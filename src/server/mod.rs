@@ -145,7 +145,7 @@ async fn build_router(
         app = app.route("/", get(root_inbox_outbox));
     }
     for path in ws_paths_for(&ws_paths) {
-        app = app.route(*path, get(ws_handler).post(nip86::rpc_handler));
+        app = app.route(path, get(ws_handler).post(nip86::rpc_handler));
     }
     let cfg = relay.config.read().await;
     if cfg.server.metrics_enabled {
