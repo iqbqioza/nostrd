@@ -310,6 +310,15 @@ curl "http://127.0.0.1:8080/api/v1/npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3ev
 # => {"events":[...],"count":N,"more":false}
 ```
 
+### Query / count / kinds / daily / id endpoints
+
+- `GET /api/v1/query` — generic filter query (authors/kinds/e/p/t/d/since/until/search/no_*/sort/limit/offset).
+- `GET /api/v1/count` — total count for the same parameters (`{"count": N, "approximate": bool}`).
+- `GET /api/v1/{npub1...}/kinds` — per-kind counts for an author, most used first.
+- `GET /api/v1/{npub1...}/{kind}/daily?year=&month=` — per-day counts for one month, zero-filled through the last day (e.g. `2026-08-31: 0` even before the 31st).
+- `GET /api/v1/ids/{hex}` — a single event by 64-hex id.
+- `GET /api/v1/{npub1...}` — the author's latest kind-0 profile.
+
 ### Monthly counts
 
 `GET /api/v1/{npub1...}/{kind}/monthly` returns per-month event counts (`{"months": [{"month": "2026-08", "count": 4, "approximate": false}], "total": 4}`) for a pubkey + kind, zero-filled over the `since`/`until` range (default: the whole period, from the earliest stored event to now; at most 1200 months).

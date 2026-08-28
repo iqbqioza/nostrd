@@ -39,6 +39,19 @@ pub struct ApiParams {
     pub no_e: Option<bool>,
     pub no_t: Option<bool>,
     pub no_d: Option<bool>,
+    /// Generic query filters (`/api/v1/query` and `/api/v1/count`):
+    /// accepted as a single value, comma-separated values, or repeated
+    /// parameters (`authors=a&authors=b`).
+    #[serde(default, deserialize_with = "de_string_list")]
+    pub authors: Vec<String>,
+    #[serde(default, deserialize_with = "de_u64_list")]
+    pub kinds: Vec<u64>,
+    /// Daily counts (`/api/v1/{npub1...}/{kind}/daily`): the month to
+    /// report, `year` (default: the current year) and `month` 1-12
+    /// (default: the current month). Every day of the month is reported,
+    /// zero-filled through the last day.
+    pub year: Option<i64>,
+    pub month: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -46,6 +59,49 @@ pub struct ApiResponse {
     pub events: Vec<Value>,
     pub count: usize,
     pub more: bool,
+}
+
+/// Deserializes a list parameter that may arrive as a single value, a
+/// comma-separated value, or a repeated parameter.
+fn de_string_list<'de, D>(de: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(de)?;
+    let parts: Vec<&str> = match &value {
+        Value::String(s) => s.split(',').collect(),
+        Value::Array(items) => items
+            .iter()
+            .map(|i| {
+                i.as_str()
+                    .ok_or_else(|| serde::de::Error::custom("expected a string"))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        _ => {
+            return Err(serde::de::Error::custom(
+                "expected a string or array of strings",
+            ));
+        }
+    };
+    Ok(parts
+        .into_iter()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect())
+}
+
+/// Like [`de_string_list`] but for unsigned integers.
+fn de_u64_list<'de, D>(de: D) -> Result<Vec<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    de_string_list(de)?
+        .into_iter()
+        .map(|s| {
+            s.parse::<u64>()
+                .map_err(|_| serde::de::Error::custom("expected an unsigned integer"))
+        })
+        .collect()
 }
 
 fn error_response(status: StatusCode, message: &str) -> (StatusCode, Json<Value>) {
@@ -108,6 +164,12 @@ fn excluded_tags(params: &ApiParams) -> Vec<&'static str> {
 }
 
 fn apply_params(mut filter: Filter, params: &ApiParams) -> Filter {
+    if !params.authors.is_empty() {
+        filter.authors = Some(params.authors.clone());
+    }
+    if !params.kinds.is_empty() {
+        filter.kinds = Some(params.kinds.clone());
+    }
     if let Some(since) = params.since {
         filter.since = Some(since);
     }
@@ -138,6 +200,19 @@ fn sort_ascending(sort: &Option<String>) -> bool {
     matches!(sort.as_deref(), Some("asc" | "ascending"))
 }
 
+/// Parses an author identifier: an `npub1...` code or a 64-hex pubkey
+/// (case-insensitive). Returns the lowercase hex pubkey.
+fn parse_author_identifier(identifier: &str) -> Result<String, String> {
+    if identifier.len() == 64 && identifier.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Ok(identifier.to_ascii_lowercase());
+    }
+    match nip19::parse_nip19(identifier) {
+        Ok(Nip19Entity::Pubkey(pk)) => Ok(hex::encode(pk)),
+        Ok(_) => Err("the endpoint requires an npub1 identifier or a 64-hex pubkey".into()),
+        Err(e) => Err(format!("invalid identifier: {e}")),
+    }
+}
+
 /// `GET /api/v1/{identifier}`
 ///
 /// Handles npub1 (with a kind sub-path) and nevent1 (no kind needed).
@@ -150,6 +225,28 @@ pub async fn api_handler(
     if let Err((status, msg)) = bound_params(&mut params, &cfg) {
         return error_response(status, &msg);
     }
+    // A 64-hex identifier is an author pubkey (profile lookup); everything
+    // else goes through the NIP-19 parsing below.
+    if let Ok(hex_pk) = parse_author_identifier(&identifier) {
+        let no_tags = excluded_tags(&params);
+        let filter = apply_params(
+            Filter {
+                authors: Some(vec![hex_pk]),
+                kinds: Some(vec![0]),
+                ..Default::default()
+            },
+            &params,
+        );
+        return query_and_respond(
+            &relay,
+            vec![filter],
+            1,
+            params.offset,
+            sort_ascending(&params.sort),
+            &no_tags,
+        )
+        .await;
+    }
     let entity = match nip19::parse_nip19(&identifier) {
         Ok(e) => e,
         Err(e) => {
@@ -158,10 +255,30 @@ pub async fn api_handler(
     };
 
     match entity {
-        Nip19Entity::Pubkey(_) => error_response(
-            StatusCode::BAD_REQUEST,
-            "npub1 requires a kind path: /api/v1/npub1.../{kind}",
-        ),
+        Nip19Entity::Pubkey(pk) => {
+            // Without a kind path the latest kind-0 profile event of the
+            // author is returned (kind 0 is replaceable, so the newest one
+            // is the current profile).
+            let hex_pk = hex::encode(pk);
+            let no_tags = excluded_tags(&params);
+            let filter = apply_params(
+                Filter {
+                    authors: Some(vec![hex_pk]),
+                    kinds: Some(vec![0]),
+                    ..Default::default()
+                },
+                &params,
+            );
+            query_and_respond(
+                &relay,
+                vec![filter],
+                1,
+                params.offset,
+                sort_ascending(&params.sort),
+                &no_tags,
+            )
+            .await
+        }
         Nip19Entity::Note(id) => {
             let hex_id = hex::encode(id);
             let filter = apply_params(
@@ -250,47 +367,37 @@ pub async fn api_kind_handler(
     if let Err((status, msg)) = bound_params(&mut params, &cfg) {
         return error_response(status, &msg);
     }
-    let entity = match nip19::parse_nip19(&identifier) {
-        Ok(e) => e,
-        Err(e) => {
-            return error_response(StatusCode::BAD_REQUEST, &format!("invalid identifier: {e}"));
-        }
+    let hex_pk = match parse_author_identifier(&identifier) {
+        Ok(pk) => pk,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
     };
-
-    match entity {
-        Nip19Entity::Pubkey(pk) => {
-            let hex_pk = hex::encode(pk);
-            // `bound_params` already capped `params.limit` at
-            // `limits.api_max_limit` when one is configured; there is no
-            // hardcoded ceiling here (a configured `api_max_limit: 0` means
-            // "no bound").
-            let limit = params.limit.unwrap_or(100);
-            // No per-filter `limit`: query_and_respond fetches `limit+offset+1`
-            // pre-filter rows (via the max_limit parameter) so pagination over
-            // the visible sequence works even when hidden events are present.
-            let filter = apply_params(
-                Filter {
-                    authors: Some(vec![hex_pk]),
-                    kinds: Some(vec![kind]),
-                    ..Default::default()
-                },
-                &params,
-            );
-            let no_tags = excluded_tags(&params);
-            query_and_respond(
-                &relay,
-                vec![filter],
-                limit,
-                params.offset,
-                sort_ascending(&params.sort),
-                &no_tags,
-            )
-            .await
-        }
-        _ => error_response(
-            StatusCode::BAD_REQUEST,
-            "kind path is only valid with npub1 identifiers",
-        ),
+    {
+        // `bound_params` already capped `params.limit` at
+        // `limits.api_max_limit` when one is configured; there is no
+        // hardcoded ceiling here (a configured `api_max_limit: 0` means
+        // "no bound").
+        let limit = params.limit.unwrap_or(100);
+        // No per-filter `limit`: query_and_respond fetches `limit+offset+1`
+        // pre-filter rows (via the max_limit parameter) so pagination over
+        // the visible sequence works even when hidden events are present.
+        let filter = apply_params(
+            Filter {
+                authors: Some(vec![hex_pk]),
+                kinds: Some(vec![kind]),
+                ..Default::default()
+            },
+            &params,
+        );
+        let no_tags = excluded_tags(&params);
+        query_and_respond(
+            &relay,
+            vec![filter],
+            limit,
+            params.offset,
+            sort_ascending(&params.sort),
+            &no_tags,
+        )
+        .await
     }
 }
 
@@ -309,19 +416,10 @@ pub async fn api_monthly_handler(
     Path((identifier, kind)): Path<(String, u64)>,
     Query(params): Query<ApiParams>,
 ) -> (StatusCode, Json<Value>) {
-    let entity = match nip19::parse_nip19(&identifier) {
-        Ok(e) => e,
-        Err(e) => {
-            return error_response(StatusCode::BAD_REQUEST, &format!("invalid identifier: {e}"));
-        }
+    let hex_pk = match parse_author_identifier(&identifier) {
+        Ok(pk) => pk,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
     };
-    let Nip19Entity::Pubkey(pk) = entity else {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "the monthly endpoint requires an npub1 identifier",
-        );
-    };
-    let hex_pk = hex::encode(pk);
 
     // Bounded month range: without `since` the range spans the whole period
     // (from the earliest stored event of this author and kind); an explicit
@@ -415,6 +513,245 @@ pub async fn api_monthly_handler(
             "total": total,
         })),
     )
+}
+
+/// `GET /api/v1/query`
+///
+/// Generic filter query without an identifier: any of the [`ApiParams`]
+/// filter fields (`authors`, `kinds`, `e`, `p`, `t`, `d`, `since`, `until`,
+/// `search`, `no_*`, `sort`, `limit`, `offset`) combine into a single
+/// NIP-01 filter.
+pub async fn api_query_handler(
+    State(relay): State<Arc<Relay>>,
+    Query(mut params): Query<ApiParams>,
+) -> (StatusCode, Json<Value>) {
+    let cfg = relay.config.read().await;
+    if let Err((status, msg)) = bound_params(&mut params, &cfg) {
+        return error_response(status, &msg);
+    }
+    let limit = params.limit.unwrap_or(100);
+    let filter = apply_params(Filter::default(), &params);
+    let no_tags = excluded_tags(&params);
+    query_and_respond(
+        &relay,
+        vec![filter],
+        limit,
+        params.offset,
+        sort_ascending(&params.sort),
+        &no_tags,
+    )
+    .await
+}
+
+/// `GET /api/v1/count`
+///
+/// Total event count for a filter (NIP-45 semantics over HTTP): the same
+/// [`ApiParams`] filter fields as `/query`, returning `{"count": N,
+/// "approximate": bool}`.
+pub async fn api_count_handler(
+    State(relay): State<Arc<Relay>>,
+    Query(params): Query<ApiParams>,
+) -> (StatusCode, Json<Value>) {
+    let Some(_permit) = relay.api_limit.try_acquire() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "server is busy, try again shortly" })),
+        );
+    };
+    let count_limit = relay.config.read().await.limits.count_limit;
+    let now = unix_now();
+    let mut filter = apply_params(Filter::default(), &params);
+    if !relay.config.read().await.nip_enabled(50) {
+        filter.search = None;
+    }
+    let (events, more) = relay.db.count(vec![filter], count_limit, now).await;
+    let has_group_events = events.iter().any(nip29::is_group_event);
+    let groups = if has_group_events {
+        Some(relay.groups.read().await)
+    } else {
+        None
+    };
+    let count = events
+        .iter()
+        .filter(|e| {
+            !nip70::is_protected(e)
+                && (e.kind != nip62::GIFT_WRAP_KIND)
+                && groups.as_deref().is_none_or(|g| g.visible_to(e, None))
+        })
+        .count();
+    drop(groups);
+    drop(_permit);
+    (
+        StatusCode::OK,
+        Json(json!({ "count": count, "approximate": more })),
+    )
+}
+
+/// `GET /api/v1/{identifier}/kinds`
+///
+/// Per-kind event counts for an author: `{"kinds": [{"kind": 1, "count":
+/// 120}, ...]}` sorted by count descending, most used first.
+pub async fn api_kinds_handler(
+    State(relay): State<Arc<Relay>>,
+    Path(identifier): Path<String>,
+    Query(_params): Query<ApiParams>,
+) -> (StatusCode, Json<Value>) {
+    let hex_pk = match parse_author_identifier(&identifier) {
+        Ok(pk) => pk,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
+    };
+
+    let Some(_permit) = relay.api_limit.try_acquire() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "server is busy, try again shortly" })),
+        );
+    };
+    let count_limit = relay.config.read().await.limits.count_limit;
+    let now = unix_now();
+    let filter: Filter = serde_json::from_value(json!({ "authors": [hex_pk] })).expect("static");
+    let (events, more) = relay.db.count(vec![filter], count_limit, now).await;
+    let has_group_events = events.iter().any(nip29::is_group_event);
+    let groups = if has_group_events {
+        Some(relay.groups.read().await)
+    } else {
+        None
+    };
+    let mut by_kind: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
+    for e in events.iter().filter(|e| {
+        !nip70::is_protected(e)
+            && (e.kind != nip62::GIFT_WRAP_KIND)
+            && groups.as_deref().is_none_or(|g| g.visible_to(e, None))
+    }) {
+        *by_kind.entry(e.kind).or_default() += 1;
+    }
+    drop(groups);
+    let mut kinds: Vec<Value> = by_kind
+        .into_iter()
+        .map(|(kind, count)| json!({ "kind": kind, "count": count }))
+        .collect();
+    kinds.sort_by(|a, b| {
+        b["count"]
+            .as_u64()
+            .cmp(&a["count"].as_u64())
+            .then_with(|| a["kind"].as_u64().cmp(&b["kind"].as_u64()))
+    });
+    drop(_permit);
+    (
+        StatusCode::OK,
+        Json(json!({ "kinds": kinds, "approximate": more })),
+    )
+}
+
+/// `GET /api/v1/{identifier}/{kind}/daily`
+///
+/// Per-day event counts for an author + kind within one month, e.g.
+/// `?year=2026&month=8` returns every day of August 2026 — including the
+/// days after today, zero-filled through the last day of the month:
+/// `{"days": [{"day": "2026-08-01", "count": 0}, ...], "total": N}`.
+pub async fn api_daily_handler(
+    State(relay): State<Arc<Relay>>,
+    Path((identifier, kind)): Path<(String, u64)>,
+    Query(params): Query<ApiParams>,
+) -> (StatusCode, Json<Value>) {
+    let hex_pk = match parse_author_identifier(&identifier) {
+        Ok(pk) => pk,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
+    };
+
+    let now = unix_now();
+    let (year, month) = match (params.year, params.month) {
+        (_, Some(m)) if !(1..=12).contains(&m) => {
+            return error_response(StatusCode::BAD_REQUEST, "month must be between 1 and 12");
+        }
+        (Some(y), m) => (y, m.unwrap_or(month_of(now).1)),
+        (None, Some(m)) => (month_of(now).0, m),
+        (None, None) => month_of(now),
+    };
+    let start = month_start(year, month);
+    let end = month_start_of_next(year, month);
+    let days_in_month = (end - start) / 86400;
+
+    let Some(_permit) = relay.api_limit.try_acquire() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "server is busy, try again shortly" })),
+        );
+    };
+    let count_limit = relay.config.read().await.limits.count_limit;
+
+    let mut day_counts = Vec::with_capacity(days_in_month as usize);
+    let mut total = 0u64;
+    for day in 0..days_in_month {
+        let day_start = start + day * 86400;
+        let filter: Filter = serde_json::from_value(json!({
+            "authors": [hex_pk],
+            "kinds": [kind],
+            "since": day_start,
+            "until": day_start + 86400 - 1,
+        }))
+        .expect("static filter");
+        let (events, _) = relay.db.count(vec![filter], count_limit, now).await;
+        let has_group_events = events.iter().any(nip29::is_group_event);
+        let groups = if has_group_events {
+            Some(relay.groups.read().await)
+        } else {
+            None
+        };
+        let count = events
+            .iter()
+            .filter(|e| {
+                !nip70::is_protected(e)
+                    && (e.kind != nip62::GIFT_WRAP_KIND)
+                    && groups.as_deref().is_none_or(|g| g.visible_to(e, None))
+            })
+            .count();
+        drop(groups);
+        total += count as u64;
+        day_counts.push(json!({
+            "day": format!("{year:04}-{month:02}-{:02}", day + 1),
+            "count": count,
+        }));
+    }
+    drop(_permit);
+    (
+        StatusCode::OK,
+        Json(json!({ "days": day_counts, "total": total })),
+    )
+}
+
+/// `GET /api/v1/ids/{hex}`
+///
+/// A single event by its 64-hex id (prefixes are not accepted).
+pub async fn api_id_handler(
+    State(relay): State<Arc<Relay>>,
+    Path(hex_id): Path<String>,
+    Query(params): Query<ApiParams>,
+) -> (StatusCode, Json<Value>) {
+    if hex_id.len() != 64 || hex::decode(&hex_id).is_err() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "the id must be a 64-character hex string",
+        );
+    }
+    let filter = apply_params(
+        Filter {
+            ids: Some(vec![hex_id]),
+            ..Default::default()
+        },
+        &params,
+    );
+    let no_tags = excluded_tags(&params);
+    let limit = params.limit.unwrap_or(1).min(100);
+    query_and_respond(
+        &relay,
+        vec![filter],
+        limit,
+        params.offset,
+        sort_ascending(&params.sort),
+        &no_tags,
+    )
+    .await
 }
 
 /// `(year, month)` of a unix timestamp.
@@ -596,13 +933,23 @@ mod tests {
         created: u64,
         tags: Vec<Vec<String>>,
     ) -> Event {
+        signed_kind_note(secp, 1, content, created, tags)
+    }
+
+    fn signed_kind_note(
+        secp: &Secp256k1<secp256k1::All>,
+        kind: u64,
+        content: &str,
+        created: u64,
+        tags: Vec<Vec<String>>,
+    ) -> Event {
         let keypair = Keypair::from_seckey_slice(secp, &[1u8; 32]).unwrap();
         let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
         let mut ev = Event {
             id: String::new(),
             pubkey,
             created_at: created,
-            kind: 1,
+            kind,
             tags,
             content: content.into(),
             sig: String::new(),
@@ -687,6 +1034,204 @@ mod tests {
                 "V2 must not be lost or repeated"
             );
             assert_eq!(resp["more"], false);
+
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn generic_query_count_kinds_daily_id_and_profile() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay().await;
+            let secp = relay.secp();
+            let pk = XOnlyPublicKey::from_keypair(
+                &Keypair::from_seckey_slice(secp, &[1u8; 32]).unwrap(),
+            )
+            .0
+            .to_string();
+            let npub = crate::nips::nip19::bech32m_encode("npub", &hex::decode(&pk).unwrap())
+                .expect("npub encoding");
+            let aug1 = 1_785_542_400u64;
+
+            let profile = signed_kind_note(relay.secp(), 0, "{\"name\":\"t\"}", aug1 + 1, vec![]);
+            let note1 = signed_note(relay.secp(), "n1", aug1 + 2, vec![]);
+            let note2 = signed_note(relay.secp(), "n2", aug1 + 3, vec![]);
+            let reaction = signed_kind_note(relay.secp(), 7, "+", aug1 + 4, vec![]);
+            for e in [&profile, &note1, &note2, &reaction] {
+                assert_eq!(
+                    relay.db.put(e.clone(), aug1 + 4).await,
+                    crate::db::PutOutcome::Stored
+                );
+            }
+
+            // /query: generic filters.
+            let (code, Json(resp)) = api_query_handler(
+                State(relay.clone()),
+                Query(ApiParams {
+                    authors: vec![pk.clone()],
+                    kinds: vec![1],
+                    ..Default::default()
+                }),
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK);
+            let events = resp["events"].as_array().unwrap();
+            assert_eq!(events.len(), 2, "both kind-1 notes");
+
+            // /count: total.
+            let (_, Json(resp)) = api_count_handler(
+                State(relay.clone()),
+                Query(ApiParams {
+                    authors: vec![pk.clone()],
+                    ..Default::default()
+                }),
+            )
+            .await;
+            assert_eq!(resp["count"], 4);
+            assert_eq!(resp["approximate"], false);
+
+            // /{npub1}/kinds: per-kind breakdown, most used first.
+            let (_, Json(resp)) = api_kinds_handler(
+                State(relay.clone()),
+                Path(npub.clone()),
+                Query(ApiParams::default()),
+            )
+            .await;
+            let kinds = resp["kinds"].as_array().unwrap();
+            assert_eq!(kinds.len(), 3);
+            assert_eq!(kinds[0]["kind"], 1);
+            assert_eq!(kinds[0]["count"], 2);
+            assert_eq!(kinds[1]["kind"], 0);
+            assert_eq!(kinds[2]["kind"], 7);
+
+            // /{npub1}/{kind}/daily: every day of the month, zero-filled
+            // through the last day (Aug 2026 has 31 days).
+            let (_, Json(resp)) = api_daily_handler(
+                State(relay.clone()),
+                Path((npub.clone(), 1u64)),
+                Query(ApiParams {
+                    year: Some(2026),
+                    month: Some(8),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            let days = resp["days"].as_array().unwrap();
+            assert_eq!(days.len(), 31, "every day of August, including future ones");
+            assert_eq!(days[0]["day"], "2026-08-01");
+            assert_eq!(days[0]["count"], 2, "n1 and n2 were posted on the 1st");
+            assert_eq!(days[30]["day"], "2026-08-31");
+            assert_eq!(days[30]["count"], 0, "zero-filled through the month end");
+            assert_eq!(resp["total"], 2);
+
+            // /ids/{hex}: single event by id.
+            let (_, Json(resp)) = api_id_handler(
+                State(relay.clone()),
+                Path(note1.id.clone()),
+                Query(ApiParams::default()),
+            )
+            .await;
+            let events = resp["events"].as_array().unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["id"], note1.id);
+            let (code, _) = api_id_handler(
+                State(relay.clone()),
+                Path("zz".to_string()),
+                Query(ApiParams::default()),
+            )
+            .await;
+            assert_eq!(code, StatusCode::BAD_REQUEST);
+
+            // /{npub1} without a kind: the latest kind-0 profile.
+            let (_, Json(resp)) = api_handler(
+                State(relay.clone()),
+                Path(npub),
+                Query(ApiParams::default()),
+            )
+            .await;
+            let events = resp["events"].as_array().unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["kind"], 0);
+
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn hex_pubkey_identifiers_are_accepted() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay().await;
+            let secp = relay.secp();
+            let pk = XOnlyPublicKey::from_keypair(
+                &Keypair::from_seckey_slice(secp, &[1u8; 32]).unwrap(),
+            )
+            .0
+            .to_string();
+            let now = unix_now();
+            let note = signed_note(relay.secp(), "hex-author", now, vec![]);
+            assert_eq!(
+                relay.db.put(note.clone(), now).await,
+                crate::db::PutOutcome::Stored
+            );
+
+            // The 64-hex pubkey works on every author endpoint, case-insensitively.
+            let upper = pk.to_ascii_uppercase();
+            for id in [&pk, &upper] {
+                let (code, Json(resp)) = api_kind_handler(
+                    State(relay.clone()),
+                    Path((id.clone(), 1u64)),
+                    Query(ApiParams::default()),
+                )
+                .await;
+                assert_eq!(code, StatusCode::OK, "hex pubkey on /{id}/1");
+                let events = resp["events"].as_array().unwrap();
+                assert_eq!(events.len(), 1);
+
+                let (code, Json(resp)) = api_monthly_handler(
+                    State(relay.clone()),
+                    Path((id.clone(), 1u64)),
+                    Query(ApiParams::default()),
+                )
+                .await;
+                assert_eq!(code, StatusCode::OK);
+                assert_eq!(resp["total"], 1);
+
+                let (code, Json(resp)) = api_kinds_handler(
+                    State(relay.clone()),
+                    Path(id.clone()),
+                    Query(ApiParams::default()),
+                )
+                .await;
+                assert_eq!(code, StatusCode::OK);
+                assert_eq!(resp["kinds"][0]["kind"], 1);
+
+                let (code, _) = api_daily_handler(
+                    State(relay.clone()),
+                    Path((id.clone(), 1u64)),
+                    Query(ApiParams::default()),
+                )
+                .await;
+                assert_eq!(code, StatusCode::OK);
+
+                let (code, Json(_resp)) = api_handler(
+                    State(relay.clone()),
+                    Path(id.clone()),
+                    Query(ApiParams::default()),
+                )
+                .await;
+                assert_eq!(code, StatusCode::OK, "hex pubkey on /{id}");
+            }
+
+            // A non-pubkey hex length or an invalid string is rejected.
+            let (code, _) = api_kind_handler(
+                State(relay.clone()),
+                Path(("ff".repeat(31), 1u64)),
+                Query(ApiParams::default()),
+            )
+            .await;
+            assert_eq!(code, StatusCode::BAD_REQUEST);
 
             relay.db.shutdown();
         });

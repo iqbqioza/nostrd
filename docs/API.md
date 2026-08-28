@@ -27,6 +27,22 @@ http://<host>:<port>/api/v1/{identifier}
 http://<host>:<port>/api/v1/{identifier}/{kind}
 ```
 
+### Generic query, count, kinds, daily and id endpoints
+
+`GET /api/v1/query` — generic filter query without an identifier. All filter parameters combine into one NIP-01 filter: `authors` (single, comma-separated or repeated), `kinds` (same), `e`, `p`, `t`, `d`, `since`, `until`, `search`, `no_p`, `no_e`, `no_t`, `no_d`, `sort`, `limit`, `offset`.
+
+`GET /api/v1/count` — total count for the same filter parameters: `{"count": N, "approximate": bool}` (NIP-45 semantics; `approximate` when the collection limit was hit).
+
+`GET /api/v1/{npub1...}/kinds` — per-kind event counts for an author: `{"kinds": [{"kind": 1, "count": 120}], "approximate": bool}`, sorted by count descending.
+
+Author identifiers (`{npub1...}`) may also be given as a **64-hex pubkey** (case-insensitive) on every endpoint.
+
+`GET /api/v1/{npub1...}/{kind}/daily?year=2026&month=8` — per-day counts for one month (default: the current month; `month` must be 1-12). **Every day of the month is reported, zero-filled through the last day** — 8/31 comes back as 0 even when today is the 28th: `{"days": [{"day": "2026-08-01", "count": 0}], "total": N}`.
+
+`GET /api/v1/ids/{hex}` — a single event by its 64-hex id (prefixes rejected).
+
+`GET /api/v1/{npub1...}` — the author's latest kind-0 profile event (kind 0 is replaceable, so the newest one is the current profile).
+
 ### Monthly counts
 
 `GET /api/v1/{npub1...}/{kind}/monthly` returns per-month event counts for an author's events of a kind, so a frontend can render e.g. `2026-08(4)`:
