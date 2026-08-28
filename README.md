@@ -158,6 +158,7 @@ The unit restarts the relay automatically on crashes and on boot. `sudo systemct
 - Linux / macOS / other Unix-like OS (daemonization uses the `daemonize` crate)
 - Rust 1.85+ (edition 2024)
 - A 64-bit system is recommended (LMDB maps can be huge on 32-bit systems)
+- Runs fine on a tiny VPS (0.25 vCPU / 512 MB) — see [Low-spec Tuning](../docs/MANUAL.md#low-spec-vps-025-vcpu--512-mb)
 
 ## Build
 

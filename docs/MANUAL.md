@@ -40,7 +40,25 @@ Key features:
 ### Requirements
 
 - A recent stable Rust toolchain
-- A Linux machine (2 GB of RAM or more is recommended)
+- A Linux machine (2 GB of RAM or more is recommended — see [Low-spec Tuning](#low-spec-vps-025-vcpu--512-mb) for 0.25 vCPU / 512 MB)
+
+### Low-spec VPS (0.25 vCPU / 512 MB)
+
+nostrd is verified to run stably even when the database exceeds RAM. The LMDB map is a **sparse 1 TiB virtual reservation** — physical disk grows only with the data written — and the process memory stays flat: a relay with a 252 MB database held **7.9 MB of private RSS** (the rest is reclaimable file cache the kernel evicts under pressure).
+
+For a tiny VPS, one setting makes the biggest difference:
+
+```toml
+[database]
+search_index = false   # halves the database size and saves CPU/IO
+```
+
+| Setting | Effect | Measured |
+| --- | --- | --- |
+| `search_index = false` | Disables the NIP-50 word index — search still works (whole-word matching by scanning content) but is slower. Recommended when full-text search is not needed | 41.8 MB → **20.5 MB** per 10,000 events (each with 3 tags and 21 words) |
+| Defaults | Already tiny: `buffer_size = 2048`, bounded queues, no per-connection growth | No change needed for 512 MB |
+
+If you need search on a tiny VPS, keep `search_index = true` and lower `max_indexed_words` (e.g. 32) instead — it caps the per-event word cost. All other defaults are already tuned for low memory: the per-connection buffers are small, the LMDB map never needs resizing at runtime, and the relay restarts instantly (no in-memory index to rebuild).
 
 ### Building
 
