@@ -172,6 +172,33 @@ impl Store {
         }
         Ok(out)
     }
+    /// Counts events per kind by walking the `by_kind` index in key order
+    /// (kind-major: every event of kind 0 first, then kind 1, ...), examining
+    /// at most `max_keys` entries. `more` is true when the walk was cut short
+    /// (the counts then cover the lowest-numbered kinds only). Returns
+    /// `(kind, count)` pairs in ascending kind order.
+    pub(crate) fn kind_counts(&self, max_keys: usize) -> Result<(Vec<(u64, u64)>, bool)> {
+        let rtxn = self.env.read_txn()?;
+        let mut counts: Vec<(u64, u64)> = Vec::new();
+        let mut examined = 0usize;
+        let mut more = false;
+        for item in self.by_kind.iter(&rtxn)? {
+            let (key, _) = item?;
+            if key.len() >= 8 {
+                let kind = u64::from_be_bytes(key[..8].try_into().expect("8-byte kind prefix"));
+                match counts.last_mut() {
+                    Some((k, c)) if *k == kind => *c += 1,
+                    _ => counts.push((kind, 1)),
+                }
+            }
+            examined += 1;
+            if examined >= max_keys {
+                more = true;
+                break;
+            }
+        }
+        Ok((counts, more))
+    }
 
     /// NIP-62: deletes every event authored by `pubkey` (including NIP-09
     /// deletion requests and NIP-59 gift wraps that p-tag it) and records the

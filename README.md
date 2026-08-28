@@ -192,6 +192,11 @@ nostrd exposes a **read-only HTTP API** on the same port under `/api/v1`, served
 | `GET /api/v1/{nevent1...}` / `GET /api/v1/{note1...}` | A single event by its NIP-19 id |
 | `GET /api/v1/{npub1...}` | The author's latest kind-0 profile event |
 | `GET /api/v1/{npub1...}/kinds` | Per-kind event counts for an author, most used first |
+| `GET /api/v1/{npub1...}/stats` | Author statistics in one call (total, first/last activity, kind breakdown) |
+| `GET /api/v1/{npub1...}/{kind}/hourly?year=&month=&day=` | Per-hour counts for one day, zero-filled across all 24 hours |
+| `GET /api/v1/ids/{hex}/related` | Events referencing an event (`#e` replies and `#q` quotes) |
+| `GET /api/v1/{npub1...}/follows` | The author's latest follow list (kind 3) |
+| `GET /api/v1/relay/kinds` | The most common kinds stored on the relay |
 | `GET /api/v1/query?authors=&kinds=&e=&p=&...` | Generic filter query without an identifier (all filter params combine) |
 | `GET /api/v1/count?authors=&kinds=&...` | Total event count for a filter (`{"count": N, "approximate": bool}`) |
 | `GET /api/v1/{npub1...}/{kind}/daily?year=&month=` | Per-day counts for one month, zero-filled through the last day |

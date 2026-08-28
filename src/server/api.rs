@@ -46,12 +46,13 @@ pub struct ApiParams {
     pub authors: Vec<String>,
     #[serde(default, deserialize_with = "de_u64_list")]
     pub kinds: Vec<u64>,
-    /// Daily counts (`/api/v1/{npub1...}/{kind}/daily`): the month to
-    /// report, `year` (default: the current year) and `month` 1-12
-    /// (default: the current month). Every day of the month is reported,
-    /// zero-filled through the last day.
+    /// Daily and hourly counts: the date to report. `year` (default: the
+    /// current year), `month` 1-12 (default: the current month) and `day`
+    /// (default: today) — daily reports every day of the month, zero-filled
+    /// through the last day; hourly reports all 24 hours of one day.
     pub year: Option<i64>,
     pub month: Option<u32>,
+    pub day: Option<u32>,
 }
 
 #[derive(Debug, Serialize)]
@@ -754,6 +755,283 @@ pub async fn api_id_handler(
     .await
 }
 
+/// `GET /api/v1/{identifier}/stats`
+///
+/// Author statistics in one call: total event count, first/last activity,
+/// per-kind breakdown and the active period, so a profile page needs a
+/// single request.
+pub async fn api_stats_handler(
+    State(relay): State<Arc<Relay>>,
+    Path(identifier): Path<String>,
+    Query(_params): Query<ApiParams>,
+) -> (StatusCode, Json<Value>) {
+    let hex_pk = match parse_author_identifier(&identifier) {
+        Ok(pk) => pk,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
+    };
+    let Some(_permit) = relay.api_limit.try_acquire() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "server is busy, try again shortly" })),
+        );
+    };
+    let count_limit = relay.config.read().await.limits.count_limit;
+    let now = unix_now();
+    let filter: Filter = serde_json::from_value(json!({ "authors": [hex_pk] })).expect("static");
+
+    let (events, more) = relay.db.count(vec![filter.clone()], count_limit, now).await;
+    let has_group_events = events.iter().any(nip29::is_group_event);
+    let groups = if has_group_events {
+        Some(relay.groups.read().await)
+    } else {
+        None
+    };
+    let mut by_kind: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
+    let mut total = 0usize;
+    for e in events.iter().filter(|e| {
+        !nip70::is_protected(e)
+            && (e.kind != nip62::GIFT_WRAP_KIND)
+            && groups.as_deref().is_none_or(|g| g.visible_to(e, None))
+    }) {
+        *by_kind.entry(e.kind).or_default() += 1;
+        total += 1;
+    }
+    drop(groups);
+
+    let (first, _) = relay.db.api_query(vec![filter.clone()], 1, now, true).await;
+    let (last, _) = relay.db.api_query(vec![filter], 1, now, false).await;
+    drop(_permit);
+    let first_seen = first.first().map(|e| e.created_at);
+    let last_seen = last.first().map(|e| e.created_at);
+    let first_month = first_seen.map(|ts| {
+        let (y, m) = month_of(ts);
+        format!("{y:04}-{m:02}")
+    });
+    let last_month = last_seen.map(|ts| {
+        let (y, m) = month_of(ts);
+        format!("{y:04}-{m:02}")
+    });
+    let kinds: Vec<Value> = by_kind
+        .into_iter()
+        .map(|(kind, count)| json!({ "kind": kind, "count": count }))
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "total": total,
+            "approximate": more,
+            "first_seen": first_seen,
+            "last_seen": last_seen,
+            "first_month": first_month,
+            "last_month": last_month,
+            "kinds": kinds,
+        })),
+    )
+}
+
+/// `GET /api/v1/{identifier}/{kind}/hourly`
+///
+/// Per-hour event counts for one day, e.g. `?year=2026&month=8&day=28`
+/// returns all 24 hours of that day, zero-filled:
+/// `{"hours": [{"hour": "2026-08-28T00", "count": 0}, ...], "total": N}`.
+pub async fn api_hourly_handler(
+    State(relay): State<Arc<Relay>>,
+    Path((identifier, kind)): Path<(String, u64)>,
+    Query(params): Query<ApiParams>,
+) -> (StatusCode, Json<Value>) {
+    let hex_pk = match parse_author_identifier(&identifier) {
+        Ok(pk) => pk,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
+    };
+    let now = unix_now();
+    let (year, month) = match (params.year, params.month) {
+        (_, Some(m)) if !(1..=12).contains(&m) => {
+            return error_response(StatusCode::BAD_REQUEST, "month must be between 1 and 12");
+        }
+        (Some(y), m) => (y, m.unwrap_or(month_of(now).1)),
+        (None, Some(m)) => (month_of(now).0, m),
+        (None, None) => month_of(now),
+    };
+    let days_in_month = (month_start_of_next(year, month) - month_start(year, month)) / 86400;
+    let day = params.day.unwrap_or_else(|| {
+        let (_, _, d) = civil_from_days((now / 86400) as i64);
+        d.min(days_in_month as u32)
+    });
+    if day == 0 || day as u64 > days_in_month {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            &format!("day must be between 1 and {days_in_month}"),
+        );
+    }
+    let day_start = month_start(year, month) + (day as u64 - 1) * 86400;
+
+    let Some(_permit) = relay.api_limit.try_acquire() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "server is busy, try again shortly" })),
+        );
+    };
+    let count_limit = relay.config.read().await.limits.count_limit;
+
+    let mut hour_counts = Vec::with_capacity(24);
+    let mut total = 0u64;
+    for h in 0..24 {
+        let h_start = day_start + h * 3600;
+        let filter: Filter = serde_json::from_value(json!({
+            "authors": [hex_pk],
+            "kinds": [kind],
+            "since": h_start,
+            "until": h_start + 3600 - 1,
+        }))
+        .expect("static filter");
+        let (events, _) = relay.db.count(vec![filter], count_limit, now).await;
+        let has_group_events = events.iter().any(nip29::is_group_event);
+        let groups = if has_group_events {
+            Some(relay.groups.read().await)
+        } else {
+            None
+        };
+        let count = events
+            .iter()
+            .filter(|e| {
+                !nip70::is_protected(e)
+                    && (e.kind != nip62::GIFT_WRAP_KIND)
+                    && groups.as_deref().is_none_or(|g| g.visible_to(e, None))
+            })
+            .count();
+        drop(groups);
+        total += count as u64;
+        hour_counts.push(json!({
+            "hour": format!("{year:04}-{month:02}-{day:02}T{h:02}"),
+            "count": count,
+        }));
+    }
+    drop(_permit);
+    (
+        StatusCode::OK,
+        Json(json!({ "hours": hour_counts, "total": total })),
+    )
+}
+
+/// `GET /api/v1/ids/{hex}/related`
+///
+/// Events referencing an event: replies and threads (`#e` tags) and quotes
+/// (`#q` tags) — the union of both filters.
+pub async fn api_related_handler(
+    State(relay): State<Arc<Relay>>,
+    Path(hex_id): Path<String>,
+    Query(params): Query<ApiParams>,
+) -> (StatusCode, Json<Value>) {
+    if hex_id.len() != 64 || hex::decode(&hex_id).is_err() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "the id must be a 64-character hex string",
+        );
+    }
+    let no_tags = excluded_tags(&params);
+    let limit = params.limit.unwrap_or(100);
+    let filters: Vec<Filter> = vec![
+        apply_params(
+            Filter {
+                tags: std::collections::BTreeMap::from([("#e".to_string(), json!(hex_id.clone()))]),
+                ..Default::default()
+            },
+            &params,
+        ),
+        apply_params(
+            Filter {
+                tags: std::collections::BTreeMap::from([("#q".to_string(), json!(hex_id.clone()))]),
+                ..Default::default()
+            },
+            &params,
+        ),
+    ];
+    query_and_respond(
+        &relay,
+        filters,
+        limit,
+        params.offset,
+        sort_ascending(&params.sort),
+        &no_tags,
+    )
+    .await
+}
+
+/// `GET /api/v1/{identifier}/follows`
+///
+/// The author's latest follow list (kind 3, NIP-02 — replaceable, so the
+/// newest event is the current list; the `p` tags carry the followed
+/// pubkeys).
+pub async fn api_follows_handler(
+    State(relay): State<Arc<Relay>>,
+    Path(identifier): Path<String>,
+    Query(params): Query<ApiParams>,
+) -> (StatusCode, Json<Value>) {
+    let hex_pk = match parse_author_identifier(&identifier) {
+        Ok(pk) => pk,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
+    };
+    let no_tags = excluded_tags(&params);
+    let filter = apply_params(
+        Filter {
+            authors: Some(vec![hex_pk]),
+            kinds: Some(vec![3]),
+            ..Default::default()
+        },
+        &params,
+    );
+    query_and_respond(
+        &relay,
+        vec![filter],
+        1,
+        params.offset,
+        sort_ascending(&params.sort),
+        &no_tags,
+    )
+    .await
+}
+
+/// `GET /api/v1/relay/kinds`
+///
+/// The most common event kinds stored on the relay: `{"kinds": [{"kind":
+/// 1, "count": 12345}, ...], "approximate": bool}` sorted by count
+/// descending. The count walk is bounded (`approximate: true` when it was
+/// cut short).
+pub async fn api_relay_kinds_handler(
+    State(relay): State<Arc<Relay>>,
+    Query(params): Query<ApiParams>,
+) -> (StatusCode, Json<Value>) {
+    let Some(_permit) = relay.api_limit.try_acquire() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "server is busy, try again shortly" })),
+        );
+    };
+    let limit = params.limit.unwrap_or(20).min(100);
+    // The walk examines at most half a million index entries (bounded work
+    // on the dedicated API reader thread); `approximate` reports whether it
+    // was cut short.
+    const MAX_KEYS: usize = 500_000;
+    let (counts, more) = relay.db.kind_counts(MAX_KEYS).await;
+    drop(_permit);
+    let mut kinds: Vec<Value> = counts
+        .into_iter()
+        .map(|(kind, count)| json!({ "kind": kind, "count": count }))
+        .collect();
+    kinds.sort_by(|a, b| {
+        b["count"]
+            .as_u64()
+            .cmp(&a["count"].as_u64())
+            .then_with(|| a["kind"].as_u64().cmp(&b["kind"].as_u64()))
+    });
+    kinds.truncate(limit);
+    (
+        StatusCode::OK,
+        Json(json!({ "kinds": kinds, "approximate": more })),
+    )
+}
+
 /// `(year, month)` of a unix timestamp.
 fn month_of(ts: u64) -> (i64, u32) {
     let (y, m, _) = civil_from_days((ts / 86400) as i64);
@@ -1309,6 +1587,139 @@ mod tests {
             assert_eq!(days[28]["day"], "2024-02-29");
             assert_eq!(days[28]["count"], 1, "the leap day is counted");
             assert_eq!(resp["total"], 1);
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn stats_hourly_related_follows_and_relay_kinds() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay().await;
+            let secp = relay.secp();
+            let pk = XOnlyPublicKey::from_keypair(
+                &Keypair::from_seckey_slice(secp, &[1u8; 32]).unwrap(),
+            )
+            .0
+            .to_string();
+            let npub = crate::nips::nip19::bech32m_encode("npub", &hex::decode(&pk).unwrap())
+                .expect("npub encoding");
+            let aug1 = 1_785_542_400u64;
+
+            let follows = signed_kind_note(
+                relay.secp(),
+                3,
+                "",
+                aug1 + 1,
+                vec![vec!["p".into(), "cc".repeat(32)]],
+            );
+            let root = signed_note(relay.secp(), "root", aug1 + 2, vec![]);
+            let reply = signed_note(
+                relay.secp(),
+                "reply",
+                aug1 + 3,
+                vec![vec!["e".into(), root.id.clone()]],
+            );
+            let quote = signed_note(
+                relay.secp(),
+                "quote",
+                aug1 + 4,
+                vec![vec!["q".into(), root.id.clone()]],
+            );
+            for e in [&follows, &root, &reply, &quote] {
+                assert_eq!(
+                    relay.db.put(e.clone(), aug1 + 4).await,
+                    crate::db::PutOutcome::Stored
+                );
+            }
+
+            // /{npub1}/stats: summary in one call.
+            let (code, Json(resp)) = api_stats_handler(
+                State(relay.clone()),
+                Path(npub.clone()),
+                Query(ApiParams::default()),
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK);
+            assert_eq!(resp["total"], 4);
+            assert_eq!(resp["first_month"], "2026-08");
+            assert_eq!(resp["last_month"], "2026-08");
+            assert_eq!(resp["first_seen"], aug1 + 1);
+            assert_eq!(resp["last_seen"], aug1 + 4);
+            let kinds = resp["kinds"].as_array().unwrap();
+            assert_eq!(kinds.len(), 2, "kind 1 (3 events) collapses into one entry");
+            assert_eq!(kinds[0]["kind"], 1);
+            assert_eq!(kinds[0]["count"], 3);
+
+            // /{npub1}/1/hourly: all 24 hours of one day, zero-filled.
+            let (_, Json(resp)) = api_hourly_handler(
+                State(relay.clone()),
+                Path((npub.clone(), 1u64)),
+                Query(ApiParams {
+                    year: Some(2026),
+                    month: Some(8),
+                    day: Some(1),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            let hours = resp["hours"].as_array().unwrap();
+            assert_eq!(hours.len(), 24);
+            assert_eq!(hours[0]["hour"], "2026-08-01T00");
+            assert_eq!(hours[0]["count"], 3, "the three kind-1 events");
+            assert_eq!(hours[23]["hour"], "2026-08-01T23");
+            assert_eq!(hours[23]["count"], 0);
+            assert_eq!(resp["total"], 3);
+            // An invalid day is rejected.
+            let (code, _) = api_hourly_handler(
+                State(relay.clone()),
+                Path((npub.clone(), 1u64)),
+                Query(ApiParams {
+                    year: Some(2026),
+                    month: Some(2),
+                    day: Some(30),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            assert_eq!(code, StatusCode::BAD_REQUEST);
+
+            // /ids/{hex}/related: replies and quotes referencing the root.
+            let (_, Json(resp)) = api_related_handler(
+                State(relay.clone()),
+                Path(root.id.clone()),
+                Query(ApiParams::default()),
+            )
+            .await;
+            let mut contents: Vec<String> = resp["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["content"].as_str().unwrap().to_string())
+                .collect();
+            contents.sort();
+            assert_eq!(contents, vec!["quote".to_string(), "reply".to_string()]);
+
+            // /{npub1}/follows: the latest kind-3 list.
+            let (_, Json(resp)) = api_follows_handler(
+                State(relay.clone()),
+                Path(npub.clone()),
+                Query(ApiParams::default()),
+            )
+            .await;
+            let events = resp["events"].as_array().unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["kind"], 3);
+            assert_eq!(events[0]["tags"][0][0], "p");
+
+            // /relay/kinds: relay-wide kind counts.
+            let (_, Json(resp)) =
+                api_relay_kinds_handler(State(relay.clone()), Query(ApiParams::default())).await;
+            let kinds = resp["kinds"].as_array().unwrap();
+            assert_eq!(kinds[0]["kind"], 1, "kind 1 is the most common");
+            assert_eq!(kinds[0]["count"], 3);
+            assert_eq!(kinds[1]["kind"], 3);
+
             relay.db.shutdown();
         });
     }

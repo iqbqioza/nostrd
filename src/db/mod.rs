@@ -113,6 +113,12 @@ enum Msg {
         now: u64,
         reply: oneshot::Sender<(Vec<Event>, bool)>,
     },
+    /// Relay-wide per-kind event counts (REST API): walks the `by_kind`
+    /// index, examining at most `max_keys` entries.
+    KindCounts {
+        max_keys: usize,
+        reply: oneshot::Sender<(Vec<(u64, u64)>, bool)>,
+    },
     Delete {
         targets: Vec<String>,
         addresses: Vec<nip09::Address>,
@@ -557,6 +563,12 @@ impl DbClient {
             reply,
         })
         .await
+    }
+
+    /// Relay-wide per-kind event counts (REST API).
+    pub async fn kind_counts(&self, max_keys: usize) -> (Vec<(u64, u64)>, bool) {
+        self.request_read(|reply| Msg::KindCounts { max_keys, reply })
+            .await
     }
 
     pub async fn apply_deletion(

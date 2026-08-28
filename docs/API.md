@@ -43,6 +43,18 @@ Author identifiers (`{npub1...}`) may also be given as a **64-hex pubkey** (case
 
 `GET /api/v1/{npub1...}` — the author's latest kind-0 profile event (kind 0 is replaceable, so the newest one is the current profile).
 
+### Stats, hourly, related, follows and relay kinds
+
+`GET /api/v1/{npub1...}/stats` — author statistics in one call: `{"total": N, "approximate": bool, "first_seen": unix, "last_seen": unix, "first_month": "2026-08", "last_month": "2026-08", "kinds": [{"kind": 1, "count": 120}]}`.
+
+`GET /api/v1/{npub1...}/{kind}/hourly?year=&month=&day=` — per-hour counts for one day (defaults: the current date; `day` validated against the month). All **24 hours are reported, zero-filled**: `{"hours": [{"hour": "2026-08-28T00", "count": 0}], "total": N}`.
+
+`GET /api/v1/ids/{hex}/related` — events referencing the event: the union of `#e` (replies, threads) and `#q` (quotes) filters.
+
+`GET /api/v1/{npub1...}/follows` — the author's latest follow list (kind 3, NIP-02; replaceable, so the newest event is the current list).
+
+`GET /api/v1/relay/kinds?limit=` — the most common kinds stored on the relay, sorted by count descending (`{"kinds": [{"kind": 1, "count": 12345}], "approximate": bool}`). The count walk examines at most 500,000 index entries; `approximate: true` when it was cut short.
+
 ### Monthly counts
 
 `GET /api/v1/{npub1...}/{kind}/monthly` returns per-month event counts for an author's events of a kind, so a frontend can render e.g. `2026-08(4)`:
