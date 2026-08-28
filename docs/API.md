@@ -31,10 +31,10 @@ http://<host>:<port>/api/v1/{identifier}/{kind}
 
 When `server.api_host` is configured (e.g. `api.example.com`), the API and the WebSocket relay are split by the **Host header**:
 
-| Host header | `/api/v1`, `/health`, `/metrics` | WebSocket relay & NIP-11 (`/`, `/ws`) |
+| Host header | `/api/v1`, `/health`, `/metrics` | WebSocket relay & NIP-11 |
 | --- | --- | --- |
 | `api.example.com` | served | `404` |
-| any other host | `404` | served |
+| any other host | `404` | served — the paths are selected by `server.ws_paths`: `/` by default, `/inbox` and `/outbox` in `inbox-outbox` mode, or all of them |
 
 Without `api_host`, the API is served on every host, next to the WebSocket endpoint.
 

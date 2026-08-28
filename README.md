@@ -242,7 +242,7 @@ nostrd blossom list
 
 All commands accept `--config <path>` (default `./nostrd.toml`).
 
-Sending `SIGHUP` to the daemon reloads the configuration at runtime: most limits, server auth settings, the NIP toggles (including the NIP-40 toggle, applied live) and the REST API concurrency ceiling apply immediately. A few settings are captured at startup and require a full restart: `live_buffer`/`live_batch_size`/`live_batch_interval_ms`, `server.api_host`, `server.management_port`, `server.metrics_enabled`, `relay.private_key` (a reload warns that it is ignored), `relay.livekit_url`, `daemon.log_max_size_bytes`/`log_max_files`, the database request timeouts/queue caps, `purge_interval_secs`, `stats_interval_secs` and `max_indexed_words`. An invalid reloaded file is rejected (the old configuration stays in force). The access control lists are runtime-managed (NIP-86) and are **not** overwritten by a reload.
+Sending `SIGHUP` to the daemon reloads the configuration at runtime: most limits, server auth settings, the NIP toggles (including the NIP-40 toggle, applied live) and the REST API concurrency ceiling apply immediately. A few settings are captured at startup and require a full restart: `live_buffer`/`live_batch_size`/`live_batch_interval_ms`, `server.api_host`, `server.ws_paths`, `server.management_port`, `server.metrics_enabled`, `relay.private_key` (a reload warns that it is ignored), `relay.livekit_url`, `daemon.log_max_size_bytes`/`log_max_files`, the database request timeouts/queue caps, `purge_interval_secs`, `stats_interval_secs` and `max_indexed_words`. An invalid reloaded file is rejected (the old configuration stays in force). The access control lists are runtime-managed (NIP-86) and are **not** overwritten by a reload.
 
 ## Configuration
 
@@ -268,6 +268,24 @@ In addition to the tunables above, a few hard bounds are fixed to keep the relay
 - A single filter may carry at most **512 `ids` or `authors` entries**; larger filters are rejected (the per-candidate match is linear in these arrays, so unbounded arrays would allow quadratic work per REQ).
 - Event ids in `ids` filters may be prefixes, but only full 32-byte ids and even-length prefixes are matched (odd-length/empty entries are ignored, consistently for historical and live delivery).
 - Over-long index keys (a tag value, content word or `d` tag long enough to exceed LMDB's key-size limit) are skipped at indexing time rather than aborting the write batch; the event is still stored.
+
+### Inbox/outbox subscription filters
+
+nostrd extends the REQ filter syntax with two convenience keys for the inbox/outbox routing model:
+
+- `"outbox": "<pubkey>"` — expands to `"authors": ["<pubkey>"]`: only events **authored by** the pubkey (stored and live).
+- `"inbox": "<pubkey>"` — expands to `"#p": ["<pubkey>"]`: only events **addressed to** the pubkey — mentions, replies, zaps and DMs that `p`-tag it.
+
+Values may be 64-hex pubkeys or `npub1...` codes, or arrays of either; an existing `authors`/`#p` key is merged. The expanded filters are plain NIP-01 filters, so both keys work for stored queries, live delivery and `COUNT`, and combine with every other filter field (e.g. `{"outbox": "<pk>", "kinds": [1]}`). An invalid pubkey rejects the subscription like any malformed filter.
+
+```jsonc
+["REQ", "my-feed", {"outbox": "npub1..."}]
+["REQ", "mentions", {"inbox": "npub1...", "kinds": [1, 7]}]
+```
+
+With `server.ws_paths = "inbox-outbox"` the relay's WebSocket endpoint is served only at `/inbox` and `/outbox` (NIP-11 on the same paths); the root returns 404. `ws_paths = "all"` serves the root and the inbox/outbox paths. The default `root` mode serves `/` only (the legacy `/ws` and `/ws/` paths are removed).
+
+**Write policies** — the inbox/outbox endpoints are write-restricted: events published through `/outbox` must be authored by the connection's NIP-42-authenticated pubkey (`server.outbox_write_policy = "any"`, the default) or by the relay itself (`"relay"` — only the relay's own events); events published through `/inbox` must carry a `p` tag — any recipient (`server.inbox_write_policy = "any"`, the default) or the relay's own pubkey (`"relay"`). The `"relay"` modes require `relay.private_key`; the root endpoint stays unrestricted.
 
 ## NIP support
 

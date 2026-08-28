@@ -534,26 +534,21 @@ pub(crate) async fn build_state(cfg: &Config, _relay: &Relay) -> Option<Arc<Blos
     }
 }
 
-/// Whether the request Host names the Blossom host.
-pub(crate) fn host_is_blossom(
-    blossom_host: &str,
-    request: &axum::http::Request<axum::body::Body>,
-) -> bool {
+/// Whether the request Host header names the Blossom host. Takes the raw
+/// header value (not the whole request) so callers can hold it across
+/// awaits without borrowing the request.
+pub(crate) fn host_is_blossom(blossom_host: &str, host_header: Option<&str>) -> bool {
     if blossom_host.trim().is_empty() {
         return false;
     }
-    request
-        .headers()
-        .get(axum::http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|h| {
-            let host = crate::server::host_header_host(h).to_ascii_lowercase();
-            host == blossom_host
-                .trim()
-                .trim_start_matches('[')
-                .trim_end_matches(']')
-                .to_ascii_lowercase()
-        })
+    host_header.is_some_and(|h| {
+        let host = crate::server::host_header_host(h).to_ascii_lowercase();
+        host == blossom_host
+            .trim()
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .to_ascii_lowercase()
+    })
 }
 
 #[cfg(test)]

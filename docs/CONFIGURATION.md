@@ -135,6 +135,9 @@ Every key is optional; a missing key uses the default shown below.
 | `require_auth` | boolean | `false` | Require NIP-42 authentication for all REQ/EVENT/COUNT/NEG |
 | `send_auth_challenge` | boolean | `true` | Send the AUTH challenge on connect |
 | `metrics_enabled` | boolean | `true` | Serve Prometheus metrics at `/metrics` |
+| `ws_paths` | string | `"root"` | WebSocket endpoint paths: `root` (`/` only), `inbox-outbox`, or `all` |
+| `inbox_write_policy` | string | `"any"` | Write policy for `/inbox`: `any` or `relay` |
+| `outbox_write_policy` | string | `"any"` | Write policy for `/outbox`: `any` or `relay` |
 
 ### Key details
 
@@ -143,6 +146,8 @@ Every key is optional; a missing key uses the default shown below.
 **`port`** — The TCP port, 1-65535; 80 requires root. This one port serves the WebSocket relay, the NIP-11 document, the REST API and the NIP-86 RPC together.
 
 **`api_host`** — A hostname (e.g. `api.example.com`) dedicated to the REST API. Requests whose Host header matches it are served only `/api/v1`, `/health` and `/metrics`; every other host gets `404` for those paths, and the API host gets `404` for the relay endpoints. This lets you serve the API and the relay on the same port behind one reverse proxy. Host matching ignores case, `:port` suffixes and IPv6 brackets. Empty = the API is available on every host. Fixed at startup — requires a `restart`.
+
+**`ws_paths`** — Which paths serve the WebSocket endpoint and the NIP-11 document: `root` serves `/` only (the default; the legacy `/ws` and `/ws/` paths are removed); `inbox-outbox` serves only `/inbox` and `/outbox`; `all` serves the root and the inbox/outbox paths. The inbox/outbox paths give the relay distinct endpoints for the inbox/outbox routing model (e.g. `wss://relay.example.com/inbox` and `wss://relay.example.com/outbox`). In `inbox-outbox` mode the root path returns 404 on every host except a configured Blossom host, where it answers the Blossom server-info document. Fixed at startup — requires a `restart`.
 
 **`management_port`** — A separate port for the legacy management REST API (`/admin/...`). `0` disables it. Must differ from `port`.
 
@@ -162,7 +167,7 @@ Every key is optional; a missing key uses the default shown below.
 
 - **`require_auth = true` with `send_auth_challenge = false`** locks everyone out — the challenge is never sent, so nobody can ever authenticate. The relay warns about this combination at startup.
 - **`management_token` and `admin_pubkey`** can both be configured at once; either one authorizes. When both are empty, the management APIs are effectively disabled (every request gets `401`).
-- The NIP-86 RPC is served on `POST /` and `POST /ws` of the main port; the legacy API on `management_port`. Both share the same authentication.
+- The NIP-86 RPC is served on `POST /` of the main port (and on the paths selected by `server.ws_paths`); the legacy API on `management_port`. Both share the same authentication.
 
 ---
 

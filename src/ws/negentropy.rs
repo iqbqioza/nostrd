@@ -55,7 +55,12 @@ impl super::Conn {
             self.send_neg_err(&sub_id, "error: NEG-OPEN subscription id too long");
             return;
         }
-        let filter: Filter = match serde_json::from_value::<Filter>(rest[1].clone()) {
+        let mut raw = rest[1].clone();
+        if crate::filter::rewrite_inbox_outbox(&mut raw).is_err() {
+            self.send_neg_err(&sub_id, "error: invalid NEG-OPEN filter");
+            return;
+        }
+        let filter: Filter = match serde_json::from_value::<Filter>(raw) {
             Ok(mut filter) => {
                 // Negentropy needs every matching record, not a capped page.
                 filter.limit = None;

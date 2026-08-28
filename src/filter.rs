@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::event::Event;
 
@@ -134,6 +134,62 @@ pub(crate) fn tag_string_values(value: &Value) -> Vec<String> {
     }
 }
 
+/// nostrd extension: the `inbox` and `outbox` filter keys expand into the
+/// standard constraints before the filter is parsed — `inbox` to `#p`
+/// (events addressed to the pubkey: mentions, replies, zaps, DMs) and
+/// `outbox` to `authors` (events authored by the pubkey). Each value is a
+/// pubkey as 64-hex or an `npub1...` code, or an array of those; existing
+/// `#p`/`authors` entries are merged. The keys make the inbox/outbox
+/// routing model expressible in a single subscription while remaining
+/// plain NIP-01 filters on the wire.
+pub(crate) fn rewrite_inbox_outbox(value: &mut Value) -> Result<(), String> {
+    let Value::Object(map) = value else {
+        return Ok(());
+    };
+    for (key, dst) in [("inbox", "#p"), ("outbox", "authors")] {
+        let Some(raw) = map.remove(key) else {
+            continue;
+        };
+        let items = match raw {
+            Value::String(s) => vec![s],
+            Value::Array(items) => items
+                .into_iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .ok_or_else(|| format!("invalid {key} filter value"))
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => return Err(format!("invalid {key} filter value")),
+        };
+        let mut pubkeys = Vec::new();
+        for item in items {
+            let valid_hex = item.len() == 64 && item.chars().all(|c| c.is_ascii_hexdigit());
+            let hex_pk = if valid_hex {
+                item.to_string()
+            } else if let Ok(crate::nips::nip19::Nip19Entity::Pubkey(pk)) =
+                crate::nips::nip19::parse_nip19(&item)
+            {
+                hex::encode(pk)
+            } else {
+                return Err(format!("invalid {key} pubkey"));
+            };
+            pubkeys.push(hex_pk);
+        }
+        let entry = map.entry(dst.to_string()).or_insert_with(|| json!([]));
+        if let Some(arr) = entry.as_array_mut() {
+            for pk in pubkeys {
+                if !arr.iter().any(|v| v == &json!(pk)) {
+                    arr.push(json!(pk));
+                }
+            }
+        } else {
+            return Err(format!("invalid existing {dst} filter value"));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,5 +307,50 @@ mod tests {
         // `#`-prefixed keys still constrain.
         let f: Filter = serde_json::from_value(serde_json::json!({"#t": ["go"]})).unwrap();
         assert!(!f.matches(&e));
+    }
+
+    #[test]
+    fn inbox_outbox_rewrite() {
+        let pk = "aa".repeat(32);
+        let npub = "npub1424242424242424242424242424242424242424242424242424qamrcaj";
+        let mut v = serde_json::json!({"inbox": pk});
+        rewrite_inbox_outbox(&mut v).unwrap();
+        assert_eq!(v, serde_json::json!({"#p": [pk]}));
+
+        let mut v = serde_json::json!({"outbox": npub});
+        rewrite_inbox_outbox(&mut v).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"authors": [pk]}),
+            "npub decodes to the pubkey"
+        );
+    }
+
+    #[test]
+    fn inbox_outbox_merge_and_array() {
+        let a = "aa".repeat(32);
+        let b = "bb".repeat(32);
+        let mut v = serde_json::json!({"inbox": [a, b], "#p": ["cc".repeat(32)]});
+        rewrite_inbox_outbox(&mut v).unwrap();
+        let f: Filter = serde_json::from_value(v).unwrap();
+        assert_eq!(
+            f.tags["#p"].as_array().unwrap().len(),
+            3,
+            "inbox values merge with existing #p"
+        );
+    }
+
+    #[test]
+    fn inbox_outbox_rejects_invalid() {
+        let mut v = serde_json::json!({"inbox": 42});
+        assert!(rewrite_inbox_outbox(&mut v).is_err());
+        let mut v = serde_json::json!({"outbox": "not-a-pubkey"});
+        assert!(rewrite_inbox_outbox(&mut v).is_err());
+        let mut v = serde_json::json!({"outbox": "ff".repeat(32)});
+        assert!(rewrite_inbox_outbox(&mut v).is_ok());
+        // Unknown keys are left untouched.
+        let mut v = serde_json::json!({"kinds": [1]});
+        rewrite_inbox_outbox(&mut v).unwrap();
+        assert_eq!(v, serde_json::json!({"kinds": [1]}));
     }
 }
