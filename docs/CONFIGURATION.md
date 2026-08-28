@@ -339,7 +339,7 @@ Every key is optional; a missing key uses the default shown below.
 
 **`purge_interval_secs`** — How often (seconds) NIP-40 expired events are physically removed from the database. Expired events are hidden from queries even between purges.
 
-**`search_index`** — When `true`, event content is word-indexed for fast NIP-50 search. When `false`, search still works (whole-word matching against content) but scans are slower. Toggling takes effect at startup.
+**`search_index`** — When `true`, event content is word-indexed for fast NIP-50 search. When `false`, search still works (whole-word matching against content) but scans are slower. Toggling takes effect at startup. For a tiny VPS (0.25 vCPU / 512 MB) set `search_index = false` — it **halves the database** (41.8 MB → 20.5 MB per 10,000 events with 3 tags and 21 words in testing) and saves CPU/IO; see the Manual's [Low-spec Tuning](../MANUAL.md#low-spec-vps-025-vcpu--512-mb).
 
 ### Behavior notes
 
