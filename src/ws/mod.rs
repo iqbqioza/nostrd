@@ -1009,6 +1009,95 @@ mod tests {
     }
 
     #[test]
+    fn ephemeral_events_rejected_via_ws_when_configured() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let now = unix_now();
+            // Default config: ephemeral forwarded (mute).
+            let mut conn = build_conn().await;
+            let ephemeral = signed_note_seeded(conn.relay.secp(), 1, "ephemeral", now, vec![]);
+            let mut ev = ephemeral.clone();
+            ev.kind = 20000;
+            ev.id = crate::nips::nip01::compute_id(&ev);
+            let id = ev.id_bytes().unwrap();
+            ev.sig = conn
+                .relay
+                .secp()
+                .sign_schnorr_no_aux_rand(
+                    &id,
+                    &Keypair::from_seckey_slice(conn.relay.secp(), &[1u8; 32]).unwrap(),
+                )
+                .to_string();
+            conn.queue_event_value(ev.clone()).await;
+            conn.flush_pending_events().await;
+            let msgs = outgoing_json(&conn);
+            let ok = msgs.iter().find(|m| m[0] == "OK" && m[1] == ev.id).unwrap();
+            assert_eq!(ok[2], true, "ephemeral must be forwarded when not rejected");
+            assert!(
+                ok[3].as_str().unwrap_or("").contains("mute"),
+                "ephemeral OK carries mute prefix"
+            );
+            conn.relay.db.shutdown();
+
+            // With reject_ephemeral = true via SIGHUP-like reload.
+            let mut conn = build_conn().await;
+            conn.relay.config.write().await.relay.reject_ephemeral = true;
+            let ephemeral2 = {
+                let mut e = signed_note_seeded(conn.relay.secp(), 1, "ephemeral2", now, vec![]);
+                e.kind = 25000;
+                e.id = crate::nips::nip01::compute_id(&e);
+                let id = e.id_bytes().unwrap();
+                e.sig = conn
+                    .relay
+                    .secp()
+                    .sign_schnorr_no_aux_rand(
+                        &id,
+                        &Keypair::from_seckey_slice(conn.relay.secp(), &[1u8; 32]).unwrap(),
+                    )
+                    .to_string();
+                e
+            };
+            let exempt = {
+                let mut e = signed_note_seeded(conn.relay.secp(), 1, "exempt", now, vec![]);
+                e.kind = 27235; // NIP-98 HTTP auth — must stay allowed
+                e.id = crate::nips::nip01::compute_id(&e);
+                let id = e.id_bytes().unwrap();
+                e.sig = conn
+                    .relay
+                    .secp()
+                    .sign_schnorr_no_aux_rand(
+                        &id,
+                        &Keypair::from_seckey_slice(conn.relay.secp(), &[1u8; 32]).unwrap(),
+                    )
+                    .to_string();
+                e
+            };
+            conn.queue_event_value(ephemeral2.clone()).await;
+            conn.queue_event_value(exempt.clone()).await;
+            conn.flush_pending_events().await;
+            let msgs = outgoing_json(&conn);
+            let ok_ephem = msgs
+                .iter()
+                .find(|m| m[0] == "OK" && m[1] == ephemeral2.id)
+                .unwrap();
+            assert_eq!(ok_ephem[2], false);
+            assert!(
+                ok_ephem[3].as_str().unwrap_or("").contains("ephemeral"),
+                "rejected ephemeral must mention ephemeral"
+            );
+            let ok_exempt = msgs
+                .iter()
+                .find(|m| m[0] == "OK" && m[1] == exempt.id)
+                .unwrap();
+            assert_eq!(
+                ok_exempt[2], true,
+                "NIPs-exempt ephemeral (27235) must not be blocked"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn flush_pending_events_acks_each_outcome() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {

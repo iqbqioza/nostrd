@@ -112,6 +112,9 @@ pub struct RelayConfig {
     /// Explicit allowlist of NIP numbers; empty means "all except disabled".
     pub enabled_nips: Vec<u16>,
     pub disabled_nips: Vec<u16>,
+    /// When true, ephemeral events (NIP-01 kinds 20000-29999) are rejected
+    /// at publish time instead of being forwarded live.
+    pub reject_ephemeral: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -285,6 +288,7 @@ impl Default for RelayConfig {
             livekit_api_secret: String::new(),
             enabled_nips: Vec::new(),
             disabled_nips: Vec::new(),
+            reject_ephemeral: false,
         }
     }
 }
@@ -1341,6 +1345,25 @@ mod tests {
             cfg.validate().is_err(),
             "unknown outbox_write_policy must be rejected"
         );
+    }
+
+    #[test]
+    fn relay_reject_ephemeral_defaults_and_parses() {
+        let cfg = Config::default();
+        assert!(!cfg.relay.reject_ephemeral, "default must be false");
+        assert!(cfg.validate().is_ok());
+
+        let toml_true = "[relay]\nreject_ephemeral = true\n";
+        let parsed: Config = toml::from_str(toml_true).expect("must parse true");
+        assert!(parsed.relay.reject_ephemeral);
+
+        let toml_false = "[relay]\nreject_ephemeral = false\n";
+        let parsed: Config = toml::from_str(toml_false).expect("must parse false");
+        assert!(!parsed.relay.reject_ephemeral);
+
+        // Missing key defaults to false via #[serde(default)]
+        let parsed: Config = toml::from_str("").expect("empty must parse");
+        assert!(!parsed.relay.reject_ephemeral);
     }
 
     #[test]
