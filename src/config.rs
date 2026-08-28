@@ -1348,6 +1348,25 @@ mod tests {
     }
 
     #[test]
+    fn relay_reject_ephemeral_defaults_and_parses() {
+        let cfg = Config::default();
+        assert!(!cfg.relay.reject_ephemeral, "default must be false");
+        assert!(cfg.validate().is_ok());
+
+        let toml_true = "[relay]\nreject_ephemeral = true\n";
+        let parsed: Config = toml::from_str(toml_true).expect("must parse true");
+        assert!(parsed.relay.reject_ephemeral);
+
+        let toml_false = "[relay]\nreject_ephemeral = false\n";
+        let parsed: Config = toml::from_str(toml_false).expect("must parse false");
+        assert!(!parsed.relay.reject_ephemeral);
+
+        // Missing key defaults to false via #[serde(default)]
+        let parsed: Config = toml::from_str("").expect("empty must parse");
+        assert!(!parsed.relay.reject_ephemeral);
+    }
+
+    #[test]
     fn validation_rejects_bad_access_entries() {
         let mut cfg = Config::default();
         cfg.access.blocked_ips = vec![("not-an-ip".into(), String::new())];
