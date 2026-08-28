@@ -1238,6 +1238,82 @@ mod tests {
     }
 
     #[test]
+    fn leap_years_are_handled() {
+        // Gregorian leap rules: divisible by 400 (2000) and by 4 but not by
+        // 100 (2024) are leap; divisible by 100 but not 400 (2100, 1900)
+        // are not.
+        assert_eq!(
+            month_start_of_next(2000, 2) - month_start(2000, 2),
+            29 * 86400,
+            "2000 is a leap year"
+        );
+        assert_eq!(
+            month_start_of_next(2024, 2) - month_start(2024, 2),
+            29 * 86400,
+            "2024 is a leap year"
+        );
+        assert_eq!(
+            month_start_of_next(2100, 2) - month_start(2100, 2),
+            28 * 86400,
+            "2100 is not a leap year"
+        );
+        assert_eq!(
+            month_start_of_next(1900, 2) - month_start(1900, 2),
+            28 * 86400,
+            "1900 is not a leap year"
+        );
+        assert_eq!(month_start(2024, 2), 1_706_745_600, "2024-02-01T00:00:00Z");
+        // February 29, 2024 belongs to February.
+        let (y, m, d) = civil_from_days((1_706_745_600 / 86400) as i64 + 28);
+        assert_eq!((y, m, d), (2024, 2, 29));
+        let months = month_range(
+            month_start(2024, 2),
+            month_start_of_next(2024, 2).saturating_sub(1),
+        );
+        assert_eq!(months, vec![(2024, 2)], "one month spanning the leap day");
+    }
+
+    #[test]
+    fn daily_counts_cover_february_leap_days() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay().await;
+            let secp = relay.secp();
+            let pk = XOnlyPublicKey::from_keypair(
+                &Keypair::from_seckey_slice(secp, &[1u8; 32]).unwrap(),
+            )
+            .0
+            .to_string();
+            let npub = crate::nips::nip19::bech32m_encode("npub", &hex::decode(&pk).unwrap())
+                .expect("npub encoding");
+            let feb1 = 1_706_745_600u64; // 2024-02-01
+            let leap_day = signed_note(relay.secp(), "leap day", feb1 + 28 * 86400 + 100, vec![]);
+            assert_eq!(
+                relay.db.put(leap_day.clone(), feb1 + 28 * 86400).await,
+                crate::db::PutOutcome::Stored
+            );
+
+            let (code, Json(resp)) = api_daily_handler(
+                State(relay.clone()),
+                Path((npub, 1u64)),
+                Query(ApiParams {
+                    year: Some(2024),
+                    month: Some(2),
+                    ..Default::default()
+                }),
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK);
+            let days = resp["days"].as_array().unwrap();
+            assert_eq!(days.len(), 29, "February 2024 has 29 days");
+            assert_eq!(days[28]["day"], "2024-02-29");
+            assert_eq!(days[28]["count"], 1, "the leap day is counted");
+            assert_eq!(resp["total"], 1);
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn month_arithmetic_roundtrips() {
         // 2026-08-01T00:00:00Z
         assert_eq!(month_start(2026, 8), 1_785_542_400);
