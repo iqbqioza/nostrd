@@ -310,6 +310,32 @@ curl "http://127.0.0.1:8080/api/v1/npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3ev
 # => {"events":[...],"count":N,"more":false}
 ```
 
+### Query / count / kinds / daily / id endpoints
+
+- `GET /api/v1/query` — generic filter query (authors/kinds/e/p/t/d/since/until/search/no_*/sort/limit/offset).
+- `GET /api/v1/count` — total count for the same parameters (`{"count": N, "approximate": bool}`).
+- `GET /api/v1/{npub1...}/kinds` — per-kind counts for an author, most used first.
+- `GET /api/v1/{npub1...}/{kind}/daily?year=&month=` — per-day counts for one month, zero-filled through the last day (e.g. `2026-08-31: 0` even before the 31st).
+- `GET /api/v1/ids/{hex}` — a single event by 64-hex id.
+- `GET /api/v1/{npub1...}` — the author's latest kind-0 profile.
+
+### Stats / hourly / related / follows / relay kinds
+
+- `GET /api/v1/{npub1...}/stats` — author summary (total, first/last activity, kind breakdown).
+- `GET /api/v1/{npub1...}/{kind}/hourly?year=&month=&day=` — 24 per-hour counts for one day, zero-filled.
+- `GET /api/v1/ids/{hex}/related` — replies (`#e`) and quotes (`#q`) referencing the event.
+- `GET /api/v1/{npub1...}/follows` — the author's latest kind-3 follow list.
+- `GET /api/v1/relay/kinds` — the most common kinds on the relay (bounded walk, `approximate` flag).
+
+### Top authors / relay lists
+
+- `GET /api/v1/relay/top-authors` — the most active authors on the relay (bounded walk, `approximate` flag).
+- `GET /api/v1/{npub1...}/relays` — the author's latest NIP-65 relay list (kind 10002).
+
+### Monthly counts
+
+`GET /api/v1/{npub1...}/{kind}/monthly` returns per-month event counts (`{"months": [{"month": "2026-08", "count": 4, "approximate": false}], "total": 4}`) for a pubkey + kind, zero-filled over the `since`/`until` range (default: the whole period, from the earliest stored event to now; at most 1200 months).
+
 ### Query parameters
 
 | Parameter | Description |
@@ -661,3 +687,5 @@ Settings that require a **restart**: `private_key`, `api_host`, `metrics_enabled
 ## 14. When You Are Stuck
 
 See [Troubleshooting (TROUBLESHOOTING.md)](TROUBLESHOOTING.md) for common errors and their fixes.
+
+Absence filters: `no_p`, `no_e`, `no_t` and `no_d` exclude events carrying that tag before pagination (e.g. `no_p=true` keeps only top-level posts — mentions, replies and DMs are dropped).

@@ -188,10 +188,24 @@ nostrd exposes a **read-only HTTP API** on the same port under `/api/v1`, served
 | Endpoint | Description |
 | --- | --- |
 | `GET /api/v1/{npub1...}/{kind}` | Events by author pubkey and kind (the `{kind}` path is mandatory for `npub1`) |
+| `GET /api/v1/{npub1...}/{kind}/monthly` | Per-month event counts for a pubkey + kind (`{"months": [{"month": "2026-08", "count": 4}], "total": 4}` — zero-filled; the whole period by default, bounded by `since`/`until`, at most 1200 months; `approximate: true` when a month hit the collection limit) |
 | `GET /api/v1/{nevent1...}` / `GET /api/v1/{note1...}` | A single event by its NIP-19 id |
+| `GET /api/v1/{npub1...}` | The author's latest kind-0 profile event |
+| `GET /api/v1/{npub1...}/kinds` | Per-kind event counts for an author, most used first |
+| `GET /api/v1/{npub1...}/stats` | Author statistics in one call (total, first/last activity, kind breakdown) |
+| `GET /api/v1/{npub1...}/{kind}/hourly?year=&month=&day=` | Per-hour counts for one day, zero-filled across all 24 hours |
+| `GET /api/v1/ids/{hex}/related` | Events referencing an event (`#e` replies and `#q` quotes) |
+| `GET /api/v1/{npub1...}/follows` | The author's latest follow list (kind 3) |
+| `GET /api/v1/relay/kinds` | The most common kinds stored on the relay |
+| `GET /api/v1/relay/top-authors` | The most active authors on the relay |
+| `GET /api/v1/{npub1...}/relays` | The author's latest NIP-65 relay list (kind 10002) |
+| `GET /api/v1/query?authors=&kinds=&e=&p=&...` | Generic filter query without an identifier (all filter params combine) |
+| `GET /api/v1/count?authors=&kinds=&...` | Total event count for a filter (`{"count": N, "approximate": bool}`) |
+| `GET /api/v1/{npub1...}/{kind}/daily?year=&month=` | Per-day counts for one month, zero-filled through the last day |
+| `GET /api/v1/ids/{hex}` | A single event by its 64-hex id |
 | `GET /api/v1/{naddr1...}` | Addressable/replaceable events by NIP-19 address |
 
-Query parameters: `limit`, `offset`, `since`, `until`, `sort`, `search`, `e`, `p`, `t`, `d`. Responses are `{ "events": [...], "count": N, "more": bool }`; `offset` + `more` paginate over the *visible* sequence (NIP-70 protected, NIP-59 gift wraps and NIP-29 private/hidden group content are withheld).
+Author identifiers accept `npub1...` codes or a 64-hex pubkey. Query parameters: `limit`, `offset`, `since`, `until`, `sort`, `search`, `e`, `p`, `t`, `d`, plus the absence filters `no_p`/`no_e`/`no_t`/`no_d` (exclude events carrying that tag, e.g. `no_p=true` for top-level posts only). Responses are `{ "events": [...], "count": N, "more": bool }`; `offset` + `more` paginate over the *visible* sequence (NIP-70 protected, NIP-59 gift wraps and NIP-29 private/hidden group content are withheld).
 
 By default the API is served on every host; set `server.api_host` (e.g. `api_host = "api.example.com"`) to serve it only on that hostname and hide `/api/v1` from every other host.
 

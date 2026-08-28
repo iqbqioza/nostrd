@@ -27,6 +27,59 @@ http://<host>:<port>/api/v1/{identifier}
 http://<host>:<port>/api/v1/{identifier}/{kind}
 ```
 
+### Generic query, count, kinds, daily and id endpoints
+
+`GET /api/v1/query` — generic filter query without an identifier. All filter parameters combine into one NIP-01 filter: `authors` (single, comma-separated or repeated), `kinds` (same), `e`, `p`, `t`, `d`, `since`, `until`, `search`, `no_p`, `no_e`, `no_t`, `no_d`, `sort`, `limit`, `offset`.
+
+`GET /api/v1/count` — total count for the same filter parameters: `{"count": N, "approximate": bool}` (NIP-45 semantics; `approximate` when the collection limit was hit).
+
+`GET /api/v1/{npub1...}/kinds` — per-kind event counts for an author: `{"kinds": [{"kind": 1, "count": 120}], "approximate": bool}`, sorted by count descending.
+
+Author identifiers (`{npub1...}`) may also be given as a **64-hex pubkey** (case-insensitive) on every endpoint.
+
+`GET /api/v1/{npub1...}/{kind}/daily?year=2026&month=8` — per-day counts for one month (default: the current month; `month` must be 1-12). **Every day of the month is reported, zero-filled through the last day** — 8/31 comes back as 0 even when today is the 28th: `{"days": [{"day": "2026-08-01", "count": 0}], "total": N}`.
+
+`GET /api/v1/ids/{hex}` — a single event by its 64-hex id (prefixes rejected).
+
+`GET /api/v1/{npub1...}` — the author's latest kind-0 profile event (kind 0 is replaceable, so the newest one is the current profile).
+
+### Stats, hourly, related, follows and relay kinds
+
+`GET /api/v1/{npub1...}/stats` — author statistics in one call: `{"total": N, "approximate": bool, "first_seen": unix, "last_seen": unix, "first_month": "2026-08", "last_month": "2026-08", "kinds": [{"kind": 1, "count": 120}]}`.
+
+`GET /api/v1/{npub1...}/{kind}/hourly?year=&month=&day=` — per-hour counts for one day (defaults: the current date; `day` validated against the month). All **24 hours are reported, zero-filled**: `{"hours": [{"hour": "2026-08-28T00", "count": 0}], "total": N}`.
+
+`GET /api/v1/ids/{hex}/related` — events referencing the event: the union of `#e` (replies, threads) and `#q` (quotes) filters.
+
+`GET /api/v1/{npub1...}/follows` — the author's latest follow list (kind 3, NIP-02; replaceable, so the newest event is the current list).
+
+`GET /api/v1/relay/kinds?limit=` — the most common kinds stored on the relay, sorted by count descending (`{"kinds": [{"kind": 1, "count": 12345}], "approximate": bool}`). The count walk examines at most 500,000 index entries; `approximate: true` when it was cut short.
+
+### Top authors and relay lists
+
+`GET /api/v1/relay/top-authors?limit=` — the most active authors on the relay, sorted by count descending (`{"authors": [{"pubkey": "<hex>", "count": 123}], "approximate": bool}`). The walk examines at most 500,000 index entries; `approximate: true` when it was cut short.
+
+`GET /api/v1/{npub1...}/relays` — the author's latest NIP-65 relay list (kind 10002, replaceable — the newest event is the current list; the `r` tags carry the relay URLs).
+
+### Monthly counts
+
+`GET /api/v1/{npub1...}/{kind}/monthly` returns per-month event counts for an author's events of a kind, so a frontend can render e.g. `2026-08(4)`:
+
+```json
+{
+  "months": [
+    { "month": "2026-08", "count": 4, "approximate": false },
+    { "month": "2026-09", "count": 0, "approximate": false }
+  ],
+  "total": 4
+}
+```
+
+- `since` / `until` bound the range (unix seconds); without them the **whole period** is covered, from the earliest stored event of that author and kind to now (an author with no events returns an empty list).
+- Every month in the range is reported, zero-filled, oldest first; the range is capped at **1200 months** (exceeding it returns `400`, as does `until < since`).
+- `approximate: true` marks a month whose count hit the collection limit (`limits.count_limit`), mirroring NIP-45.
+- The same visibility rules as the rest of the API apply (protected events, gift wraps and private/hidden group content are withheld).
+
 ### `server.api_host` (host-based routing)
 
 When `server.api_host` is configured (e.g. `api.example.com`), the API and the WebSocket relay are split by the **Host header**:
@@ -85,6 +138,12 @@ All parameters are optional and passed as URL query strings.
 | `p` | string | Require a `p` tag with this value |
 | `t` | string | Require a `t` tag with this value |
 | `d` | string | Require a `d` tag with this value. For `naddr1...` the address's own `d` is used unless `d` is given (which overrides it) |
+| `no_p` | boolean | Exclude events carrying a `p` tag (mentions, replies, DMs — `no_p=true` is a "top-level posts only" filter) |
+| `no_e` | boolean | Exclude events carrying an `e` tag (replies) |
+| `no_t` | boolean | Exclude events carrying a `t` tag (hashtags) |
+| `no_d` | boolean | Exclude events carrying a `d` tag (addressable events) |
+
+> **Exclusion note**: `no_*` filters are applied before pagination, like the visibility rules — excluded events never consume `limit` slots or offset steps. Multiple exclusions combine (e.g. `no_p=true&no_e=true` keeps only top-level posts).
 
 > **Search note**: like the WebSocket path, search matches **whole words** — `search=ru` does not match the word "rust". When NIP-50 is disabled, `search` is silently ignored.
 

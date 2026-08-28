@@ -36,7 +36,12 @@ use crate::relay::Relay;
 use crate::stats::Stats;
 use crate::util::unix_now;
 use crate::ws::handle_connection;
-use api::{api_handler, api_kind_handler};
+use api::{
+    api_count_handler, api_daily_handler, api_follows_handler, api_handler, api_hourly_handler,
+    api_id_handler, api_kind_handler, api_kinds_handler, api_monthly_handler, api_query_handler,
+    api_related_handler, api_relay_kinds_handler, api_relays_handler, api_stats_handler,
+    api_top_authors_handler,
+};
 use axum::serve::ListenerExt;
 use livekit::{livekit_supported, livekit_token};
 
@@ -126,8 +131,21 @@ async fn build_router(
     blossom_state: Option<Arc<blossom::BlossomState>>,
 ) -> Router {
     let api_routes = Router::new()
+        .route("/query", get(api_query_handler))
+        .route("/count", get(api_count_handler))
+        .route("/relay/kinds", get(api_relay_kinds_handler))
+        .route("/relay/top-authors", get(api_top_authors_handler))
+        .route("/ids/{hex}", get(api_id_handler))
+        .route("/ids/{hex}/related", get(api_related_handler))
         .route("/{identifier}", get(api_handler))
         .route("/{identifier}/{kind}", get(api_kind_handler))
+        .route("/{identifier}/kinds", get(api_kinds_handler))
+        .route("/{identifier}/stats", get(api_stats_handler))
+        .route("/{identifier}/follows", get(api_follows_handler))
+        .route("/{identifier}/relays", get(api_relays_handler))
+        .route("/{identifier}/{kind}/monthly", get(api_monthly_handler))
+        .route("/{identifier}/{kind}/daily", get(api_daily_handler))
+        .route("/{identifier}/{kind}/hourly", get(api_hourly_handler))
         .layer(axum::middleware::from_fn(reject_ws_upgrade));
     // `server.ws_paths` selects which paths serve the WebSocket/NIP-11/NIP-86
     // endpoint: the default root paths, the inbox/outbox paths only, or all
