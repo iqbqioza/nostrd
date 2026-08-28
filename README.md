@@ -98,7 +98,7 @@ curl -fsSL -o install.sh https://raw.githubusercontent.com/iqbqioza/nostrd/main/
 chmod +x install.sh
 ./install.sh                       # latest release, into ~/.local/bin (no sudo needed)
 
-VERSION=v0.1.1 ./install.sh            # a specific release
+VERSION=v0.1.2 ./install.sh            # a specific release
 INSTALL_DIR=/usr/local/bin sudo ./install.sh    # system-wide (requires sudo)
 ./install.sh --force                            # overwrite without asking
 curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrd/main/install.sh | sh -s -- --force
