@@ -144,12 +144,12 @@ impl super::Relay {
         }
         // Ephemeral rejection (configurable): NIP-01 kinds 20000-29999 are
         // normally forwarded live without storage; when enabled they are
-        // rejected outright. NIP-42 AUTH (22242) is excluded — its
-        // publish is always rejected with a dedicated message below, and
-        // the AUTH flow (`["AUTH", event]`) never reaches this check.
+        // rejected outright, except for NIPs-specified ephemeral kinds
+        // that must not be blocked (NIP-42 AUTH, NIP-98 HTTP auth,
+        // NIP-43 JOIN/LEAVE, NIP-46 Nostr Connect, NIP-47 wallet).
         if cfg.relay.reject_ephemeral
             && (20000..30000).contains(&event.kind)
-            && event.kind != crate::nips::nip42::AUTH_KIND
+            && !Self::is_ephemeral_exempt(event.kind)
         {
             return Err("blocked: ephemeral events not allowed".into());
         }
@@ -280,6 +280,23 @@ impl super::Relay {
         }
 
         Ok(())
+    }
+
+    /// NIPs-specified ephemeral kinds that must not be blocked even when
+    /// `reject_ephemeral` is enabled (NIP-42 AUTH, NIP-98 HTTP auth,
+    /// NIP-43 JOIN/LEAVE, NIP-46 Nostr Connect, NIP-47 wallet).
+    fn is_ephemeral_exempt(kind: u64) -> bool {
+        matches!(
+            kind,
+            crate::nips::nip42::AUTH_KIND
+                | crate::nips::nip98::AUTH_KIND
+                | crate::nips::nip43::JOIN
+                | crate::nips::nip43::LEAVE
+                | 24133 // NIP-46 Nostr Connect
+                | 23194 // NIP-47 wallet request
+                | 23195 // NIP-47 wallet response
+                | 23196 // NIP-47 wallet notification
+        )
     }
 }
 
@@ -463,6 +480,26 @@ mod tests {
                 assert!(
                     matches!(out, super::Precheck::Accept),
                     "kind {kind} must not be rejected by ephemeral filter"
+                );
+            }
+            // NIPs-specified ephemeral kinds must be exempt even when enabled.
+            for kind in [
+                22242, // NIP-42 AUTH
+                27235, // NIP-98 HTTP auth
+                28934, // NIP-43 JOIN
+                28936, // NIP-43 LEAVE
+                24133, // NIP-46 Nostr Connect
+                23194, // NIP-47 wallet request
+                23195, // NIP-47 wallet response
+                23196, // NIP-47 wallet notification
+            ] {
+                let ev = signed(kind, vec![]);
+                let out = relay2
+                    .precheck(&cfg2, &access2, &ev, unix_now(), &[], None)
+                    .await;
+                assert!(
+                    !matches!(out, super::Precheck::Reject(msg) if msg.contains("ephemeral")),
+                    "kind {kind} must be exempt from ephemeral rejection"
                 );
             }
             drop(cfg2);
