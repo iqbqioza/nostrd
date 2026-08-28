@@ -144,8 +144,13 @@ impl super::Relay {
         }
         // Ephemeral rejection (configurable): NIP-01 kinds 20000-29999 are
         // normally forwarded live without storage; when enabled they are
-        // rejected outright.
-        if cfg.relay.reject_ephemeral && (20000..30000).contains(&event.kind) {
+        // rejected outright. NIP-42 AUTH (22242) is excluded — its
+        // publish is always rejected with a dedicated message below, and
+        // the AUTH flow (`["AUTH", event]`) never reaches this check.
+        if cfg.relay.reject_ephemeral
+            && (20000..30000).contains(&event.kind)
+            && event.kind != crate::nips::nip42::AUTH_KIND
+        {
             return Err("blocked: ephemeral events not allowed".into());
         }
         // NIP-01: each tag is an array of one or more strings.
@@ -514,11 +519,19 @@ mod tests {
             .await;
             let relay = Arc::new(relay);
             let cfg = relay.config.read().await;
-            let ev = signed(24242, vec![]);
+            let ev = signed(20001, vec![]);
             let res = relay.validate_base(&cfg, &ev, unix_now(), &[]);
             assert!(
                 res.is_err() && res.unwrap_err().contains("ephemeral"),
                 "validate_base must reject ephemeral when enabled"
+            );
+            // NIP-42 AUTH (22242) must not be masked as ephemeral — it has
+            // its own dedicated rejection below.
+            let auth_ev = signed(22242, vec![]);
+            let auth_res = relay.validate_base(&cfg, &auth_ev, unix_now(), &[]);
+            assert!(
+                auth_res.is_err() && !auth_res.unwrap_err().contains("ephemeral"),
+                "AUTH kind must not be rejected as ephemeral"
             );
             relay.db.shutdown();
         });
