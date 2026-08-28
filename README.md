@@ -197,6 +197,8 @@ nostrd exposes a **read-only HTTP API** on the same port under `/api/v1`, served
 | `GET /api/v1/ids/{hex}/related` | Events referencing an event (`#e` replies and `#q` quotes) |
 | `GET /api/v1/{npub1...}/follows` | The author's latest follow list (kind 3) |
 | `GET /api/v1/relay/kinds` | The most common kinds stored on the relay |
+| `GET /api/v1/relay/top-authors` | The most active authors on the relay |
+| `GET /api/v1/{npub1...}/relays` | The author's latest NIP-65 relay list (kind 10002) |
 | `GET /api/v1/query?authors=&kinds=&e=&p=&...` | Generic filter query without an identifier (all filter params combine) |
 | `GET /api/v1/count?authors=&kinds=&...` | Total event count for a filter (`{"count": N, "approximate": bool}`) |
 | `GET /api/v1/{npub1...}/{kind}/daily?year=&month=` | Per-day counts for one month, zero-filled through the last day |

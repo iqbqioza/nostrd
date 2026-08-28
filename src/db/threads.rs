@@ -152,6 +152,17 @@ fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, ms
             let _ = reply.send(out);
             false
         }
+        Msg::AuthorCounts { max_keys, reply } => {
+            let out = match store.author_counts(max_keys) {
+                Ok(out) => out,
+                Err(e) => {
+                    db_error(errors, &e);
+                    (Vec::new(), false)
+                }
+            };
+            let _ = reply.send(out);
+            false
+        }
         Msg::LoadAccess { reply } => {
             let access = match store.load_access() {
                 Ok(access) => access,
@@ -538,6 +549,16 @@ pub(crate) fn spawn(
                                 }
                                 Msg::KindCounts { max_keys, reply } => {
                                     let out = match store.kind_counts(max_keys) {
+                                        Ok(out) => out,
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            (Vec::new(), false)
+                                        }
+                                    };
+                                    let _ = reply.send(out);
+                                }
+                                Msg::AuthorCounts { max_keys, reply } => {
+                                    let out = match store.author_counts(max_keys) {
                                         Ok(out) => out,
                                         Err(e) => {
                                             db_error(&thread_errors, &e);

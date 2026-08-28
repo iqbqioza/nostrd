@@ -200,6 +200,33 @@ impl Store {
         Ok((counts, more))
     }
 
+    /// Counts events per author by walking the `by_pubkey` index in key
+    /// order (pubkey-major), examining at most `max_keys` entries. `more`
+    /// is true when the walk was cut short. Returns `(pubkey, count)` pairs
+    /// in ascending pubkey order.
+    pub(crate) fn author_counts(&self, max_keys: usize) -> Result<(crate::db::AuthorCounts, bool)> {
+        let rtxn = self.env.read_txn()?;
+        let mut counts: crate::db::AuthorCounts = Vec::new();
+        let mut examined = 0usize;
+        let mut more = false;
+        for item in self.by_pubkey.iter(&rtxn)? {
+            let (key, _) = item?;
+            if key.len() >= ID_LEN {
+                let pubkey = key[..ID_LEN].to_vec();
+                match counts.last_mut() {
+                    Some((p, c)) if *p == pubkey => *c += 1,
+                    _ => counts.push((pubkey, 1)),
+                }
+            }
+            examined += 1;
+            if examined >= max_keys {
+                more = true;
+                break;
+            }
+        }
+        Ok((counts, more))
+    }
+
     /// NIP-62: deletes every event authored by `pubkey` (including NIP-09
     /// deletion requests and NIP-59 gift wraps that p-tag it) and records the
     /// pubkey so that no future event from it is accepted.

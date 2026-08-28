@@ -1032,6 +1032,75 @@ pub async fn api_relay_kinds_handler(
     )
 }
 
+/// `GET /api/v1/relay/top-authors`
+///
+/// The most active authors on the relay: `{"authors": [{"pubkey": "<hex>",
+/// "count": 123}], "approximate": bool}` sorted by count descending. The
+/// walk is bounded (`approximate: true` when it was cut short).
+pub async fn api_top_authors_handler(
+    State(relay): State<Arc<Relay>>,
+    Query(params): Query<ApiParams>,
+) -> (StatusCode, Json<Value>) {
+    let Some(_permit) = relay.api_limit.try_acquire() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "server is busy, try again shortly" })),
+        );
+    };
+    let limit = params.limit.unwrap_or(20).min(100);
+    const MAX_KEYS: usize = 500_000;
+    let (counts, more) = relay.db.author_counts(MAX_KEYS).await;
+    drop(_permit);
+    let mut authors: Vec<Value> = counts
+        .into_iter()
+        .map(|(pubkey, count)| json!({ "pubkey": hex::encode(pubkey), "count": count }))
+        .collect();
+    authors.sort_by(|a, b| {
+        b["count"]
+            .as_u64()
+            .cmp(&a["count"].as_u64())
+            .then_with(|| a["pubkey"].as_str().cmp(&b["pubkey"].as_str()))
+    });
+    authors.truncate(limit);
+    (
+        StatusCode::OK,
+        Json(json!({ "authors": authors, "approximate": more })),
+    )
+}
+
+/// `GET /api/v1/{identifier}/relays`
+///
+/// The author's latest NIP-65 relay list (kind 10002, replaceable — the
+/// newest event is the current list; the `r` tags carry the relay URLs).
+pub async fn api_relays_handler(
+    State(relay): State<Arc<Relay>>,
+    Path(identifier): Path<String>,
+    Query(params): Query<ApiParams>,
+) -> (StatusCode, Json<Value>) {
+    let hex_pk = match parse_author_identifier(&identifier) {
+        Ok(pk) => pk,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
+    };
+    let no_tags = excluded_tags(&params);
+    let filter = apply_params(
+        Filter {
+            authors: Some(vec![hex_pk]),
+            kinds: Some(vec![10002]),
+            ..Default::default()
+        },
+        &params,
+    );
+    query_and_respond(
+        &relay,
+        vec![filter],
+        1,
+        params.offset,
+        sort_ascending(&params.sort),
+        &no_tags,
+    )
+    .await
+}
+
 /// `(year, month)` of a unix timestamp.
 fn month_of(ts: u64) -> (i64, u32) {
     let (y, m, _) = civil_from_days((ts / 86400) as i64);
@@ -1719,6 +1788,62 @@ mod tests {
             assert_eq!(kinds[0]["kind"], 1, "kind 1 is the most common");
             assert_eq!(kinds[0]["count"], 3);
             assert_eq!(kinds[1]["kind"], 3);
+
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn top_authors_and_relay_lists() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay().await;
+            let secp = relay.secp();
+            let pk = XOnlyPublicKey::from_keypair(
+                &Keypair::from_seckey_slice(secp, &[1u8; 32]).unwrap(),
+            )
+            .0
+            .to_string();
+            let npub = crate::nips::nip19::bech32m_encode("npub", &hex::decode(&pk).unwrap())
+                .expect("npub encoding");
+            let now = unix_now();
+
+            let relays = signed_kind_note(
+                relay.secp(),
+                10002,
+                "",
+                now,
+                vec![vec!["r".into(), "wss://relay.example.com".into()]],
+            );
+            let note = signed_note(relay.secp(), "top author", now - 1, vec![]);
+            for e in [&relays, &note] {
+                assert_eq!(
+                    relay.db.put(e.clone(), now).await,
+                    crate::db::PutOutcome::Stored
+                );
+            }
+
+            // /{npub1}/relays: the latest NIP-65 list.
+            let (code, Json(resp)) = api_relays_handler(
+                State(relay.clone()),
+                Path(npub.clone()),
+                Query(ApiParams::default()),
+            )
+            .await;
+            assert_eq!(code, StatusCode::OK);
+            let events = resp["events"].as_array().unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0]["kind"], 10002);
+            assert_eq!(events[0]["tags"][0][1], "wss://relay.example.com");
+
+            // /relay/top-authors: the author ranks first.
+            let (_, Json(resp)) =
+                api_top_authors_handler(State(relay.clone()), Query(ApiParams::default())).await;
+            let authors = resp["authors"].as_array().unwrap();
+            assert!(
+                authors.iter().any(|a| a["pubkey"] == pk && a["count"] == 2),
+                "the single author is listed with its event count"
+            );
 
             relay.db.shutdown();
         });

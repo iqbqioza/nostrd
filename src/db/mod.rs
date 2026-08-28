@@ -20,6 +20,8 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 
 use scan::{FULL_SCAN_BUDGET, NegItems, SCAN_BUDGET};
+/// `(pubkey, count)` pairs of a relay-wide author-activity walk.
+pub(crate) type AuthorCounts = Vec<(Vec<u8>, u64)>;
 use store::Store;
 
 use crate::config::DatabaseConfig;
@@ -118,6 +120,12 @@ enum Msg {
     KindCounts {
         max_keys: usize,
         reply: oneshot::Sender<(Vec<(u64, u64)>, bool)>,
+    },
+    /// Relay-wide per-author event counts (REST API): walks the
+    /// `by_pubkey` index, examining at most `max_keys` entries.
+    AuthorCounts {
+        max_keys: usize,
+        reply: oneshot::Sender<(AuthorCounts, bool)>,
     },
     Delete {
         targets: Vec<String>,
@@ -568,6 +576,12 @@ impl DbClient {
     /// Relay-wide per-kind event counts (REST API).
     pub async fn kind_counts(&self, max_keys: usize) -> (Vec<(u64, u64)>, bool) {
         self.request_read(|reply| Msg::KindCounts { max_keys, reply })
+            .await
+    }
+
+    /// Relay-wide per-author event counts (REST API).
+    pub async fn author_counts(&self, max_keys: usize) -> (AuthorCounts, bool) {
+        self.request_read(|reply| Msg::AuthorCounts { max_keys, reply })
             .await
     }
 

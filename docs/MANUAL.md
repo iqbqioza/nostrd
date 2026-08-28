@@ -327,6 +327,11 @@ curl "http://127.0.0.1:8080/api/v1/npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3ev
 - `GET /api/v1/{npub1...}/follows` — the author's latest kind-3 follow list.
 - `GET /api/v1/relay/kinds` — the most common kinds on the relay (bounded walk, `approximate` flag).
 
+### Top authors / relay lists
+
+- `GET /api/v1/relay/top-authors` — the most active authors on the relay (bounded walk, `approximate` flag).
+- `GET /api/v1/{npub1...}/relays` — the author's latest NIP-65 relay list (kind 10002).
+
 ### Monthly counts
 
 `GET /api/v1/{npub1...}/{kind}/monthly` returns per-month event counts (`{"months": [{"month": "2026-08", "count": 4, "approximate": false}], "total": 4}`) for a pubkey + kind, zero-filled over the `since`/`until` range (default: the whole period, from the earliest stored event to now; at most 1200 months).
