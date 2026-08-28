@@ -112,6 +112,9 @@ pub struct RelayConfig {
     /// Explicit allowlist of NIP numbers; empty means "all except disabled".
     pub enabled_nips: Vec<u16>,
     pub disabled_nips: Vec<u16>,
+    /// When true, ephemeral events (NIP-01 kinds 20000-29999) are rejected
+    /// at publish time instead of being forwarded live.
+    pub reject_ephemeral: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -285,6 +288,7 @@ impl Default for RelayConfig {
             livekit_api_secret: String::new(),
             enabled_nips: Vec::new(),
             disabled_nips: Vec::new(),
+            reject_ephemeral: false,
         }
     }
 }

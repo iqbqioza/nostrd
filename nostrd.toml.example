@@ -82,6 +82,11 @@ enabled_nips = []
 # (except Blossom, which is provided by the dedicated [blossom] file server).
 disabled_nips = []
 
+# When true, ephemeral events (NIP-01 kinds 20000-29999) are rejected at
+# publish time with `blocked: ephemeral events not allowed` instead of being
+# forwarded live to subscribers.
+reject_ephemeral = false
+
 # -----------------------------------------------------------------------------
 # Network server
 # -----------------------------------------------------------------------------

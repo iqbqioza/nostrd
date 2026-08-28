@@ -142,6 +142,12 @@ impl super::Relay {
         if event.kind > 65535 {
             return Err("invalid: kind out of range".into());
         }
+        // Ephemeral rejection (configurable): NIP-01 kinds 20000-29999 are
+        // normally forwarded live without storage; when enabled they are
+        // rejected outright.
+        if cfg.relay.reject_ephemeral && (20000..30000).contains(&event.kind) {
+            return Err("blocked: ephemeral events not allowed".into());
+        }
         // NIP-01: each tag is an array of one or more strings.
         if event.tags.iter().any(|t| t.is_empty()) {
             return Err("invalid: empty tag".into());
@@ -339,6 +345,184 @@ mod tests {
 
     #[test]
     fn vanished_pubkey_remains_visible_to_its_own_pubkey() {}
+
+    #[test]
+    fn ephemeral_rejection_respects_config() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            // Default config: ephemeral events are allowed.
+            let mut cfg = Config::default();
+            cfg.database.path = std::env::temp_dir().join("nostrd-ephemeral-test-allow");
+            let _ = std::fs::remove_dir_all(&cfg.database.path);
+            let db = crate::db::DbClient::open(
+                &cfg.database,
+                true,
+                Arc::new(Default::default()),
+                0,
+                128,
+                4096,
+                262144,
+            )
+            .unwrap();
+            let config = Arc::new(RwLock::new(cfg));
+            let stats = crate::stats::Stats::new();
+            let relay = Relay::new(
+                config.clone(),
+                db,
+                stats,
+                "",
+                crate::relay::LiveBusConfig {
+                    buffer: 1024,
+                    batch_interval_ms: 10,
+                    batch_size: 64,
+                },
+            )
+            .await;
+            let relay = Arc::new(relay);
+            let cfg = relay.config.read().await;
+            let access = AccessControl::default();
+
+            for kind in [20000, 25000, 29999] {
+                let ev = signed(kind, vec![]);
+                let out = relay
+                    .precheck(&cfg, &access, &ev, unix_now(), &[], None)
+                    .await;
+                assert!(
+                    matches!(out, super::Precheck::Accept),
+                    "kind {kind} must be accepted when reject_ephemeral is false"
+                );
+            }
+            // Boundary kinds must not be treated as ephemeral.
+            for kind in [19999, 30000, 1, 0] {
+                let ev = signed(kind, vec![]);
+                let out = relay
+                    .precheck(&cfg, &access, &ev, unix_now(), &[], None)
+                    .await;
+                assert!(
+                    matches!(out, super::Precheck::Accept),
+                    "kind {kind} must not be ephemeral"
+                );
+            }
+            drop(cfg);
+            relay.db.shutdown();
+
+            // With reject_ephemeral = true: ephemeral range is blocked.
+            let mut cfg2 = Config::default();
+            cfg2.relay.reject_ephemeral = true;
+            cfg2.database.path = std::env::temp_dir().join("nostrd-ephemeral-test-reject");
+            let _ = std::fs::remove_dir_all(&cfg2.database.path);
+            let db2 = crate::db::DbClient::open(
+                &cfg2.database,
+                true,
+                Arc::new(Default::default()),
+                0,
+                128,
+                4096,
+                262144,
+            )
+            .unwrap();
+            let config2 = Arc::new(RwLock::new(cfg2));
+            let stats2 = crate::stats::Stats::new();
+            let relay2 = Relay::new(
+                config2.clone(),
+                db2,
+                stats2,
+                "",
+                crate::relay::LiveBusConfig {
+                    buffer: 1024,
+                    batch_interval_ms: 10,
+                    batch_size: 64,
+                },
+            )
+            .await;
+            let relay2 = Arc::new(relay2);
+            let cfg2 = relay2.config.read().await;
+            let access2 = AccessControl::default();
+
+            for kind in [20000, 25000, 29999] {
+                let ev = signed(kind, vec![]);
+                let out = relay2
+                    .precheck(&cfg2, &access2, &ev, unix_now(), &[], None)
+                    .await;
+                assert!(
+                    matches!(out, super::Precheck::Reject(msg) if msg.contains("ephemeral")),
+                    "kind {kind} must be rejected when reject_ephemeral is true"
+                );
+            }
+            // Boundaries still accepted.
+            for kind in [19999, 30000, 1, 0] {
+                let ev = signed(kind, vec![]);
+                let out = relay2
+                    .precheck(&cfg2, &access2, &ev, unix_now(), &[], None)
+                    .await;
+                assert!(
+                    matches!(out, super::Precheck::Accept),
+                    "kind {kind} must not be rejected by ephemeral filter"
+                );
+            }
+            drop(cfg2);
+            // SIGHUP-like reload: flipping the flag back to false must immediately allow ephemeral again.
+            {
+                let mut w = relay2.config.write().await;
+                w.relay.reject_ephemeral = false;
+            }
+            let cfg2_reloaded = relay2.config.read().await;
+            let ev = signed(20000, vec![]);
+            let out = relay2
+                .precheck(&cfg2_reloaded, &access2, &ev, unix_now(), &[], None)
+                .await;
+            assert!(
+                matches!(out, super::Precheck::Accept),
+                "reloading to false must re-allow ephemeral"
+            );
+            drop(cfg2_reloaded);
+            relay2.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn ephemeral_rejection_via_validate_base() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut cfg = Config::default();
+            cfg.relay.reject_ephemeral = true;
+            cfg.database.path = std::env::temp_dir().join("nostrd-ephemeral-validate-base");
+            let _ = std::fs::remove_dir_all(&cfg.database.path);
+            let db = crate::db::DbClient::open(
+                &cfg.database,
+                true,
+                Arc::new(Default::default()),
+                0,
+                128,
+                4096,
+                262144,
+            )
+            .unwrap();
+            let config = Arc::new(RwLock::new(cfg));
+            let stats = crate::stats::Stats::new();
+            let relay = Relay::new(
+                config.clone(),
+                db,
+                stats,
+                "",
+                crate::relay::LiveBusConfig {
+                    buffer: 1024,
+                    batch_interval_ms: 10,
+                    batch_size: 64,
+                },
+            )
+            .await;
+            let relay = Arc::new(relay);
+            let cfg = relay.config.read().await;
+            let ev = signed(24242, vec![]);
+            let res = relay.validate_base(&cfg, &ev, unix_now(), &[]);
+            assert!(
+                res.is_err() && res.unwrap_err().contains("ephemeral"),
+                "validate_base must reject ephemeral when enabled"
+            );
+            relay.db.shutdown();
+        });
+    }
 
     #[test]
     fn blocked_pubkey_can_still_vanish() {

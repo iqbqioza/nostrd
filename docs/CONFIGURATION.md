@@ -82,6 +82,7 @@ Every key is optional; a missing key uses the default shown below.
 | `livekit_api_secret` | string | `""` | LiveKit API secret (used to sign JWTs) |
 | `enabled_nips` | array of integers | `[]` | Explicit NIP allowlist |
 | `disabled_nips` | array of integers | `[]` | NIPs to disable (ignored when `enabled_nips` is non-empty) |
+| `reject_ephemeral` | boolean | `false` | When `true`, NIP-01 ephemeral events (kinds 20000-29999) are rejected (`blocked: ephemeral events not allowed`) |
 
 ### Key details
 
