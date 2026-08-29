@@ -112,7 +112,7 @@ Every key is optional; a missing key uses the default shown below.
 
 **`disabled_nips`** — Removes specific NIPs from the default set. For example `[50]` disables search (REQ/COUNT/API `search` is then ignored), `[28]` disables public-chat semantics. Requires a `restart` to change. Only relay-side NIPs are relevant: [1, 9, 11, 13, 26, 28, 29, 33, 40, 42, 43, 45, 50, 62, 67, 70, 77, 86, 98].
 
-**`reject_ephemeral`** — When `true`, NIP-01 ephemeral events (kinds `20000-29999`) are rejected at publish time with `blocked: ephemeral events not allowed`. Exempt kinds that NIPs require to be relayed are still forwarded: `22242` (NIP-42 AUTH), `27235` (NIP-98 HTTP auth), `28934`/`28935`/`28936` (NIP-43 JOIN/Invite/LEAVE), `24133` (NIP-46 Nostr Connect), `23194`/`23195` (NIP-47 wallet request/response), `24242` (BUD-02 Blossom). Takes effect immediately on `SIGHUP` reload and on the next publish.
+**`reject_ephemeral`** — When `true`, NIP-01 ephemeral events (kinds `20000-29999`) are rejected at publish time with `blocked: ephemeral events not allowed`. Exempt kinds that NIPs require to be relayed are still forwarded: `22242` (NIP-42 AUTH), `27235` (NIP-98 HTTP auth), `28934`/`28935`/`28936` (NIP-43 JOIN/Invite/LEAVE), `24133` (NIP-46 Nostr Connect), `23194`/`23195` (NIP-47 wallet request/response), `24242` (BUD-02 Blossom), `21059` (NIP-59 ephemeral gift wrap). Takes effect immediately on `SIGHUP` reload and on the next publish.
 
 ### Behavior notes
 

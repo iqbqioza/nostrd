@@ -285,8 +285,9 @@ impl super::Relay {
     /// NIPs-specified ephemeral kinds that must not be blocked even when
     /// `reject_ephemeral` is enabled (NIP-42 AUTH, NIP-98 HTTP auth,
     /// NIP-43 JOIN/LEAVE/INVITE, NIP-46 Nostr Connect, NIP-47 wallet
-    /// request/response, BUD-02 Blossom blobs — per NIPs README Event Kinds
-    /// table and the NIP-42/43/46/47/98/B7 specs).
+    /// request/response, NIP-59 ephemeral gift wrap, BUD-02 Blossom blobs
+    /// — per NIPs README Event Kinds table and the NIP-42/43/46/47/59/98/B7
+    /// specs).
     fn is_ephemeral_exempt(kind: u64) -> bool {
         matches!(
             kind,
@@ -299,6 +300,7 @@ impl super::Relay {
                 | 23194 // NIP-47 wallet request
                 | 23195 // NIP-47 wallet response
                 | 24242 // BUD-02 Blossom / NIP-B7 blobs
+                | 21059 // NIP-59 ephemeral gift wrap
         )
     }
 }
@@ -496,6 +498,7 @@ mod tests {
                 23194, // NIP-47 wallet request
                 23195, // NIP-47 wallet response
                 24242, // BUD-02 Blossom / NIP-B7 blobs
+                21059, // NIP-59 ephemeral gift wrap
             ] {
                 let ev = signed(kind, vec![]);
                 let out = relay2
