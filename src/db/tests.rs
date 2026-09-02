@@ -2019,16 +2019,17 @@ fn api_count_serves_aggregations_and_stays_healthy() {
 
 #[test]
 fn api_count_fails_fast_under_queue_pressure_and_after_shutdown() {
-    // `max_api_pending` follows `max_pending_msgs` (min 1): with a cap of
-    // one, aggregations must fail fast instead of queueing behind each
-    // other, and the counter must recover for later calls.
+    // `max_api_pending` follows `max_pending_msgs` (min 1): when the
+    // pending counter is at the cap, aggregations must fail fast instead
+    // of queueing behind each other, and the counter must recover for
+    // later calls.
     let db = DbClient::open(
         &config(),
         true,
         Arc::new(Default::default()),
         0,
         128,
-        1, // max_pending_msgs = 1 -> max_api_pending = 1 (writes still work)
+        2, // max_pending_msgs = 2 -> max_api_pending = 2 (writes still work)
         262144,
     )
     .unwrap();
@@ -2043,14 +2044,14 @@ fn api_count_fails_fast_under_queue_pressure_and_after_shutdown() {
         // Deterministic fail-fast: the pending counter is at the cap, so
         // the next aggregation must be refused without reaching the queue.
         db.api_pending
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            .fetch_add(2, std::sync::atomic::Ordering::Relaxed);
         let (events, more) = db.api_count(vec![kinds1.clone()], 2000, now).await;
         assert!(
             events.is_empty() && !more,
             "an aggregation at the pending cap must fail fast"
         );
         db.api_pending
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            .fetch_sub(2, std::sync::atomic::Ordering::Relaxed);
 
         // Concurrent aggregations against a cap of one in-flight request:
         // some may be served and the rest fail fast — whichever happens,
