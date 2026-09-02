@@ -30,7 +30,7 @@ Key features:
 
 - **Simple and stable**: written in Rust; a single binary does everything
 - **Fast storage and search**: LMDB database with a full-text search index
-- **Broad NIP support**: 22 NIPs implemented (plus the Blossom file server), including deletion, proof-of-work, delegation, groups, search, and a management API
+- **Broad NIP support**: 29 NIPs implemented (plus the Blossom file server), including deletion, proof-of-work, delegation, groups, search, and a management API
 - **Easy to operate**: daemon mode, log rotation, hot configuration reload, statistics output, a REST API, and Prometheus metrics
 
 ---
@@ -430,24 +430,31 @@ If `server.management_port` is set, the legacy REST endpoints are available at `
 | 9 | Event deletion |
 | 11 | Relay information document |
 | 13 | Proof of work |
+| 17 | Private DMs (kind 14, wrapped in 15; ephemeral wraps 1059/21059 forwarded) |
 | 22 | Comments (kind 1111, threaded via the `#e` index) |
 | 26 | Delegated event signing |
 | 28 | Public chat |
 | 29 | Relay-based groups |
+| 32 | Labeling (kind 1985, `#l`/`#L` indexed) |
 | 33 | Parameterized replaceable events |
 | 40 | Expiration timestamp |
 | 42 | Client authentication |
 | 43 | Relay access metadata (roles) |
 | 45 | Counting results (COUNT / HyperLogLog) |
+| 46 | Nostr Connect (ephemeral kind 24133, exempt from `reject_ephemeral`) |
+| 47 | Nostr Wallet Connect (ephemeral kinds 23194/23195, exempt from `reject_ephemeral`) |
 | 50 | Search capability (full-text, relevance-ordered) |
+| 57 | Lightning zaps (kinds 9734/9735, `#z` indexed) |
 | 59 | Gift wrap (recipient-only serving) |
 | 62 | Request to vanish |
+| 65 | Relay list metadata (kind 10002, `#r` indexed) |
 | 67 | EOSE completeness hint |
 | 70 | Protected events |
 | 77 | Negentropy syncing |
+| 78 | Application-specific data (kind 30078, addressable) |
 | 86 | Relay management API |
 | 98 | HTTP auth |
-| A3 | Payment targets (kind 10133, replaceable) |
+| A3 | Payment targets (kind 10133, replaceable). `draft` with no integer identifier — served but **not** advertised in `supported_nips` (which only holds integers) |
 
 Blossom (BUD-01/02) is not a NIP and is **not** advertised in the NIP-11 document: it is served as a separate file server on the `[blossom]` hostname (see [Section 11](#11-blossom-file-server-media-hosting)), with its own kind-24242 upload authorization.
 

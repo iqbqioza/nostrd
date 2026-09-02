@@ -304,7 +304,7 @@ With `server.ws_paths = "inbox-outbox"` the relay's WebSocket endpoint is served
 
 ## NIP support
 
-All relay-side NIPs are implemented; client-side NIPs are stored and served as plain events but are deliberately **not** advertised in the NIP-11 document (per the spec). File-storage NIPs (34 git, 94 file metadata, 95/96 HTTP file storage) are excluded by design — except Blossom, which is provided by the dedicated [Blossom file server](#features).
+All relay-side NIPs are implemented; client-side NIPs are stored and served as plain events. A subset of client-side NIPs that clients rely on (17, 22, 32, 46, 47, 57, 59, 65, 78) is **deliberately** advertised in the NIP-11 document; the rest are not (per the spec: "Client-side NIPs SHOULD NOT be advertised"). NIP-A3 (kind 10133) is served but cannot be advertised: it is a `draft` with no integer identifier, and NIP-11's `supported_nips` is an array of integer identifiers. File-storage NIPs (34 git, 94 file metadata, 95/96 HTTP file storage) are excluded by design — except Blossom, which is provided by the dedicated [Blossom file server](#features).
 
 The advertised `supported_nips` list is **dynamic**: a NIP is dropped when all the kinds it defines are blocked by `blocked_kinds`/`allowed_kinds` (e.g. blocking kind 5 hides NIP-09), when `reject_ephemeral` rejects every kind it relies on, or when it is disabled via `enabled_nips`/`disabled_nips`. Runtime changes (NIP-86 `allowkind`/`disallowkind`, `SIGHUP` reloads) are reflected in the next NIP-11 fetch.
 
@@ -314,24 +314,31 @@ The advertised `supported_nips` list is **dynamic**: a NIP is dropped when all t
 | [09](https://github.com/nostr-protocol/nips/blob/master/09.md) | Event deletion |
 | [11](https://github.com/nostr-protocol/nips/blob/master/11.md) | Relay information document |
 | [13](https://github.com/nostr-protocol/nips/blob/master/13.md) | Proof of work |
+| [17](https://github.com/nostr-protocol/nips/blob/master/17.md) | Private DMs (kind 14, wrapped in 15; the ephemeral wraps 1059/21059 are forwarded, gift-wrap serving follows NIP-59) |
 | [22](https://github.com/nostr-protocol/nips/blob/master/22.md) | Comments (kind 1111 — replies to kind 1 notes and other events, served via the `#e` threading index; root-scope `E`/`K`/`A`/`I` tags are indexed too) |
 | [26](https://github.com/nostr-protocol/nips/blob/master/26.md) | Delegated event signing |
 | [28](https://github.com/nostr-protocol/nips/blob/master/28.md) | Public chat (channel messages are served via the `#e` index) |
 | [29](https://github.com/nostr-protocol/nips/blob/master/29.md) | Relay-based groups (moderation events, relay-signed metadata, subgroups, invite codes, LiveKit rooms) |
+| [32](https://github.com/nostr-protocol/nips/blob/master/32.md) | Labeling (kind 1985; `#l`/`#L` tags are indexed) |
 | [33](https://github.com/nostr-protocol/nips/blob/master/33.md) | Parameterized replaceable events |
 | [40](https://github.com/nostr-protocol/nips/blob/master/40.md) | Expiration timestamp |
 | [42](https://github.com/nostr-protocol/nips/blob/master/42.md) | Client authentication (AUTH) |
 | [43](https://github.com/nostr-protocol/nips/blob/master/43.md) | Relay access metadata and requests (roles, membership lists, join/leave) |
 | [45](https://github.com/nostr-protocol/nips/blob/master/45.md) | Counting results (COUNT, with HyperLogLog registers) |
+| [46](https://github.com/nostr-protocol/nips/blob/master/46.md) | Nostr Connect (ephemeral kind 24133 is forwarded; exempt from `reject_ephemeral`) |
+| [47](https://github.com/nostr-protocol/nips/blob/master/47.md) | Nostr Wallet Connect (ephemeral kinds 23194/23195 are forwarded; exempt from `reject_ephemeral`) |
 | [50](https://github.com/nostr-protocol/nips/blob/master/50.md) | Search capability (whole-word terms, relevance-ordered by IDF weights) |
+| [57](https://github.com/nostr-protocol/nips/blob/master/57.md) | Lightning zaps (kinds 9734/9735 stored and served; `#z` tags are indexed) |
 | [59](https://github.com/nostr-protocol/nips/blob/master/59.md) | Gift wrap (recipient-only serving, NIP-09/62 linked deletion) |
 | [62](https://github.com/nostr-protocol/nips/blob/master/62.md) | Request to vanish |
+| [65](https://github.com/nostr-protocol/nips/blob/master/65.md) | Relay list metadata (kind 10002, replaceable; `#r` tags are indexed) |
 | [67](https://github.com/nostr-protocol/nips/blob/master/67.md) | EOSE completeness hint (`finish`/`more`) |
 | [70](https://github.com/nostr-protocol/nips/blob/master/70.md) | Protected events |
 | [77](https://github.com/nostr-protocol/nips/blob/master/77.md) | Negentropy syncing (NEG-OPEN/MSG/CLOSE) |
+| [78](https://github.com/nostr-protocol/nips/blob/master/78.md) | Application-specific data (kind 30078, addressable) |
 | [86](https://github.com/nostr-protocol/nips/blob/master/86.md) | Relay management API (JSON-RPC) |
 | [98](https://github.com/nostr-protocol/nips/blob/master/98.md) | HTTP auth (kind 27235) |
-| [A3](https://github.com/nostr-protocol/nips/blob/master/A3.md) | Payment targets (kind 10133, replaceable — the latest per pubkey is kept; `payto` tags are queryable via the full scan) |
+| [A3](https://github.com/nostr-protocol/nips/blob/master/A3.md) | Payment targets (kind 10133, replaceable — the latest per pubkey is kept; `payto` tags are queryable via the full scan). `draft` with no integer identifier, so it cannot appear in `supported_nips` |
 | [Blossom](https://github.com/hzrd149/blossom) (BUD-01/02) | File server — SHA-256-addressed uploads (kind-24242 auth), served on the `[blossom]` hostname (see [above](#blossom-file-server-media-hosting)) |
 
 ## Architecture notes

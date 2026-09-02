@@ -9,16 +9,21 @@ use crate::error::{Error, Result};
 
 pub const DEFAULT_CONFIG: &str = "nostrd.toml";
 
-/// NIPs with relay-side behaviour implemented by this relay, as advertised
-/// in the NIP-11 document. NIPs whose behaviour is purely client-side are
-/// deliberately not advertised (NIP-11: "Client-side NIPs SHOULD NOT be
-/// advertised"): NIP-28 explicitly "imposes no additional requirements on
-/// relays", so it is not listed. File-storage NIPs (34/94/95/96) are
+/// NIPs advertised in the NIP-11 document. NIPs whose behaviour is purely
+/// client-side are generally not advertised (NIP-11: "Client-side NIPs SHOULD
+/// NOT be advertised"): NIP-28 explicitly "imposes no additional requirements
+/// on relays", so it is not listed. The client-side NIPs that ARE listed
+/// (17/22/32/46/47/57/59/65/78) are advertised deliberately: the relay stores
+/// and serves their events (or forwards their ephemeral kinds), so clients
+/// rely on them. NIP-A3 (kind 10133) is served but cannot be advertised: it
+/// is a `draft` with no integer identifier and NIP-11's `supported_nips` is
+/// an array of integer identifiers. File-storage NIPs (34/94/95/96) are
 /// excluded per the project rules (Blossom is provided separately by the
 /// `[blossom]` file server). NIP-33 was merged into NIP-01 but remains
 /// advertised for clients that check it.
 pub const RELAY_NIPS: &[u16] = &[
-    1, 9, 11, 13, 26, 29, 33, 40, 42, 43, 45, 50, 62, 67, 70, 77, 86, 98,
+    1, 9, 11, 13, 17, 22, 26, 29, 32, 33, 40, 42, 43, 45, 46, 47, 50, 57, 59, 62, 65, 67, 70, 77,
+    78, 86, 98,
 ];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -494,22 +499,31 @@ impl Config {
             9 => Some(&[5]),
             11 => None,
             13 => None,
+            17 => Some(&[14, 15, 1059, 21059]),
+            22 => Some(&[1111]),
             26 => None,
             28 => Some(&[40, 41, 42, 43, 44]),
             29 => Some(&[
-                9000, 9001, 9002, 9005, 9007, 9008, 9009, 9010, 9021, 9022, 39000, 39001, 39002,
-                39005,
+                9000, 9001, 9002, 9003, 9004, 9005, 9006, 9007, 9008, 9009, 9010, 9020, 9021, 9022,
+                39000, 39001, 39002, 39005,
             ]),
+            32 => Some(&[1985]),
             33 => None, // range 30000-39999 — not checked against kind block lists
             40 => None,
             42 => Some(&[22242]),
-            43 => Some(&[8000, 8001, 28934, 28936, 33534, 13534]),
+            43 => Some(&[8000, 8001, 28934, 28935, 28936, 33534, 13534]),
             45 => None,
+            46 => Some(&[24133]),
+            47 => Some(&[23194, 23195]),
             50 => None,
+            57 => Some(&[9734, 9735]),
+            59 => Some(&[1059, 21059]),
             62 => Some(&[62]),
+            65 => Some(&[10002]),
             67 => None,
             70 => None,
             77 => None,
+            78 => Some(&[30078]),
             86 => None,
             98 => Some(&[27235]),
             _ => None,
@@ -1234,13 +1248,18 @@ mod tests {
         let nips = cfg.effective_supported_nips(&access);
         // Relay-side NIPs are advertised.
         for n in [
-            1, 9, 11, 13, 26, 29, 33, 40, 42, 43, 45, 50, 62, 67, 70, 77, 86, 98,
+            1, 9, 11, 13, 17, 22, 26, 29, 32, 33, 40, 42, 43, 45, 46, 47, 50, 57, 59, 62, 65, 67,
+            70, 77, 78, 86, 98,
         ] {
             assert!(nips.contains(&n), "NIP-{n} must be advertised");
         }
-        // Client-side NIPs must not be advertised (NIP-11). NIP-28
-        // explicitly "imposes no additional requirements on relays".
-        for n in [2, 3, 5, 17, 19, 28, 32, 51, 65, 68, 99] {
+        // Client-side NIPs without relay-side behaviour must not be
+        // advertised (NIP-11). NIP-28 explicitly "imposes no additional
+        // requirements on relays". The advertised client-side set (17/22/32/
+        // 46/47/57/59/65/78) is deliberate: their events are stored and
+        // served. NIP-A3 (kind 10133) is served but has no integer
+        // identifier, so it cannot appear in the numeric list.
+        for n in [2, 3, 5, 19, 28, 51, 68, 99] {
             assert!(
                 !nips.contains(&n),
                 "client-side NIP-{n} must not be advertised"
@@ -1322,6 +1341,54 @@ mod tests {
             nips.contains(&40),
             "NIP-40 (no kinds) is always advertised when enabled"
         );
+    }
+
+    #[test]
+    fn advertised_client_nips_track_their_kinds() {
+        let cfg = Config::default();
+        // Each advertised client-side NIP is dropped when all its kinds are
+        // blocked.
+        for (nip, kinds) in [
+            (17, &[14u64, 15, 1059, 21059][..]),
+            (22, &[1111][..]),
+            (32, &[1985][..]),
+            (46, &[24133][..]),
+            (47, &[23194, 23195][..]),
+            (57, &[9734, 9735][..]),
+            (59, &[1059, 21059][..]),
+            (65, &[10002][..]),
+            (78, &[30078][..]),
+        ] {
+            let access = AccessControl {
+                blocked_kinds: kinds.to_vec(),
+                ..Default::default()
+            };
+            let nips = cfg.effective_supported_nips(&access);
+            assert!(
+                !nips.contains(&nip),
+                "NIP-{nip} must not be advertised when all its kinds are blocked"
+            );
+        }
+        // reject_ephemeral keeps the exempt ephemeral kinds of NIP-46/47 and
+        // the regular kinds of NIP-17 (only 1059 is rejected).
+        let mut cfg = Config::default();
+        cfg.relay.reject_ephemeral = true;
+        let access = AccessControl::default();
+        let nips = cfg.effective_supported_nips(&access);
+        assert!(
+            nips.contains(&46),
+            "NIP-46 (exempt) stays with reject_ephemeral"
+        );
+        assert!(
+            nips.contains(&47),
+            "NIP-47 (exempt) stays with reject_ephemeral"
+        );
+        assert!(nips.contains(&17), "NIP-17 stays via kinds 14/15");
+        assert!(nips.contains(&59), "NIP-59 stays via kind 1059/21059");
+        assert!(nips.contains(&22), "NIP-22 stays via kind 1111");
+        // NIP-65/78 are replaceable/addressable: never dropped by reject_ephemeral.
+        assert!(nips.contains(&65));
+        assert!(nips.contains(&78));
     }
 
     #[test]

@@ -157,7 +157,10 @@ mod tests {
             .as_array()
             .expect("supported_nips is an array");
         let nips: Vec<u16> = nips.iter().map(|n| n.as_u64().unwrap() as u16).collect();
-        for expected in [1u16, 9, 11, 26, 29, 42, 45, 50, 62, 70, 77, 86, 98] {
+        for expected in [
+            1u16, 9, 11, 13, 17, 22, 26, 29, 32, 33, 40, 42, 43, 45, 46, 47, 50, 57, 59, 62, 65,
+            67, 70, 77, 78, 86, 98,
+        ] {
             assert!(
                 nips.contains(&expected),
                 "NIP-{expected} must be advertised"
