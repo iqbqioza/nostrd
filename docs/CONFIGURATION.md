@@ -518,9 +518,9 @@ Editing the file and sending `kill -HUP $(cat nostrd.pid)` reloads it **without 
 | Applies on SIGHUP | Requires `nostrd restart` |
 | --- | --- |
 | `relay.name`, `description`, `pubkey`, `contact`, `icon`, `post_policy`, `public_url`, `relay.reject_ephemeral`, `relay.enable_git` | `relay.private_key` |
-| most of `[limits]` | `relay.livekit_*` |
-| NIP-40 on/off, API concurrency | `relay.enabled_nips` / `disabled_nips` |
-| — | `server.api_host`, `metrics_enabled` |
+| most of `[limits]` | `relay.livekit_*`, `relay.enabled_nips` / `disabled_nips` |
+| NIP-40 on/off, API concurrency | `server.host`, `server.port`, `server.api_host`, `server.ws_paths`, `server.management_port`, `server.management_host`, `server.metrics_enabled` |
+| — | `database.path`, `database.purge_interval_secs`, `daemon.log_max_size_bytes`, `log_max_files`, `stats_interval_secs`, `db_request_timeout_secs`, `db_queue_msgs`, `db_queue_events`, `max_indexed_words`, `live_buffer`, `live_batch_size`, `live_batch_interval_ms`, `blossom.host`, `blossom.storage`, `blossom.local_path`, `blossom.max_upload_bytes`, `blossom.s3_*` |
 
 `[access]` is **not** applied by a reload: the access lists are seeded once at startup and then managed at runtime via NIP-86.
 

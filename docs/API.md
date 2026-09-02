@@ -103,7 +103,7 @@ Without `api_host`, the API is served on every host, next to the WebSocket endpo
 
 | Identifier | Returns | `limit` default |
 | --- | --- | --- |
-| `npub1...` | **error `400`** — an npub requires the kind path (see 2.2) | — |
+| `npub1...` | the author's latest kind-0 profile event | `1` (fixed) |
 | `note1...` | the single event with this id | `1` (fixed) |
 | `nevent1...` | the single event with this id (relays/author/kind hints ignored) | `1` (fixed) |
 | `naddr1...` | events of the address: kind + author + `d` tag from the address | `100` |
@@ -215,8 +215,7 @@ Errors return a JSON body with an `error` field:
 | Error example | When |
 | --- | --- |
 | `invalid identifier: ...` | The NIP-19 identifier cannot be decoded (400) |
-| `npub1 requires a kind path: /api/v1/npub1.../{kind}` | An npub without the kind path (400) |
-| `kind path is only valid with npub1 identifiers` | A kind path with note/nevent/naddr (400) |
+| `the endpoint requires an npub1 identifier or a 64-hex pubkey` | A kind path given with a note1/nevent1/naddr1 identifier, or an unrecognized path (400) |
 | `offset exceeds the maximum of 10000` | `offset` above `api_max_offset` (400) |
 | `search exceeds the maximum of 1024 bytes` | `search` longer than `api_max_search_bytes` (400) |
 | `server is busy, try again shortly` | Too many concurrent API requests (`api_max_concurrent` reached) (503) |

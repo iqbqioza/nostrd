@@ -843,6 +843,17 @@ async fn reload_handler(
                         // at startup: a reload cannot rebuild the routes.
                         let static_routes = [
                             ("server.api_host", old.server.api_host != new_config.server.api_host),
+                            ("server.host", old.server.host != new_config.server.host),
+                            ("server.port", old.server.port != new_config.server.port),
+                            ("server.ws_paths", old.server.ws_paths != new_config.server.ws_paths),
+                            (
+                                "server.management_port",
+                                old.server.management_port != new_config.server.management_port,
+                            ),
+                            (
+                                "server.management_host",
+                                old.server.management_host != new_config.server.management_host,
+                            ),
                             (
                                 "server.metrics_enabled",
                                 old.server.metrics_enabled != new_config.server.metrics_enabled,
@@ -888,6 +899,60 @@ async fn reload_handler(
                                         != new_config.blossom.s3_access_key
                                     || old.blossom.s3_secret_key
                                         != new_config.blossom.s3_secret_key,
+                            ),
+                            (
+                                "database.path",
+                                old.database.path != new_config.database.path,
+                            ),
+                            (
+                                "database.purge_interval_secs",
+                                old.database.purge_interval_secs
+                                    != new_config.database.purge_interval_secs,
+                            ),
+                            (
+                                "daemon.log_max_size_bytes",
+                                old.daemon.log_max_size_bytes
+                                    != new_config.daemon.log_max_size_bytes,
+                            ),
+                            (
+                                "daemon.log_max_files",
+                                old.daemon.log_max_files != new_config.daemon.log_max_files,
+                            ),
+                            (
+                                "daemon.stats_interval_secs",
+                                old.daemon.stats_interval_secs
+                                    != new_config.daemon.stats_interval_secs,
+                            ),
+                            (
+                                "limits.db_request_timeout_secs",
+                                old.limits.db_request_timeout_secs
+                                    != new_config.limits.db_request_timeout_secs,
+                            ),
+                            (
+                                "limits.db_queue_msgs",
+                                old.limits.db_queue_msgs != new_config.limits.db_queue_msgs,
+                            ),
+                            (
+                                "limits.db_queue_events",
+                                old.limits.db_queue_events != new_config.limits.db_queue_events,
+                            ),
+                            (
+                                "limits.max_indexed_words",
+                                old.limits.max_indexed_words
+                                    != new_config.limits.max_indexed_words,
+                            ),
+                            (
+                                "limits.live_buffer",
+                                old.limits.live_buffer != new_config.limits.live_buffer,
+                            ),
+                            (
+                                "limits.live_batch_size",
+                                old.limits.live_batch_size != new_config.limits.live_batch_size,
+                            ),
+                            (
+                                "limits.live_batch_interval_ms",
+                                old.limits.live_batch_interval_ms
+                                    != new_config.limits.live_batch_interval_ms,
                             ),
                         ];
                         for (name, changed) in static_routes {
