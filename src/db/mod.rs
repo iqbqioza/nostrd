@@ -530,6 +530,50 @@ impl DbClient {
         out
     }
 
+    /// REST API count aggregation (COUNT / per-kind / related /
+    /// monthly/daily/hourly): served by the dedicated API reader thread
+    /// like [`Self::api_query`], so the multi-month loops and per-endpoint
+    /// scans never block WebSocket queries on the shared reader. Applies
+    /// the same fail-fast queue cap.
+    pub async fn api_count(
+        &self,
+        filters: Vec<Filter>,
+        limit: usize,
+        now: u64,
+    ) -> (Vec<Event>, bool) {
+        if self.api_pending.load(std::sync::atomic::Ordering::Relaxed) >= self.max_api_pending {
+            self.errors
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return (Vec::new(), false);
+        }
+        let (tx, rx) = oneshot::channel();
+        self.api_pending
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let msg = Msg::Count {
+            filters,
+            limit,
+            now,
+            reply: tx,
+        };
+        if self.api_read_tx.send(msg).is_err() {
+            self.api_pending
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            return (Vec::new(), false);
+        }
+        let out = if self.timeout_secs == 0 {
+            rx.await.unwrap_or_default()
+        } else {
+            tokio::time::timeout(std::time::Duration::from_secs(self.timeout_secs), rx)
+                .await
+                .map(|r| r.unwrap_or_default())
+                .unwrap_or_default()
+        };
+        // The API reader thread decrements `api_pending` once it has
+        // processed the message (including its panic path), so this path
+        // must not decrement again.
+        out
+    }
+
     /// Records the first-seen time of each pubkey when unknown; returns
     /// `(created, first_seen)` per entry, aligned with the input.
     pub async fn touch_first_seen_batch(&self, entries: Vec<([u8; 32], u64)>) -> Vec<(bool, u64)> {

@@ -1961,6 +1961,135 @@ fn api_query_uses_dedicated_reader_and_stays_healthy() {
 }
 
 #[test]
+fn api_count_serves_aggregations_and_stays_healthy() {
+    // `api_count` (REST API aggregations: monthly/daily/hourly and the
+    // count endpoints) must be served by the dedicated API reader thread
+    // with the same fail-fast cap as `api_query`, and the pending counter
+    // must not leak.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        for i in 0..32 {
+            let ev = event(1, &format!("agg-{i}"), now - i, vec![]);
+            assert_eq!(db.put(ev, now).await, PutOutcome::Stored);
+        }
+        let kinds1: Filter = serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap();
+        let kinds2: Filter = serde_json::from_value(serde_json::json!({"kinds": [2]})).unwrap();
+
+        // Success path: matching events are returned with the `more` flag.
+        let (events, more) = db.api_count(vec![kinds1.clone()], 2000, now).await;
+        assert_eq!(events.len(), 32, "api_count must return the matches");
+        assert!(!more);
+        // Empty path: no matching events.
+        let (events, more) = db.api_count(vec![kinds2.clone()], 2000, now).await;
+        assert!(events.is_empty());
+        assert!(!more);
+        // The shared-reader WebSocket path is unaffected by API traffic.
+        let (events, _) = db.query(vec![kinds1.clone()], 500, now).await;
+        assert_eq!(events.len(), 32);
+    });
+    // The request-timeout path (timeout_secs > 0) still serves the result.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        30,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    rt.block_on(async {
+        let kinds1: Filter = serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap();
+        let (events, _) = db.api_count(vec![kinds1], 2000, unix_now()).await;
+        assert!(events.is_empty());
+    });
+    db.shutdown();
+}
+
+#[test]
+fn api_count_fails_fast_under_queue_pressure_and_after_shutdown() {
+    // `max_api_pending` follows `max_pending_msgs` (min 1): when the
+    // pending counter is at the cap, aggregations must fail fast instead
+    // of queueing behind each other, and the counter must recover for
+    // later calls.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        2, // max_pending_msgs = 2 -> max_api_pending = 2 (writes still work)
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        for i in 0..8 {
+            let ev = event(1, &format!("agg-{i}"), now - i, vec![]);
+            assert_eq!(db.put(ev, now).await, PutOutcome::Stored);
+        }
+        let kinds1: Filter = serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap();
+        // Deterministic fail-fast: the pending counter is at the cap, so
+        // the next aggregation must be refused without reaching the queue.
+        db.api_pending
+            .fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+        let (events, more) = db.api_count(vec![kinds1.clone()], 2000, now).await;
+        assert!(
+            events.is_empty() && !more,
+            "an aggregation at the pending cap must fail fast"
+        );
+        db.api_pending
+            .fetch_sub(2, std::sync::atomic::Ordering::Relaxed);
+
+        // Concurrent aggregations against a cap of one in-flight request:
+        // some may be served and the rest fail fast — whichever happens,
+        // the counter must not leak (the later call below is served
+        // normally).
+        let mut futures = Vec::new();
+        for _ in 0..16 {
+            let kinds1 = kinds1.clone();
+            let db = db.clone();
+            futures.push(tokio::spawn(async move {
+                db.api_count(vec![kinds1], 2000, now).await
+            }));
+        }
+        for f in futures {
+            let (events, _) = f.await.unwrap();
+            assert_eq!(
+                events.len() % 8,
+                0,
+                "a served aggregation returns all matches; a failed one returns none"
+            );
+        }
+        // The counter recovers: a later call is served normally.
+        let (events, _) = db.api_count(vec![kinds1.clone()], 2000, now).await;
+        assert_eq!(events.len(), 8, "api_count must recover after fail-fast");
+        // The WebSocket path is unaffected.
+        let (events, _) = db.query(vec![kinds1.clone()], 500, now).await;
+        assert_eq!(events.len(), 8);
+
+        // After shutdown the channel is closed: api_count must return an
+        // empty result instead of panicking.
+        db.shutdown();
+        let (events, more) = db.api_count(vec![kinds1.clone()], 2000, now).await;
+        assert!(events.is_empty());
+        assert!(!more);
+    });
+}
+
+#[test]
 fn mixed_search_and_plain_filters_return_the_union() {
     // Regression: a REQ mixing a search filter and a plain filter must
     // return the union of both (each with its own limit), not a response
