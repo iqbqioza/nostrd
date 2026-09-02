@@ -228,10 +228,13 @@ restrict_uploads = false            # true = only allow-listed pubkeys may uploa
 | Endpoint | Description |
 | --- | --- |
 | `GET /` | Blossom server info (on the Blossom host) |
-| `GET` / `HEAD` `/<sha256>[.ext]` | Fetch / probe a blob |
-| `PUT /upload` | Upload a blob (kind-24242 auth) |
+| `GET` / `HEAD` `/<sha256>[.ext]` | Fetch / probe a blob (`GET` supports RFC 7233 byte ranges) |
+| `PUT /upload` | Upload a blob (kind-24242 auth; `t=upload` + `x` + `expiration` tags) |
+| `HEAD /upload` | BUD-06 pre-flight — would the upload be accepted? (`X-SHA-256` / `X-Content-Type` / `X-Content-Length` headers) |
+| `PUT /media` | BUD-05 media upload (stored verbatim — no optimization) |
+| `HEAD /media` | BUD-05 pre-flight (same headers as `HEAD /upload`) |
 | `GET /list/<pubkey>` | Blobs uploaded by a pubkey |
-| `DELETE /<sha256>` | Delete a blob (uploader only) |
+| `DELETE /<sha256>` | Delete a blob (uploader only; `t=delete` + `x` tags) |
 
 The upload allowlist is managed in the relay database (LMDB), independent from the relay's own allow/deny lists:
 

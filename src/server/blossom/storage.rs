@@ -234,7 +234,20 @@ impl LocalStore {
     ) -> Result<()> {
         let dir = self.root.join(npub);
         tokio::fs::create_dir_all(&dir).await?;
-        tokio::fs::write(self.blob_path(npub, sha256), bytes).await?;
+        // Atomic write: the bytes land in a temp file first and are moved
+        // into place with a rename. A crash mid-write can then never leave
+        // a truncated blob at the final path — the file is either complete
+        // or absent (the LMDB mapping may already reference the sha, but a
+        // missing file is a healable state, a truncated one is not).
+        let tmp_path = dir.join(format!(".{sha256}.tmp"));
+        if let Err(e) = tokio::fs::write(&tmp_path, bytes).await {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(e.into());
+        }
+        if let Err(e) = tokio::fs::rename(&tmp_path, self.blob_path(npub, sha256)).await {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(e.into());
+        }
         Ok(())
     }
 
@@ -531,6 +544,27 @@ mod tests {
         // The last owner's delete removes the mapping.
         assert!(s.delete(&a, &sha).await.unwrap());
         assert!(s.find(&sha).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn local_put_is_atomic() {
+        // The final file must be written via a temp file + rename: no
+        // `.tmp` leftovers, and the blob is served from its final path.
+        let (s, _db_path) = store("atomic").await;
+        let a = pk(1);
+        let sha = "ef".repeat(32);
+        let bytes = b"atomic blob";
+        s.put(&a, &sha, bytes, "text/plain").await.unwrap();
+        let npub_a = npub_of(&a);
+        assert_eq!(s.read(&npub_a, &sha).await.unwrap().unwrap(), bytes);
+        let npub_dir =
+            std::env::temp_dir().join(format!("nostrd-blossom-test-atomic-{}", std::process::id()));
+        let dir = npub_dir.join(&npub_a);
+        let entries = std::fs::read_dir(&dir).unwrap();
+        let names: Vec<String> = entries
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec![sha], "no temp files may be left behind");
     }
 
     #[tokio::test]

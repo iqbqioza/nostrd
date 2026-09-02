@@ -568,17 +568,22 @@ Both backends use the `bucket/{npub1xxx}/{file}` hierarchy: every upload is stor
 | Method | Path | Auth | Description |
 | --- | --- | --- | --- |
 | `GET` | `/` | — | Blossom server info |
-| `GET` / `HEAD` | `/<sha256>[.ext]` | — | Fetch / probe a blob (`.ext` is advisory) |
-| `PUT` | `/upload` | kind 24242 (`t=upload`) | Upload a blob; returns 201 + the descriptor |
+| `GET` / `HEAD` | `/<sha256>[.ext]` | — | Fetch / probe a blob (`.ext` is advisory); `GET` supports RFC 7233 byte ranges (206 / `accept-ranges: bytes`) |
+| `PUT` | `/upload` | kind 24242 (`t=upload`, `x=<sha256>`, `expiration`) | Upload a blob; returns 201 + the descriptor |
+| `HEAD` | `/upload` | kind 24242 (`t=upload`, `x=<sha256>`, `expiration`) | BUD-06 pre-flight — would the upload be accepted? Uses `X-SHA-256` / `X-Content-Length` / `X-Content-Type` headers (400 malformed / 411 missing length / 413 too large) |
+| `PUT` | `/media` | kind 24242 (`t=media`, `x=<sha256>`, `expiration`) | BUD-05 media upload (stored verbatim — no optimization); returns 201 + the descriptor |
+| `HEAD` | `/media` | kind 24242 (`t=media`, `x=<sha256>`, `expiration`) | BUD-05 pre-flight — would the upload be accepted? Uses `X-SHA-256` / `X-Content-Length` / `X-Content-Type` headers (400 malformed / 411 missing length / 413 too large) |
 | `GET` | `/list/<pubkey>` | — | Blobs uploaded by a pubkey (hex), sorted by `uploaded` descending; supports `cursor` (the sha256 of the last entry of the previous page) and `limit` |
-| `DELETE` | `/<sha256>` | kind 24242 (`t=delete`, `x=<sha256>`) | Delete a blob (uploader only) |
+| `DELETE` | `/<sha256>` | kind 24242 (`t=delete`, `x=<sha256>`, `expiration`) | Delete a blob (uploader only) |
 
 - `PUT /upload` returns **201** when the blob was newly stored and **200** when it already exists (BUD-02).
 - Authorization tokens are accepted in the spec's **Base64url (no padding)** form and in the padded standard form (BUD-11).
+- The optional `X-SHA-256` request header is verified against the actual bytes: a mismatch returns **409** (BUD-02).
+- The CORS pre-flight accepts the BUD-05/06 headers (`X-SHA-256`, `X-Content-Type`, `X-Content-Length`), so browser clients like nostter can upload to `/media`.
 
-Uploads and deletes authenticate with a Nostr auth event (kind 24242, `server` tag naming the Blossom host), sent as `Authorization: Nostr <base64>`.
+Uploads and deletes authenticate with a Nostr auth event (kind 24242, `server` tag naming the Blossom host), sent as `Authorization: Nostr <base64>`. Per BUD-11 the token must carry an `expiration` tag set to a unix timestamp in the future, the `t` verb matching the endpoint (`upload` / `delete`), and — for upload and delete — an `x` tag with the blob's sha256.
 
-The descriptor `url` includes the MIME-derived extension (e.g. `https://media.example.com/<sha256>.png`), like the Blossom spec's examples. The extension is advisory: the file is served by its hash alone, and `/<sha256>.<ext>` (any extension) resolves to the same blob.
+The descriptor `url` includes the MIME-derived extension (e.g. `https://media.example.com/<sha256>.png`; unknown types get `.bin`), like the Blossom spec's examples. The extension is advisory: the file is served by its hash alone, and `/<sha256>.<ext>` (any extension) resolves to the same blob.
 
 ### 11.4 Example
 

@@ -234,11 +234,20 @@ Group posts have a time limit (`group_late_publish_secs`, default 7 days). Older
 
 ### 3b-1. Upload fails with `401`
 
-The upload authorization event (kind 24242) was rejected. Check that the client's `server` tag names exactly the configured `blossom.host` (hostname only, no scheme/path), that the token's `expiration` tag is in the future, and that the signing key is the uploader's own.
+The upload authorization event (kind 24242) was rejected. Check that:
+- the token's `expiration` tag is **present** and set to a unix timestamp in the future (BUD-11 makes it mandatory),
+- for upload/media/delete the token carries an **`x` tag with the blob's sha256** (also mandatory per BUD-11),
+- the `server` tag (when present) names exactly the configured `blossom.host` (hostname only, no scheme/path),
+- the token was signed within the last 10 minutes (a freshness window against replay),
+- and the signing key is the uploader's own.
 
 ### 3b-2. Upload fails with `403`
 
 `blossom.restrict_uploads = true` is set and the pubkey is not on the allowlist — add it with `nostrd blossom allow npub1...` (the daemon reloads automatically). If the list looks wrong, `nostrd blossom list` shows it.
+
+### 3b-2a. Upload fails with `409`
+
+The client sent an `X-SHA-256` header that does not match the actual request body (the declared hash was computed over different bytes — e.g. the file changed between hashing and sending). Clients may omit the header entirely.
 
 ### 3b-3. `GET /` on the media host serves the NIP-11 document instead of the Blossom server info
 

@@ -7,8 +7,14 @@
 //!
 //! Endpoints:
 //! - `GET /`            — server info
-//! - `GET /<sha256>[.ext]` / `HEAD` — fetch / probe a blob
-//! - `PUT /upload`      — upload (NIP-98 style auth, kind 24242, `t=upload`)
+//! - `GET /<sha256>[.ext]` / `HEAD` — fetch / probe a blob (with RFC 7233
+//!   byte-range support on `GET`)
+//! - `PUT /upload`      — upload (NIP-98 style auth, kind 24242, `t=upload`,
+//!   mandatory `expiration` and `x` tags per BUD-11)
+//! - `HEAD /upload`     — BUD-06 pre-flight (`X-SHA-256` / `X-Content-Length`
+//!   / `X-Content-Type` headers, `t=upload` auth)
+//! - `PUT /media` / `HEAD /media` — BUD-05 media upload + pre-flight
+//!   (stored verbatim; auth `t=media`, `x` tag required)
 //! - `GET /list/<pubkey>` — blobs uploaded by a pubkey
 //! - `DELETE /<sha256>[.ext]` — delete (auth, `t=delete`, `x=<sha256>`)
 
@@ -46,7 +52,15 @@ pub(crate) async fn routes(relay: &Arc<Relay>) -> axum::Router<Arc<Relay>> {
     axum::Router::new()
         .route(
             "/upload",
-            put(upload).layer(DefaultBodyLimit::max(max_upload)),
+            put(upload)
+                .head(head_upload)
+                .layer(DefaultBodyLimit::max(max_upload)),
+        )
+        .route(
+            "/media",
+            put(upload_media)
+                .head(head_media)
+                .layer(DefaultBodyLimit::max(max_upload)),
         )
         .route("/list/{pubkey}", get(list))
         .route("/{blob}", get(get_blob).head(head_blob).delete(delete_blob))
@@ -65,7 +79,7 @@ pub(crate) fn is_blossom_path(path: &str) -> bool {
     // The root `/` stays with the relay (WS + NIP-11): the WS handler
     // answers it with the Blossom server info when the Host names the
     // Blossom host.
-    if path == "/upload" {
+    if path == "/upload" || path == "/media" {
         return true;
     }
     if let Some(rest) = path.strip_prefix("/list/") {
@@ -87,6 +101,9 @@ fn is_pubkey(value: &str) -> bool {
 /// The advisory file extension for a MIME type, appended to the
 /// Blossom descriptor `url` (the spec's examples always include it;
 /// the extension is a hint — the file is served by hash alone).
+/// BUD-02 requires the URL to carry an extension, so unknown types fall
+/// back to `.bin` (BUD-10: "If the file extension is unknown, it MUST
+/// default to `.bin`").
 fn ext_of(mime: &str) -> &'static str {
     match mime {
         "image/jpeg" => ".jpg",
@@ -110,7 +127,7 @@ fn ext_of(mime: &str) -> &'static str {
         "application/json" => ".json",
         "application/zip" => ".zip",
         "application/gzip" => ".gz",
-        _ => "",
+        _ => ".bin",
     }
 }
 
@@ -191,8 +208,77 @@ pub(crate) fn sanitize_mime(raw: &str) -> String {
     }
 }
 
+/// The `t`-tag values of `name` in a Blossom auth event.
+fn event_tags<'a>(event: &'a crate::event::Event, name: &'a str) -> impl Iterator<Item = &'a str> {
+    event
+        .tags
+        .iter()
+        .filter(move |t| t.len() >= 2 && t[0] == name)
+        .map(|t| t[1].as_str())
+}
+
+/// Validates a Blossom auth event (BUD-11): kind 24242 with a `t` verb, a
+/// mandatory `expiration` tag set to a unix timestamp in the future, an
+/// optional `server` tag naming our host and — when the endpoint implies a
+/// blob hash — a mandatory matching `x` tag. Returns the pubkey.
+fn validate_auth_event(
+    secp: &secp256k1::Secp256k1<secp256k1::All>,
+    event: &crate::event::Event,
+    host: &str,
+    verb: &str,
+    expected_sha: Option<&str>,
+    now: u64,
+) -> Option<String> {
+    if event.kind != 24242 {
+        return None;
+    }
+    if crate::nips::nip01::verify(event, secp).is_err() {
+        return None;
+    }
+    // BUD-11: `created_at` must be in the past. The relay additionally
+    // enforces a freshness window: an intercepted token cannot be replayed
+    // long after signing (the 10-minute slack tolerates client clock skew).
+    if event.created_at.abs_diff(now) > 600 {
+        return None;
+    }
+    if !event_tags(event, "t").any(|t| t == verb) {
+        return None;
+    }
+    // BUD-11: the `expiration` tag is mandatory and must be a unix
+    // timestamp in the future — a missing or unparseable value is rejected
+    // too, so an intercepted token cannot outlive its scope.
+    let exp = event_tags(event, "expiration").next()?;
+    if exp.parse::<u64>().map(|e| e <= now).unwrap_or(true) {
+        return None;
+    }
+    // The `server` tags (when present) must name our host. BUD-11: a token
+    // may carry multiple `server` tags ("the token is valid for all
+    // servers" listed), and the relay must accept it when its domain
+    // appears in at least one. The tag may carry a scheme and a path; IPv6
+    // hosts use brackets (`[::1]`), whose colons must not be mistaken for
+    // a port separator.
+    let host = host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    let servers: Vec<&str> = event_tags(event, "server").collect();
+    if !servers.is_empty() && !servers.iter().any(|s| auth_server_host(s) == host) {
+        return None;
+    }
+    // BUD-11: when the endpoint implies a blob hash (upload/delete), at
+    // least one `x` tag must match it.
+    if let Some(sha) = expected_sha
+        && !event_tags(event, "x").any(|x| x == sha)
+    {
+        return None;
+    }
+    Some(event.pubkey.clone())
+}
+
 /// Verifies a Blossom auth event (BUD-11): kind 24242 with `t` (verb),
-/// optional `server` and `x` (sha256 scope) tags. Returns the pubkey.
+/// mandatory future `expiration`, optional `server` and `x` (sha256 scope)
+/// tags. Returns the pubkey.
 async fn verify_auth(
     relay: &Relay,
     state: &BlossomState,
@@ -211,56 +297,14 @@ async fn verify_auth(
         .or_else(|_| base64::engine::general_purpose::STANDARD.decode(encoded))
         .ok()?;
     let event: crate::event::Event = serde_json::from_slice(&raw).ok()?;
-    if event.kind != 24242 {
-        return None;
-    }
-    if crate::nips::nip01::verify(&event, relay.secp()).is_err() {
-        return None;
-    }
-    let now = unix_now();
-    if event.created_at.abs_diff(now) > 600 {
-        return None;
-    }
-    fn tags<'a>(event: &'a crate::event::Event, name: &'a str) -> impl Iterator<Item = &'a str> {
-        event
-            .tags
-            .iter()
-            .filter(move |t| t.len() >= 2 && t[0] == name)
-            .map(|t| t[1].as_str())
-    }
-    if !tags(&event, "t").any(|t| t == verb) {
-        return None;
-    }
-    // The `expiration` tag (BUD-11): when present it must be a unix
-    // timestamp in the future — an unparseable value is rejected too.
-    if let Some(exp) = tags(&event, "expiration").next()
-        && exp.parse::<u64>().map(|e| e <= now).unwrap_or(true)
-    {
-        return None;
-    }
-    // The `server` tag (when present) must name our host. The tag may
-    // carry a scheme and a path; IPv6 hosts use brackets (`[::1]`), whose
-    // colons must not be mistaken for a port separator.
-    if let Some(server) = tags(&event, "server").next() {
-        // The state keeps the configured host for URL building (IPv6 keeps
-        // its brackets there); the comparison uses the normalized form.
-        let host = state
-            .host
-            .trim()
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .to_ascii_lowercase();
-        let tag_host = auth_server_host(server);
-        if tag_host != host {
-            return None;
-        }
-    }
-    if let Some(sha) = expected_sha
-        && !tags(&event, "x").any(|x| x == sha)
-    {
-        return None;
-    }
-    Some(event.pubkey)
+    validate_auth_event(
+        relay.secp(),
+        &event,
+        &state.host,
+        verb,
+        expected_sha,
+        unix_now(),
+    )
 }
 
 fn error(status: StatusCode, reason: &str) -> Response {
@@ -279,30 +323,115 @@ fn error(status: StatusCode, reason: &str) -> Response {
         .into_response()
 }
 
-/// `GET /<sha256>` — serve the blob.
-async fn get_blob(State(relay): State<Arc<Relay>>, AxPath(blob): AxPath<String>) -> Response {
+/// Parses a single `Range: bytes=` request (RFC 7233) against `size`.
+///
+/// Returns `Ok(None)` when the range should be ignored (a multi-range
+/// header, or a unit other than `bytes` — RFC 7233 allows the server to
+/// ignore the header), `Ok(Some((start, end)))` for a satisfiable single
+/// range (inclusive end, clamped to the blob size) and `Err(())` for an
+/// unsatisfiable or malformed range (416 with `Content-Range: bytes */`).
+fn parse_range(header: &str, size: usize) -> Result<Option<(usize, usize)>, ()> {
+    let Some(spec) = header
+        .trim()
+        .strip_prefix("bytes=")
+        .or_else(|| header.trim().strip_prefix("Bytes="))
+    else {
+        return Ok(None); // not a byte range: ignore
+    };
+    if spec.contains(',') {
+        return Ok(None); // multi-range: serve the full blob instead
+    }
+    let (start, end) = match spec.split_once('-') {
+        Some((start, end)) if !start.is_empty() => {
+            // `bytes=start-end` / `bytes=start-`
+            let start: usize = start.parse().map_err(|_| ())?;
+            let end = if end.is_empty() {
+                size.saturating_sub(1)
+            } else {
+                end.parse::<usize>()
+                    .map_err(|_| ())?
+                    .min(size.saturating_sub(1))
+            };
+            (start, end)
+        }
+        Some((_, suffix)) => {
+            // `bytes=-suffix`: the last `suffix` bytes
+            let suffix: usize = suffix.parse().map_err(|_| ())?;
+            if suffix == 0 {
+                return Err(());
+            }
+            (size.saturating_sub(suffix), size.saturating_sub(1))
+        }
+        None => return Err(()),
+    };
+    if start >= size || end < start {
+        return Err(());
+    }
+    Ok(Some((start, end)))
+}
+
+/// `GET /<sha256>` — serve the blob (with RFC 7233 single-range support).
+async fn get_blob(
+    State(relay): State<Arc<Relay>>,
+    headers: HeaderMap,
+    AxPath(blob): AxPath<String>,
+) -> Response {
     let Some(state) = state_of(&relay).await else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "blossom not initialized");
     };
     let Some(sha) = split_blob(&blob) else {
-        return error(StatusCode::NOT_FOUND, "invalid blob hash");
+        return error(StatusCode::BAD_REQUEST, "invalid blob hash");
     };
     let Some(desc) = state.store.find(&sha).await else {
         return error(StatusCode::NOT_FOUND, "blob not found");
     };
     match state.store.read(&desc.npub(), &sha).await {
-        Ok(Some(bytes)) => (
-            [
+        Ok(Some(bytes)) => {
+            let size = bytes.len();
+            let base_headers = [
                 (axum::http::header::CONTENT_TYPE, desc.mime),
                 (axum::http::header::ETAG, format!("\"{sha}\"")),
                 (
                     axum::http::header::CACHE_CONTROL,
                     "public, max-age=31536000, immutable".to_string(),
                 ),
-            ],
-            bytes,
-        )
-            .into_response(),
+                (axum::http::header::ACCEPT_RANGES, "bytes".to_string()),
+            ];
+            // BUD-01: RFC 7233 range requests (video/audio streaming).
+            let range = headers
+                .get(axum::http::header::RANGE)
+                .and_then(|v| v.to_str().ok())
+                .map(|r| parse_range(r, size));
+            match range {
+                Some(Err(())) => {
+                    // Unsatisfiable or malformed range: 416 with the
+                    // required `Content-Range: bytes */<size>`.
+                    let mut response = error(
+                        StatusCode::RANGE_NOT_SATISFIABLE,
+                        "requested byte range is not satisfiable",
+                    );
+                    response.headers_mut().insert(
+                        axum::http::header::CONTENT_RANGE,
+                        format!("bytes */{size}").parse().unwrap(),
+                    );
+                    response
+                }
+                Some(Ok(Some((start, end)))) => {
+                    let mut response = (
+                        StatusCode::PARTIAL_CONTENT,
+                        base_headers,
+                        bytes[start..=end].to_vec(),
+                    )
+                        .into_response();
+                    response.headers_mut().insert(
+                        axum::http::header::CONTENT_RANGE,
+                        format!("bytes {start}-{end}/{size}").parse().unwrap(),
+                    );
+                    response
+                }
+                _ => (StatusCode::OK, base_headers, bytes).into_response(),
+            }
+        }
         Ok(None) => error(StatusCode::NOT_FOUND, "blob not found"),
         Err(e) => error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -317,7 +446,7 @@ async fn head_blob(State(relay): State<Arc<Relay>>, AxPath(blob): AxPath<String>
         return error(StatusCode::SERVICE_UNAVAILABLE, "blossom not initialized");
     };
     let Some(sha) = split_blob(&blob) else {
-        return error(StatusCode::NOT_FOUND, "invalid blob hash");
+        return error(StatusCode::BAD_REQUEST, "invalid blob hash");
     };
     let Some(desc) = state.store.find(&sha).await else {
         return error(StatusCode::NOT_FOUND, "blob not found");
@@ -328,17 +457,56 @@ async fn head_blob(State(relay): State<Arc<Relay>>, AxPath(blob): AxPath<String>
             (axum::http::header::CONTENT_TYPE, desc.mime),
             (axum::http::header::CONTENT_LENGTH, desc.size.to_string()),
             (axum::http::header::ETAG, format!("\"{sha}\"")),
+            (axum::http::header::ACCEPT_RANGES, "bytes".to_string()),
         ],
     )
         .into_response()
 }
 
-/// `PUT /upload` — upload a blob. Returns 201 + the BlobDescriptor.
+/// `PUT /upload` — upload a blob (BUD-02). Returns 201 + the descriptor.
 async fn upload(State(relay): State<Arc<Relay>>, headers: HeaderMap, body: Bytes) -> Response {
+    put_blob(relay, headers, body, "upload").await
+}
+
+/// `PUT /media` — media optimization upload (BUD-05). nostrd stores the
+/// exact bytes received (optimization is a SHOULD, not a MUST); the
+/// endpoint exists so clients that treat it as a trusted processing
+/// server (e.g. nostter) can upload without changes.
+async fn upload_media(
+    State(relay): State<Arc<Relay>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    put_blob(relay, headers, body, "media").await
+}
+
+/// Shared PUT logic for `/upload` (BUD-02) and `/media` (BUD-05).
+async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Bytes, verb: &str) -> Response {
     let Some(state) = state_of(&relay).await else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "blossom not initialized");
     };
-    let Some(pubkey) = verify_auth(&relay, &state, &headers, "upload", None).await else {
+    let sha = {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(&body))
+    };
+    // BUD-02/05: the optional `X-SHA-256` header declares the expected hash
+    // of the request body — a provided value that does not match the actual
+    // bytes is a 409 Conflict, and a malformed value is a 400.
+    if let Some(declared) = headers.get("x-sha-256").and_then(|v| v.to_str().ok()) {
+        let declared = declared.trim().to_ascii_lowercase();
+        if declared.len() != 64 || hex::decode(&declared).is_err() {
+            return error(StatusCode::BAD_REQUEST, "malformed X-SHA-256 header");
+        }
+        if declared != sha {
+            return error(
+                StatusCode::CONFLICT,
+                "the X-SHA-256 header does not match the request body",
+            );
+        }
+    }
+    // BUD-11: upload/media tokens MUST carry an `x` tag matching the blob
+    // hash (the token is scoped to exactly the bytes being uploaded).
+    let Some(pubkey) = verify_auth(&relay, &state, &headers, verb, Some(&sha)).await else {
         return error(StatusCode::UNAUTHORIZED, "invalid or missing authorization");
     };
     // Upload allowlist: when restrict_uploads is on, only the listed
@@ -355,11 +523,7 @@ async fn upload(State(relay): State<Arc<Relay>>, headers: HeaderMap, body: Bytes
             .and_then(|v| v.to_str().ok())
             .unwrap_or("application/octet-stream"),
     );
-    let sha = {
-        use sha2::{Digest, Sha256};
-        hex::encode(Sha256::digest(&body))
-    };
-    // BUD-02: 201 for a newly stored blob, 200 when it already exists.
+    // BUD-02/05: 201 for a newly stored blob, 200 when it already exists.
     let existed = state.store.find(&sha).await.is_some();
     match state.store.put(&pubkey, &sha, &body, &mime).await {
         Ok(desc) => {
@@ -388,6 +552,69 @@ async fn upload(State(relay): State<Arc<Relay>>, headers: HeaderMap, body: Bytes
             &format!("storage error: {e}"),
         ),
     }
+}
+
+/// `HEAD /upload` — BUD-06 pre-flight: whether a `PUT /upload` would be
+/// accepted, based on the `X-SHA-256`, `X-Content-Type` and
+/// `X-Content-Length` headers alone.
+async fn head_upload(State(relay): State<Arc<Relay>>, headers: HeaderMap) -> Response {
+    head_preflight(relay, headers, "upload").await
+}
+
+/// `HEAD /media` — BUD-05/BUD-06 pre-flight: whether a `PUT /media` would
+/// be accepted, based on the `X-SHA-256`, `X-Content-Type` and
+/// `X-Content-Length` headers alone.
+async fn head_media(State(relay): State<Arc<Relay>>, headers: HeaderMap) -> Response {
+    head_preflight(relay, headers, "media").await
+}
+
+/// Shared pre-flight logic for `HEAD /upload` (BUD-06) and `HEAD /media`
+/// (BUD-05): evaluates the declared `X-SHA-256` / `X-Content-Length` /
+/// `X-Content-Type` headers against the server policy and returns whether
+/// the corresponding PUT would be accepted.
+async fn head_preflight(relay: Arc<Relay>, headers: HeaderMap, verb: &str) -> Response {
+    let Some(state) = state_of(&relay).await else {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "blossom not initialized");
+    };
+    // `X-SHA-256` is required: it is the only source of the blob hash
+    // without a body.
+    let Some(x_sha) = headers.get("x-sha-256").and_then(|v| v.to_str().ok()) else {
+        return error(StatusCode::BAD_REQUEST, "missing X-SHA-256 header");
+    };
+    let x_sha = x_sha.trim().to_ascii_lowercase();
+    if x_sha.len() != 64 || hex::decode(&x_sha).is_err() {
+        return error(StatusCode::BAD_REQUEST, "malformed X-SHA-256 header");
+    }
+    // `X-Content-Length` is required and bounded by the upload ceiling.
+    let Some(len) = headers
+        .get("x-content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+    else {
+        return error(
+            StatusCode::LENGTH_REQUIRED,
+            "missing X-Content-Length header",
+        );
+    };
+    let max_upload = relay.config.read().await.blossom.max_upload_bytes as u64;
+    if len > max_upload {
+        return error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "the upload exceeds the configured size limit",
+        );
+    }
+    // BUD-11: upload/media tokens carry the matching verb and an `x` tag
+    // matching the declared hash.
+    let Some(pubkey) = verify_auth(&relay, &state, &headers, verb, Some(&x_sha)).await else {
+        return error(StatusCode::UNAUTHORIZED, "invalid or missing authorization");
+    };
+    if upload_allowed(&relay, &pubkey).await.is_err() {
+        return error(
+            StatusCode::FORBIDDEN,
+            "uploads are restricted to the configured allowlist",
+        );
+    }
+    StatusCode::OK.into_response()
 }
 
 /// `GET /list/<pubkey>` — blobs uploaded by a pubkey (hex), sorted by
@@ -456,7 +683,7 @@ async fn delete_blob(
         return error(StatusCode::SERVICE_UNAVAILABLE, "blossom not initialized");
     };
     let Some(sha) = split_blob(&blob) else {
-        return error(StatusCode::NOT_FOUND, "invalid blob hash");
+        return error(StatusCode::BAD_REQUEST, "invalid blob hash");
     };
     let Some(pubkey) = verify_auth(&relay, &state, &headers, "delete", Some(&sha)).await else {
         return error(StatusCode::UNAUTHORIZED, "invalid or missing authorization");
@@ -554,6 +781,229 @@ pub(crate) fn host_is_blossom(blossom_host: &str, host_header: Option<&str>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::Event;
+    use secp256k1::{Keypair, Secp256k1, XOnlyPublicKey};
+
+    fn auth_event(
+        secp: &Secp256k1<secp256k1::All>,
+        created: u64,
+        verb: &str,
+        expiration: Option<u64>,
+        x: Option<&str>,
+        server: Option<&str>,
+    ) -> Event {
+        let keypair = Keypair::from_seckey_slice(secp, &[9u8; 32]).unwrap();
+        let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
+        let mut tags: Vec<Vec<String>> = vec![vec!["t".into(), verb.into()]];
+        if let Some(exp) = expiration {
+            tags.push(vec!["expiration".into(), exp.to_string()]);
+        }
+        if let Some(x) = x {
+            tags.push(vec!["x".into(), x.into()]);
+        }
+        if let Some(server) = server {
+            tags.push(vec!["server".into(), server.into()]);
+        }
+        let mut ev = Event {
+            id: String::new(),
+            pubkey,
+            created_at: created,
+            kind: 24242,
+            tags,
+            content: String::new(),
+            sig: String::new(),
+        };
+        ev.id = crate::nips::nip01::compute_id(&ev);
+        let id = ev.id_bytes().unwrap();
+        ev.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+        ev
+    }
+
+    #[test]
+    fn auth_event_validation_follows_bud11() {
+        let secp = Secp256k1::new();
+        let now = unix_now();
+        let sha = "a".repeat(64);
+        let host = "media.example.com";
+        // A fully-specified upload token validates.
+        let ev = auth_event(
+            &secp,
+            now,
+            "upload",
+            Some(now + 300),
+            Some(&sha),
+            Some(host),
+        );
+        assert_eq!(
+            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            Some(ev.pubkey.clone())
+        );
+        // BUD-11: the `expiration` tag is mandatory.
+        let ev = auth_event(&secp, now, "upload", None, Some(&sha), Some(host));
+        assert_eq!(
+            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            None,
+            "a token without an expiration tag must be rejected"
+        );
+        // An expired or unparseable expiration is rejected.
+        let ev = auth_event(&secp, now, "upload", Some(now - 1), Some(&sha), Some(host));
+        assert_eq!(
+            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            None
+        );
+        let ev = auth_event(&secp, now, "upload", Some(0), Some(&sha), Some(host));
+        assert_eq!(
+            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            None
+        );
+        // The `t` verb must match the endpoint.
+        let ev = auth_event(
+            &secp,
+            now,
+            "delete",
+            Some(now + 300),
+            Some(&sha),
+            Some(host),
+        );
+        assert_eq!(
+            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            None
+        );
+        // A `server` tag naming another host is rejected.
+        let ev = auth_event(
+            &secp,
+            now,
+            "upload",
+            Some(now + 300),
+            Some(&sha),
+            Some("evil.example.com"),
+        );
+        assert_eq!(
+            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            None
+        );
+        // BUD-11: multiple `server` tags are accepted when our domain
+        // appears in at least one of them.
+        let mut ev = auth_event(
+            &secp,
+            now,
+            "upload",
+            Some(now + 300),
+            Some(&sha),
+            Some("evil.example.com"),
+        );
+        // Re-sign after adding the second `server` tag (the signature must
+        // cover the final tag set).
+        ev.tags.push(vec!["server".into(), host.into()]);
+        ev.id = crate::nips::nip01::compute_id(&ev);
+        let id = ev.id_bytes().unwrap();
+        let keypair = Keypair::from_seckey_slice(&secp, &[9u8; 32]).unwrap();
+        ev.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+        assert_eq!(
+            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            Some(ev.pubkey.clone()),
+            "a token listing several servers must be accepted when ours is among them"
+        );
+        // BUD-11: an upload token must carry an `x` tag matching the blob.
+        let ev = auth_event(&secp, now, "upload", Some(now + 300), None, Some(host));
+        assert_eq!(
+            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            None,
+            "an upload token without an x tag must be rejected"
+        );
+        let ev = auth_event(
+            &secp,
+            now,
+            "upload",
+            Some(now + 300),
+            Some("b".repeat(64).as_str()),
+            Some(host),
+        );
+        assert_eq!(
+            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            None,
+            "an x tag for a different blob must be rejected"
+        );
+        // A token stamped too far in the past or the future is stale.
+        let ev = auth_event(
+            &secp,
+            now - 601,
+            "upload",
+            Some(now + 300),
+            Some(&sha),
+            Some(host),
+        );
+        assert_eq!(
+            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            None
+        );
+        let ev = auth_event(
+            &secp,
+            now + 601,
+            "upload",
+            Some(now + 300),
+            Some(&sha),
+            Some(host),
+        );
+        assert_eq!(
+            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            None
+        );
+        // A wrong event kind is rejected.
+        let mut ev = auth_event(
+            &secp,
+            now,
+            "upload",
+            Some(now + 300),
+            Some(&sha),
+            Some(host),
+        );
+        ev.kind = 22242;
+        assert_eq!(
+            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            None
+        );
+        // A delete token without an `x` tag is rejected (implied hash).
+        let ev = auth_event(&secp, now, "delete", Some(now + 300), None, Some(host));
+        assert_eq!(
+            validate_auth_event(&secp, &ev, host, "delete", Some(&sha), now),
+            None
+        );
+        // An unsigned (invalid signature) token is rejected.
+        let mut ev = auth_event(
+            &secp,
+            now,
+            "upload",
+            Some(now + 300),
+            Some(&sha),
+            Some(host),
+        );
+        ev.sig = "f".repeat(128);
+        assert_eq!(
+            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            None
+        );
+    }
+
+    #[test]
+    fn byte_ranges_follow_rfc7233() {
+        // Satisfiable ranges (end is inclusive and clamped).
+        assert_eq!(parse_range("bytes=0-4", 10), Ok(Some((0, 4))));
+        assert_eq!(parse_range("bytes=5-", 10), Ok(Some((5, 9))));
+        assert_eq!(parse_range("bytes=-3", 10), Ok(Some((7, 9))));
+        assert_eq!(parse_range("bytes=0-99", 10), Ok(Some((0, 9))));
+        assert_eq!(parse_range("bytes=5-5", 10), Ok(Some((5, 5))));
+        // Unsatisfiable or malformed ranges.
+        assert_eq!(parse_range("bytes=10-", 10), Err(()));
+        assert_eq!(parse_range("bytes=8-4", 10), Err(()));
+        assert_eq!(parse_range("bytes=-0", 10), Err(()));
+        assert_eq!(parse_range("bytes=abc", 10), Err(()));
+        assert_eq!(parse_range("bytes=0-", 0), Err(()));
+        // Multi-ranges and non-byte units are ignored (full response).
+        assert_eq!(parse_range("bytes=0-4,6-8", 10), Ok(None));
+        assert_eq!(parse_range("items=0-4", 10), Ok(None));
+        assert_eq!(parse_range("", 10), Ok(None));
+    }
 
     #[test]
     fn auth_server_host_normalization() {
@@ -602,14 +1052,16 @@ mod tests {
         assert_eq!(ext_of("image/svg+xml"), ".svg");
         assert_eq!(ext_of("text/plain"), ".txt");
         assert_eq!(ext_of("video/mp4"), ".mp4");
-        assert_eq!(ext_of("application/octet-stream"), "");
-        assert_eq!(ext_of("unknown/type"), "");
+        // BUD-02/BUD-10: unknown types still get the mandatory extension.
+        assert_eq!(ext_of("application/octet-stream"), ".bin");
+        assert_eq!(ext_of("unknown/type"), ".bin");
     }
 
     #[test]
     fn blossom_path_detection() {
         assert!(!is_blossom_path("/"));
         assert!(is_blossom_path("/upload"));
+        assert!(is_blossom_path("/media"));
         assert!(is_blossom_path(&format!("/list/{}", "aa".repeat(32))));
         assert!(is_blossom_path(&format!("/{}.jpg", "a".repeat(64))));
         assert!(is_blossom_path(&format!("/{}", "a".repeat(64))));
