@@ -13,17 +13,18 @@ pub const DEFAULT_CONFIG: &str = "nostrd.toml";
 /// client-side are generally not advertised (NIP-11: "Client-side NIPs SHOULD
 /// NOT be advertised"): NIP-28 explicitly "imposes no additional requirements
 /// on relays", so it is not listed. The client-side NIPs that ARE listed
-/// (17/22/32/46/47/57/59/65/78/84/85/87/88) are advertised deliberately:
+/// (17/22/32/46/47/57/59/65/78/84/85/87/88/94) are advertised deliberately:
 /// the relay stores and serves their events (or forwards their ephemeral
 /// kinds), so clients rely on them. NIP-A3 (kind 10133) is served but cannot
 /// be advertised: it is a `draft` with no integer identifier and NIP-11's
-/// `supported_nips` is an array of integer identifiers. File-storage NIPs
-/// (34/94/95/96) are excluded per the project rules (Blossom is provided
-/// separately by the `[blossom]` file server). NIP-33 was merged into NIP-01
-/// but remains advertised for clients that check it.
+/// `supported_nips` is an array of integer identifiers. The remaining
+/// file-storage NIPs (34 git, 95/96 HTTP file storage) are excluded per the
+/// project rules (Blossom is provided separately by the `[blossom]` file
+/// server). NIP-33 was merged into NIP-01 but remains advertised for
+/// clients that check it.
 pub const RELAY_NIPS: &[u16] = &[
     1, 9, 11, 13, 17, 22, 26, 29, 32, 33, 40, 42, 43, 45, 46, 47, 50, 57, 59, 62, 65, 67, 70, 77,
-    78, 84, 85, 86, 87, 88, 98,
+    78, 84, 85, 86, 87, 88, 94, 98,
 ];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -529,6 +530,7 @@ impl Config {
             86 => None,
             87 => Some(&[38172, 38173]),
             88 => Some(&[1018, 1068]),
+            94 => Some(&[1063]),
             98 => Some(&[27235]),
             _ => None,
         }
@@ -1253,14 +1255,14 @@ mod tests {
         // Relay-side NIPs are advertised.
         for n in [
             1, 9, 11, 13, 17, 22, 26, 29, 32, 33, 40, 42, 43, 45, 46, 47, 50, 57, 59, 62, 65, 67,
-            70, 77, 78, 84, 85, 86, 87, 88, 98,
+            70, 77, 78, 84, 85, 86, 87, 88, 94, 98,
         ] {
             assert!(nips.contains(&n), "NIP-{n} must be advertised");
         }
         // Client-side NIPs without relay-side behaviour must not be
         // advertised (NIP-11). NIP-28 explicitly "imposes no additional
         // requirements on relays". The advertised client-side set (17/22/32/
-        // 46/47/57/59/65/78/84/85/87/88) is deliberate: their events are
+        // 46/47/57/59/65/78/84/85/87/88/94) is deliberate: their events are
         // stored and served. NIP-A3 (kind 10133) is served but has no integer
         // identifier, so it cannot appear in the numeric list.
         for n in [2, 3, 5, 19, 28, 51, 68, 99] {
@@ -1366,6 +1368,7 @@ mod tests {
             (85, &[30382, 30383, 30384][..]),
             (87, &[38172, 38173][..]),
             (88, &[1018, 1068][..]),
+            (94, &[1063][..]),
         ] {
             let access = AccessControl {
                 blocked_kinds: kinds.to_vec(),

@@ -30,7 +30,7 @@ Key features:
 
 - **Simple and stable**: written in Rust; a single binary does everything
 - **Fast storage and search**: LMDB database with a full-text search index
-- **Broad NIP support**: 33 NIPs implemented (plus the Blossom file server), including deletion, proof-of-work, delegation, groups, search, and a management API
+- **Broad NIP support**: 34 NIPs implemented (plus the Blossom file server), including deletion, proof-of-work, delegation, groups, search, and a management API
 - **Easy to operate**: daemon mode, log rotation, hot configuration reload, statistics output, a REST API, and Prometheus metrics
 
 ---
@@ -457,6 +457,7 @@ If `server.management_port` is set, the legacy REST endpoints are available at `
 | 86 | Relay management API |
 | 87 | Cashu and Fedimint announcements (kinds 38172/38173) |
 | 88 | Polls (kinds 1068/1018) |
+| 94 | File metadata (kind 1063 — references an externally hosted file) |
 | 98 | HTTP auth |
 | A3 | Payment targets (kind 10133, replaceable). `draft` with no integer identifier — served but **not** advertised in `supported_nips` (which only holds integers) |
 
