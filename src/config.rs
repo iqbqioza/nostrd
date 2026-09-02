@@ -24,8 +24,8 @@ pub const DEFAULT_CONFIG: &str = "nostrd.toml";
 /// the `[blossom]` file server). NIP-33 was merged into NIP-01 but remains
 /// advertised for clients that check it.
 pub const RELAY_NIPS: &[u16] = &[
-    1, 9, 11, 13, 17, 22, 26, 29, 32, 33, 34, 40, 42, 43, 45, 46, 47, 50, 57, 59, 62, 65, 67, 70,
-    77, 78, 84, 85, 86, 87, 88, 94, 98,
+    1, 9, 11, 13, 17, 22, 26, 29, 32, 33, 34, 40, 42, 43, 45, 46, 47, 50, 57, 59, 62, 65, 66, 67,
+    70, 77, 78, 84, 85, 86, 87, 88, 94, 98,
 ];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -551,6 +551,7 @@ impl Config {
             59 => Some(&[1059, 21059]),
             62 => Some(&[62]),
             65 => Some(&[10002]),
+            66 => Some(&[30166, 10166]),
             67 => None,
             70 => None,
             77 => None,
@@ -1284,8 +1285,8 @@ mod tests {
         let nips = cfg.effective_supported_nips(&access);
         // Relay-side NIPs are advertised.
         for n in [
-            1, 9, 11, 13, 17, 22, 26, 29, 32, 33, 40, 42, 43, 45, 46, 47, 50, 57, 59, 62, 65, 67,
-            70, 77, 78, 84, 85, 86, 87, 88, 94, 98,
+            1, 9, 11, 13, 17, 22, 26, 29, 32, 33, 40, 42, 43, 45, 46, 47, 50, 57, 59, 62, 65, 66,
+            67, 70, 77, 78, 84, 85, 86, 87, 88, 94, 98,
         ] {
             assert!(nips.contains(&n), "NIP-{n} must be advertised");
         }
@@ -1405,6 +1406,7 @@ mod tests {
             (57, &[9734, 9735][..]),
             (59, &[1059, 21059][..]),
             (65, &[10002][..]),
+            (66, &[30166, 10166][..]),
             (78, &[30078][..]),
             (84, &[9802][..]),
             (85, &[30382, 30383, 30384][..]),

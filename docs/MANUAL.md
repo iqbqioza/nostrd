@@ -30,7 +30,7 @@ Key features:
 
 - **Simple and stable**: written in Rust; a single binary does everything
 - **Fast storage and search**: LMDB database with a full-text search index
-- **Broad NIP support**: 35 NIPs implemented (plus the Blossom file server), including deletion, proof-of-work, delegation, groups, search, and a management API
+- **Broad NIP support**: 36 NIPs implemented (plus the Blossom file server), including deletion, proof-of-work, delegation, groups, search, and a management API
 - **Easy to operate**: daemon mode, log rotation, hot configuration reload, statistics output, a REST API, and Prometheus metrics
 
 ---
@@ -450,6 +450,7 @@ If `server.management_port` is set, the legacy REST endpoints are available at `
 | 59 | Gift wrap (recipient-only serving) |
 | 62 | Request to vanish |
 | 65 | Relay list metadata (kind 10002, `#r` indexed) |
+| 66 | Relay discovery & liveness (self-publishes kind 30166 when `relay.private_key` is set, refreshed every 12 h) |
 | 67 | EOSE completeness hint |
 | 70 | Protected events |
 | 77 | Negentropy syncing |
