@@ -153,6 +153,11 @@ impl super::Relay {
         {
             return Err("blocked: ephemeral events not allowed".into());
         }
+        // NIP-34 (git): the kinds are rejected unless `relay.enable_git`
+        // is set — the default keeps the relay free of patch payloads.
+        if !cfg.relay.enable_git && Config::is_git_kind(event.kind) {
+            return Err("blocked: NIP-34 git events are disabled".into());
+        }
         // NIP-01: each tag is an array of one or more strings.
         if event.tags.iter().any(|t| t.is_empty()) {
             return Err("invalid: empty tag".into());
@@ -372,6 +377,113 @@ mod tests {
 
     #[test]
     fn vanished_pubkey_remains_visible_to_its_own_pubkey() {}
+
+    #[test]
+    fn git_kinds_follow_enable_git() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            // Default config (enable_git = false): every NIP-34 kind is
+            // rejected.
+            let mut cfg = Config::default();
+            cfg.database.path = std::env::temp_dir().join("nostrd-git-test-disabled");
+            let _ = std::fs::remove_dir_all(&cfg.database.path);
+            let db = crate::db::DbClient::open(
+                &cfg.database,
+                true,
+                Arc::new(Default::default()),
+                0,
+                128,
+                4096,
+                262144,
+            )
+            .unwrap();
+            let config = Arc::new(RwLock::new(cfg));
+            let relay = Arc::new(
+                Relay::new(
+                    config.clone(),
+                    db,
+                    crate::stats::Stats::new(),
+                    "",
+                    crate::relay::LiveBusConfig {
+                        buffer: 1024,
+                        batch_interval_ms: 10,
+                        batch_size: 64,
+                    },
+                )
+                .await,
+            );
+            let cfg = relay.config.read().await;
+            let access = AccessControl::default();
+            for kind in [1617, 1618, 1619, 1621, 1622, 1630, 1633, 30617, 30618] {
+                let ev = signed(kind, vec![]);
+                let out = relay
+                    .precheck(&cfg, &access, &ev, unix_now(), &[], None)
+                    .await;
+                assert!(
+                    matches!(out, super::Precheck::Reject(msg) if msg.contains("NIP-34")),
+                    "kind {kind} must be rejected when enable_git is false"
+                );
+            }
+            // Boundary kinds around the git ranges stay accepted.
+            for kind in [1616, 1623, 1629, 1634, 30616, 30619] {
+                let ev = signed(kind, vec![]);
+                let out = relay
+                    .precheck(&cfg, &access, &ev, unix_now(), &[], None)
+                    .await;
+                assert!(
+                    matches!(out, super::Precheck::Accept),
+                    "kind {kind} must not be treated as a git kind"
+                );
+            }
+            drop(cfg);
+            relay.db.shutdown();
+
+            // enable_git = true: the kinds are accepted.
+            let mut cfg2 = Config::default();
+            cfg2.relay.enable_git = true;
+            cfg2.database.path = std::env::temp_dir().join("nostrd-git-test-enabled");
+            let _ = std::fs::remove_dir_all(&cfg2.database.path);
+            let db2 = crate::db::DbClient::open(
+                &cfg2.database,
+                true,
+                Arc::new(Default::default()),
+                0,
+                128,
+                4096,
+                262144,
+            )
+            .unwrap();
+            let config2 = Arc::new(RwLock::new(cfg2));
+            let relay2 = Arc::new(
+                Relay::new(
+                    config2.clone(),
+                    db2,
+                    crate::stats::Stats::new(),
+                    "",
+                    crate::relay::LiveBusConfig {
+                        buffer: 1024,
+                        batch_interval_ms: 10,
+                        batch_size: 64,
+                    },
+                )
+                .await,
+            );
+            let cfg2 = relay2.config.read().await;
+            let access2 = AccessControl::default();
+            for kind in [1617, 1621, 1633, 30618] {
+                let ev = signed(kind, vec![]);
+                let out = relay2
+                    .precheck(&cfg2, &access2, &ev, unix_now(), &[], None)
+                    .await;
+                assert!(
+                    matches!(out, super::Precheck::Accept),
+                    "kind {kind} must be accepted when enable_git is true"
+                );
+            }
+            drop(cfg2);
+            relay2.db.shutdown();
+        });
+    }
 
     #[test]
     fn ephemeral_rejection_respects_config() {

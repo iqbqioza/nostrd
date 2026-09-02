@@ -166,5 +166,10 @@ mod tests {
                 "NIP-{expected} must be advertised"
             );
         }
+        // NIP-34 (git) is gated behind `relay.enable_git` (default false).
+        assert!(
+            !nips.contains(&34),
+            "NIP-34 must not be advertised while enable_git is false"
+        );
     }
 }
