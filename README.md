@@ -307,7 +307,7 @@ With `server.ws_paths = "inbox-outbox"` the relay's WebSocket endpoint is served
 
 ## NIP support
 
-All relay-side NIPs are implemented; client-side NIPs are stored and served as plain events. A subset of client-side NIPs that clients rely on (17, 22, 32, 46, 47, 57, 59, 65, 78) is **deliberately** advertised in the NIP-11 document; the rest are not (per the spec: "Client-side NIPs SHOULD NOT be advertised"). NIP-A3 (kind 10133) is served but cannot be advertised: it is a `draft` with no integer identifier, and NIP-11's `supported_nips` is an array of integer identifiers. File-storage NIPs (34 git, 94 file metadata, 95/96 HTTP file storage) are excluded by design — except Blossom, which is provided by the dedicated [Blossom file server](#features).
+All relay-side NIPs are implemented; client-side NIPs are stored and served as plain events. A subset of client-side NIPs that clients rely on (17, 22, 32, 46, 47, 57, 59, 65, 78, 84, 85, 87, 88) is **deliberately** advertised in the NIP-11 document; the rest are not (per the spec: "Client-side NIPs SHOULD NOT be advertised"). NIP-A3 (kind 10133) is served but cannot be advertised: it is a `draft` with no integer identifier, and NIP-11's `supported_nips` is an array of integer identifiers. File-storage NIPs (34 git, 94 file metadata, 95/96 HTTP file storage) are excluded by design — except Blossom, which is provided by the dedicated [Blossom file server](#features).
 
 The advertised `supported_nips` list is **dynamic**: a NIP is dropped when all the kinds it defines are blocked by `blocked_kinds`/`allowed_kinds` (e.g. blocking kind 5 hides NIP-09), when `reject_ephemeral` rejects every kind it relies on, or when it is disabled via `enabled_nips`/`disabled_nips`. Runtime changes (NIP-86 `allowkind`/`disallowkind`, `SIGHUP` reloads) are reflected in the next NIP-11 fetch.
 
@@ -339,7 +339,11 @@ The advertised `supported_nips` list is **dynamic**: a NIP is dropped when all t
 | [70](https://github.com/nostr-protocol/nips/blob/master/70.md) | Protected events |
 | [77](https://github.com/nostr-protocol/nips/blob/master/77.md) | Negentropy syncing (NEG-OPEN/MSG/CLOSE) |
 | [78](https://github.com/nostr-protocol/nips/blob/master/78.md) | Application-specific data (kind 30078, addressable) |
+| [84](https://github.com/nostr-protocol/nips/blob/master/84.md) | Highlights (kind 9802, quoting a note and/or an image URL) |
+| [85](https://github.com/nostr-protocol/nips/blob/master/85.md) | Trusted assertions (kinds 30382/30383/30384, addressable) |
 | [86](https://github.com/nostr-protocol/nips/blob/master/86.md) | Relay management API (JSON-RPC) |
+| [87](https://github.com/nostr-protocol/nips/blob/master/87.md) | Cashu and Fedimint mint announcements (kinds 38172/38173) |
+| [88](https://github.com/nostr-protocol/nips/blob/master/88.md) | Polls (kinds 1068/1018) |
 | [98](https://github.com/nostr-protocol/nips/blob/master/98.md) | HTTP auth (kind 27235) |
 | [A3](https://github.com/nostr-protocol/nips/blob/master/A3.md) | Payment targets (kind 10133, replaceable — the latest per pubkey is kept; `payto` tags are queryable via the full scan). `draft` with no integer identifier, so it cannot appear in `supported_nips` |
 | [Blossom](https://github.com/hzrd149/blossom) (BUD-01/02) | File server — SHA-256-addressed uploads (kind-24242 auth), served on the `[blossom]` hostname (see [above](#blossom-file-server-media-hosting)) |
