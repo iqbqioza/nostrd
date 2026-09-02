@@ -1278,6 +1278,19 @@ mod tests {
         );
         assert!(nips.contains(&1));
 
+        // Blocking only ONE of a NIP's many kinds keeps it advertised
+        // (any accepted kind keeps the NIP).
+        let cfg = Config::default();
+        let access = AccessControl {
+            blocked_kinds: vec![9000], // one NIP-29 group kind
+            ..Default::default()
+        };
+        let nips = cfg.effective_supported_nips(&access);
+        assert!(
+            nips.contains(&29),
+            "NIP-29 must stay advertised when only kind 9000 is blocked"
+        );
+
         // reject_ephemeral with a non-exempt ephemeral kind drops NIP-42/98.
         let mut cfg = Config::default();
         cfg.relay.reject_ephemeral = true;

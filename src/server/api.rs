@@ -1962,14 +1962,7 @@ mod tests {
                  (September is included once the clock passes it)"
             );
             // The last reported month must be the current one.
-            let (y, m) = {
-                let now = unix_now();
-                let days = now / 86400;
-                let secs = now % 86400;
-                // Reuse the month math from the handler.
-                let _ = (days, secs);
-                crate::server::api::month_of(now)
-            };
+            let (y, m) = crate::server::api::month_of(unix_now());
             let last = months.last().unwrap()["month"].as_str().unwrap();
             assert_eq!(
                 last,
