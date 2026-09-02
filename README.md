@@ -336,6 +336,7 @@ The advertised `supported_nips` list is **dynamic**: a NIP is dropped when all t
 | [59](https://github.com/nostr-protocol/nips/blob/master/59.md) | Gift wrap (recipient-only serving, NIP-09/62 linked deletion) |
 | [62](https://github.com/nostr-protocol/nips/blob/master/62.md) | Request to vanish |
 | [65](https://github.com/nostr-protocol/nips/blob/master/65.md) | Relay list metadata (kind 10002, replaceable; `#r` tags are indexed) |
+| [66](https://github.com/nostr-protocol/nips/blob/master/66.md) | Relay discovery & liveness (the relay self-publishes its kind 30166 discovery event when `relay.private_key` is set; 30166/10166 events from monitors are stored and served) |
 | [67](https://github.com/nostr-protocol/nips/blob/master/67.md) | EOSE completeness hint (`finish`/`more`) |
 | [70](https://github.com/nostr-protocol/nips/blob/master/70.md) | Protected events |
 | [77](https://github.com/nostr-protocol/nips/blob/master/77.md) | Negentropy syncing (NEG-OPEN/MSG/CLOSE) |

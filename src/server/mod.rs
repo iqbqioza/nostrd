@@ -365,6 +365,10 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
         shutdown_rx.clone(),
     )));
     tasks.push(tokio::spawn(purge_loop(relay.clone(), shutdown_rx.clone())));
+    tasks.push(tokio::spawn(nip66_publisher(
+        relay.clone(),
+        shutdown_rx.clone(),
+    )));
     tasks.push(tokio::spawn(signal_handler(shutdown_tx.clone())));
     tasks.push(tokio::spawn(reload_handler(
         config_path,
@@ -691,6 +695,52 @@ fn write_atomic(path: &Path, data: &[u8]) {
     if let Err(e) = result {
         error!("cannot write {}: {e}", path.display());
         let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// NIP-66: publishes the relay's own kind 30166 discovery event at startup
+/// (the first interval tick fires immediately) and every `REFRESH_SECS`
+/// while a relay key is configured and NIP-66 is enabled (the addressable
+/// event's newest version wins, so re-publishing keeps `created_at` recent
+/// for clients and monitors).
+async fn nip66_publisher(relay: Arc<Relay>, mut shutdown: watch::Receiver<bool>) {
+    let mut ticker = interval(Duration::from_secs(crate::nips::nip66::REFRESH_SECS));
+    ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                let cfg = relay.config.read().await;
+                let enabled = cfg.nip_enabled(66);
+                drop(cfg);
+                if !enabled {
+                    continue;
+                }
+                let Some(pubkey) = relay.relay_pubkey() else {
+                    log::debug!(
+                        "nip66: no relay.private_key configured — discovery event not published"
+                    );
+                    continue;
+                };
+                let (cfg, access) = {
+                    let cfg = relay.config.read().await;
+                    let access = relay.access.read().await;
+                    (cfg, access)
+                };
+                let mut event = crate::nips::nip66::relay_discovery_event(
+                    &cfg,
+                    &access,
+                    &pubkey,
+                    &relay.stats,
+                    crate::util::unix_now(),
+                );
+                drop(cfg);
+                drop(access);
+                if relay.store_relay_event(&mut event).await {
+                    log::debug!("nip66: published the relay discovery event");
+                }
+            }
+            _ = shutdown.changed() => break,
+        }
     }
 }
 
