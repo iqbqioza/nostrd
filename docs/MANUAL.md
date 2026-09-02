@@ -579,7 +579,7 @@ Both backends use the `bucket/{npub1xxx}/{file}` hierarchy: every upload is stor
 
 Uploads and deletes authenticate with a Nostr auth event (kind 24242, `server` tag naming the Blossom host), sent as `Authorization: Nostr <base64>`. Per BUD-11 the token must carry an `expiration` tag set to a unix timestamp in the future, the `t` verb matching the endpoint (`upload` / `delete`), and — for upload and delete — an `x` tag with the blob's sha256.
 
-The descriptor `url` includes the MIME-derived extension (e.g. `https://media.example.com/<sha256>.png`), like the Blossom spec's examples. The extension is advisory: the file is served by its hash alone, and `/<sha256>.<ext>` (any extension) resolves to the same blob.
+The descriptor `url` includes the MIME-derived extension (e.g. `https://media.example.com/<sha256>.png`; unknown types get `.bin`), like the Blossom spec's examples. The extension is advisory: the file is served by its hash alone, and `/<sha256>.<ext>` (any extension) resolves to the same blob.
 
 ### 11.4 Example
 

@@ -89,6 +89,9 @@ fn is_pubkey(value: &str) -> bool {
 /// The advisory file extension for a MIME type, appended to the
 /// Blossom descriptor `url` (the spec's examples always include it;
 /// the extension is a hint — the file is served by hash alone).
+/// BUD-02 requires the URL to carry an extension, so unknown types fall
+/// back to `.bin` (BUD-10: "If the file extension is unknown, it MUST
+/// default to `.bin`").
 fn ext_of(mime: &str) -> &'static str {
     match mime {
         "image/jpeg" => ".jpg",
@@ -112,7 +115,7 @@ fn ext_of(mime: &str) -> &'static str {
         "application/json" => ".json",
         "application/zip" => ".zip",
         "application/gzip" => ".gz",
-        _ => "",
+        _ => ".bin",
     }
 }
 
@@ -236,21 +239,20 @@ fn validate_auth_event(
     if exp.parse::<u64>().map(|e| e <= now).unwrap_or(true) {
         return None;
     }
-    // The `server` tag (when present) must name our host. The tag may
-    // carry a scheme and a path; IPv6 hosts use brackets (`[::1]`), whose
-    // colons must not be mistaken for a port separator.
-    if let Some(server) = event_tags(event, "server").next() {
-        // The state keeps the configured host for URL building (IPv6 keeps
-        // its brackets there); the comparison uses the normalized form.
-        let host = host
-            .trim()
-            .trim_start_matches('[')
-            .trim_end_matches(']')
-            .to_ascii_lowercase();
-        let tag_host = auth_server_host(server);
-        if tag_host != host {
-            return None;
-        }
+    // The `server` tags (when present) must name our host. BUD-11: a token
+    // may carry multiple `server` tags ("the token is valid for all
+    // servers" listed), and the relay must accept it when its domain
+    // appears in at least one. The tag may carry a scheme and a path; IPv6
+    // hosts use brackets (`[::1]`), whose colons must not be mistaken for
+    // a port separator.
+    let host = host
+        .trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .to_ascii_lowercase();
+    let servers: Vec<&str> = event_tags(event, "server").collect();
+    if !servers.is_empty() && !servers.iter().any(|s| auth_server_host(s) == host) {
+        return None;
     }
     // BUD-11: when the endpoint implies a blob hash (upload/delete), at
     // least one `x` tag must match it.
@@ -366,7 +368,7 @@ async fn get_blob(
         return error(StatusCode::SERVICE_UNAVAILABLE, "blossom not initialized");
     };
     let Some(sha) = split_blob(&blob) else {
-        return error(StatusCode::NOT_FOUND, "invalid blob hash");
+        return error(StatusCode::BAD_REQUEST, "invalid blob hash");
     };
     let Some(desc) = state.store.find(&sha).await else {
         return error(StatusCode::NOT_FOUND, "blob not found");
@@ -432,7 +434,7 @@ async fn head_blob(State(relay): State<Arc<Relay>>, AxPath(blob): AxPath<String>
         return error(StatusCode::SERVICE_UNAVAILABLE, "blossom not initialized");
     };
     let Some(sha) = split_blob(&blob) else {
-        return error(StatusCode::NOT_FOUND, "invalid blob hash");
+        return error(StatusCode::BAD_REQUEST, "invalid blob hash");
     };
     let Some(desc) = state.store.find(&sha).await else {
         return error(StatusCode::NOT_FOUND, "blob not found");
@@ -589,7 +591,7 @@ async fn delete_blob(
         return error(StatusCode::SERVICE_UNAVAILABLE, "blossom not initialized");
     };
     let Some(sha) = split_blob(&blob) else {
-        return error(StatusCode::NOT_FOUND, "invalid blob hash");
+        return error(StatusCode::BAD_REQUEST, "invalid blob hash");
     };
     let Some(pubkey) = verify_auth(&relay, &state, &headers, "delete", Some(&sha)).await else {
         return error(StatusCode::UNAUTHORIZED, "invalid or missing authorization");
@@ -788,6 +790,28 @@ mod tests {
             validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
             None
         );
+        // BUD-11: multiple `server` tags are accepted when our domain
+        // appears in at least one of them.
+        let mut ev = auth_event(
+            &secp,
+            now,
+            "upload",
+            Some(now + 300),
+            Some(&sha),
+            Some("evil.example.com"),
+        );
+        // Re-sign after adding the second `server` tag (the signature must
+        // cover the final tag set).
+        ev.tags.push(vec!["server".into(), host.into()]);
+        ev.id = crate::nips::nip01::compute_id(&ev);
+        let id = ev.id_bytes().unwrap();
+        let keypair = Keypair::from_seckey_slice(&secp, &[9u8; 32]).unwrap();
+        ev.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+        assert_eq!(
+            validate_auth_event(&secp, &ev, host, "upload", Some(&sha), now),
+            Some(ev.pubkey.clone()),
+            "a token listing several servers must be accepted when ours is among them"
+        );
         // BUD-11: an upload token must carry an `x` tag matching the blob.
         let ev = auth_event(&secp, now, "upload", Some(now + 300), None, Some(host));
         assert_eq!(
@@ -936,8 +960,9 @@ mod tests {
         assert_eq!(ext_of("image/svg+xml"), ".svg");
         assert_eq!(ext_of("text/plain"), ".txt");
         assert_eq!(ext_of("video/mp4"), ".mp4");
-        assert_eq!(ext_of("application/octet-stream"), "");
-        assert_eq!(ext_of("unknown/type"), "");
+        // BUD-02/BUD-10: unknown types still get the mandatory extension.
+        assert_eq!(ext_of("application/octet-stream"), ".bin");
+        assert_eq!(ext_of("unknown/type"), ".bin");
     }
 
     #[test]
