@@ -83,6 +83,7 @@ Every key is optional; a missing key uses the default shown below.
 | `enabled_nips` | array of integers | `[]` | Explicit NIP allowlist |
 | `disabled_nips` | array of integers | `[]` | NIPs to disable (ignored when `enabled_nips` is non-empty) |
 | `reject_ephemeral` | boolean | `false` | When `true`, NIP-01 ephemeral events (kinds 20000-29999) are rejected (`blocked: ephemeral events not allowed`) |
+| `enable_git` | boolean | `false` | When `true`, NIP-34 git events (kinds 1617-1633, 30617/30618) are accepted and NIP-34 is advertised. Default `false`: the kinds are rejected (`blocked: NIP-34 git events are disabled`) and NIP-34 is not advertised |
 
 ### Key details
 
@@ -110,9 +111,11 @@ Every key is optional; a missing key uses the default shown below.
 
 **`enabled_nips`** — An explicit allowlist of NIP numbers. When non-empty, **only** these NIPs are advertised (NIP-11) and their relay-side behavior is active; `disabled_nips` is ignored. Requires a `restart` to change.
 
-**`disabled_nips`** — Removes specific NIPs from the default set. For example `[50]` disables search (REQ/COUNT/API `search` is then ignored), `[28]` disables public-chat semantics. Requires a `restart` to change. Only relay-side NIPs are relevant: [1, 9, 11, 13, 17, 22, 26, 29, 32, 33, 40, 42, 43, 45, 46, 47, 50, 57, 59, 62, 65, 67, 70, 77, 78, 84, 85, 86, 87, 88, 98] (NIP-28 is a behavior gate only — it is never advertised; NIP-A3 is a `draft` without an integer identifier, so it cannot appear in `supported_nips`).
+**`disabled_nips`** — Removes specific NIPs from the default set. For example `[50]` disables search (REQ/COUNT/API `search` is then ignored), `[28]` disables public-chat semantics. Requires a `restart` to change. Only relay-side NIPs are relevant: [1, 9, 11, 13, 17, 22, 26, 29, 32, 33, 40, 42, 43, 45, 46, 47, 50, 57, 59, 62, 65, 67, 70, 77, 78, 84, 85, 86, 87, 88, 94, 98] (NIP-28 is a behavior gate only — it is never advertised; NIP-A3 is a `draft` without an integer identifier, so it cannot appear in `supported_nips`).
 
 **`reject_ephemeral`** — When `true`, NIP-01 ephemeral events (kinds `20000-29999`) are rejected at publish time with `blocked: ephemeral events not allowed`. Exempt kinds that NIPs require to be relayed are still forwarded: `22242` (NIP-42 AUTH), `27235` (NIP-98 HTTP auth), `28934`/`28935`/`28936` (NIP-43 JOIN/Invite/LEAVE), `24133` (NIP-46 Nostr Connect), `23194`/`23195` (NIP-47 wallet request/response), `24242` (BUD-02 Blossom), `21059` (NIP-59 ephemeral gift wrap). Takes effect immediately on `SIGHUP` reload and on the next publish.
+
+**`enable_git`** — When `true`, NIP-34 git events (kinds `1617`-`1633`, `30617`/`30618`) are accepted and NIP-34 is advertised in the NIP-11 document. Default `false`: the kinds are rejected with `blocked: NIP-34 git events are disabled` (patch payloads can be large, so this is opt-in) and NIP-34 stays out of `supported_nips`. Takes effect immediately on `SIGHUP` reload and on the next publish.
 
 ### Behavior notes
 
@@ -514,7 +517,7 @@ Editing the file and sending `kill -HUP $(cat nostrd.pid)` reloads it **without 
 
 | Applies on SIGHUP | Requires `nostrd restart` |
 | --- | --- |
-| `relay.name`, `description`, `pubkey`, `contact`, `icon`, `post_policy`, `public_url`, `relay.reject_ephemeral` | `relay.private_key` |
+| `relay.name`, `description`, `pubkey`, `contact`, `icon`, `post_policy`, `public_url`, `relay.reject_ephemeral`, `relay.enable_git` | `relay.private_key` |
 | most of `[limits]` | `relay.livekit_*` |
 | NIP-40 on/off, API concurrency | `relay.enabled_nips` / `disabled_nips` |
 | — | `server.api_host`, `metrics_enabled` |
@@ -543,6 +546,7 @@ livekit_api_secret = ""
 enabled_nips = []
 disabled_nips = []
 reject_ephemeral = false
+enable_git = false
 
 [server]
 host = "0.0.0.0"

@@ -13,17 +13,19 @@ pub const DEFAULT_CONFIG: &str = "nostrd.toml";
 /// client-side are generally not advertised (NIP-11: "Client-side NIPs SHOULD
 /// NOT be advertised"): NIP-28 explicitly "imposes no additional requirements
 /// on relays", so it is not listed. The client-side NIPs that ARE listed
-/// (17/22/32/46/47/57/59/65/78/84/85/87/88) are advertised deliberately:
+/// (17/22/32/46/47/57/59/65/78/84/85/87/88/94) are advertised deliberately:
 /// the relay stores and serves their events (or forwards their ephemeral
-/// kinds), so clients rely on them. NIP-A3 (kind 10133) is served but cannot
-/// be advertised: it is a `draft` with no integer identifier and NIP-11's
-/// `supported_nips` is an array of integer identifiers. File-storage NIPs
-/// (34/94/95/96) are excluded per the project rules (Blossom is provided
-/// separately by the `[blossom]` file server). NIP-33 was merged into NIP-01
-/// but remains advertised for clients that check it.
+/// kinds), so clients rely on them. NIP-34 (git) is advertised only when
+/// `relay.enable_git` is set (the kinds are rejected otherwise). NIP-A3
+/// (kind 10133) is served but cannot be advertised: it is a `draft` with no
+/// integer identifier and NIP-11's `supported_nips` is an array of integer
+/// identifiers. The remaining file-storage NIPs (95/96 HTTP file storage)
+/// are excluded per the project rules (Blossom is provided separately by
+/// the `[blossom]` file server). NIP-33 was merged into NIP-01 but remains
+/// advertised for clients that check it.
 pub const RELAY_NIPS: &[u16] = &[
-    1, 9, 11, 13, 17, 22, 26, 29, 32, 33, 40, 42, 43, 45, 46, 47, 50, 57, 59, 62, 65, 67, 70, 77,
-    78, 84, 85, 86, 87, 88, 98,
+    1, 9, 11, 13, 17, 22, 26, 29, 32, 33, 34, 40, 42, 43, 45, 46, 47, 50, 57, 59, 62, 65, 67, 70,
+    77, 78, 84, 85, 86, 87, 88, 94, 98,
 ];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -120,6 +122,10 @@ pub struct RelayConfig {
     /// When true, ephemeral events (NIP-01 kinds 20000-29999) are rejected
     /// at publish time instead of being forwarded live.
     pub reject_ephemeral: bool,
+    /// When true, NIP-34 git events (kinds 1617-1633, 30617/30618) are
+    /// accepted and NIP-34 is advertised in the NIP-11 document. Default
+    /// false: the kinds are rejected and NIP-34 is not advertised.
+    pub enable_git: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -294,6 +300,7 @@ impl Default for RelayConfig {
             enabled_nips: Vec::new(),
             disabled_nips: Vec::new(),
             reject_ephemeral: false,
+            enable_git: false,
         }
     }
 }
@@ -468,6 +475,9 @@ impl Config {
         if !access.allows_kind(kind) {
             return false;
         }
+        if !self.relay.enable_git && Self::is_git_kind(kind) {
+            return false;
+        }
         if self.relay.reject_ephemeral
             && (20000..30000).contains(&kind)
             && !Self::is_ephemeral_exempt(kind)
@@ -475,6 +485,24 @@ impl Config {
             return false;
         }
         true
+    }
+
+    /// The NIP-34 git event kinds. `enable_git` gates them at publish time
+    /// and (via [`Self::is_kind_effectively_allowed`]) drops NIP-34 from
+    /// the advertised list when disabled.
+    pub(crate) fn is_git_kind(kind: u64) -> bool {
+        matches!(
+            kind,
+            1617 // NIP-34 Patches
+                | 1618 // Pull Requests
+                | 1619 // Pull Request Updates
+                | 1621 // Issues
+                | 1622 // Git Replies (deprecated)
+                | 1630
+                ..=1633 // Status
+                | 30617 // Repository announcements
+                | 30618 // Repository state announcements
+        )
     }
 
     fn is_ephemeral_exempt(kind: u64) -> bool {
@@ -509,6 +537,9 @@ impl Config {
             ]),
             32 => Some(&[1985]),
             33 => None, // range 30000-39999 — not checked against kind block lists
+            34 => Some(&[
+                1617, 1618, 1619, 1621, 1622, 1630, 1631, 1632, 1633, 30617, 30618,
+            ]),
             40 => None,
             42 => Some(&[22242]),
             43 => Some(&[8000, 8001, 28934, 28935, 28936, 33534, 13534]),
@@ -529,6 +560,7 @@ impl Config {
             86 => None,
             87 => Some(&[38172, 38173]),
             88 => Some(&[1018, 1068]),
+            94 => Some(&[1063]),
             98 => Some(&[27235]),
             _ => None,
         }
@@ -1253,14 +1285,19 @@ mod tests {
         // Relay-side NIPs are advertised.
         for n in [
             1, 9, 11, 13, 17, 22, 26, 29, 32, 33, 40, 42, 43, 45, 46, 47, 50, 57, 59, 62, 65, 67,
-            70, 77, 78, 84, 85, 86, 87, 88, 98,
+            70, 77, 78, 84, 85, 86, 87, 88, 94, 98,
         ] {
             assert!(nips.contains(&n), "NIP-{n} must be advertised");
         }
+        // NIP-34 (git) is gated behind `enable_git` (default false).
+        assert!(
+            !nips.contains(&34),
+            "NIP-34 must not be advertised while enable_git is false"
+        );
         // Client-side NIPs without relay-side behaviour must not be
         // advertised (NIP-11). NIP-28 explicitly "imposes no additional
         // requirements on relays". The advertised client-side set (17/22/32/
-        // 46/47/57/59/65/78/84/85/87/88) is deliberate: their events are
+        // 46/47/57/59/65/78/84/85/87/88/94) is deliberate: their events are
         // stored and served. NIP-A3 (kind 10133) is served but has no integer
         // identifier, so it cannot appear in the numeric list.
         for n in [2, 3, 5, 19, 28, 51, 68, 99] {
@@ -1269,6 +1306,13 @@ mod tests {
                 "client-side NIP-{n} must not be advertised"
             );
         }
+        // `enable_git = true` advertises NIP-34.
+        let mut cfg = Config::default();
+        cfg.relay.enable_git = true;
+        assert!(
+            cfg.effective_supported_nips(&access).contains(&34),
+            "NIP-34 must be advertised when enable_git is true"
+        );
         // An explicit allowlist still only advertises relay-side NIPs.
         let mut cfg = Config::default();
         cfg.relay.enabled_nips = vec![1, 2, 50];
@@ -1366,6 +1410,7 @@ mod tests {
             (85, &[30382, 30383, 30384][..]),
             (87, &[38172, 38173][..]),
             (88, &[1018, 1068][..]),
+            (94, &[1063][..]),
         ] {
             let access = AccessControl {
                 blocked_kinds: kinds.to_vec(),
@@ -1377,6 +1422,20 @@ mod tests {
                 "NIP-{nip} must not be advertised when all its kinds are blocked"
             );
         }
+        // NIP-34: enabled via `enable_git`, and dropped when every git kind
+        // is blocked.
+        let mut cfg = Config::default();
+        cfg.relay.enable_git = true;
+        let access = AccessControl {
+            blocked_kinds: vec![
+                1617, 1618, 1619, 1621, 1622, 1630, 1631, 1632, 1633, 30617, 30618,
+            ],
+            ..Default::default()
+        };
+        assert!(
+            !cfg.effective_supported_nips(&access).contains(&34),
+            "NIP-34 must not be advertised when all git kinds are blocked"
+        );
         // reject_ephemeral keeps the exempt ephemeral kinds of NIP-46/47 and
         // the regular kinds of NIP-17 (only 1059 is rejected).
         let mut cfg = Config::default();

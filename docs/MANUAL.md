@@ -30,7 +30,7 @@ Key features:
 
 - **Simple and stable**: written in Rust; a single binary does everything
 - **Fast storage and search**: LMDB database with a full-text search index
-- **Broad NIP support**: 33 NIPs implemented (plus the Blossom file server), including deletion, proof-of-work, delegation, groups, search, and a management API
+- **Broad NIP support**: 35 NIPs implemented (plus the Blossom file server), including deletion, proof-of-work, delegation, groups, search, and a management API
 - **Easy to operate**: daemon mode, log rotation, hot configuration reload, statistics output, a REST API, and Prometheus metrics
 
 ---
@@ -126,6 +126,7 @@ If anything is wrong, it tells you exactly what. It is strongly recommended to r
 | `enabled_nips` | Explicit allowlist of NIP numbers (empty = all enabled) | empty |
 | `disabled_nips` | List of NIP numbers to disable | empty |
 | `reject_ephemeral` | When `true`, reject NIP-01 ephemeral events (kinds 20000–29999), except the NIP-mandated kinds (`22242`, `27235`, `28934`/`28935`/`28936`, `24133`, `23194`/`23195`, `24242`, `21059`) | `false` |
+| `enable_git` | When `true`, accept NIP-34 git events (kinds 1617–1633, 30617/30618) and advertise NIP-34. Off by default: the kinds are rejected (`blocked: NIP-34 git events are disabled`) | `false` |
 
 To generate a secret key, use the `nostrd genkey` command (see [5. Command Reference](#5-command-reference)).
 
@@ -437,6 +438,7 @@ If `server.management_port` is set, the legacy REST endpoints are available at `
 | 29 | Relay-based groups |
 | 32 | Labeling (kind 1985, `#l`/`#L` indexed) |
 | 33 | Parameterized replaceable events |
+| 34 | git stuff (kinds 1617-1633, 30617/30618 — **opt-in** via `relay.enable_git`, off by default) |
 | 40 | Expiration timestamp |
 | 42 | Client authentication |
 | 43 | Relay access metadata (roles) |
@@ -457,6 +459,7 @@ If `server.management_port` is set, the legacy REST endpoints are available at `
 | 86 | Relay management API |
 | 87 | Cashu and Fedimint announcements (kinds 38172/38173) |
 | 88 | Polls (kinds 1068/1018) |
+| 94 | File metadata (kind 1063 — references an externally hosted file) |
 | 98 | HTTP auth |
 | A3 | Payment targets (kind 10133, replaceable). `draft` with no integer identifier — served but **not** advertised in `supported_nips` (which only holds integers) |
 
