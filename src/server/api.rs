@@ -481,7 +481,7 @@ pub async fn api_monthly_handler(
             "until": end.saturating_sub(1),
         }))
         .expect("static filter");
-        let (events, more) = relay.db.count(vec![filter], count_limit, now).await;
+        let (events, more) = relay.db.api_count(vec![filter], count_limit, now).await;
         // The same visibility rules as the unauthenticated API: protected
         // events, gift wraps and private/hidden group content are withheld.
         let has_group_events = events.iter().any(nip29::is_group_event);
@@ -565,7 +565,7 @@ pub async fn api_count_handler(
     if !relay.config.read().await.nip_enabled(50) {
         filter.search = None;
     }
-    let (events, more) = relay.db.count(vec![filter], count_limit, now).await;
+    let (events, more) = relay.db.api_count(vec![filter], count_limit, now).await;
     let has_group_events = events.iter().any(nip29::is_group_event);
     let groups = if has_group_events {
         Some(relay.groups.read().await)
@@ -611,7 +611,7 @@ pub async fn api_kinds_handler(
     let count_limit = relay.config.read().await.limits.count_limit;
     let now = unix_now();
     let filter: Filter = serde_json::from_value(json!({ "authors": [hex_pk] })).expect("static");
-    let (events, more) = relay.db.count(vec![filter], count_limit, now).await;
+    let (events, more) = relay.db.api_count(vec![filter], count_limit, now).await;
     let has_group_events = events.iter().any(nip29::is_group_event);
     let groups = if has_group_events {
         Some(relay.groups.read().await)
@@ -692,7 +692,7 @@ pub async fn api_daily_handler(
             "until": day_start + 86400 - 1,
         }))
         .expect("static filter");
-        let (events, _) = relay.db.count(vec![filter], count_limit, now).await;
+        let (events, _) = relay.db.api_count(vec![filter], count_limit, now).await;
         let has_group_events = events.iter().any(nip29::is_group_event);
         let groups = if has_group_events {
             Some(relay.groups.read().await)
@@ -779,7 +779,10 @@ pub async fn api_stats_handler(
     let now = unix_now();
     let filter: Filter = serde_json::from_value(json!({ "authors": [hex_pk] })).expect("static");
 
-    let (events, more) = relay.db.count(vec![filter.clone()], count_limit, now).await;
+    let (events, more) = relay
+        .db
+        .api_count(vec![filter.clone()], count_limit, now)
+        .await;
     let has_group_events = events.iter().any(nip29::is_group_event);
     let groups = if has_group_events {
         Some(relay.groups.read().await)
@@ -885,7 +888,7 @@ pub async fn api_hourly_handler(
             "until": h_start + 3600 - 1,
         }))
         .expect("static filter");
-        let (events, _) = relay.db.count(vec![filter], count_limit, now).await;
+        let (events, _) = relay.db.api_count(vec![filter], count_limit, now).await;
         let has_group_events = events.iter().any(nip29::is_group_event);
         let groups = if has_group_events {
             Some(relay.groups.read().await)
