@@ -11,6 +11,8 @@
 //!   byte-range support on `GET`)
 //! - `PUT /upload`      — upload (NIP-98 style auth, kind 24242, `t=upload`,
 //!   mandatory `expiration` and `x` tags per BUD-11)
+//! - `HEAD /upload`     — BUD-06 pre-flight (`X-SHA-256` / `X-Content-Length`
+//!   / `X-Content-Type` headers, `t=upload` auth)
 //! - `PUT /media` / `HEAD /media` — BUD-05 media upload + pre-flight
 //!   (stored verbatim; auth `t=media`, `x` tag required)
 //! - `GET /list/<pubkey>` — blobs uploaded by a pubkey
@@ -50,7 +52,9 @@ pub(crate) async fn routes(relay: &Arc<Relay>) -> axum::Router<Arc<Relay>> {
     axum::Router::new()
         .route(
             "/upload",
-            put(upload).layer(DefaultBodyLimit::max(max_upload)),
+            put(upload)
+                .head(head_upload)
+                .layer(DefaultBodyLimit::max(max_upload)),
         )
         .route(
             "/media",
@@ -550,10 +554,25 @@ async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Bytes, verb: &str
     }
 }
 
+/// `HEAD /upload` — BUD-06 pre-flight: whether a `PUT /upload` would be
+/// accepted, based on the `X-SHA-256`, `X-Content-Type` and
+/// `X-Content-Length` headers alone.
+async fn head_upload(State(relay): State<Arc<Relay>>, headers: HeaderMap) -> Response {
+    head_preflight(relay, headers, "upload").await
+}
+
 /// `HEAD /media` — BUD-05/BUD-06 pre-flight: whether a `PUT /media` would
 /// be accepted, based on the `X-SHA-256`, `X-Content-Type` and
 /// `X-Content-Length` headers alone.
 async fn head_media(State(relay): State<Arc<Relay>>, headers: HeaderMap) -> Response {
+    head_preflight(relay, headers, "media").await
+}
+
+/// Shared pre-flight logic for `HEAD /upload` (BUD-06) and `HEAD /media`
+/// (BUD-05): evaluates the declared `X-SHA-256` / `X-Content-Length` /
+/// `X-Content-Type` headers against the server policy and returns whether
+/// the corresponding PUT would be accepted.
+async fn head_preflight(relay: Arc<Relay>, headers: HeaderMap, verb: &str) -> Response {
     let Some(state) = state_of(&relay).await else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "blossom not initialized");
     };
@@ -581,11 +600,12 @@ async fn head_media(State(relay): State<Arc<Relay>>, headers: HeaderMap) -> Resp
     if len > max_upload {
         return error(
             StatusCode::PAYLOAD_TOO_LARGE,
-            "the media exceeds the configured size limit",
+            "the upload exceeds the configured size limit",
         );
     }
-    // BUD-11: media tokens carry `t=media` and an `x` tag matching the hash.
-    let Some(pubkey) = verify_auth(&relay, &state, &headers, "media", Some(&x_sha)).await else {
+    // BUD-11: upload/media tokens carry the matching verb and an `x` tag
+    // matching the declared hash.
+    let Some(pubkey) = verify_auth(&relay, &state, &headers, verb, Some(&x_sha)).await else {
         return error(StatusCode::UNAUTHORIZED, "invalid or missing authorization");
     };
     if upload_allowed(&relay, &pubkey).await.is_err() {

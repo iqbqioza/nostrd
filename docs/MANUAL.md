@@ -570,6 +570,7 @@ Both backends use the `bucket/{npub1xxx}/{file}` hierarchy: every upload is stor
 | `GET` | `/` | — | Blossom server info |
 | `GET` / `HEAD` | `/<sha256>[.ext]` | — | Fetch / probe a blob (`.ext` is advisory); `GET` supports RFC 7233 byte ranges (206 / `accept-ranges: bytes`) |
 | `PUT` | `/upload` | kind 24242 (`t=upload`, `x=<sha256>`, `expiration`) | Upload a blob; returns 201 + the descriptor |
+| `HEAD` | `/upload` | kind 24242 (`t=upload`, `x=<sha256>`, `expiration`) | BUD-06 pre-flight — would the upload be accepted? Uses `X-SHA-256` / `X-Content-Length` / `X-Content-Type` headers (400 malformed / 411 missing length / 413 too large) |
 | `PUT` | `/media` | kind 24242 (`t=media`, `x=<sha256>`, `expiration`) | BUD-05 media upload (stored verbatim — no optimization); returns 201 + the descriptor |
 | `HEAD` | `/media` | kind 24242 (`t=media`, `x=<sha256>`, `expiration`) | BUD-05 pre-flight — would the upload be accepted? Uses `X-SHA-256` / `X-Content-Length` / `X-Content-Type` headers (400 malformed / 411 missing length / 413 too large) |
 | `GET` | `/list/<pubkey>` | — | Blobs uploaded by a pubkey (hex), sorted by `uploaded` descending; supports `cursor` (the sha256 of the last entry of the previous page) and `limit` |
