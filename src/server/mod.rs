@@ -496,6 +496,7 @@ async fn blossom_root_info(
         "supported_file_hashes": ["sha256"],
         "tos_url": null,
         "payment_required": false,
+        "upload_url": format!("https://{}/upload", cfg.blossom.host.trim()),
         "max_file_size": cfg.blossom.max_upload_bytes,
         "storage": cfg.blossom.storage,
     });
