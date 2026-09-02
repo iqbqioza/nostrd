@@ -315,7 +315,7 @@ The advertised `supported_nips` list is **dynamic**: a NIP is dropped when all t
 | [11](https://github.com/nostr-protocol/nips/blob/master/11.md) | Relay information document |
 | [13](https://github.com/nostr-protocol/nips/blob/master/13.md) | Proof of work |
 | [17](https://github.com/nostr-protocol/nips/blob/master/17.md) | Private DMs (kind 14, wrapped in 15; the ephemeral wraps 1059/21059 are forwarded, gift-wrap serving follows NIP-59) |
-| [22](https://github.com/nostr-protocol/nips/blob/master/22.md) | Comments (kind 1111 — replies to kind 1 notes and other events, served via the `#e` threading index; root-scope `E`/`K`/`A`/`I` tags are indexed too) |
+| [22](https://github.com/nostr-protocol/nips/blob/master/22.md) | Comments (kind 1111 — replies to kind 1 notes and other events, served via the `#e` threading index; root-scope `E`/`K`/`A`/`I` tags are queryable too, via the full-scan fallback) |
 | [26](https://github.com/nostr-protocol/nips/blob/master/26.md) | Delegated event signing |
 | [28](https://github.com/nostr-protocol/nips/blob/master/28.md) | Public chat (channel messages are served via the `#e` index) |
 | [29](https://github.com/nostr-protocol/nips/blob/master/29.md) | Relay-based groups (moderation events, relay-signed metadata, subgroups, invite codes, LiveKit rooms) |
