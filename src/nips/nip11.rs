@@ -159,7 +159,7 @@ mod tests {
         let nips: Vec<u16> = nips.iter().map(|n| n.as_u64().unwrap() as u16).collect();
         for expected in [
             1u16, 9, 11, 13, 17, 22, 26, 29, 32, 33, 40, 42, 43, 45, 46, 47, 50, 57, 59, 62, 65,
-            67, 70, 77, 78, 86, 98,
+            67, 70, 77, 78, 84, 85, 86, 87, 88, 98,
         ] {
             assert!(
                 nips.contains(&expected),
