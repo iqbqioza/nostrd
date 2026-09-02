@@ -19,13 +19,19 @@ pub(crate) const REFRESH_SECS: u64 = 12 * 3600;
 
 /// The relay's normalized URL (NIP-66 requires the `d` tag to be the
 /// normalized URL): `relay.public_url` when set, otherwise
-/// `wss://host:port/`.
+/// `wss://host:port/`. IPv6 literals are bracketed to form a valid
+/// authority (the same convention as the NIP-42/62/98 relay identity).
 pub(crate) fn normalized_url(cfg: &Config) -> String {
     let url = cfg.relay.public_url.trim();
     if !url.is_empty() {
         return url.to_string();
     }
-    format!("wss://{}:{}/", cfg.server.host, cfg.server.port)
+    let host = if cfg.server.host.contains(':') {
+        format!("[{}]", cfg.server.host)
+    } else {
+        cfg.server.host.clone()
+    };
+    format!("wss://{host}:{}/", cfg.server.port)
 }
 
 /// Builds the relay's kind 30166 discovery event (unsigned — the publisher
@@ -50,6 +56,9 @@ pub(crate) fn relay_discovery_event(
         tags.push(vec!["R".into(), "!auth".into()]);
     }
     tags.push(vec!["R".into(), "!payment".into()]);
+    // NIP-66's `R` keys cover auth, writes, pow and payment: the relay
+    // never restricts writes, so the requirement is negated.
+    tags.push(vec!["R".into(), "!writes".into()]);
     if cfg.nip_enabled(13) && cfg.limits.require_pow > 0 {
         tags.push(vec!["R".into(), "pow".into()]);
     } else {
@@ -101,6 +110,7 @@ mod tests {
             .collect();
         assert!(reqs.contains(&"!payment"));
         assert!(reqs.contains(&"!auth"));
+        assert!(reqs.contains(&"!writes"));
         assert!(reqs.contains(&"!pow"));
         // The content is the stringified NIP-11 document.
         let doc: serde_json::Value = serde_json::from_str(&ev.content).unwrap();
@@ -114,5 +124,9 @@ mod tests {
         assert_eq!(normalized_url(&cfg), "wss://127.0.0.1:8080/");
         cfg.relay.public_url = "wss://relay.example.com/".into();
         assert_eq!(normalized_url(&cfg), "wss://relay.example.com/");
+        // IPv6 literals must be bracketed to form a valid URL.
+        let mut cfg = Config::default();
+        cfg.server.host = "::1".into();
+        assert_eq!(normalized_url(&cfg), "wss://[::1]:8080/");
     }
 }
