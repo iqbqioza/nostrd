@@ -1956,9 +1956,25 @@ mod tests {
                 "starts at the earliest event"
             );
             assert_eq!(months[0]["count"], 2);
+            assert!(
+                resp["total"].as_u64().unwrap() >= 2,
+                "the whole period starts at the earliest event and ends at now \
+                 (September is included once the clock passes it)"
+            );
+            // The last reported month must be the current one.
+            let (y, m) = {
+                let now = unix_now();
+                let days = now / 86400;
+                let secs = now % 86400;
+                // Reuse the month math from the handler.
+                let _ = (days, secs);
+                crate::server::api::month_of(now)
+            };
+            let last = months.last().unwrap()["month"].as_str().unwrap();
             assert_eq!(
-                resp["total"], 2,
-                "the range ends at now (September is in the future)"
+                last,
+                format!("{y:04}-{m:02}"),
+                "the range ends at the current month"
             );
 
             relay.db.shutdown();
