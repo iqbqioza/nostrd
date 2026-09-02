@@ -430,21 +430,90 @@ impl Config {
     /// spec says client-side NIPs SHOULD NOT be advertised, and advertising
     /// them misleads clients (e.g. into relying on NIP-02 or NIP-05 features
     /// this relay does not provide).
-    pub fn supported_nips(&self) -> Vec<u16> {
-        if !self.relay.enabled_nips.is_empty() {
-            return self
-                .relay
+    pub fn effective_supported_nips(&self, access: &AccessControl) -> Vec<u16> {
+        let base = if !self.relay.enabled_nips.is_empty() {
+            self.relay
                 .enabled_nips
                 .iter()
                 .copied()
                 .filter(|num| RELAY_NIPS.contains(num))
-                .collect();
-        }
-        RELAY_NIPS
-            .iter()
-            .copied()
-            .filter(|num| !self.relay.disabled_nips.contains(num))
+                .collect::<Vec<_>>()
+        } else {
+            RELAY_NIPS
+                .iter()
+                .copied()
+                .filter(|num| !self.relay.disabled_nips.contains(num))
+                .collect::<Vec<_>>()
+        };
+        base.into_iter()
+            .filter(|nip| {
+                if let Some(kinds) = Self::nip_kinds(*nip) {
+                    kinds
+                        .iter()
+                        .any(|k| self.is_kind_effectively_allowed(*k, access))
+                } else {
+                    // No associated kinds (e.g. NIP-11, NIP-86) — always advertised when enabled.
+                    true
+                }
+            })
             .collect()
+    }
+
+    fn is_kind_effectively_allowed(&self, kind: u64, access: &AccessControl) -> bool {
+        if !access.allows_kind(kind) {
+            return false;
+        }
+        if self.relay.reject_ephemeral
+            && (20000..30000).contains(&kind)
+            && !Self::is_ephemeral_exempt(kind)
+        {
+            return false;
+        }
+        true
+    }
+
+    fn is_ephemeral_exempt(kind: u64) -> bool {
+        matches!(
+            kind,
+            22242 // NIP-42 AUTH
+                | 27235 // NIP-98 HTTP auth
+                | 28934 // NIP-43 JOIN
+                | 28935 // NIP-43 Invite Request
+                | 28936 // NIP-43 LEAVE
+                | 24133 // NIP-46 Nostr Connect
+                | 23194 // NIP-47 wallet request
+                | 23195 // NIP-47 wallet response
+                | 24242 // BUD-02 Blossom / NIP-B7 blobs
+                | 21059 // NIP-59 ephemeral gift wrap
+        )
+    }
+
+    fn nip_kinds(nip: u16) -> Option<&'static [u64]> {
+        match nip {
+            1 => None, // core — always advertised
+            9 => Some(&[5]),
+            11 => None,
+            13 => None,
+            26 => None,
+            28 => Some(&[40, 41, 42, 43, 44]),
+            29 => Some(&[
+                9000, 9001, 9002, 9005, 9007, 9008, 9009, 9010, 9021, 9022, 39000, 39001, 39002,
+                39005,
+            ]),
+            33 => None, // range 30000-39999 — not checked against kind block lists
+            40 => None,
+            42 => Some(&[22242]),
+            43 => Some(&[8000, 8001, 28934, 28936, 33534, 13534]),
+            45 => None,
+            50 => None,
+            62 => Some(&[62]),
+            67 => None,
+            70 => None,
+            77 => None,
+            86 => None,
+            98 => Some(&[27235]),
+            _ => None,
+        }
     }
 
     /// The relay's own URL identity (host:port plus the optional public
@@ -1147,15 +1216,22 @@ mod tests {
         Config::write_default(&path).unwrap();
         let cfg = Config::load(&path).unwrap();
         assert_eq!(cfg.server.port, 8080);
-        assert!(cfg.supported_nips().contains(&1));
-        assert!(cfg.supported_nips().contains(&11));
+        assert!(
+            cfg.effective_supported_nips(&crate::config::AccessControl::default())
+                .contains(&1)
+        );
+        assert!(
+            cfg.effective_supported_nips(&crate::config::AccessControl::default())
+                .contains(&11)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn only_relay_nips_are_advertised() {
         let cfg = Config::default();
-        let nips = cfg.supported_nips();
+        let access = AccessControl::default();
+        let nips = cfg.effective_supported_nips(&access);
         // Relay-side NIPs are advertised.
         for n in [
             1, 9, 11, 13, 26, 29, 33, 40, 42, 43, 45, 50, 62, 67, 70, 77, 86, 98,
@@ -1173,16 +1249,79 @@ mod tests {
         // An explicit allowlist still only advertises relay-side NIPs.
         let mut cfg = Config::default();
         cfg.relay.enabled_nips = vec![1, 2, 50];
-        assert_eq!(cfg.supported_nips(), vec![1, 50]);
+        assert_eq!(cfg.effective_supported_nips(&access), vec![1, 50]);
     }
 
     #[test]
     fn disabled_nips_are_removed() {
         let mut cfg = Config::default();
         cfg.relay.disabled_nips = vec![11, 50];
-        assert!(!cfg.supported_nips().contains(&11));
+        let access = AccessControl::default();
+        assert!(!cfg.effective_supported_nips(&access).contains(&11));
         assert!(!cfg.nip_enabled(50));
         assert!(cfg.nip_enabled(1));
+    }
+
+    #[test]
+    fn blocked_or_ephemeral_rejected_kinds_drop_their_nip() {
+        // Blocking every kind a NIP defines must drop that NIP from the
+        // advertisement.
+        let cfg = Config::default();
+        let access = AccessControl {
+            blocked_kinds: vec![5], // NIP-09 (deletion)
+            ..Default::default()
+        };
+        let nips = cfg.effective_supported_nips(&access);
+        assert!(
+            !nips.contains(&9),
+            "NIP-09 must not be advertised when kind 5 is blocked"
+        );
+        assert!(nips.contains(&1));
+
+        // Blocking only ONE of a NIP's many kinds keeps it advertised
+        // (any accepted kind keeps the NIP).
+        let cfg = Config::default();
+        let access = AccessControl {
+            blocked_kinds: vec![9000], // one NIP-29 group kind
+            ..Default::default()
+        };
+        let nips = cfg.effective_supported_nips(&access);
+        assert!(
+            nips.contains(&29),
+            "NIP-29 must stay advertised when only kind 9000 is blocked"
+        );
+
+        // reject_ephemeral with a non-exempt ephemeral kind drops NIP-42/98.
+        let mut cfg = Config::default();
+        cfg.relay.reject_ephemeral = true;
+        let access = AccessControl::default();
+        let nips = cfg.effective_supported_nips(&access);
+        assert!(
+            nips.contains(&42),
+            "NIP-42 AUTH kind is exempt and still advertised"
+        );
+        assert!(
+            nips.contains(&98),
+            "NIP-98 HTTP auth kind is exempt and still advertised"
+        );
+
+        // Allowing only a subset still advertises the NIP (any accepted kind).
+        let cfg = Config::default();
+        let access = AccessControl {
+            allowed_kinds: vec![1, 9000, 28936, 24242, 22242],
+            ..Default::default()
+        };
+        let nips = cfg.effective_supported_nips(&access);
+        assert!(nips.contains(&1), "kind 1 is allowed -> NIP-01 advertised");
+        assert!(
+            nips.contains(&29),
+            "group kinds 9000/28936 are allowed -> NIP-29 advertised"
+        );
+        assert!(nips.contains(&42), "22242 allowed -> NIP-42 advertised");
+        assert!(
+            nips.contains(&40),
+            "NIP-40 (no kinds) is always advertised when enabled"
+        );
     }
 
     #[test]

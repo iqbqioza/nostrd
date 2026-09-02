@@ -125,6 +125,7 @@ If anything is wrong, it tells you exactly what. It is strongly recommended to r
 | `livekit_api_key` / `livekit_api_secret` | LiveKit API key and secret | empty |
 | `enabled_nips` | Explicit allowlist of NIP numbers (empty = all enabled) | empty |
 | `disabled_nips` | List of NIP numbers to disable | empty |
+| `reject_ephemeral` | When `true`, reject NIP-01 ephemeral events (kinds 20000–29999), except the NIP-mandated kinds (`22242`, `27235`, `28934`/`28935`/`28936`, `24133`, `23194`/`23195`, `24242`, `21059`) | `false` |
 
 To generate a secret key, use the `nostrd genkey` command (see [5. Command Reference](#5-command-reference)).
 
@@ -259,7 +260,7 @@ curl http://127.0.0.1:8080/health
 curl -H "Accept: application/nostr+json" http://127.0.0.1:8080/
 ```
 
-Returns the relay name, supported NIPs, limits, and more as JSON.
+Returns the relay name, supported NIPs, limits, and more as JSON. The `supported_nips` list is dynamic — see [Section 8](#8-supported-nips) for what controls it.
 
 ### Reload the config without replacing the process
 
@@ -449,6 +450,17 @@ If `server.management_port` is set, the legacy REST endpoints are available at `
 | A3 | Payment targets (kind 10133, replaceable) |
 
 Blossom (BUD-01/02) is not a NIP and is **not** advertised in the NIP-11 document: it is served as a separate file server on the `[blossom]` hostname (see [Section 11](#11-blossom-file-server-media-hosting)), with its own kind-24242 upload authorization.
+
+### Dynamic NIP advertisement
+
+The NIP-11 `supported_nips` list is not static: a NIP is dropped from it when every kind the NIP defines is rejected by the relay's access control. Concretely:
+
+- **`blocked_kinds`** — blocking all kinds of a NIP hides it (e.g. blocking kind `5` hides NIP-09). Blocking only some kinds keeps the NIP (e.g. blocking `9000` but not `9001` keeps NIP-29).
+- **`allowed_kinds`** — a NIP's kind is only accepted when listed; a NIP whose kinds are all unlisted is hidden.
+- **`reject_ephemeral`** — ephemeral kinds that are not in the NIP-mandated exempt list (`22242`, `27235`, `28934`/`28935`/`28936`, `24133`, `23194`/`23195`, `24242`, `21059`) are rejected, so NIPs relying on them are hidden.
+- NIPs without dedicated kinds (11, 13, 26, 33, 40, 45, 50, 67, 70, 77, 86) are always advertised when enabled.
+
+Changes made at runtime — NIP-86 `allowkind`/`disallowkind`, or a `SIGHUP` reload of `reject_ephemeral` — are reflected in the next NIP-11 fetch. `enabled_nips`/`disabled_nips` still require a restart.
 
 ---
 

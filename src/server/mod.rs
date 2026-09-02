@@ -511,8 +511,10 @@ async fn blossom_root_info(
 /// when the client asked for it.
 async fn nip11_doc(relay: Arc<Relay>, wants_nostr_json: bool) -> Response {
     let cfg = relay.config.read().await;
+    let access = relay.access.read().await;
     let body = Json(relay_info(
         &cfg,
+        &access,
         &relay.stats,
         relay.relay_pubkey().as_deref(),
     ));

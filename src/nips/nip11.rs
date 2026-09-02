@@ -8,11 +8,16 @@ use axum::Json;
 use axum::extract::State;
 use serde_json::{Value, json};
 
-use crate::config::Config;
+use crate::config::{AccessControl, Config};
 use crate::relay::Relay;
 use crate::stats::Stats;
 
-pub fn relay_info(config: &Config, stats: &Stats, self_pubkey: Option<&str>) -> Value {
+pub fn relay_info(
+    config: &Config,
+    access: &AccessControl,
+    stats: &Stats,
+    self_pubkey: Option<&str>,
+) -> Value {
     let limits = &config.limits;
     // NIP-11: any field may be omitted. Empty string fields are omitted
     // too: some clients try to decode the pubkey/icon as data and fail on
@@ -23,7 +28,7 @@ pub fn relay_info(config: &Config, stats: &Stats, self_pubkey: Option<&str>) -> 
         "pubkey": config.relay.pubkey,
         "contact": config.relay.contact,
         "icon": config.relay.icon,
-        "supported_nips": config.supported_nips(),
+        "supported_nips": config.effective_supported_nips(access),
         "software": env!("CARGO_PKG_REPOSITORY"),
         "version": env!("CARGO_PKG_VERSION"),
         "limitation": {
@@ -93,8 +98,9 @@ mod tests {
 
     fn info() -> Value {
         let cfg = Config::default();
+        let access = crate::config::AccessControl::default();
         let stats = Stats::new();
-        relay_info(&cfg, &stats, None)
+        relay_info(&cfg, &access, &stats, None)
     }
 
     #[test]
@@ -136,7 +142,8 @@ mod tests {
         cfg.relay.contact = "https://example.com/contact".to_string();
         cfg.relay.icon = "https://example.com/icon.png".to_string();
         let stats = Stats::new();
-        let info = relay_info(&cfg, &stats, Some(&"bb".repeat(32)));
+        let access = crate::config::AccessControl::default();
+        let info = relay_info(&cfg, &access, &stats, Some(&"bb".repeat(32)));
         assert_eq!(info["pubkey"], "aa".repeat(32));
         assert_eq!(info["contact"], "https://example.com/contact");
         assert_eq!(info["icon"], "https://example.com/icon.png");

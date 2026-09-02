@@ -138,8 +138,10 @@ async fn admin_info(
         return resp;
     }
     let cfg = state.relay.config.read().await;
+    let access = state.relay.access.read().await;
     Json(relay_info(
         &cfg,
+        &access,
         &state.relay.stats,
         state.relay.relay_pubkey().as_deref(),
     ))
