@@ -454,7 +454,7 @@ If `server.management_port` is set, the legacy REST endpoints are available at `
 | 78 | Application-specific data (kind 30078, addressable) |
 | 86 | Relay management API |
 | 98 | HTTP auth |
-| A3 | Payment targets (kind 10133, replaceable) |
+| A3 | Payment targets (kind 10133, replaceable). `draft` with no integer identifier — served but **not** advertised in `supported_nips` (which only holds integers) |
 
 Blossom (BUD-01/02) is not a NIP and is **not** advertised in the NIP-11 document: it is served as a separate file server on the `[blossom]` hostname (see [Section 11](#11-blossom-file-server-media-hosting)), with its own kind-24242 upload authorization.
 
