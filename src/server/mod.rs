@@ -726,12 +726,18 @@ async fn nip66_publisher(relay: Arc<Relay>, mut shutdown: watch::Receiver<bool>)
                     let access = relay.access.read().await;
                     (cfg, access)
                 };
+                // The monotonic stamp (store_relay_event's documented
+                // requirement for every relay-generated event) guarantees a
+                // strictly newer created_at on each publish, so the
+                // addressable slot can never be retained by a stale version
+                // on an equal-timestamp id tie-break.
+                let stamp = relay.stamp_floor(crate::util::unix_now());
                 let mut event = crate::nips::nip66::relay_discovery_event(
                     &cfg,
                     &access,
                     &pubkey,
                     &relay.stats,
-                    crate::util::unix_now(),
+                    stamp,
                 );
                 drop(cfg);
                 drop(access);
