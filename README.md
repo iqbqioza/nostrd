@@ -306,6 +306,8 @@ With `server.ws_paths = "inbox-outbox"` the relay's WebSocket endpoint is served
 
 All relay-side NIPs are implemented; client-side NIPs are stored and served as plain events but are deliberately **not** advertised in the NIP-11 document (per the spec). File-storage NIPs (34 git, 94 file metadata, 95/96 HTTP file storage) are excluded by design — except Blossom, which is provided by the dedicated [Blossom file server](#features).
 
+The advertised `supported_nips` list is **dynamic**: a NIP is dropped when all the kinds it defines are blocked by `blocked_kinds`/`allowed_kinds` (e.g. blocking kind 5 hides NIP-09), when `reject_ephemeral` rejects every kind it relies on, or when it is disabled via `enabled_nips`/`disabled_nips`. Runtime changes (NIP-86 `allowkind`/`disallowkind`, `SIGHUP` reloads) are reflected in the next NIP-11 fetch.
+
 | NIP | Description |
 | --- | --- |
 | [01](https://github.com/nostr-protocol/nips/blob/master/01.md) | Basic protocol (EVENT/REQ/CLOSE, filters, replaceable/ephemeral/addressable events) |

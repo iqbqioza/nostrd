@@ -179,6 +179,14 @@ When using Cloudflare Tunnel:
 
 ---
 
+### 2-8. A NIP is missing from the NIP-11 `supported_nips` list
+
+**Cause**: The advertised list is dynamic — a NIP is hidden when all the kinds it defines are rejected: they are all in `blocked_kinds`, none of them is in `allowed_kinds`, or they are ephemeral kinds rejected by `reject_ephemeral` (only the exempt kinds `22242`, `27235`, `28934`/`28935`/`28936`, `24133`, `23194`/`23195`, `24242`, `21059` are forwarded). Runtime access changes via NIP-86 (`allowkind`/`disallowkind`) apply immediately; NIPs without dedicated kinds (11, 13, 26, 33, 40, 45, 50, 67, 70, 77, 86) are always advertised when enabled.
+
+**Fix**: Check the active access lists — NIP-86 `listallowedkinds` shows the kind allowlist (use `disallowkind` to add a kind to the blocklist, `allowkind` to remove it), and `GET /` shows the effective `supported_nips` immediately. Remove the blocking kind or the `reject_ephemeral` setting, then `SIGHUP` or re-issue the NIP-86 call.
+
+---
+
 ## 3. Errors When Publishing
 
 ### 3-1. `OK` is `false` — error reference

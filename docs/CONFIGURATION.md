@@ -110,7 +110,7 @@ Every key is optional; a missing key uses the default shown below.
 
 **`enabled_nips`** — An explicit allowlist of NIP numbers. When non-empty, **only** these NIPs are advertised (NIP-11) and their relay-side behavior is active; `disabled_nips` is ignored. Requires a `restart` to change.
 
-**`disabled_nips`** — Removes specific NIPs from the default set. For example `[50]` disables search (REQ/COUNT/API `search` is then ignored), `[28]` disables public-chat semantics. Requires a `restart` to change. Only relay-side NIPs are relevant: [1, 9, 11, 13, 26, 28, 29, 33, 40, 42, 43, 45, 50, 62, 67, 70, 77, 86, 98].
+**`disabled_nips`** — Removes specific NIPs from the default set. For example `[50]` disables search (REQ/COUNT/API `search` is then ignored), `[28]` disables public-chat semantics. Requires a `restart` to change. Only relay-side NIPs are relevant: [1, 9, 11, 13, 26, 29, 33, 40, 42, 43, 45, 50, 62, 67, 70, 77, 86, 98] (NIP-28 is a behavior gate only — it is never advertised).
 
 **`reject_ephemeral`** — When `true`, NIP-01 ephemeral events (kinds `20000-29999`) are rejected at publish time with `blocked: ephemeral events not allowed`. Exempt kinds that NIPs require to be relayed are still forwarded: `22242` (NIP-42 AUTH), `27235` (NIP-98 HTTP auth), `28934`/`28935`/`28936` (NIP-43 JOIN/Invite/LEAVE), `24133` (NIP-46 Nostr Connect), `23194`/`23195` (NIP-47 wallet request/response), `24242` (BUD-02 Blossom), `21059` (NIP-59 ephemeral gift wrap). Takes effect immediately on `SIGHUP` reload and on the next publish.
 
@@ -121,6 +121,7 @@ Every key is optional; a missing key uses the default shown below.
 - **`public_url`**: matching tolerates different schemes (`wss`/`ws`/`https`/`http`) and paths, and is case-insensitive. When the relay binds `0.0.0.0` or `127.0.0.1` and `public_url` is empty, a loud warning explains that NIP-42/62/98 URL checks will fail.
 - **`livekit_url` + `livekit_api_key` + `livekit_api_secret`**: all three are needed together; a URL without credentials logs a warning (tokens would be signed with an empty secret).
 - **`enabled_nips` / `disabled_nips`**: `enabled_nips` wins over `disabled_nips`. Both affect the NIP-11 `supported_nips` list and the relay's behavior gates (NIP-29 groups, NIP-50 search, NIP-40 expiry, ...).
+- **The NIP-11 `supported_nips` list is dynamic**: besides `enabled_nips`/`disabled_nips`, a NIP is dropped when every kind it defines is blocked — by `blocked_kinds`, by `allowed_kinds` (a NIP's kind is only accepted if it is listed), or by `reject_ephemeral` (a NIP whose kinds are all ephemeral and not in the exempt list is hidden). Kinds without an owning NIP are not affected. Runtime access changes (NIP-86 `allowkind`/`disallowkind`) and `SIGHUP` reloads are reflected in the next NIP-11 fetch; `enabled_nips`/`disabled_nips` still require a restart.
 
 ---
 
