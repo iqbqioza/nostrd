@@ -11,6 +11,8 @@
 //!   byte-range support on `GET`)
 //! - `PUT /upload`      — upload (NIP-98 style auth, kind 24242, `t=upload`,
 //!   mandatory `expiration` and `x` tags per BUD-11)
+//! - `PUT /media` / `HEAD /media` — BUD-05 media upload + pre-flight
+//!   (stored verbatim; auth `t=media`, `x` tag required)
 //! - `GET /list/<pubkey>` — blobs uploaded by a pubkey
 //! - `DELETE /<sha256>[.ext]` — delete (auth, `t=delete`, `x=<sha256>`)
 
@@ -50,6 +52,12 @@ pub(crate) async fn routes(relay: &Arc<Relay>) -> axum::Router<Arc<Relay>> {
             "/upload",
             put(upload).layer(DefaultBodyLimit::max(max_upload)),
         )
+        .route(
+            "/media",
+            put(upload_media)
+                .head(head_media)
+                .layer(DefaultBodyLimit::max(max_upload)),
+        )
         .route("/list/{pubkey}", get(list))
         .route("/{blob}", get(get_blob).head(head_blob).delete(delete_blob))
         .with_state(relay.clone())
@@ -67,7 +75,7 @@ pub(crate) fn is_blossom_path(path: &str) -> bool {
     // The root `/` stays with the relay (WS + NIP-11): the WS handler
     // answers it with the Blossom server info when the Host names the
     // Blossom host.
-    if path == "/upload" {
+    if path == "/upload" || path == "/media" {
         return true;
     }
     if let Some(rest) = path.strip_prefix("/list/") {
@@ -451,8 +459,25 @@ async fn head_blob(State(relay): State<Arc<Relay>>, AxPath(blob): AxPath<String>
         .into_response()
 }
 
-/// `PUT /upload` — upload a blob. Returns 201 + the BlobDescriptor.
+/// `PUT /upload` — upload a blob (BUD-02). Returns 201 + the descriptor.
 async fn upload(State(relay): State<Arc<Relay>>, headers: HeaderMap, body: Bytes) -> Response {
+    put_blob(relay, headers, body, "upload").await
+}
+
+/// `PUT /media` — media optimization upload (BUD-05). nostrd stores the
+/// exact bytes received (optimization is a SHOULD, not a MUST); the
+/// endpoint exists so clients that treat it as a trusted processing
+/// server (e.g. nostter) can upload without changes.
+async fn upload_media(
+    State(relay): State<Arc<Relay>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    put_blob(relay, headers, body, "media").await
+}
+
+/// Shared PUT logic for `/upload` (BUD-02) and `/media` (BUD-05).
+async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Bytes, verb: &str) -> Response {
     let Some(state) = state_of(&relay).await else {
         return error(StatusCode::SERVICE_UNAVAILABLE, "blossom not initialized");
     };
@@ -460,8 +485,8 @@ async fn upload(State(relay): State<Arc<Relay>>, headers: HeaderMap, body: Bytes
         use sha2::{Digest, Sha256};
         hex::encode(Sha256::digest(&body))
     };
-    // BUD-02: the optional `X-SHA-256` header declares the expected hash of
-    // the request body — a provided value that does not match the actual
+    // BUD-02/05: the optional `X-SHA-256` header declares the expected hash
+    // of the request body — a provided value that does not match the actual
     // bytes is a 409 Conflict, and a malformed value is a 400.
     if let Some(declared) = headers.get("x-sha-256").and_then(|v| v.to_str().ok()) {
         let declared = declared.trim().to_ascii_lowercase();
@@ -475,9 +500,9 @@ async fn upload(State(relay): State<Arc<Relay>>, headers: HeaderMap, body: Bytes
             );
         }
     }
-    // BUD-11: upload tokens MUST carry an `x` tag matching the blob hash
-    // (the token is scoped to exactly the bytes being uploaded).
-    let Some(pubkey) = verify_auth(&relay, &state, &headers, "upload", Some(&sha)).await else {
+    // BUD-11: upload/media tokens MUST carry an `x` tag matching the blob
+    // hash (the token is scoped to exactly the bytes being uploaded).
+    let Some(pubkey) = verify_auth(&relay, &state, &headers, verb, Some(&sha)).await else {
         return error(StatusCode::UNAUTHORIZED, "invalid or missing authorization");
     };
     // Upload allowlist: when restrict_uploads is on, only the listed
@@ -494,7 +519,7 @@ async fn upload(State(relay): State<Arc<Relay>>, headers: HeaderMap, body: Bytes
             .and_then(|v| v.to_str().ok())
             .unwrap_or("application/octet-stream"),
     );
-    // BUD-02: 201 for a newly stored blob, 200 when it already exists.
+    // BUD-02/05: 201 for a newly stored blob, 200 when it already exists.
     let existed = state.store.find(&sha).await.is_some();
     match state.store.put(&pubkey, &sha, &body, &mime).await {
         Ok(desc) => {
@@ -523,6 +548,53 @@ async fn upload(State(relay): State<Arc<Relay>>, headers: HeaderMap, body: Bytes
             &format!("storage error: {e}"),
         ),
     }
+}
+
+/// `HEAD /media` — BUD-05/BUD-06 pre-flight: whether a `PUT /media` would
+/// be accepted, based on the `X-SHA-256`, `X-Content-Type` and
+/// `X-Content-Length` headers alone.
+async fn head_media(State(relay): State<Arc<Relay>>, headers: HeaderMap) -> Response {
+    let Some(state) = state_of(&relay).await else {
+        return error(StatusCode::SERVICE_UNAVAILABLE, "blossom not initialized");
+    };
+    // `X-SHA-256` is required: it is the only source of the blob hash
+    // without a body.
+    let Some(x_sha) = headers.get("x-sha-256").and_then(|v| v.to_str().ok()) else {
+        return error(StatusCode::BAD_REQUEST, "missing X-SHA-256 header");
+    };
+    let x_sha = x_sha.trim().to_ascii_lowercase();
+    if x_sha.len() != 64 || hex::decode(&x_sha).is_err() {
+        return error(StatusCode::BAD_REQUEST, "malformed X-SHA-256 header");
+    }
+    // `X-Content-Length` is required and bounded by the upload ceiling.
+    let Some(len) = headers
+        .get("x-content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+    else {
+        return error(
+            StatusCode::LENGTH_REQUIRED,
+            "missing X-Content-Length header",
+        );
+    };
+    let max_upload = relay.config.read().await.blossom.max_upload_bytes as u64;
+    if len > max_upload {
+        return error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "the media exceeds the configured size limit",
+        );
+    }
+    // BUD-11: media tokens carry `t=media` and an `x` tag matching the hash.
+    let Some(pubkey) = verify_auth(&relay, &state, &headers, "media", Some(&x_sha)).await else {
+        return error(StatusCode::UNAUTHORIZED, "invalid or missing authorization");
+    };
+    if upload_allowed(&relay, &pubkey).await.is_err() {
+        return error(
+            StatusCode::FORBIDDEN,
+            "uploads are restricted to the configured allowlist",
+        );
+    }
+    StatusCode::OK.into_response()
 }
 
 /// `GET /list/<pubkey>` — blobs uploaded by a pubkey (hex), sorted by
@@ -969,6 +1041,7 @@ mod tests {
     fn blossom_path_detection() {
         assert!(!is_blossom_path("/"));
         assert!(is_blossom_path("/upload"));
+        assert!(is_blossom_path("/media"));
         assert!(is_blossom_path(&format!("/list/{}", "aa".repeat(32))));
         assert!(is_blossom_path(&format!("/{}.jpg", "a".repeat(64))));
         assert!(is_blossom_path(&format!("/{}", "a".repeat(64))));
