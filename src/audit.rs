@@ -52,7 +52,10 @@ impl AuditLog {
     /// and once per window a single summary line reports how many entries
     /// were suppressed.
     pub(crate) fn log(&self, entry: String) {
-        let mut state = self.state.lock().unwrap();
+        // A poisoned mutex (a thread panicked while holding it) must not
+        // take the audit log down: the state is still valid, so the
+        // guard is recovered with `into_inner`.
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let now = unix_now();
         if now.saturating_sub(state.window_start) >= WINDOW_SECS {
             if state.suppressed > 0 {
@@ -81,13 +84,23 @@ impl AuditLog {
     /// The recent audit entries (oldest first), for tests.
     #[cfg(test)]
     pub(crate) fn recent(&self) -> Vec<String> {
-        self.state.lock().unwrap().recent.iter().cloned().collect()
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .recent
+            .iter()
+            .cloned()
+            .collect()
     }
 
     /// Clears the ring (tests).
     #[cfg(test)]
     pub(crate) fn clear(&self) {
-        self.state.lock().unwrap().recent.clear();
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .recent
+            .clear();
     }
 }
 
@@ -106,6 +119,24 @@ mod tests {
         assert_eq!(recent.len(), RING_CAP);
         assert_eq!(recent[0], format!("op {}", 5));
         assert_eq!(recent[RING_CAP - 1], format!("op {}", RING_CAP + 4));
+    }
+
+    #[test]
+    fn audit_log_recovers_from_poisoned_mutex() {
+        let audit = std::sync::Arc::new(AuditLog::default());
+        audit.clear();
+        let audit_for_thread = std::sync::Arc::clone(&audit);
+        let handle = std::thread::spawn(move || {
+            let _g = audit_for_thread.state.lock().unwrap();
+            panic!("poison");
+        });
+        handle.join().unwrap_err();
+        audit.log("after poison".into());
+        assert_eq!(
+            audit.recent(),
+            vec!["after poison".to_string()],
+            "the audit log must recover and record"
+        );
     }
 
     #[test]

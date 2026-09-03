@@ -22,14 +22,22 @@ struct Logger {
 
 impl log::Log for Logger {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
+        // A poisoned mutex (a thread panicked while holding it) must not
+        // take the logging down with it: the inner state is still valid,
+        // so the guard is recovered with `into_inner`.
         self.inner
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             .is_none_or(|l| l.enabled(metadata))
     }
     fn log(&self, record: &log::Record) {
-        if let Some(l) = self.inner.lock().unwrap().as_ref() {
+        if let Some(l) = self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
             l.log(record);
         } else {
             // No backend installed yet (before config load): write to stderr.
@@ -37,7 +45,12 @@ impl log::Log for Logger {
         }
     }
     fn flush(&self) {
-        if let Some(l) = self.inner.lock().unwrap().as_ref() {
+        if let Some(l) = self
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
             l.flush();
         }
     }
@@ -61,7 +74,7 @@ pub fn init() {
 /// Installs a rotating file backend (used in daemon mode).
 pub fn install_file_logger(path: PathBuf, max_size: u64, max_files: u32) -> std::io::Result<()> {
     let logger = FileLogger::open(path, max_size, max_files)?;
-    let mut inner = LOGGER.inner.lock().unwrap();
+    let mut inner = LOGGER.inner.lock().unwrap_or_else(|e| e.into_inner());
     *inner = Some(Box::new(logger));
     Ok(())
 }
@@ -142,7 +155,7 @@ impl log::Log for FileLogger {
     }
     fn log(&self, record: &log::Record) {
         let line = format_record(record);
-        let mut state = self.inner.lock().unwrap();
+        let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let written = state
             .file
             .write_all(line.as_bytes())
@@ -153,9 +166,8 @@ impl log::Log for FileLogger {
         }
     }
     fn flush(&self) {
-        if let Ok(mut state) = self.inner.lock() {
-            let _ = state.file.flush();
-        }
+        let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = state.file.flush();
     }
 }
 
@@ -207,6 +219,56 @@ pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use log::Log;
+
+    #[test]
+    fn poison_then_log_recovers() {
+        // A thread panicking while holding the logger's mutex must not
+        // take logging down: the guard is recovered with `into_inner`.
+        let handle = std::thread::spawn(|| {
+            let _g = LOGGER.inner.lock().unwrap();
+            panic!("poison");
+        });
+        handle.join().unwrap_err();
+        let record = log::Record::builder()
+            .args(format_args!("poison test"))
+            .level(log::Level::Info)
+            .build();
+        LOGGER.log(&record);
+        LOGGER.flush();
+        assert!(LOGGER.enabled(record.metadata()));
+    }
+
+    #[test]
+    fn file_logger_recovers_from_poisoned_mutex() {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join("nostrd-log-poison-test")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("relay.log");
+        let logger = std::sync::Arc::new(FileLogger::open(path.clone(), 1 << 20, 4).unwrap());
+        let logger_for_thread = std::sync::Arc::clone(&logger);
+        let handle = std::thread::spawn(move || {
+            let _g = logger_for_thread.inner.lock().unwrap();
+            panic!("poison");
+        });
+        handle.join().unwrap_err();
+        let record = log::Record::builder()
+            .args(format_args!("after poison"))
+            .level(log::Level::Info)
+            .build();
+        logger.log(&record);
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("after poison"),
+            "the record must still be written after the poison"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn utc_format_is_stable() {
