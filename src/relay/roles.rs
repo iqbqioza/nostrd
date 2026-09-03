@@ -30,15 +30,19 @@ impl super::Relay {
         }
     }
 
-    /// Signs, stores and broadcasts a relay-generated event.
-    async fn publish_relay_event(&self, mut event: Event) {
-        let _ = self.store_relay_event(&mut event).await;
+    /// Signs, stores and broadcasts a relay-generated event. Returns
+    /// whether the event actually landed in the database: the RPC-facing
+    /// role methods must not report success when the persistence failed
+    /// (a success would leave the operator with an in-memory-only change
+    /// that silently disappears on the next restart).
+    async fn publish_relay_event(&self, mut event: Event) -> bool {
+        self.store_relay_event(&mut event).await
     }
 
     /// Publishes the current membership list and an add/remove user event.
-    pub(crate) async fn publish_membership(&self, change: Option<(bool, String)>) {
+    pub(crate) async fn publish_membership(&self, change: Option<(bool, String)>) -> bool {
         let Some(relay_pubkey) = self.relay_pubkey() else {
-            return;
+            return false;
         };
         // Stamped with the monotonic clock so concurrent changes cannot
         // collide on a timestamp (see `StampClock`).
@@ -59,9 +63,11 @@ impl super::Relay {
             }
             events
         };
+        let mut all_stored = true;
         for event in events {
-            self.publish_relay_event(event).await;
+            all_stored &= self.publish_relay_event(event).await;
         }
+        all_stored
     }
 
     /// NIP-43 role management, used by the NIP-86 RPC methods.
@@ -84,8 +90,7 @@ impl super::Relay {
             roles.create(id, label, description, color, order);
             roles.role_event(id, &relay_pubkey, self.stamp_floor(unix_now()))
         };
-        self.publish_relay_event(event).await;
-        true
+        self.publish_relay_event(event).await
     }
 
     /// NIP-86 `editrole`: updates an *existing* role. A typo'd or missing id
@@ -117,15 +122,22 @@ impl super::Relay {
             // Publish a tombstone `kind:33534` so the deletion survives the
             // restart rebuild (the rebuild skips `["deleted"]` tombstones);
             // then republish the membership list without the deleted role.
+            // A failed tombstone save reports false: without it the role
+            // would be resurrected by the rebuild after a restart (the
+            // operator can re-create and re-delete to retry).
             let relay_pubkey = self.relay_pubkey().unwrap_or_default();
             let event = {
                 let roles = self.roles.read().await;
                 roles.role_deletion_event(id, &relay_pubkey, self.stamp_floor(unix_now()))
             };
-            self.publish_relay_event(event).await;
-            self.publish_membership(None).await;
+            let stored = self.publish_relay_event(event).await;
+            if stored {
+                self.publish_membership(None).await;
+            }
+            stored
+        } else {
+            false
         }
-        removed
     }
 
     pub async fn assign_role(&self, pubkey: &str, role: &str) -> bool {
@@ -135,9 +147,10 @@ impl super::Relay {
         let assigned = self.roles.write().await.assign(pubkey, role);
         if assigned {
             self.publish_membership(Some((true, pubkey.to_string())))
-                .await;
+                .await
+        } else {
+            false
         }
-        assigned
     }
 
     pub async fn unassign_role(&self, pubkey: &str, role: &str) -> bool {
@@ -147,9 +160,10 @@ impl super::Relay {
         let changed = self.roles.write().await.unassign(pubkey, role);
         if changed {
             self.publish_membership(Some((false, pubkey.to_string())))
-                .await;
+                .await
+        } else {
+            false
         }
-        changed
     }
 
     /// NIP-43 leave request: removes the user from the member list and
@@ -157,7 +171,8 @@ impl super::Relay {
     pub(crate) async fn apply_leave_request(&self, event: &Event) {
         let removed = self.roles.write().await.remove_pubkey(&event.pubkey);
         if removed {
-            self.publish_membership(Some((false, event.pubkey.clone())))
+            let _ = self
+                .publish_membership(Some((false, event.pubkey.clone())))
                 .await;
         }
     }
