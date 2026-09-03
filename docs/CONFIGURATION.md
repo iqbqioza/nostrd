@@ -193,6 +193,7 @@ Every key is optional; a missing key uses the default shown below.
 | `http_read_timeout_secs` | integer | `30` | Seconds to deliver a complete HTTP request head before the connection is closed (`0` = disabled; slow-loris defense — applies to WebSocket upgrades too) |
 | `max_conn_per_sec_per_ip` | integer | `0` | Max new connections per second per source IP (`0` = unlimited) |
 | `max_events_per_min_per_pubkey` | integer | `0` | Max events a pubkey may publish per minute (`0` = unlimited) |
+| `max_req_response_bytes` | integer | `33554432` | Byte budget for one REQ response (`0` = unlimited); beyond it the subscription is closed with `CLOSED` |
 
 ### Subscriptions and queries
 
@@ -259,7 +260,9 @@ Every key is optional; a missing key uses the default shown below.
 
 **`buffer_size`** — The initial read/write buffer size per connection (bytes). It grows on demand; a small value keeps hundreds of thousands of idle connections cheap.
 
-**`max_out_queue_bytes`** — The per-connection cap on queued outgoing bytes, protecting memory against slow readers. REQ responses and EOSE bypass it (they are one-shot — dropping them would lose data permanently); live traffic is dropped when full (recoverable by re-subscribing).
+**`max_out_queue_bytes`** — The per-connection cap on queued outgoing bytes, protecting memory against slow readers. REQ responses are pumped through the queue in bounded chunks (see `max_req_response_bytes`), so they cannot pin more than the cap either; EOSE and CLOSED messages are tiny and take the uncapped path. Live traffic is dropped when full (recoverable by re-subscribing).
+
+**`max_req_response_bytes`** — Byte budget for a single REQ response (the stored events delivered for one subscription). The response is pumped into the capped outgoing queue in chunks as the socket drains; when the budget is exceeded the subscription is closed with `CLOSED ... blocked: response too large; narrow the filter or paginate` and the client can re-request with a narrower filter. `0` disables the budget. A connection may queue at most four pending responses; older ones are cut off with their EOSE.
 
 **`ws_idle_timeout_secs`** — Connections with no inbound frames for this long are closed. While enabled, the relay also sends periodic WebSocket PINGs: healthy clients answer with a PONG (an inbound frame, which resets the timer) and stay connected; dead peers are reaped. `0` = disabled (no timeout, no pings).
 
@@ -601,6 +604,7 @@ api_max_search_bytes = 1024
 http_read_timeout_secs = 30
 max_conn_per_sec_per_ip = 0
 max_events_per_min_per_pubkey = 0
+max_req_response_bytes = 33554432
 live_batch_interval_ms = 10
 live_batch_size = 64
 live_buffer = 65536

@@ -257,6 +257,11 @@ pub struct LimitsConfig {
     /// Spam defense: a pubkey may publish at most this many events per
     /// minute (a sliding 60-second window). 0 disables the check.
     pub max_events_per_min_per_pubkey: u64,
+    /// Byte budget for a single REQ response (the stored events delivered
+    /// for one subscription). Responses larger than this are cut off with
+    /// a `CLOSED ... response too large` reply so a slow reader cannot
+    /// pin unbounded memory; 0 disables the budget.
+    pub max_req_response_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -374,6 +379,7 @@ impl Default for LimitsConfig {
             http_read_timeout_secs: 30,
             max_conn_per_sec_per_ip: 0,
             max_events_per_min_per_pubkey: 0,
+            max_req_response_bytes: 32 * 1024 * 1024,
         }
     }
 }
@@ -1170,6 +1176,7 @@ fn known_config_keys() -> &'static [(&'static str, &'static [&'static str])] {
                 "http_read_timeout_secs",
                 "max_conn_per_sec_per_ip",
                 "max_events_per_min_per_pubkey",
+                "max_req_response_bytes",
             ],
         ),
         (
@@ -1330,6 +1337,7 @@ mod tests {
         assert_eq!(cfg.limits.http_read_timeout_secs, 30);
         assert_eq!(cfg.limits.max_conn_per_sec_per_ip, 0);
         assert_eq!(cfg.limits.max_events_per_min_per_pubkey, 0);
+        assert_eq!(cfg.limits.max_req_response_bytes, 32 * 1024 * 1024);
         // The written default file loads back with the same values.
         let dir = std::env::temp_dir().join("nostrd-config-limits-test");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1341,6 +1349,7 @@ mod tests {
         assert_eq!(loaded.limits.http_read_timeout_secs, 30);
         assert_eq!(loaded.limits.max_conn_per_sec_per_ip, 0);
         assert_eq!(loaded.limits.max_events_per_min_per_pubkey, 0);
+        assert_eq!(loaded.limits.max_req_response_bytes, 32 * 1024 * 1024);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

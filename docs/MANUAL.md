@@ -177,6 +177,7 @@ To generate a secret key, use the `nostrd genkey` command (see [5. Command Refer
 | `http_read_timeout_secs` | Seconds to complete an HTTP request head (0 = disabled; slow-loris defense, applies to WS upgrades too) | `30` |
 | `max_conn_per_sec_per_ip` | Max new connections per second per source IP (0 = unlimited) | `0` |
 | `max_events_per_min_per_pubkey` | Max events a pubkey may publish per minute (0 = unlimited) | `0` |
+| `max_req_response_bytes` | Byte budget for one REQ response (0 = unlimited; over it the subscription is closed with `CLOSED`) | `33554432` (32 MiB) |
 | `db_queue_msgs` / `db_queue_events` | Overload protection when the DB queue backs up | `4096` / `262144` |
 | `max_sub_bytes` | Total subscription filter bytes per connection | `524288` |
 | `group_late_publish_secs` | Reject NIP-29 group events older than this (0 = off) | `604800` (7 days) |

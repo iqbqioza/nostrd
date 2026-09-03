@@ -271,6 +271,13 @@ ws_idle_timeout_secs = 300
 # 0 disables the check.
 max_events_per_min_per_pubkey = 0
 
+# Byte budget for a single REQ response: the stored events are pumped to the
+# socket in bounded chunks as it drains, so a slow reader cannot pin more
+# than max_out_queue_bytes in the queue — or more than this budget per
+# response. Beyond the budget the subscription is closed with
+# `CLOSED ... response too large`. 0 disables the budget.
+max_req_response_bytes = 33554432
+
 # Overload protection: when the database thread's queue holds more than this
 # many pending messages (or db_queue_events pending events), new database
 # requests fail fast instead of accumulating in memory. Keeps the relay up
