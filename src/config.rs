@@ -245,6 +245,18 @@ pub struct LimitsConfig {
     /// Bounded queue for events waiting to be broadcast live; messages are
     /// dropped (never stored) when it overflows.
     pub live_buffer: usize,
+    /// HTTP/1.1 header read timeout in seconds: a connection that does not
+    /// deliver a complete request head within this window is closed
+    /// (slow-loris defense). Applies to every HTTP connection, WebSocket
+    /// upgrades included.
+    pub http_read_timeout_secs: u64,
+    /// Per-IP cap on new connections per second (all protocols). A host
+    /// opening sockets faster than this is refused until the window slides.
+    /// 0 disables the check.
+    pub max_conn_per_sec_per_ip: u64,
+    /// Spam defense: a pubkey may publish at most this many events per
+    /// minute (a sliding 60-second window). 0 disables the check.
+    pub max_events_per_min_per_pubkey: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -329,7 +341,7 @@ impl Default for LimitsConfig {
     fn default() -> Self {
         LimitsConfig {
             max_connections: 10_000,
-            max_connections_per_ip: 0,
+            max_connections_per_ip: 64,
             max_ws_message_size: 1 << 20,
             max_filters: 20,
             max_subscriptions: 20,
@@ -347,7 +359,7 @@ impl Default for LimitsConfig {
             db_request_timeout_secs: 30,
             new_pubkey_min_age_secs: 0,
             max_out_queue_bytes: 256 * 1024,
-            ws_idle_timeout_secs: 0,
+            ws_idle_timeout_secs: 300,
             db_queue_msgs: 4_096,
             db_queue_events: 262_144,
             max_sub_bytes: 512 * 1024,
@@ -359,6 +371,9 @@ impl Default for LimitsConfig {
             api_max_limit: 500,
             api_max_offset: 10_000,
             api_max_search_bytes: 1_024,
+            http_read_timeout_secs: 30,
+            max_conn_per_sec_per_ip: 0,
+            max_events_per_min_per_pubkey: 0,
         }
     }
 }
@@ -1068,11 +1083,13 @@ pub(crate) fn write_text_atomic(path: &Path, text: &str) -> std::io::Result<()> 
 /// start with the default value). Implemented as a warning rather than a
 /// hard error because older config files legitimately carry keys the schema
 /// dropped (e.g. `software`/`version`).
-fn warn_unknown_fields(raw: &str) {
-    let Ok(value) = raw.parse::<toml::Value>() else {
-        return;
-    };
-    let known: &[(&str, &[&str])] = &[
+/// The known config keys per section, used by [`warn_unknown_fields`] to
+/// flag typos. A section or key missing from this list makes `nostrd check`
+/// (and every start) warn about perfectly valid settings — the list must
+/// cover every serializable field (enforced by the
+/// `known_keys_cover_every_serialized_field` test).
+fn known_config_keys() -> &'static [(&'static str, &'static [&'static str])] {
+    &[
         // `software`/`version` were part of the older config template and
         // are recognized (and ignored) so operators upgrading from it are
         // not warned about them on every start.
@@ -1150,6 +1167,9 @@ fn warn_unknown_fields(raw: &str) {
                 "live_batch_interval_ms",
                 "live_batch_size",
                 "live_buffer",
+                "http_read_timeout_secs",
+                "max_conn_per_sec_per_ip",
+                "max_events_per_min_per_pubkey",
             ],
         ),
         (
@@ -1199,7 +1219,14 @@ fn warn_unknown_fields(raw: &str) {
                 "restrict_uploads",
             ],
         ),
-    ];
+    ]
+}
+
+fn warn_unknown_fields(raw: &str) {
+    let Ok(value) = raw.parse::<toml::Value>() else {
+        return;
+    };
+    let known = known_config_keys();
     let Some(table) = value.as_table() else {
         return;
     };
@@ -1233,6 +1260,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn known_keys_cover_every_serialized_field() {
+        // The `warn_unknown_fields` list must cover every serializable
+        // config field, or `nostrd check` (and every start) warns about
+        // perfectly valid settings. Serialize the default config and
+        // cross-check every emitted section and key against the list.
+        let cfg = Config::default();
+        let raw = toml::to_string(&cfg).unwrap();
+        let value: toml::Value = raw.parse().unwrap();
+        let known = known_config_keys();
+        for (section, keys) in known {
+            let Some(table) = value.get(*section).and_then(toml::Value::as_table) else {
+                continue;
+            };
+            for key in table.keys() {
+                assert!(
+                    keys.contains(&key.as_str()),
+                    "config key [{section}].{key} is missing from the known-keys list"
+                );
+            }
+        }
+        for section in value.as_table().unwrap().keys() {
+            assert!(
+                known.iter().any(|(s, _)| s == section),
+                "config section [{section}] is missing from the known-keys list"
+            );
+        }
+    }
+
+    #[test]
     fn blossom_allowlist_pubkey_validation() {
         assert!(is_pubkey_or_npub(&"a".repeat(64)));
         assert!(is_pubkey_or_npub(
@@ -1261,6 +1317,30 @@ mod tests {
             "relative blossom path resolves against the config directory"
         );
         assert_eq!(cfg.database.path, dir.join("data"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn limits_defaults_are_safe_and_roundtrip() {
+        // The hardened defaults: a per-IP connection cap and an idle
+        // timeout are on, and the new rate limits default to off (opt-in).
+        let cfg = Config::default();
+        assert_eq!(cfg.limits.max_connections_per_ip, 64);
+        assert_eq!(cfg.limits.ws_idle_timeout_secs, 300);
+        assert_eq!(cfg.limits.http_read_timeout_secs, 30);
+        assert_eq!(cfg.limits.max_conn_per_sec_per_ip, 0);
+        assert_eq!(cfg.limits.max_events_per_min_per_pubkey, 0);
+        // The written default file loads back with the same values.
+        let dir = std::env::temp_dir().join("nostrd-config-limits-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nostrd.toml");
+        Config::write_default(&path).unwrap();
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.limits.max_connections_per_ip, 64);
+        assert_eq!(loaded.limits.ws_idle_timeout_secs, 300);
+        assert_eq!(loaded.limits.http_read_timeout_secs, 30);
+        assert_eq!(loaded.limits.max_conn_per_sec_per_ip, 0);
+        assert_eq!(loaded.limits.max_events_per_min_per_pubkey, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

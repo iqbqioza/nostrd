@@ -185,11 +185,14 @@ Every key is optional; a missing key uses the default shown below.
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `max_connections` | integer | `10000` | Maximum concurrent connections (must be ≥ 1) |
-| `max_connections_per_ip` | integer | `0` | Max connections per source IP (`0` = no per-IP cap) |
+| `max_connections_per_ip` | integer | `64` | Max connections per source IP (`0` = no per-IP cap) |
 | `max_ws_message_size` | integer | `1048576` | Max bytes per WebSocket message/frame |
 | `buffer_size` | integer | `2048` | Initial per-connection buffer size (bytes) |
 | `max_out_queue_bytes` | integer | `262144` | Per-connection outgoing queue cap (bytes) |
-| `ws_idle_timeout_secs` | integer | `0` | Close idle connections after this long (`0` = never) |
+| `ws_idle_timeout_secs` | integer | `300` | Close idle connections after this long (`0` = never) |
+| `http_read_timeout_secs` | integer | `30` | Seconds to deliver a complete HTTP request head before the connection is closed (`0` = disabled; slow-loris defense — applies to WebSocket upgrades too) |
+| `max_conn_per_sec_per_ip` | integer | `0` | Max new connections per second per source IP (`0` = unlimited) |
+| `max_events_per_min_per_pubkey` | integer | `0` | Max events a pubkey may publish per minute (`0` = unlimited) |
 
 ### Subscriptions and queries
 
@@ -248,7 +251,7 @@ Every key is optional; a missing key uses the default shown below.
 
 ### Key details
 
-**`max_connections`** — The total number of concurrent WebSocket connections. New connections beyond this are rejected at the socket level. Must be ≥ 1.
+**`max_connections`** — The total number of concurrent connections (WebSocket and HTTP). New connections beyond this are refused at the socket level. Must be ≥ 1.
 
 **`max_connections_per_ip`** — The number of simultaneous connections allowed from a single source IP. Prevents one host from consuming the whole connection budget. `0` = unlimited.
 
@@ -259,6 +262,12 @@ Every key is optional; a missing key uses the default shown below.
 **`max_out_queue_bytes`** — The per-connection cap on queued outgoing bytes, protecting memory against slow readers. REQ responses and EOSE bypass it (they are one-shot — dropping them would lose data permanently); live traffic is dropped when full (recoverable by re-subscribing).
 
 **`ws_idle_timeout_secs`** — Connections with no inbound frames for this long are closed. While enabled, the relay also sends periodic WebSocket PINGs: healthy clients answer with a PONG (an inbound frame, which resets the timer) and stay connected; dead peers are reaped. `0` = disabled (no timeout, no pings).
+
+**`http_read_timeout_secs`** — Seconds a connection has to deliver a complete HTTP request head (the request line and headers) before it is closed. This closes slow-loris sockets that trickle bytes without ever completing a request — the attack would otherwise pin file descriptors and memory. Applies to every HTTP connection, WebSocket upgrades included (an upgrade request is a normal HTTP request head). `0` disables the timeout.
+
+**`max_conn_per_sec_per_ip`** — Maximum number of new connections a single source IP may open per second (sliding window). Sockets beyond the window are refused immediately. `0` = unlimited.
+
+**`max_events_per_min_per_pubkey`** — A pubkey may publish at most this many events per minute (sliding 60-second window); the excess is rejected with `rate-limited: too many events`. The window is bounded at 10,000 tracked pubkeys (the map is cleared, never grown). `0` = unlimited.
 
 **`max_filters`** — The maximum number of filters a single REQ (or COUNT) may carry. Violations get a `CLOSED ... too many filters` reply. This also bounds scanning work per REQ.
 
@@ -518,9 +527,9 @@ Editing the file and sending `kill -HUP $(cat nostrd.pid)` reloads it **without 
 | Applies on SIGHUP | Requires `nostrd restart` |
 | --- | --- |
 | `relay.name`, `description`, `pubkey`, `contact`, `icon`, `post_policy`, `public_url`, `relay.reject_ephemeral`, `relay.enable_git` | `relay.private_key` |
-| most of `[limits]` | `relay.livekit_*`, `relay.enabled_nips` / `disabled_nips` |
+| most of `[limits]` (not the three below) | `relay.livekit_*`, `relay.enabled_nips` / `disabled_nips` |
 | NIP-40 on/off, API concurrency | `server.host`, `server.port`, `server.api_host`, `server.ws_paths`, `server.management_port`, `server.management_host`, `server.metrics_enabled` |
-| — | `database.path`, `database.purge_interval_secs`, `daemon.log_max_size_bytes`, `log_max_files`, `stats_interval_secs`, `db_request_timeout_secs`, `db_queue_msgs`, `db_queue_events`, `max_indexed_words`, `live_buffer`, `live_batch_size`, `live_batch_interval_ms`, `blossom.host`, `blossom.storage`, `blossom.local_path`, `blossom.max_upload_bytes`, `blossom.s3_*` |
+| — | `database.path`, `database.purge_interval_secs`, `daemon.log_max_size_bytes`, `log_max_files`, `stats_interval_secs`, `db_request_timeout_secs`, `db_queue_msgs`, `db_queue_events`, `max_indexed_words`, `live_buffer`, `live_batch_size`, `live_batch_interval_ms`, `max_connections`, `http_read_timeout_secs`, `max_conn_per_sec_per_ip`, `blossom.host`, `blossom.storage`, `blossom.local_path`, `blossom.max_upload_bytes`, `blossom.s3_*` |
 
 `[access]` is **not** applied by a reload: the access lists are seeded once at startup and then managed at runtime via NIP-86.
 
@@ -562,7 +571,7 @@ metrics_enabled = true
 
 [limits]
 max_connections = 10000
-max_connections_per_ip = 0
+max_connections_per_ip = 64
 max_ws_message_size = 1048576
 max_filters = 20
 max_subscriptions = 20
@@ -580,7 +589,7 @@ neg_max_items = 100000
 db_request_timeout_secs = 30
 new_pubkey_min_age_secs = 0
 max_out_queue_bytes = 262144
-ws_idle_timeout_secs = 0
+ws_idle_timeout_secs = 300
 db_queue_msgs = 4096
 db_queue_events = 262144
 max_sub_bytes = 524288
@@ -589,6 +598,9 @@ api_max_concurrent = 32
 api_max_limit = 500
 api_max_offset = 10000
 api_max_search_bytes = 1024
+http_read_timeout_secs = 30
+max_conn_per_sec_per_ip = 0
+max_events_per_min_per_pubkey = 0
 live_batch_interval_ms = 10
 live_batch_size = 64
 live_buffer = 65536

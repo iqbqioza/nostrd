@@ -25,7 +25,7 @@
 
 nostrd is designed around two goals:
 
-- **Never go down.** Overload protection, a dedicated reader thread, panic containment and strict resource bounds keep the relay serving even under sustained abuse, a stalled disk or a memory-constrained host.
+- **Never go down.** Overload protection, a dedicated reader thread, panic containment and strict resource bounds keep the relay serving even under sustained abuse, a stalled disk or a memory-constrained host. The HTTP layer is hardened too: a connection cap that also covers plain HTTP, a header-read timeout that closes slow-loris sockets, per-IP connection-rate limiting, and optional per-pubkey publish rate limits.
 - **Spec-complete.** All relay-side NIPs are implemented and verified against the official specifications (file-storage NIPs excluded by design, except Blossom via the dedicated file server).
 
 ## Table of contents
@@ -260,7 +260,7 @@ nostrd blossom list
 
 All commands accept `--config <path>` (default `./nostrd.toml`).
 
-Sending `SIGHUP` to the daemon reloads the configuration at runtime: most limits, server auth settings, the NIP toggles (including the NIP-40 toggle, applied live) and the REST API concurrency ceiling apply immediately. A few settings are captured at startup and require a full restart — the log warns when one of them changed: `server.host`, `server.port`, `server.api_host`, `server.ws_paths`, `server.management_port`, `server.management_host`, `server.metrics_enabled`, `database.path`, `database.purge_interval_secs`, `relay.private_key` (a reload warns that it is ignored), `relay.enabled_nips`/`disabled_nips`, `relay.livekit_*`, `blossom.host`/`storage`/`local_path`/`max_upload_bytes`/`s3_*`, `daemon.log_max_size_bytes`/`log_max_files`/`stats_interval_secs`, the database request timeouts/queue caps, `live_buffer`/`live_batch_size`/`live_batch_interval_ms` and `max_indexed_words`. An invalid reloaded file is rejected (the old configuration stays in force). The access control lists are runtime-managed (NIP-86) and are **not** overwritten by a reload.
+Sending `SIGHUP` to the daemon reloads the configuration at runtime: most limits, server auth settings, the NIP toggles (including the NIP-40 toggle, applied live) and the REST API concurrency ceiling apply immediately. A few settings are captured at startup and require a full restart — the log warns when one of them changed: `server.host`, `server.port`, `server.api_host`, `server.ws_paths`, `server.management_port`, `server.management_host`, `server.metrics_enabled`, `database.path`, `database.purge_interval_secs`, `relay.private_key` (a reload warns that it is ignored), `relay.enabled_nips`/`disabled_nips`, `relay.livekit_*`, `blossom.host`/`storage`/`local_path`/`max_upload_bytes`/`s3_*`, `daemon.log_max_size_bytes`/`log_max_files`/`stats_interval_secs`, the database request timeouts/queue caps, `live_buffer`/`live_batch_size`/`live_batch_interval_ms`, `max_indexed_words`, and the HTTP-layer limits `max_connections`/`http_read_timeout_secs`/`max_conn_per_sec_per_ip` (they shape the accept loop built at startup). An invalid reloaded file is rejected (the old configuration stays in force). The access control lists are runtime-managed (NIP-86) and are **not** overwritten by a reload.
 
 ## Configuration
 
@@ -270,7 +270,7 @@ Every setting is optional — missing entries fall back to the defaults, and `no
 | --- | --- |
 | `[relay]` | Identity, URLs (incl. `public_url` for NIP-42/62/98), `private_key`, LiveKit, NIP toggles |
 | `[server]` | Binding, `api_host` split, management API, authentication |
-| `[limits]` | All limits and overload protections (connections, events, search, API bounds) |
+| `[limits]` | All limits and overload protections (connections incl. the HTTP layer, per-IP and per-pubkey rate limits, events, search, API bounds) |
 | `[database]` | LMDB storage (paths, memory-map sizes, search index) |
 | `[daemon]` | PID/log/stats files and log rotation |
 | `[access]` | Initial access control lists (NIP-86 manages them at runtime) |

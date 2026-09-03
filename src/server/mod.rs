@@ -26,6 +26,7 @@ use tokio::net::TcpListener;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::watch;
 use tokio::time::{MissedTickBehavior, interval};
+use tower::util::ServiceExt;
 
 use crate::config::Config;
 use crate::db::DbClient;
@@ -378,26 +379,27 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
         shutdown_rx.clone(),
     )));
 
-    let main = axum::serve(
-        listener.tap_io(|stream| {
-            // Keep per-connection kernel buffers small so that hundreds of
-            // thousands of idle connections do not pin gigabytes of kernel
-            // memory (each buffer is a per-socket allocation); slow readers
-            // are throttled per-connection instead.
-            let _ = stream.set_nodelay(true);
-            // SAFETY: `setsockopt` only touches the socket's own buffers.
-            unsafe {
-                set_sock_opt(stream, libc::SO_RCVBUF, 32 * 1024);
-                set_sock_opt(stream, libc::SO_SNDBUF, 32 * 1024);
-            }
-        }),
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    let (header_timeout, max_connections, per_sec_per_ip) = {
+        let cfg = relay.config.read().await;
+        (
+            // 0 = disabled (the documented convention): hyper treats
+            // `Some(Duration::ZERO)` as an immediate timeout, so the
+            // config value is mapped to `None` here.
+            (cfg.limits.http_read_timeout_secs > 0)
+                .then(|| std::time::Duration::from_secs(cfg.limits.http_read_timeout_secs)),
+            cfg.limits.max_connections,
+            IpConnLimiter::new(cfg.limits.max_conn_per_sec_per_ip),
+        )
+    };
+    let _ = serve_limited(
+        listener,
+        app,
+        max_connections,
+        header_timeout,
+        per_sec_per_ip,
+        shutdown_rx,
     )
-    .with_graceful_shutdown(await_shutdown(shutdown_rx))
     .await;
-    if let Err(e) = main {
-        error!("relay server error: {e}");
-    }
 
     let _ = shutdown_tx.send(true);
     for task in tasks {
@@ -773,6 +775,181 @@ async fn purge_loop(relay: Arc<Relay>, mut shutdown: watch::Receiver<bool>) {
     }
 }
 
+/// Per-IP connection-rate limiter: a host may open at most
+/// `max_per_sec` connections per sliding second; excess sockets are
+/// refused immediately. Bounded at 10,000 tracked IPs (the map is
+/// cleared, not grown, when the bound is reached).
+struct IpConnLimiter {
+    max_per_sec: u64,
+    seen: std::sync::Mutex<
+        std::collections::HashMap<std::net::IpAddr, std::collections::VecDeque<u64>>,
+    >,
+}
+
+impl IpConnLimiter {
+    fn new(max_per_sec: u64) -> Option<Self> {
+        (max_per_sec > 0).then_some(IpConnLimiter {
+            max_per_sec,
+            seen: std::sync::Mutex::new(std::collections::HashMap::new()),
+        })
+    }
+
+    /// Whether a connection from `ip` may be accepted at `now`.
+    fn allow(&self, ip: std::net::IpAddr, now: u64) -> bool {
+        const MAX_TRACKED_IPS: usize = 10_000;
+        let mut seen = self.seen.lock().unwrap_or_else(|p| p.into_inner());
+        if seen.len() >= MAX_TRACKED_IPS {
+            seen.clear();
+        }
+        let window = seen.entry(ip).or_default();
+        while window.front().is_some_and(|t| now.saturating_sub(*t) >= 1) {
+            window.pop_front();
+        }
+        if window.len() >= self.max_per_sec as usize {
+            return false;
+        }
+        window.push_back(now);
+        true
+    }
+}
+
+/// Serves the main listener with the HTTP-layer hardening: a cap on
+/// concurrent connections (`limits.max_connections`, also enforced on
+/// plain HTTP and WebSocket upgrades), an optional per-IP connection rate
+/// limit, and an HTTP/1.1 header read timeout that closes slow-loris
+/// sockets that never complete a request head. On shutdown the accept
+/// loop stops, active connections get a graceful-shutdown signal, and
+/// stragglers are aborted after a bounded grace period.
+#[allow(clippy::too_many_arguments)]
+async fn serve_limited(
+    listener: tokio::net::TcpListener,
+    app: axum::Router,
+    max_connections: usize,
+    header_timeout: Option<std::time::Duration>,
+    per_sec_per_ip: Option<IpConnLimiter>,
+    mut shutdown: watch::Receiver<bool>,
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let active = Arc::new(AtomicUsize::new(0));
+    let (drain_tx, drain_rx) = watch::channel(());
+    // Connection task handles, used to abort stragglers at shutdown. The
+    // vector is pruned of finished handles above 1024 entries, so a
+    // long-running relay cannot grow it without bound.
+    let mut conn_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+    loop {
+        tokio::select! {
+            _ = shutdown.changed() => break,
+            accepted = listener.accept() => {
+                let Ok((stream, peer)) = accepted else {
+                    // An accept error (e.g. EMFILE with exhausted file
+                    // descriptors) would otherwise spin the loop hot; back
+                    // off briefly so the relay keeps serving existing
+                    // connections while the OS recovers.
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                };
+                // Per-IP connection rate limit (slow-loris / socket flood).
+                if let Some(limiter) = &per_sec_per_ip
+                    && !limiter.allow(peer.ip(), crate::util::unix_now())
+                {
+                    continue;
+                }
+                // Connection cap: refuse the socket outright at the cap so
+                // established-but-idle sockets cannot pin file descriptors.
+                if active.load(Ordering::Relaxed) >= max_connections {
+                    continue;
+                }
+                active.fetch_add(1, Ordering::Relaxed);
+
+                // Keep per-connection kernel buffers small so that hundreds
+                // of thousands of idle connections do not pin gigabytes of
+                // kernel memory (see the same tuning in `ws_handler`).
+                let _ = stream.set_nodelay(true);
+                unsafe {
+                    set_sock_opt(&stream, libc::SO_RCVBUF, 32 * 1024);
+                    set_sock_opt(&stream, libc::SO_SNDBUF, 32 * 1024);
+                }
+
+                let app = app.clone();
+                let active = Arc::clone(&active);
+                let mut drain_rx = drain_rx.clone();
+                let io = hyper_util::rt::TokioIo::new(stream);
+                // Inject the peer address as ConnectInfo (the axum
+                // `ConnectInfo` extractor reads this extension).
+                let svc = app.layer(axum::middleware::from_fn(
+                    move |mut req: axum::extract::Request,
+                          next: axum::middleware::Next| {
+                        let peer = peer;
+                        async move {
+                            req.extensions_mut()
+                                .insert(axum::extract::ConnectInfo(peer));
+                            next.run(req).await
+                        }
+                    },
+                ));
+                let hyper_service = hyper_util::service::TowerToHyperService::new(
+                    svc.map_request(|req: hyper::Request<hyper::body::Incoming>| {
+                        req.map(axum::body::Body::new)
+                    }),
+                );
+                conn_tasks.push(tokio::spawn(async move {
+                    let mut builder = hyper_util::server::conn::auto::Builder::new(
+                        hyper_util::rt::TokioExecutor::new(),
+                    );
+                    // Slow-loris defense: a connection must complete its
+                    // request head within the window or it is closed
+                    // (`None` disables the timeout — the config maps 0 to
+                    // None so the documented "0 = disabled" holds).
+                    builder
+                        .http1()
+                        .timer(hyper_util::rt::TokioTimer::new())
+                        .header_read_timeout(header_timeout);
+                    // CONNECT protocol needed for HTTP/2 websockets.
+                    builder.http2().enable_connect_protocol();
+                    let mut conn = std::pin::pin!(
+                        builder.serve_connection_with_upgrades(io, hyper_service)
+                    );
+                    tokio::select! {
+                        result = conn.as_mut() => {
+                            if let Err(e) = result {
+                                log::debug!("connection {peer} ended: {e}");
+                            }
+                        }
+                        _ = drain_rx.changed() => {
+                            conn.as_mut().graceful_shutdown();
+                            let _ = conn.as_mut().await;
+                        }
+                    }
+                    active.fetch_sub(1, Ordering::Relaxed);
+                }));
+                // Bound the handle vector: prune the finished tasks once
+                // it grows past 1024 entries (amortized constant work per
+                // accept; live tasks are never pruned).
+                if conn_tasks.len() > 1024 {
+                    conn_tasks.retain(|task| !task.is_finished());
+                }
+            }
+        }
+    }
+    // Graceful drain: signal every connection, wait a bounded grace, then
+    // abort the stragglers so shutdown never hangs on a stuck peer. The
+    // grace stays well under the CLI stop timeout (10 s), so a relay with
+    // long-lived WebSocket connections still stops in time.
+    let _ = drain_tx.send(());
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while active.load(Ordering::Relaxed) > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .ok();
+    for task in conn_tasks {
+        task.abort();
+    }
+}
+
 async fn signal_handler(shutdown: watch::Sender<bool>) {
     let mut terminate = match signal(SignalKind::terminate()) {
         Ok(s) => s,
@@ -954,6 +1131,20 @@ async fn reload_handler(
                                 old.limits.live_batch_interval_ms
                                     != new_config.limits.live_batch_interval_ms,
                             ),
+                            (
+                                "limits.max_connections",
+                                old.limits.max_connections != new_config.limits.max_connections,
+                            ),
+                            (
+                                "limits.http_read_timeout_secs",
+                                old.limits.http_read_timeout_secs
+                                    != new_config.limits.http_read_timeout_secs,
+                            ),
+                            (
+                                "limits.max_conn_per_sec_per_ip",
+                                old.limits.max_conn_per_sec_per_ip
+                                    != new_config.limits.max_conn_per_sec_per_ip,
+                            ),
                         ];
                         for (name, changed) in static_routes {
                             if changed {
@@ -995,6 +1186,235 @@ async fn reload_handler(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::SocketAddr;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::TcpStream;
+
+    fn test_app() -> axum::Router {
+        axum::Router::new().route("/", axum::routing::get(|| async { "ok" }))
+    }
+
+    async fn serve_limited_for_test(
+        max_connections: usize,
+        header_timeout: Option<Duration>,
+        per_sec: Option<IpConnLimiter>,
+    ) -> (SocketAddr, watch::Sender<bool>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = watch::channel(false);
+        let handle = tokio::spawn(serve_limited(
+            listener,
+            test_app(),
+            max_connections,
+            header_timeout,
+            per_sec,
+            rx,
+        ));
+        (addr, tx, handle)
+    }
+
+    /// Opens a keep-alive HTTP connection, sends `GET /`, and reads until
+    /// the response head (`200 OK`) arrives; the socket stays open so the
+    /// connection remains active on the server.
+    async fn http_keepalive(addr: SocketAddr) -> (TcpStream, Vec<u8>) {
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        s.write_all(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        let deadline = tokio::time::sleep(Duration::from_secs(5));
+        tokio::pin!(deadline);
+        while !String::from_utf8_lossy(&buf).contains("200 OK") {
+            tokio::select! {
+                n = s.read(&mut tmp) => {
+                    match n {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                    }
+                }
+                _ = &mut deadline => break,
+            }
+        }
+        (s, buf)
+    }
+
+    /// Reads the connection to EOF (the server closed it), returning the
+    /// bytes received.
+    async fn read_to_eof(mut s: TcpStream, timeout: Duration) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        let deadline = tokio::time::sleep(timeout);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                n = s.read(&mut tmp) => {
+                    match n {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => buf.extend_from_slice(&tmp[..n]),
+                    }
+                }
+                _ = &mut deadline => break,
+            }
+        }
+        buf
+    }
+
+    #[tokio::test]
+    async fn serve_limited_serves_http_and_applies_the_connection_cap() {
+        let (addr, tx, handle) =
+            serve_limited_for_test(1, Some(Duration::from_secs(30)), None).await;
+        // A normal request is served.
+        let (conn1, body) = http_keepalive(addr).await;
+        assert!(
+            String::from_utf8_lossy(&body).contains("200 OK"),
+            "the first connection must be served"
+        );
+        // With max_connections = 1 the second connection is dropped at the
+        // socket level: the TCP connect succeeds but the server refuses.
+        let refused = http_keepalive(addr).await;
+        assert!(
+            refused.1.is_empty(),
+            "the capped connection must be dropped without a response"
+        );
+        // Closing the first connection releases the slot.
+        drop(conn1);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let (conn3, body) = http_keepalive(addr).await;
+        assert!(
+            String::from_utf8_lossy(&body).contains("200 OK"),
+            "the slot must be released when the first connection closes"
+        );
+        drop(conn3);
+        tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_limited_applies_the_per_ip_rate_limit() {
+        let (addr, tx, handle) =
+            serve_limited_for_test(10, Some(Duration::from_secs(30)), IpConnLimiter::new(1)).await;
+        // The first connection of the second is accepted.
+        let (conn1, body) = http_keepalive(addr).await;
+        assert!(String::from_utf8_lossy(&body).contains("200 OK"));
+        // A second connection from the same IP within the same second is
+        // refused by the rate limiter.
+        let refused = http_keepalive(addr).await;
+        assert!(
+            refused.1.is_empty(),
+            "the rate-limited connection must be dropped"
+        );
+        // After the window slides, a new connection is accepted again.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let (conn3, body) = http_keepalive(addr).await;
+        assert!(
+            String::from_utf8_lossy(&body).contains("200 OK"),
+            "the window must slide open after one second"
+        );
+        drop(conn1);
+        drop(conn3);
+        tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_limited_closes_slow_loris_sockets() {
+        let (addr, tx, handle) =
+            serve_limited_for_test(10, Some(Duration::from_secs(2)), None).await;
+        // A connection that never completes its request head is closed
+        // after the header read timeout.
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        s.write_all(b"G").await.unwrap();
+        let started = std::time::Instant::now();
+        let got = read_to_eof(s, Duration::from_secs(10)).await;
+        assert!(
+            got.is_empty(),
+            "the slow-loris socket must be closed without a response"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(1500) && elapsed < Duration::from_secs(9),
+            "the timeout must fire near the configured 2s (took {elapsed:?})"
+        );
+        tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_limited_header_timeout_can_be_disabled() {
+        // `None` (the config maps `http_read_timeout_secs = 0` to `None`):
+        // a connection that never completes its request head stays open
+        // instead of being closed.
+        let (addr, tx, handle) = serve_limited_for_test(10, None, None).await;
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        s.write_all(b"G").await.unwrap();
+        let got = read_to_eof(s, Duration::from_millis(1500)).await;
+        assert!(
+            got.is_empty(),
+            "with the timeout disabled the socket must stay open"
+        );
+        // The socket is still usable: completing the request head gets a
+        // response (the connection was not reaped by the header timer).
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        s.write_all(b"GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let got = read_to_eof(s, Duration::from_secs(5)).await;
+        assert!(
+            String::from_utf8_lossy(&got).contains("200 OK"),
+            "a complete request must still be served"
+        );
+        tx.send(true).unwrap();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn serve_limited_drains_on_shutdown() {
+        let (addr, tx, handle) =
+            serve_limited_for_test(10, Some(Duration::from_secs(30)), None).await;
+        let (conn, body) = http_keepalive(addr).await;
+        assert!(String::from_utf8_lossy(&body).contains("200 OK"));
+        // Shutdown: the accept loop stops and active connections are
+        // gracefully closed.
+        tx.send(true).unwrap();
+        let got = read_to_eof(conn, Duration::from_secs(10)).await;
+        assert!(
+            got.is_empty() || String::from_utf8_lossy(&got).contains("200"),
+            "the active connection must be closed on shutdown"
+        );
+        handle.await.unwrap();
+    }
+
+    #[test]
+    fn ip_conn_limiter_windows_per_second() {
+        let limiter = IpConnLimiter::new(2).unwrap();
+        let ip: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+        let now = 1_700_000_000u64;
+        assert!(limiter.allow(ip, now));
+        assert!(limiter.allow(ip, now));
+        assert!(!limiter.allow(ip, now), "the third connection is refused");
+        // The window slides after one second.
+        assert!(limiter.allow(ip, now + 1));
+        // Another IP has its own window.
+        let other: std::net::IpAddr = "203.0.113.8".parse().unwrap();
+        assert!(limiter.allow(other, now));
+        // Disabled (0) returns no limiter.
+        assert!(IpConnLimiter::new(0).is_none());
+    }
+
+    #[test]
+    fn ip_conn_limiter_map_is_bounded() {
+        let limiter = IpConnLimiter::new(1).unwrap();
+        for i in 0..20_000u32 {
+            let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, (i >> 8) as u8, i as u8));
+            assert!(limiter.allow(ip, 1_700_000_000));
+        }
+        assert!(
+            limiter.seen.lock().unwrap().len() <= 10_000,
+            "the tracked-IP map must not exceed its bound"
+        );
+    }
 
     #[test]
     fn ws_paths_for_selects_endpoints() {

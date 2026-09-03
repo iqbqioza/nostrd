@@ -167,15 +167,15 @@ When using Cloudflare Tunnel:
 
 ### 2-6. New connections are refused under load
 
-**Cause**: `max_connections` (default 10000) was reached, or the per-IP cap (`max_connections_per_ip`) kicked in.
+**Cause**: `max_connections` (default 10000) was reached, the per-IP cap (`max_connections_per_ip`, default 64) kicked in, or the per-second connection rate limit (`max_conn_per_sec_per_ip`) refused the burst. The caps apply to every connection — WebSocket and plain HTTP alike.
 
-**Fix**: Review and adjust the settings. `max_connections_per_ip = 0` disables the per-IP cap (be careful about floods).
+**Fix**: Review and adjust the settings. `max_connections_per_ip = 0` disables the per-IP cap (be careful about floods); `max_conn_per_sec_per_ip = 0` disables the rate limit. These three settings require a restart.
 
 ### 2-7. Connections drop after a while
 
 **Cause**: If `ws_idle_timeout_secs` is set, idle connections are closed. Healthy clients answer the relay's PING with a PONG and stay connected; only dead peers are reaped.
 
-**Fix**: This is intentional. Set `ws_idle_timeout_secs = 0` to disable it.
+**Fix**: This is intentional — the default is `300` seconds (idle connections are reaped after 5 minutes). Set `ws_idle_timeout_secs = 0` to disable it entirely.
 
 ---
 
@@ -204,6 +204,7 @@ When publishing fails, the 4th element of the `OK` message explains why. The com
 | `duplicate: event already stored` | The same event is already stored (normal) |
 | `blocked: pubkey not allowed` | The pubkey is banned (`banpubkey`) or outside the allowlist |
 | `blocked: kind not allowed` | This kind is disallowed |
+| `rate-limited: too many events` | The pubkey exceeded `max_events_per_min_per_pubkey` (sliding 60-second window). Wait a minute and retry, or raise/disable the limit |
 | `blocked: event has been banned` | The event id is banned |
 | `blocked: event has been deleted` | Re-publishing a deleted event |
 | `invalid: event has expired` | The NIP-40 expiration has passed |

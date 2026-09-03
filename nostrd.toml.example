@@ -174,13 +174,23 @@ outbox_write_policy = "any"
 # Limits (anti-abuse and resource bounds)
 # -----------------------------------------------------------------------------
 [limits]
-# Maximum number of concurrent WebSocket connections.
+# Maximum number of concurrent connections (WebSocket and HTTP).
 max_connections = 10000
 
-# Per-source-IP cap on WebSocket connections: a single host cannot consume
-# the whole connection budget (a socket flood from one IP would otherwise
-# evict legitimate clients). 0 = no per-IP cap.
-max_connections_per_ip = 0
+# Per-source-IP cap on connections: a single host cannot consume the whole
+# connection budget (a socket flood from one IP would otherwise evict
+# legitimate clients). 0 = no per-IP cap.
+max_connections_per_ip = 64
+
+# Maximum number of new connections a single source IP may open per second
+# (sliding window; sockets beyond it are refused immediately). 0 = unlimited.
+max_conn_per_sec_per_ip = 0
+
+# Seconds a connection has to deliver a complete HTTP request head (the
+# request line and headers) before it is closed: closes slow-loris sockets
+# that trickle bytes without ever completing a request. Applies to WebSocket
+# upgrades too. Requires a restart to change.
+http_read_timeout_secs = 30
 
 # Maximum size in bytes of a single incoming WebSocket message.
 max_ws_message_size = 1048576
@@ -254,7 +264,12 @@ max_out_queue_bytes = 262144
 # alive-but-silent subscriber (which auto-answers with a PONG) keeps its slot
 # while dead peers are detected and reaped — otherwise a flood of idle
 # connections can exhaust max_connections. 0 disables the idle timeout.
-ws_idle_timeout_secs = 0
+ws_idle_timeout_secs = 300
+
+# Spam defense: a pubkey may publish at most this many events per minute
+# (sliding 60-second window; the excess gets `rate-limited: too many events`).
+# 0 disables the check.
+max_events_per_min_per_pubkey = 0
 
 # Overload protection: when the database thread's queue holds more than this
 # many pending messages (or db_queue_events pending events), new database
