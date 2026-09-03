@@ -134,7 +134,7 @@ Every key is optional; a missing key uses the default shown below.
 | --- | --- | --- | --- |
 | `host` | string | `"127.0.0.1"` | Bind address. `0.0.0.0` (or `::`) accepts connections from anywhere |
 | `port` | integer | `8080` | Port (1–65535). Port 80 requires root |
-| `api_host` | string | `""` | Hostname dedicated to the REST API |
+| `api_host` | string | `""` | Hostname dedicated to the REST API (must be a bare hostname — no scheme, port, path or whitespace; validated at `nostrd check`/startup) |
 | `management_port` | integer | `0` | Legacy management API port (`0` = disabled; must differ from `port`) |
 | `management_host` | string | `"127.0.0.1"` | Bind address of the management port |
 | `management_token` | string | `""` | Bearer token for the management APIs |
@@ -458,7 +458,7 @@ nostrd relay list                # show both lists and restrict_relay
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
-| `host` | string | `""` | Hostname dedicated to the Blossom server, e.g. `media.example.com`. Empty = the feature is disabled |
+| `host` | string | `""` | Hostname dedicated to the Blossom server, e.g. `media.example.com` (must be a bare hostname — no scheme, port, path or whitespace; validated at `nostrd check`/startup). Empty = the feature is disabled |
 | `storage` | string | `"local"` | Storage backend: `"local"` or `"s3"` (any S3-compatible service, including Cloudflare R2) |
 | `local_path` | string | `"./data/images"` | Local storage directory: `<local_path>/<npub1...>/<sha256>` |
 | `max_upload_bytes` | integer | `20971520` | Maximum accepted upload size (the `PUT /upload` body limit) |
