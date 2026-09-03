@@ -303,7 +303,9 @@ pub async fn rpc_handler(
                 audit!(&relay, &identity, "createrole", params);
                 rpc_ok(json!(true))
             } else {
-                rpc_err("restricted: NIP-43 is disabled or the relay key is not configured")
+                rpc_err(
+                    "restricted: NIP-43 is disabled, the relay key is missing or the event could not be stored",
+                )
             }
         }
         "editrole" => {
@@ -331,7 +333,9 @@ pub async fn rpc_handler(
                 audit!(&relay, &identity, "deleterole", params);
                 rpc_ok(json!(true))
             } else {
-                rpc_err("restricted: NIP-43 is disabled or the relay key is not configured")
+                rpc_err(
+                    "restricted: NIP-43 is disabled, the relay key is missing or the event could not be stored",
+                )
             }
         }
         "assignrole" => {
@@ -349,7 +353,7 @@ pub async fn rpc_handler(
                 rpc_ok(json!(true))
             } else {
                 rpc_err(
-                    "restricted: NIP-43 is disabled, the relay key is missing or the role does not exist",
+                    "restricted: NIP-43 is disabled, the relay key is missing, the role does not exist or the event could not be stored",
                 )
             }
         }
@@ -545,6 +549,12 @@ mod tests {
     /// A relay with `server.management_token` configured (the bearer
     /// token path, so the tests need no NIP-98 signing).
     async fn build_admin_relay() -> std::sync::Arc<Relay> {
+        build_admin_relay_with_key(None).await
+    }
+
+    /// Like [`Self::build_admin_relay`], with NIP-43 and a relay key when
+    /// `key` is given.
+    async fn build_admin_relay_with_key(key: Option<&str>) -> std::sync::Arc<Relay> {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = std::env::temp_dir()
@@ -554,6 +564,10 @@ mod tests {
         let mut cfg = Config::default();
         cfg.database.path = path;
         cfg.server.management_token = "test-token".into();
+        if let Some(key) = key {
+            cfg.relay.enabled_nips = vec![43];
+            cfg.relay.private_key = key.to_string();
+        }
         let db = crate::db::DbClient::open(
             &cfg.database,
             true,
@@ -570,7 +584,7 @@ mod tests {
             config,
             db,
             stats,
-            "",
+            key.unwrap_or(""),
             crate::relay::LiveBusConfig {
                 buffer: 1024,
                 batch_interval_ms: 10,
@@ -623,6 +637,51 @@ mod tests {
         // Invalid params are not audited (nothing was changed).
         let _ = rpc_call(&relay, "banpubkey", vec![json!("not-a-pubkey")]).await;
         assert_eq!(relay.audit.recent().len(), 1);
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn role_rpc_reports_storage_failure() {
+        // A role mutation whose relay-generated event cannot be stored
+        // (the database is gone) must report failure, not success.
+        let relay = build_admin_relay_with_key(Some(&"ab".repeat(32))).await;
+        relay.db.shutdown();
+        let resp = rpc_call(
+            &relay,
+            "createrole",
+            vec![json!("admin"), json!("Administrator")],
+        )
+        .await;
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        assert!(
+            body.windows(5).any(|w| w == b"error"),
+            "a failed role save must be reported: {body:?}"
+        );
+        // The same applies to delete: the tombstone could not be stored.
+        let resp = rpc_call(&relay, "deleterole", vec![json!("ghost")]).await;
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        assert!(body.windows(5).any(|w| w == b"error"));
+    }
+
+    #[tokio::test]
+    async fn role_rpc_succeeds_when_events_are_stored() {
+        let relay = build_admin_relay_with_key(Some(&"cd".repeat(32))).await;
+        relay.audit.clear();
+        let resp = rpc_call(&relay, "createrole", vec![json!("mod"), json!("Moderator")]).await;
+        let body = axum::body::to_bytes(resp.into_body(), 4096).await.unwrap();
+        assert!(
+            body.windows(4).any(|w| w == b"true"),
+            "a stored role must report success: {body:?}"
+        );
+        assert!(
+            relay.roles.read().await.roles.contains_key("mod"),
+            "the role must be in the in-memory store"
+        );
+        let recent = relay.audit.recent();
+        assert!(
+            recent.iter().any(|e| e.contains("createrole")),
+            "the role mutation must be audited: {recent:?}"
+        );
         relay.db.shutdown();
     }
 
