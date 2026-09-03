@@ -179,6 +179,14 @@ When using Cloudflare Tunnel:
 
 ---
 
+### 2-7a. A subscription ends with `CLOSED ... response too large`
+
+**Cause**: The stored events of one REQ exceeded `max_req_response_bytes` (default 32 MiB) — the response is delivered in bounded chunks as the socket drains, and beyond the budget the subscription is closed so a slow reader cannot pin unbounded memory. This only happens with very large events or very wide filters.
+
+**Fix**: Narrow the filter (tighter `since`/`until`, a lower `limit`) or raise `max_req_response_bytes` (0 disables the budget).
+
+---
+
 ### 2-8. A NIP is missing from the NIP-11 `supported_nips` list
 
 **Cause**: The advertised list is dynamic — a NIP is hidden when all the kinds it defines are rejected: they are all in `blocked_kinds`, none of them is in `allowed_kinds`, or they are ephemeral kinds rejected by `reject_ephemeral` (only the exempt kinds `22242`, `27235`, `28934`/`28935`/`28936`, `24133`, `23194`/`23195`, `24242`, `21059` are forwarded). Runtime access changes via NIP-86 (`allowkind`/`disallowkind`) apply immediately; NIPs without dedicated kinds (11, 13, 26, 33, 40, 45, 50, 67, 70, 77, 86) are always advertised when enabled.

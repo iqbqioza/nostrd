@@ -26,6 +26,26 @@ const OUT_QUEUE_LIMIT: usize = 4096;
 /// batch (the batch shares a single write commit).
 pub(crate) const EVENT_BATCH: usize = 64;
 
+/// A REQ response waiting to be pumped to the socket in bounded chunks:
+/// the scan result is held here and moved into the capped outgoing queue
+/// as the socket drains, instead of being queued all at once (which could
+/// pin hundreds of MiB for a slow reader).
+pub(crate) struct PendingReq {
+    pub(crate) sub_id: String,
+    pub(crate) events: std::collections::VecDeque<Event>,
+    pub(crate) eose_hint: bool,
+    pub(crate) truncated_or_more: bool,
+    /// Serialized bytes of the EVENT messages queued so far (against
+    /// `limits.max_req_response_bytes`).
+    pub(crate) sent_bytes: u64,
+}
+
+/// Upper bound on queued REQ responses per connection: beyond this the
+/// oldest pending response is cut off (its EOSE is sent immediately) so a
+/// client flooding REQs while reading slowly cannot pile up unbounded
+/// scan results.
+const MAX_PENDING_REQS: usize = 4;
+
 pub struct Conn {
     pub(crate) relay: Arc<Relay>,
     /// The WebSocket endpoint path this connection was established on
@@ -40,6 +60,12 @@ pub struct Conn {
     /// Per-connection byte cap for the outgoing queue (`limits.max_out_queue_bytes`,
     /// cached once per connection).
     pub(crate) out_queue_bytes: usize,
+    /// Byte budget for a single REQ response (`limits.max_req_response_bytes`,
+    /// cached once per connection; 0 = unlimited).
+    pub(crate) req_response_bytes: u64,
+    /// REQ responses awaiting the pump: the scan results are moved into
+    /// the capped outgoing queue in chunks as the socket drains.
+    pub(crate) pending_reqs: std::collections::VecDeque<PendingReq>,
     /// Subscription id -> (filters, serialized filter bytes).
     subs: HashMap<String, (Vec<Filter>, usize)>,
     /// Bytes held by the filters of all active subscriptions.
@@ -105,20 +131,14 @@ impl Conn {
         }
     }
 
-    /// Queues a message without the outgoing byte cap: used for one-shot
-    /// REQ responses, where a dropped event is lost permanently (the
-    /// subscription is answered once). The byte cap exists to protect
-    /// memory against slow readers on *continuous* live traffic, where a
-    /// drop is recoverable; a REQ response is bounded by the scan's
-    /// `max_limit` and the message-count cap instead. Live delivery keeps
-    /// the capped path.
-    pub(crate) fn send_json_uncapped(&mut self, value: Value) {
+    /// Queues a completion-critical control message (EOSE / CLOSED) without
+    /// any outgoing cap: a dropped EOSE would leave the client hanging on
+    /// a completed subscription — worse than a dropped live event. The
+    /// messages are tiny and their volume is bounded by the REQ/CLOSE
+    /// rate, so bypassing the caps does not meaningfully weaken the
+    /// queue's memory bound.
+    pub(crate) fn send_control(&mut self, value: Value) {
         if let Ok(text) = serde_json::to_string(&value) {
-            if self.outgoing.len() >= OUT_QUEUE_LIMIT {
-                self.dropped += 1;
-                self.relay.stats.bump(&self.relay.stats.buffers_dropped, 1);
-                return;
-            }
             let size = text.len();
             self.out_bytes += size;
             self.out_msgs += 1;
@@ -132,13 +152,126 @@ impl Conn {
     }
 
     /// NIP-01 CLOSED: a REQ was rejected or ended, with a machine-readable
-    /// reason.
+    /// reason. Completion-critical: a dropped CLOSED would leave the
+    /// client waiting on a subscription that will never deliver.
     pub(crate) fn send_closed(&mut self, sub_id: &str, reason: &str) {
-        self.send_json(json!(["CLOSED", sub_id, reason]));
+        self.send_control(json!(["CLOSED", sub_id, reason]));
     }
 
     pub(crate) fn send_ok(&mut self, id: &str, accepted: bool, message: &str) {
         self.send_json(json!(["OK", id, accepted, message]));
+    }
+
+    /// Queues a REQ response for the pump. Responses are processed in
+    /// order; when more than [`MAX_PENDING_REQS`] are queued (a client
+    /// flooding REQs while reading slowly), the oldest is cut off — its
+    /// EOSE is sent immediately so the client sees a completed
+    /// subscription instead of a hanging one.
+    pub(crate) fn enqueue_pending_req(&mut self, pending: PendingReq) {
+        // A REQ replaces the subscription of the same id (NIP-01): drop
+        // any still-pumping response for it so stale events are never
+        // delivered for the replaced subscription.
+        self.pending_reqs.retain(|p| p.sub_id != pending.sub_id);
+        if self.pending_reqs.len() >= MAX_PENDING_REQS
+            && let Some(dropped) = self.pending_reqs.pop_front()
+        {
+            self.finish_pending_req(dropped);
+        }
+        self.pending_reqs.push_back(pending);
+    }
+
+    /// Sends the closing EOSE (or the budget CLOSED) of a pending
+    /// response. EOSE/CLOSED are tiny, so they take the uncapped path —
+    /// the byte cap exists for large payloads, and a dropped EOSE would
+    /// leave the client hanging on a completed subscription.
+    fn finish_pending_req(&mut self, pending: PendingReq) {
+        let eose = if pending.eose_hint {
+            let hint = if pending.truncated_or_more {
+                "more"
+            } else {
+                "finish"
+            };
+            json!(["EOSE", pending.sub_id, [hint]])
+        } else {
+            json!(["EOSE", pending.sub_id])
+        };
+        self.send_control(eose);
+    }
+
+    /// Moves the pending REQ responses into the capped outgoing queue in
+    /// bounded chunks: at most one pump per loop iteration, filling the
+    /// queue up to the byte cap. A slow reader therefore pins at most the
+    /// byte cap in the queue, and at most `req_response_bytes` per
+    /// response — responses beyond the budget are closed with
+    /// `CLOSED ... response too large` so the client can re-request with
+    /// a narrower filter.
+    pub(crate) fn pump_pending_reqs(&mut self) {
+        loop {
+            // A subscription closed while its response was still pumping
+            // is dropped without an EOSE (the client already closed it).
+            let closed = self
+                .pending_reqs
+                .front()
+                .is_some_and(|f| !self.subs.contains_key(&f.sub_id));
+            if closed {
+                self.pending_reqs.pop_front();
+                continue;
+            }
+            let Some(front) = self.pending_reqs.front_mut() else {
+                break;
+            };
+            let mut budget_exceeded = false;
+            while self.outgoing.len() < OUT_QUEUE_LIMIT {
+                let Some(event) = front.events.front() else {
+                    break;
+                };
+                let text = serde_json::to_string(&json!(["EVENT", front.sub_id, event]))
+                    .unwrap_or_default();
+                let size = text.len();
+                // Strict byte cap after the first message: a single
+                // oversized event must still be delivered (dropping it
+                // would lose data permanently), so the first push may
+                // exceed the cap by one message; afterwards the queue
+                // cannot grow past the cap.
+                if self.out_bytes > 0 && self.out_bytes.saturating_add(size) > self.out_queue_bytes
+                {
+                    break;
+                }
+                if self.req_response_bytes > 0
+                    && front.sent_bytes.saturating_add(size as u64) > self.req_response_bytes
+                {
+                    budget_exceeded = true;
+                    break;
+                }
+                front.events.pop_front();
+                front.sent_bytes += size as u64;
+                self.out_bytes += size;
+                self.out_msgs += 1;
+                self.out_bytes_total += size as u64;
+                self.outgoing.push_back(Message::Text(text.into()));
+            }
+            if budget_exceeded {
+                let sub_id = front.sub_id.clone();
+                self.send_control(json!([
+                    "CLOSED",
+                    sub_id,
+                    "blocked: response too large; narrow the filter or paginate"
+                ]));
+                // The CLOSED ends the subscription: release it exactly
+                // like a client CLOSE (filter bytes, live slot, stats).
+                self.remove_subscription(&sub_id);
+                self.pending_reqs.pop_front();
+                continue;
+            }
+            if front.events.is_empty() {
+                let pending = self.pending_reqs.pop_front().unwrap();
+                self.finish_pending_req(pending);
+                continue;
+            }
+            // The queue is full or the count cap is reached: the next
+            // loop iteration resumes the pump after the drain.
+            break;
+        }
     }
 
     /// Whether the connection is authenticated (with any pubkey).
@@ -244,11 +377,19 @@ pub async fn handle_connection(
     };
 
     let (mut sender, mut receiver) = socket.split();
-    let (max_msg_size, out_queue_bytes, expiry_enabled, giftwrap_restricted, idle_timeout) = {
+    let (
+        max_msg_size,
+        out_queue_bytes,
+        req_response_bytes,
+        expiry_enabled,
+        giftwrap_restricted,
+        idle_timeout,
+    ) = {
         let cfg = relay.config.read().await;
         (
             cfg.limits.max_ws_message_size,
             cfg.limits.max_out_queue_bytes,
+            cfg.limits.max_req_response_bytes,
             cfg.nip_enabled(40),
             cfg.nip_enabled(42),
             cfg.limits.ws_idle_timeout_secs,
@@ -287,6 +428,7 @@ pub async fn handle_connection(
         outgoing: std::collections::VecDeque::new(),
         out_bytes: 0,
         out_queue_bytes,
+        req_response_bytes,
         subs: HashMap::new(),
         sub_bytes: 0,
         neg: HashMap::new(),
@@ -302,6 +444,7 @@ pub async fn handle_connection(
         in_bytes: 0,
         out_msgs: 0,
         out_bytes_total: 0,
+        pending_reqs: std::collections::VecDeque::new(),
     };
     conn.send_auth_challenge().await;
 
@@ -318,6 +461,9 @@ pub async fn handle_connection(
                 break;
             }
         }
+        // Pump the queued REQ responses through the capped outgoing queue
+        // in bounded chunks (see `pump_pending_reqs`).
+        conn.pump_pending_reqs();
         let live_fut = async {
             match conn.live.as_mut() {
                 Some(rx) => rx.recv().await,
@@ -412,6 +558,18 @@ pub async fn handle_connection(
                     break;
                 }
                 conn.flush_pending_events().await;
+                // Deliver the REQ responses queued by the frames handled
+                // in this iteration: without this, a client that sends one
+                // REQ and waits would not receive the response until the
+                // next select event (a further frame, the keep-alive PING
+                // or a live batch) drives the top-of-loop drain.
+                while let Some(msg) = conn.outgoing.pop_front() {
+                    conn.out_bytes = conn.out_bytes.saturating_sub(message_size(&msg));
+                    if sender.send(msg).await.is_err() {
+                        break;
+                    }
+                }
+                conn.pump_pending_reqs();
                 // Drop the receiver again when every subscription is closed,
                 // so connections without active subscriptions are never
                 // woken by live events. (Subscribing happens in `handle_req`
@@ -637,6 +795,8 @@ mod tests {
             outgoing: std::collections::VecDeque::new(),
             out_bytes: 0,
             out_queue_bytes,
+            req_response_bytes: 0,
+            pending_reqs: std::collections::VecDeque::new(),
             subs: HashMap::new(),
             sub_bytes: 0,
             neg: HashMap::new(),
@@ -678,6 +838,7 @@ mod tests {
             conn.relay.db.put(e2.clone(), now).await;
             conn.handle_req(&[json!("sub"), json!({"kinds": [1]})])
                 .await;
+            conn.pump_pending_reqs();
             let msgs = outgoing_json(&conn);
             let events: Vec<&Value> = msgs.iter().filter(|m| m[0] == "EVENT").collect();
             assert_eq!(events.len(), 2);
@@ -703,6 +864,7 @@ mod tests {
             conn.relay.db.put(protected.clone(), now).await;
             conn.handle_req(&[json!("sub"), json!({"kinds": [1]})])
                 .await;
+            conn.pump_pending_reqs();
             let ids: Vec<String> = outgoing_json(&conn)
                 .iter()
                 .filter(|m| m[0] == "EVENT")
@@ -756,6 +918,7 @@ mod tests {
             // outbox: only the events authored by the pubkey.
             conn.handle_req(&[json!("o"), json!({"outbox": alice_pk})])
                 .await;
+            conn.pump_pending_reqs();
             let contents: Vec<String> = outgoing_json(&conn)
                 .iter()
                 .filter(|m| m[0] == "EVENT" && m[1] == "o")
@@ -771,6 +934,7 @@ mod tests {
             // inbox: only the events addressed to the pubkey (#p tag).
             conn.handle_req(&[json!("i"), json!({"inbox": alice_pk})])
                 .await;
+            conn.pump_pending_reqs();
             let contents: Vec<String> = outgoing_json(&conn)
                 .iter()
                 .filter(|m| m[0] == "EVENT" && m[1] == "i")
@@ -781,6 +945,7 @@ mod tests {
             // Combined: events by Bob addressed to Alice.
             conn.handle_req(&[json!("io"), json!({"outbox": bob_pk, "inbox": alice_pk})])
                 .await;
+            conn.pump_pending_reqs();
             let contents: Vec<String> = outgoing_json(&conn)
                 .iter()
                 .filter(|m| m[0] == "EVENT" && m[1] == "io")
@@ -816,6 +981,7 @@ mod tests {
             assert!(conn.is_authed());
             conn.handle_req(&[json!("sub"), json!({"kinds": [1]})])
                 .await;
+            conn.pump_pending_reqs();
             let ids: Vec<String> = outgoing_json(&conn)
                 .iter()
                 .filter(|m| m[0] == "EVENT")
@@ -1244,6 +1410,7 @@ mod tests {
             }
             conn.handle_req(&[json!("sub"), json!({"kinds": [1], "limit": 3})])
                 .await;
+            conn.pump_pending_reqs();
             let contents: Vec<String> = outgoing_json(&conn)
                 .iter()
                 .filter(|m| m[0] == "EVENT")
@@ -1259,15 +1426,15 @@ mod tests {
     }
 
     #[test]
-    fn req_response_bypasses_the_outgoing_byte_cap() {
-        // Regression: REQ response events used to be dropped by the
-        // outgoing byte cap (a dropped event is lost permanently — the
-        // subscription is answered once), so a REQ with large events
-        // silently returned fewer events than the filter requested.
+    fn req_response_chunks_through_the_outgoing_byte_cap() {
+        // Backpressure: REQ responses are pumped through the capped
+        // outgoing queue in bounded chunks — the queue never holds more
+        // than the byte cap, and no response event is dropped (a dropped
+        // event is lost permanently — the subscription is answered once).
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let mut conn = build_conn().await;
-            // A tiny per-connection cap so the queue would drop big messages.
+            // A tiny per-connection cap so one chunk holds a single event.
             conn.out_queue_bytes = 1024;
             let now = unix_now();
             let big = "x".repeat(10_000);
@@ -1279,28 +1446,304 @@ mod tests {
                     now - i,
                     vec![],
                 );
+                conn.relay.db.put(ev.clone(), now).await;
                 ids.push(ev.id.clone());
-                conn.relay.db.put(ev, now).await;
             }
             conn.handle_req(&[json!("sub"), json!({"kinds": [1], "limit": 5})])
                 .await;
-            let delivered: Vec<String> = outgoing_json(&conn)
-                .iter()
-                .filter(|m| m[0] == "EVENT")
-                .map(|m| m[2]["id"].as_str().unwrap().to_string())
-                .collect();
+            assert_eq!(
+                conn.pending_reqs.len(),
+                1,
+                "the response is queued for the pump"
+            );
+            // Pump in chunks until the response is fully queued. Each
+            // pump respects the byte cap: the queue never grows past it.
+            let mut delivered = Vec::new();
+            loop {
+                conn.pump_pending_reqs();
+                assert!(
+                    conn.out_bytes <= conn.out_queue_bytes + 11_000,
+                    "the queue is bounded by the cap plus one event (a single \
+                     oversized event must still be delivered)"
+                );
+                for msg in outgoing_json(&conn) {
+                    if msg[0] == "EVENT" {
+                        delivered.push(msg[2]["id"].as_str().unwrap().to_string());
+                    }
+                }
+                conn.outgoing.clear();
+                conn.out_bytes = 0;
+                if conn.pending_reqs.is_empty() {
+                    break;
+                }
+            }
             assert_eq!(
                 delivered.len(),
                 5,
-                "all five response events must be queued despite the tiny cap"
+                "all five response events must be delivered through the chunks"
             );
             assert!(
                 ids.iter().all(|id| delivered.contains(id)),
                 "no response event may be dropped"
             );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn pump_closes_oversized_responses() {
+        // `max_req_response_bytes`: a response exceeding the budget is
+        // closed with `CLOSED ... response too large`; the events already
+        // queued stay, and the client can re-request with a narrower
+        // filter instead of the subscription hanging.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.req_response_bytes = 3_000;
+            let now = unix_now();
+            let mut events = std::collections::VecDeque::new();
+            for i in 0..3 {
+                let ev = signed_note(
+                    conn.relay.secp(),
+                    &format!("big-{i}-{}", "y".repeat(2_000)),
+                    now - i,
+                    vec![],
+                );
+                events.push_back(ev);
+            }
+            conn.subs.insert("s".into(), (Vec::new(), 0));
+            conn.enqueue_pending_req(PendingReq {
+                sub_id: "s".into(),
+                events,
+                eose_hint: false,
+                truncated_or_more: false,
+                sent_bytes: 0,
+            });
+            conn.pump_pending_reqs();
+            let msgs = outgoing_json(&conn);
+            let events_sent = msgs.iter().filter(|m| m[0] == "EVENT").count();
+            let closed = msgs.iter().find(|m| m[0] == "CLOSED" && m[1] == "s");
             assert!(
-                outgoing_json(&conn).iter().any(|m| m[0] == "EOSE"),
-                "the EOSE must be queued too"
+                !conn.subs.contains_key("s"),
+                "the CLOSED must release the subscription"
+            );
+            assert_eq!(events_sent, 1, "the first event fits the budget");
+            assert!(
+                closed.is_some_and(|m| m[2].as_str().unwrap().contains("response too large")),
+                "the over-budget response must be closed"
+            );
+            assert!(
+                !msgs.iter().any(|m| m[0] == "EOSE"),
+                "a closed response must not send EOSE"
+            );
+            assert!(
+                conn.pending_reqs.is_empty(),
+                "the closed response must not stay queued"
+            );
+            // An event larger than the whole budget closes immediately.
+            let mut events = std::collections::VecDeque::new();
+            events.push_back(signed_note(
+                conn.relay.secp(),
+                &"z".repeat(10_000),
+                now,
+                vec![],
+            ));
+            conn.subs.insert("s2".into(), (Vec::new(), 0));
+            conn.enqueue_pending_req(PendingReq {
+                sub_id: "s2".into(),
+                events,
+                eose_hint: false,
+                truncated_or_more: false,
+                sent_bytes: 0,
+            });
+            conn.pump_pending_reqs();
+            let msgs = outgoing_json(&conn);
+            assert!(
+                msgs.iter().any(|m| m[0] == "CLOSED" && m[1] == "s2"),
+                "an event beyond the whole budget closes without delivery"
+            );
+            assert!(!conn.subs.contains_key("s2"));
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn pending_reqs_are_bounded_and_the_oldest_is_cut_off() {
+        // More than MAX_PENDING_REQS queued REQ responses (a client
+        // flooding REQs while reading slowly): the oldest is cut off with
+        // its EOSE sent immediately, so the subscription never hangs.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            for i in 0..5 {
+                conn.subs.insert(format!("s{i}"), (Vec::new(), 0));
+                let mut events = std::collections::VecDeque::new();
+                events.push_back(signed_note(
+                    conn.relay.secp(),
+                    &format!("e{i}"),
+                    now - i,
+                    vec![],
+                ));
+                conn.enqueue_pending_req(PendingReq {
+                    sub_id: format!("s{i}"),
+                    events,
+                    eose_hint: true,
+                    truncated_or_more: false,
+                    sent_bytes: 0,
+                });
+            }
+            assert_eq!(
+                conn.pending_reqs.len(),
+                MAX_PENDING_REQS,
+                "the queue must be bounded"
+            );
+            // The cut-off response (s0) got its EOSE immediately.
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "EOSE" && m[1] == "s0"),
+                "the oldest response must be finished with an EOSE"
+            );
+            // The remaining responses are pumped in order with their
+            // EOSEs (eose_hint = true -> the hint variant).
+            let mut all = Vec::new();
+            loop {
+                conn.pump_pending_reqs();
+                for m in outgoing_json(&conn) {
+                    all.push(m.clone());
+                }
+                conn.outgoing.clear();
+                conn.out_bytes = 0;
+                if conn.pending_reqs.is_empty() {
+                    break;
+                }
+            }
+            for i in 1..5 {
+                assert!(
+                    all.iter()
+                        .any(|m| m[0] == "EOSE" && m[1] == format!("s{i}")),
+                    "response s{i} must finish with its EOSE"
+                );
+            }
+            assert!(
+                all.iter()
+                    .any(|m| m[0] == "EOSE" && m[1] == "s1" && m[2] == json!(["finish"])),
+                "the hint variant must be sent when eose_hint is on"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn pump_skips_closed_subscriptions_and_replaced_ids() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            let mut events = std::collections::VecDeque::new();
+            events.push_back(signed_note(conn.relay.secp(), "e0", now, vec![]));
+            // A response whose subscription was CLOSEd in the meantime is
+            // dropped by the pump without events or EOSE.
+            conn.enqueue_pending_req(PendingReq {
+                sub_id: "closed".into(),
+                events,
+                eose_hint: true,
+                truncated_or_more: false,
+                sent_bytes: 0,
+            });
+            conn.pump_pending_reqs();
+            assert!(
+                conn.pending_reqs.is_empty(),
+                "the response of a closed subscription must be dropped"
+            );
+            assert!(
+                outgoing_json(&conn).is_empty(),
+                "no events or EOSE may be queued for a closed subscription"
+            );
+            // A REQ replacing the same subscription id drops the stale
+            // still-pumping response.
+            conn.subs.insert("s".into(), (Vec::new(), 0));
+            let mut first = std::collections::VecDeque::new();
+            first.push_back(signed_note(conn.relay.secp(), "old", now, vec![]));
+            conn.enqueue_pending_req(PendingReq {
+                sub_id: "s".into(),
+                events: first,
+                eose_hint: false,
+                truncated_or_more: false,
+                sent_bytes: 0,
+            });
+            let mut second = std::collections::VecDeque::new();
+            second.push_back(signed_note(conn.relay.secp(), "new", now - 1, vec![]));
+            conn.enqueue_pending_req(PendingReq {
+                sub_id: "s".into(),
+                events: second,
+                eose_hint: false,
+                truncated_or_more: false,
+                sent_bytes: 0,
+            });
+            assert_eq!(conn.pending_reqs.len(), 1, "the stale response is dropped");
+            conn.pump_pending_reqs();
+            let msgs = outgoing_json(&conn);
+            assert!(
+                msgs.iter()
+                    .any(|m| m[0] == "EVENT" && m[2]["content"] == "new"),
+                "only the replacement response is delivered"
+            );
+            assert!(
+                !msgs
+                    .iter()
+                    .any(|m| m[0] == "EVENT" && m[2]["content"] == "old"),
+                "the stale response must not be delivered"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn eose_is_delivered_even_at_the_message_count_cap() {
+        // A REQ response of exactly OUT_QUEUE_LIMIT events fills the
+        // queue to the message-count cap; the EOSE must still be queued
+        // (a dropped EOSE would leave the client hanging on a completed
+        // subscription).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            // A byte cap generous enough that the message-count cap is the
+            // binding constraint for ~300-byte events (4096 of them).
+            conn.out_queue_bytes = 8 << 20;
+            conn.subs.insert("s".into(), (Vec::new(), 0));
+            let now = unix_now();
+            let mut events = std::collections::VecDeque::new();
+            for i in 0..OUT_QUEUE_LIMIT {
+                events.push_back(signed_note(
+                    conn.relay.secp(),
+                    &format!("tiny-{i}"),
+                    now - i as u64,
+                    vec![],
+                ));
+            }
+            conn.enqueue_pending_req(PendingReq {
+                sub_id: "s".into(),
+                events,
+                eose_hint: false,
+                truncated_or_more: false,
+                sent_bytes: 0,
+            });
+            conn.pump_pending_reqs();
+            let msgs = outgoing_json(&conn);
+            assert_eq!(
+                msgs.iter().filter(|m| m[0] == "EVENT").count(),
+                OUT_QUEUE_LIMIT,
+                "all events must be queued"
+            );
+            assert!(
+                msgs.iter().any(|m| m[0] == "EOSE" && m[1] == "s"),
+                "the EOSE must be delivered even at the message-count cap"
+            );
+            assert!(
+                conn.pending_reqs.is_empty(),
+                "the response must be finished"
             );
             conn.relay.db.shutdown();
         });

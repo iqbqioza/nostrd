@@ -393,19 +393,18 @@ impl super::Conn {
         }
         let truncated = to_send.len() > original_total;
         to_send.truncate(original_total);
-        // The response is queued without the outgoing byte cap: a dropped
-        // REQ event would be lost permanently (the byte cap only applies to
-        // the recoverable live traffic).
-        for event in to_send {
-            self.send_json_uncapped(json!(["EVENT", sub_id, event]));
-        }
-        // NIP-67: EOSE completeness hint.
-        if eose_hint {
-            let hint = if more || truncated { "more" } else { "finish" };
-            self.send_json_uncapped(json!(["EOSE", sub_id, [hint]]));
-        } else {
-            self.send_json_uncapped(json!(["EOSE", sub_id]));
-        }
+        // The response is queued for the pump instead of being pushed into
+        // the outgoing queue all at once: the connection loop moves it into
+        // the capped queue in bounded chunks as the socket drains, so a
+        // slow reader can never pin more than the byte cap in the queue —
+        // or more than `limits.max_req_response_bytes` per response.
+        self.enqueue_pending_req(crate::ws::PendingReq {
+            sub_id: sub_id.to_string(),
+            events: to_send.into(),
+            eose_hint,
+            truncated_or_more: truncated || more,
+            sent_bytes: 0,
+        });
     }
 
     pub(crate) fn handle_close(&mut self, rest: &[Value]) {
@@ -413,6 +412,17 @@ impl super::Conn {
             self.send_notice("error: CLOSE requires a subscription id");
             return;
         };
+        self.remove_subscription(sub_id);
+        // Drop the live receiver with the last subscription so
+        // connection without active subscriptions are never woken.
+        if self.subs.is_empty() {
+            self.live = None;
+        }
+    }
+
+    /// Releases a subscription (and any negentropy state held under the
+    /// same id): its filter bytes, its live slot and its negentropy items.
+    pub(crate) fn remove_subscription(&mut self, sub_id: &str) {
         if let Some((_, bytes)) = self.subs.remove(sub_id) {
             self.sub_bytes = self.sub_bytes.saturating_sub(bytes);
             self.relay
@@ -425,11 +435,6 @@ impl super::Conn {
             if let Some(state) = self.neg.remove(sub_id) {
                 self.neg_total = self.neg_total.saturating_sub(state.items.len());
                 self.release_neg_stats_subscription();
-            }
-            // Drop the live receiver with the last subscription so
-            // connection without active subscriptions are never woken.
-            if self.subs.is_empty() {
-                self.live = None;
             }
         }
     }
@@ -473,7 +478,9 @@ impl super::Conn {
                 self.authed_pubkeys.push(event.pubkey.clone());
             }
         }
-        self.send_json(nip42::ok(&id, accepted));
+        // The AUTH result is completion-critical: a dropped OK leaves the
+        // client unsure whether its authentication was accepted.
+        self.send_control(nip42::ok(&id, accepted));
     }
 
     pub(crate) async fn handle_count(&mut self, rest: &[Value]) {
@@ -573,7 +580,7 @@ impl super::Conn {
                 })
                 .collect()
         };
-        self.send_json(nip45::count_response(sub_id, &filters, &events, more));
+        self.send_control(nip45::count_response(sub_id, &filters, &events, more));
     }
 
     /// NIP-59 / NIP-17: gift wraps are signed by random keys, so they may
