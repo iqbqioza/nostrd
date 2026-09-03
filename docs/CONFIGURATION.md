@@ -211,6 +211,7 @@ Every key is optional; a missing key uses the default shown below.
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `max_content_bytes` | integer | `65536` | Max event content length in **characters** |
+| `max_admin_body_bytes` | integer | `65536` | Body limit for the NIP-86 management RPC (`POST /` and the legacy management port); oversized requests are refused with `413` |
 | `max_tags` | integer | `2000` | Max tags per event |
 | `max_tag_value_bytes` | integer | `1024` | Max bytes per tag value |
 | `max_created_at_future` | integer | `3600` | Tolerated future skew of `created_at` (seconds) |
@@ -285,6 +286,8 @@ Every key is optional; a missing key uses the default shown below.
 **`max_sub_bytes`** — The total bytes of all subscription filters held by one connection. Prevents a connection from pinning many megabytes of filter data.
 
 **`max_content_bytes`** — The maximum length of an event's `content` field, counted in **characters** (not bytes), matching the NIP-11 `max_content_length` definition. Events above it are rejected with `invalid: content too large`.
+
+**`max_admin_body_bytes`** — The request body limit for the NIP-86 management RPC: the JSON-RPC handler mounted on the relay's public `POST /` routes and the legacy management port. NIP-86 requests are tiny method+params documents, so the 64 KiB default is generous while keeping the publicly reachable route from buffering large bodies. Management mutations are recorded in a rate-limited audit log (at most 600 entries per minute, then a single per-window summary line) with the authenticated identity.
 
 **`max_tags`** — The maximum number of tags per event. Violations are rejected with `invalid: too many tags`.
 
@@ -535,9 +538,9 @@ Editing the file and sending `kill -HUP $(cat nostrd.pid)` reloads it **without 
 | Applies on SIGHUP | Requires `nostrd restart` |
 | --- | --- |
 | `relay.name`, `description`, `pubkey`, `contact`, `icon`, `post_policy`, `public_url`, `relay.reject_ephemeral`, `relay.enable_git` | `relay.private_key` |
-| most of `[limits]` (not the three below) | `relay.livekit_*`, `relay.enabled_nips` / `disabled_nips` |
+| most of `[limits]` (the restart-column entries below apply on restart only) | `relay.livekit_*`, `relay.enabled_nips` / `disabled_nips` |
 | NIP-40 on/off, API concurrency | `server.host`, `server.port`, `server.api_host`, `server.ws_paths`, `server.management_port`, `server.management_host`, `server.metrics_enabled` |
-| — | `database.path`, `database.purge_interval_secs`, `daemon.log_max_size_bytes`, `log_max_files`, `stats_interval_secs`, `db_request_timeout_secs`, `db_queue_msgs`, `db_queue_events`, `max_indexed_words`, `live_buffer`, `live_batch_size`, `live_batch_interval_ms`, `max_connections`, `http_read_timeout_secs`, `max_conn_per_sec_per_ip`, `blossom.host`, `blossom.storage`, `blossom.local_path`, `blossom.max_upload_bytes`, `blossom.min_free_bytes`, `blossom.s3_*` |
+| — | `database.path`, `database.purge_interval_secs`, `daemon.log_max_size_bytes`, `log_max_files`, `stats_interval_secs`, `db_request_timeout_secs`, `db_queue_msgs`, `db_queue_events`, `max_indexed_words`, `live_buffer`, `live_batch_size`, `live_batch_interval_ms`, `max_connections`, `http_read_timeout_secs`, `max_conn_per_sec_per_ip`, `max_admin_body_bytes`, `blossom.host`, `blossom.storage`, `blossom.local_path`, `blossom.max_upload_bytes`, `blossom.min_free_bytes`, `blossom.s3_*` |
 
 `[access]` is **not** applied by a reload: the access lists are seeded once at startup and then managed at runtime via NIP-86.
 

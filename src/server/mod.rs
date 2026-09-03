@@ -157,6 +157,7 @@ async fn build_router(
     // of them. The inbox and outbox paths give the relay distinct endpoints
     // for the inbox/outbox routing model.
     let ws_paths = relay.config.read().await.server.ws_paths.trim().to_string();
+    let max_admin_body = relay.config.read().await.limits.max_admin_body_bytes;
     let mut app = Router::new()
         .route("/health", get(health_handler))
         .route("/relay/stats", get(stats_handler))
@@ -168,7 +169,12 @@ async fn build_router(
         app = app.route("/", get(root_inbox_outbox));
     }
     for path in ws_paths_for(&ws_paths) {
-        app = app.route(path, get(ws_handler).post(nip86::rpc_handler));
+        app = app.route(
+            path,
+            get(ws_handler)
+                .post(nip86::rpc_handler)
+                .layer(axum::extract::DefaultBodyLimit::max(max_admin_body)),
+        );
     }
     let cfg = relay.config.read().await;
     if cfg.server.metrics_enabled {
@@ -343,7 +349,8 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
     };
 
     if let Some((addr, listener)) = mgmt {
-        let mgmt_app = nip86::router(relay.clone(), shutdown_tx.clone());
+        let max_admin_body = relay.config.read().await.limits.max_admin_body_bytes;
+        let mgmt_app = nip86::router(relay.clone(), shutdown_tx.clone(), max_admin_body);
         let rx = shutdown_rx.clone();
         tasks.push(tokio::spawn(async move {
             if let Err(e) = axum::serve(

@@ -62,6 +62,19 @@ fn rpc_err(message: &str) -> Response {
     (StatusCode::OK, Json(json!({ "error": message }))).into_response()
 }
 
+/// Records a management mutation in the relay's rate-limited audit
+/// log: `method` + bounded params + the authenticated identity.
+macro_rules! audit {
+    ($relay:expr, $identity:expr, $method:expr, $params:expr) => {
+        $relay.audit.log(format!(
+            "{} {} by {}",
+            $method,
+            audit_params($params),
+            $identity
+        ))
+    };
+}
+
 /// NIP-86 JSON-RPC handler, mounted on `POST /` and `POST /ws`.
 pub async fn rpc_handler(
     State(relay): State<Arc<Relay>>,
@@ -97,13 +110,13 @@ pub async fn rpc_handler(
         )
             .into_response();
     }
-    if !rpc_authenticated(&relay, &headers, &uri).await {
+    let Some(identity) = rpc_authenticated(&relay, &headers, &uri).await else {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "error": "unauthorized" })),
         )
             .into_response();
-    }
+    };
     let request: Value = match serde_json::from_str(&body) {
         Ok(request) => request,
         Err(_) => return rpc_err("invalid request"),
@@ -135,6 +148,7 @@ pub async fn rpc_handler(
                 }
             }
             relay.persist_access().await;
+            audit!(&relay, &identity, "banpubkey", params);
             rpc_ok(json!(true))
         }
         "unbanpubkey" => {
@@ -146,6 +160,7 @@ pub async fn rpc_handler(
                 access.blocked_pubkeys.retain(|(p, _)| p != pubkey);
             }
             relay.persist_access().await;
+            audit!(&relay, &identity, "unbanpubkey", params);
             rpc_ok(json!(true))
         }
         "listbannedpubkeys" => {
@@ -179,6 +194,7 @@ pub async fn rpc_handler(
                 }
             }
             relay.persist_access().await;
+            audit!(&relay, &identity, "allowpubkey", params);
             rpc_ok(json!(true))
         }
         "unallowpubkey" => {
@@ -190,6 +206,7 @@ pub async fn rpc_handler(
                 access.allowed_pubkeys.retain(|(p, _)| p != pubkey);
             }
             relay.persist_access().await;
+            audit!(&relay, &identity, "unallowpubkey", params);
             rpc_ok(json!(true))
         }
         "listallowedpubkeys" => {
@@ -215,6 +232,7 @@ pub async fn rpc_handler(
                 }
             }
             relay.persist_access().await;
+            audit!(&relay, &identity, "allowkind", params);
             rpc_ok(json!(true))
         }
         "disallowkind" => {
@@ -228,6 +246,7 @@ pub async fn rpc_handler(
                 }
             }
             relay.persist_access().await;
+            audit!(&relay, &identity, "disallowkind", params);
             rpc_ok(json!(true))
         }
         "listallowedkinds" => {
@@ -265,6 +284,7 @@ pub async fn rpc_handler(
             // reload and a restart (without persistence the reload handler
             // would silently revert it).
             relay.persist_relay_field(field, value).await;
+            audit!(&relay, &identity, method, params);
             rpc_ok(json!(true))
         }
         // NIP-43 role management.
@@ -280,6 +300,7 @@ pub async fn rpc_handler(
                 .create_role(id, label, description, color, order)
                 .await
             {
+                audit!(&relay, &identity, "createrole", params);
                 rpc_ok(json!(true))
             } else {
                 rpc_err("restricted: NIP-43 is disabled or the relay key is not configured")
@@ -294,6 +315,7 @@ pub async fn rpc_handler(
             let color = params.get(3).and_then(Value::as_str).unwrap_or("");
             let order = params.get(4).and_then(Value::as_i64);
             if relay.edit_role(id, label, description, color, order).await {
+                audit!(&relay, &identity, "editrole", params);
                 rpc_ok(json!(true))
             } else {
                 rpc_err(
@@ -306,6 +328,7 @@ pub async fn rpc_handler(
                 return rpc_err("invalid params");
             };
             if relay.delete_role(id).await {
+                audit!(&relay, &identity, "deleterole", params);
                 rpc_ok(json!(true))
             } else {
                 rpc_err("restricted: NIP-43 is disabled or the relay key is not configured")
@@ -322,6 +345,7 @@ pub async fn rpc_handler(
                 return rpc_err("invalid pubkey");
             }
             if relay.assign_role(pubkey, role).await {
+                audit!(&relay, &identity, "assignrole", params);
                 rpc_ok(json!(true))
             } else {
                 rpc_err(
@@ -337,6 +361,7 @@ pub async fn rpc_handler(
                 return rpc_err("invalid params");
             };
             relay.unassign_role(pubkey, role).await;
+            audit!(&relay, &identity, "unassignrole", params);
             rpc_ok(json!(true))
         }
         "blockip" => {
@@ -360,6 +385,7 @@ pub async fn rpc_handler(
             relay.persist_access().await;
             // Drop existing connections from this IP, not just new ones.
             relay.note_ip_blocks_changed();
+            audit!(&relay, &identity, "blockip", params);
             rpc_ok(json!(true))
         }
         "unblockip" => {
@@ -375,6 +401,7 @@ pub async fn rpc_handler(
             // connections that were blocked mid-flight re-verify (a version
             // bump with an empty list is harmless).
             relay.note_ip_blocks_changed();
+            audit!(&relay, &identity, "unblockip", params);
             rpc_ok(json!(true))
         }
         "listblockedips" => {
@@ -400,6 +427,7 @@ pub async fn rpc_handler(
                 return rpc_err("invalid event id");
             };
             relay.db.ban_event(id, reason).await;
+            audit!(&relay, &identity, "banevent", params);
             rpc_ok(json!(true))
         }
         "allowevent" => {
@@ -413,6 +441,7 @@ pub async fn rpc_handler(
                 return rpc_err("invalid event id");
             };
             relay.db.unban_event(id).await;
+            audit!(&relay, &identity, "allowevent", params);
             rpc_ok(json!(true))
         }
         "listbannedevents" => {
@@ -431,6 +460,17 @@ pub async fn rpc_handler(
         }
         _ => rpc_err("unsupported method"),
     }
+}
+
+/// Summarizes the mutation's params for the audit trail, bounded so a
+/// long reason cannot bloat the log.
+fn audit_params(params: &[Value]) -> String {
+    let mut text = serde_json::to_string(params).unwrap_or_default();
+    if text.len() > 200 {
+        text.truncate(200);
+        text.push('…');
+    }
+    text
 }
 
 fn is_pubkey(value: &str) -> bool {
@@ -459,7 +499,13 @@ fn ct_eq(a: &str, b: &str) -> bool {
 /// matches this relay's URL, including the request path and query
 /// (NIP-98: "the `u` tag MUST be exactly the same as the absolute request
 /// URL"; the scheme is normalized so TLS-terminating proxies keep working).
-async fn rpc_authenticated(relay: &Relay, headers: &HeaderMap, uri: &axum::http::Uri) -> bool {
+/// Returns the identity for the audit trail: the NIP-98 pubkey or
+/// `"management-token"`.
+async fn rpc_authenticated(
+    relay: &Relay,
+    headers: &HeaderMap,
+    uri: &axum::http::Uri,
+) -> Option<String> {
     let cfg = relay.config.read().await;
     if !cfg.server.management_token.is_empty()
         && let Some(token) = headers
@@ -468,14 +514,14 @@ async fn rpc_authenticated(relay: &Relay, headers: &HeaderMap, uri: &axum::http:
             .and_then(|v| v.strip_prefix("Bearer "))
         && ct_eq(token, &cfg.server.management_token)
     {
-        return true;
+        return Some("management-token".into());
     }
     if !cfg.server.admin_pubkey.is_empty()
         && let Some(auth) = headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Nostr "))
-        && nip98::verify(
+        && let Some(pubkey) = nip98::verify(
             auth,
             Some(&cfg.server.admin_pubkey),
             relay.secp(),
@@ -484,16 +530,120 @@ async fn rpc_authenticated(relay: &Relay, headers: &HeaderMap, uri: &axum::http:
             |url| nip98::matches_request_url(url, &cfg.relay_identity(), uri.path(), uri.query()),
         )
         .await
-        .is_some()
     {
-        return true;
+        return Some(pubkey);
     }
-    false
+    None
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use crate::relay::Relay;
+
+    /// A relay with `server.management_token` configured (the bearer
+    /// token path, so the tests need no NIP-98 signing).
+    async fn build_admin_relay() -> std::sync::Arc<Relay> {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir()
+            .join("nostrd-nip86-test")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        let mut cfg = Config::default();
+        cfg.database.path = path;
+        cfg.server.management_token = "test-token".into();
+        let db = crate::db::DbClient::open(
+            &cfg.database,
+            true,
+            std::sync::Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
+        let config = std::sync::Arc::new(tokio::sync::RwLock::new(cfg));
+        let stats = crate::stats::Stats::new();
+        let relay = Relay::new(
+            config,
+            db,
+            stats,
+            "",
+            crate::relay::LiveBusConfig {
+                buffer: 1024,
+                batch_interval_ms: 10,
+                batch_size: 64,
+            },
+        )
+        .await;
+        std::sync::Arc::new(relay)
+    }
+
+    fn bearer_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "Bearer test-token".parse().unwrap());
+        headers.insert(header::CONTENT_TYPE, RPC_CONTENT_TYPE.parse().unwrap());
+        headers
+    }
+
+    async fn rpc_call(relay: &std::sync::Arc<Relay>, method: &str, params: Vec<Value>) -> Response {
+        rpc_handler(
+            State(relay.clone()),
+            axum::extract::ConnectInfo("127.0.0.1:1234".parse().unwrap()),
+            axum::http::Uri::from_static("/"),
+            bearer_headers(),
+            serde_json::to_string(&json!({ "method": method, "params": params })).unwrap(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn mutations_are_audited() {
+        let relay = build_admin_relay().await;
+        relay.audit.clear();
+        let resp = rpc_call(
+            &relay,
+            "banpubkey",
+            vec![json!("aa".repeat(32)), json!("spam")],
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let recent = relay.audit.recent();
+        assert_eq!(recent.len(), 1, "the mutation must be audited");
+        assert!(
+            recent[0].contains("banpubkey") && recent[0].contains("management-token"),
+            "the audit entry must name the method and the identity: {}",
+            recent[0]
+        );
+        // Read-only methods are not audited.
+        let _ = rpc_call(&relay, "listbannedpubkeys", vec![]).await;
+        assert_eq!(relay.audit.recent().len(), 1);
+        // Invalid params are not audited (nothing was changed).
+        let _ = rpc_call(&relay, "banpubkey", vec![json!("not-a-pubkey")]).await;
+        assert_eq!(relay.audit.recent().len(), 1);
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn unauthorized_mutations_are_not_audited() {
+        let relay = build_admin_relay().await;
+        relay.audit.clear();
+        let mut headers = bearer_headers();
+        headers.insert(header::AUTHORIZATION, "Bearer wrong-token".parse().unwrap());
+        let resp = rpc_handler(
+            State(relay.clone()),
+            axum::extract::ConnectInfo("127.0.0.1:1234".parse().unwrap()),
+            axum::http::Uri::from_static("/"),
+            headers,
+            serde_json::to_string(&json!({ "method": "banpubkey", "params": [] })).unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        assert!(relay.audit.recent().is_empty());
+        relay.db.shutdown();
+    }
 
     #[test]
     fn ct_eq_rejects_unequal_lengths_and_nul_padding() {
