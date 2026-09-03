@@ -13,6 +13,10 @@ pub enum Error {
     Hex(hex::FromHexError),
     Config(String),
     Protocol(String),
+    /// The storage backend is out of space: the free space on the
+    /// filesystem hosting the Blossom blobs dropped below
+    /// `blossom.min_free_bytes`.
+    StorageFull,
     Other(String),
 }
 
@@ -26,6 +30,7 @@ impl fmt::Display for Error {
             Error::Hex(e) => write!(f, "hex error: {e}"),
             Error::Config(e) => write!(f, "config error: {e}"),
             Error::Protocol(e) => write!(f, "protocol error: {e}"),
+            Error::StorageFull => write!(f, "storage is full"),
             Error::Other(e) => write!(f, "{e}"),
         }
     }

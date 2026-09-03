@@ -39,6 +39,15 @@ enum Storage {
     S3(S3Store),
 }
 
+/// A streamable blob source: the local file (already seeked) or an S3
+/// range response. The response bodies are streamed in chunks, so a large
+/// blob never has to be held in memory in full.
+#[derive(Debug)]
+pub(crate) enum BlobStream {
+    Local(tokio::fs::File),
+    S3(reqwest::Response),
+}
+
 /// Blob storage: the LMDB-persisted mapping plus the file backend.
 pub(crate) struct BlobStore {
     storage: Storage,
@@ -49,11 +58,12 @@ impl BlobStore {
     pub(crate) async fn new(
         storage: &str,
         local_path: &Path,
+        min_free_bytes: u64,
         s3: Option<S3Config>,
         db: DbClient,
     ) -> Result<BlobStore> {
         let storage = match storage {
-            "local" => Storage::Local(LocalStore::new(local_path).await?),
+            "local" => Storage::Local(LocalStore::new(local_path, min_free_bytes).await?),
             "s3" => Storage::S3(
                 S3Store::new(s3.expect("s3 config validated by Config::validate")).await?,
             ),
@@ -66,6 +76,15 @@ impl BlobStore {
         Ok(BlobStore { storage, db })
     }
 
+    /// Whether the storage backend currently accepts uploads (the
+    /// disk-full guard, shared by the PUT path and the BUD-06 preflight).
+    pub(crate) fn check_space(&self) -> Result<()> {
+        match &self.storage {
+            Storage::Local(s) => s.check_space(),
+            Storage::S3(_) => Ok(()),
+        }
+    }
+
     /// Stores a blob: the LMDB mapping first (so a crash leaves a healable
     /// state — a mapping without a file can be deleted), then the file.
     pub(crate) async fn put(
@@ -75,6 +94,11 @@ impl BlobStore {
         bytes: &[u8],
         mime: &str,
     ) -> Result<Descriptor> {
+        // Disk-full guard first: a refused upload must not even leave an
+        // orphan mapping behind (the mapping-first design heals such
+        // leftovers, but only the bytes that will actually land should be
+        // committed).
+        self.check_space()?;
         let uploaded = crate::util::unix_now() as i64;
         // The mapping must land first: without it the file would be an
         // unreachable orphan. Abort the upload when the commit fails.
@@ -121,11 +145,20 @@ impl BlobStore {
             .is_some_and(|meta| meta.owners.iter().any(|o| o == pubkey))
     }
 
-    /// Reads the blob's bytes. `npub` comes from the resolved descriptor.
-    pub(crate) async fn read(&self, npub: &str, sha256: &str) -> Result<Option<Vec<u8>>> {
+    /// Opens a streamable reader for the blob, positioned at `start`
+    /// (the caller derived `start`/`len` from the descriptor's size and a
+    /// parsed Range header). The body is streamed in chunks, so a large
+    /// blob is never materialized in memory in full.
+    pub(crate) async fn open_stream(
+        &self,
+        npub: &str,
+        sha256: &str,
+        start: u64,
+        len: u64,
+    ) -> Result<Option<BlobStream>> {
         match &self.storage {
-            Storage::Local(s) => s.read(npub, sha256).await,
-            Storage::S3(s) => s.read(npub, sha256).await,
+            Storage::Local(s) => s.open(npub, sha256, start, len).await,
+            Storage::S3(s) => s.open(npub, sha256, start, len).await,
         }
     }
 
@@ -210,18 +243,50 @@ fn npub_of(pubkey: &str) -> String {
 
 struct LocalStore {
     root: PathBuf,
+    /// Disk-full guard: uploads are refused while the free space on the
+    /// filesystem hosting `root` is below this many bytes (0 disables).
+    min_free_bytes: u64,
 }
 
 impl LocalStore {
-    async fn new(root: &Path) -> Result<LocalStore> {
+    async fn new(root: &Path, min_free_bytes: u64) -> Result<LocalStore> {
         tokio::fs::create_dir_all(root).await?;
         Ok(LocalStore {
             root: root.to_path_buf(),
+            min_free_bytes,
         })
     }
 
     fn blob_path(&self, npub: &str, sha256: &str) -> PathBuf {
         self.root.join(npub).join(sha256)
+    }
+
+    /// Free bytes on the filesystem hosting the blob root, when statvfs
+    /// succeeds (the same check the LMDB writer uses before committing).
+    fn free_space(&self) -> Option<u64> {
+        let c_path = std::ffi::CString::new(self.root.as_os_str().as_encoded_bytes()).ok()?;
+        let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: `stat` points at a valid buffer and the path is a valid
+        // NUL-terminated string.
+        if unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) } == 0 {
+            let stat = unsafe { stat.assume_init() };
+            Some(stat.f_bavail * stat.f_frsize)
+        } else {
+            None
+        }
+    }
+
+    /// Whether the disk currently has room for an upload (the shared
+    /// disk-full guard: `put` refuses, the BUD-06 preflight reports).
+    fn check_space(&self) -> Result<()> {
+        if self.min_free_bytes > 0
+            && self
+                .free_space()
+                .is_some_and(|free| free < self.min_free_bytes)
+        {
+            return Err(crate::error::Error::StorageFull);
+        }
+        Ok(())
     }
 
     async fn put(
@@ -251,12 +316,24 @@ impl LocalStore {
         Ok(())
     }
 
-    async fn read(&self, npub: &str, sha256: &str) -> Result<Option<Vec<u8>>> {
-        match tokio::fs::read(self.blob_path(npub, sha256)).await {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+    /// Opens the blob for streaming, seeked to `start`; the caller reads
+    /// at most `len` bytes from the returned file (`len` is enforced by
+    /// the streaming wrapper, not by the file handle).
+    async fn open(
+        &self,
+        npub: &str,
+        sha256: &str,
+        start: u64,
+        _len: u64,
+    ) -> Result<Option<BlobStream>> {
+        let mut file = match tokio::fs::File::open(self.blob_path(npub, sha256)).await {
+            Ok(f) => f,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        use tokio::io::AsyncSeekExt;
+        file.seek(std::io::SeekFrom::Start(start)).await?;
+        Ok(Some(BlobStream::Local(file)))
     }
 
     async fn delete(&self, npub: &str, sha256: &str) -> Result<bool> {
@@ -379,9 +456,21 @@ impl S3Store {
             .await
     }
 
-    async fn read(&self, npub: &str, sha256: &str) -> Result<Option<Vec<u8>>> {
-        match self.client.get_object(&format!("{npub}/{sha256}")).await? {
-            Some(bytes) => Ok(Some(bytes)),
+    /// Opens the blob for streaming: fetches the `bytes=start-...` range
+    /// and returns the response body (streamed in chunks by the caller).
+    async fn open(
+        &self,
+        npub: &str,
+        sha256: &str,
+        start: u64,
+        len: u64,
+    ) -> Result<Option<BlobStream>> {
+        match self
+            .client
+            .get_object_range(&format!("{npub}/{sha256}"), start, len)
+            .await?
+        {
+            Some(resp) => Ok(Some(BlobStream::S3(resp))),
             None => Ok(None),
         }
     }
@@ -495,12 +584,39 @@ mod tests {
         (db, cfg.path)
     }
 
+    /// Reads a blob through the streaming path (open + collect).
+    async fn read_all(store: &BlobStore, npub: &str, sha: &str) -> Option<Vec<u8>> {
+        use futures_util::StreamExt as _;
+        let stream = store.open_stream(npub, sha, 0, u64::MAX).await.unwrap()?;
+        let mut out = Vec::new();
+        match stream {
+            crate::server::blossom::storage::BlobStream::Local(mut file) => {
+                use tokio::io::AsyncReadExt as _;
+                let mut buf = [0u8; 1024];
+                loop {
+                    let n = file.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    out.extend_from_slice(&buf[..n]);
+                }
+            }
+            crate::server::blossom::storage::BlobStream::S3(resp) => {
+                let mut stream = resp.bytes_stream();
+                while let Some(chunk) = stream.next().await {
+                    out.extend_from_slice(&chunk.unwrap());
+                }
+            }
+        }
+        Some(out)
+    }
+
     async fn store(tmp: &str) -> (BlobStore, std::path::PathBuf) {
         let (db, db_path) = db(tmp).await;
         let dir =
             std::env::temp_dir().join(format!("nostrd-blossom-test-{tmp}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let s = BlobStore::new("local", &dir, None, db).await.unwrap();
+        let s = BlobStore::new("local", &dir, 0, None, db).await.unwrap();
         (s, db_path)
     }
 
@@ -528,14 +644,14 @@ mod tests {
 
         let npub_a = npub_of(&a);
         let npub_b = npub_of(&b);
-        assert_eq!(s.read(&npub_a, &sha).await.unwrap().unwrap(), bytes);
-        assert_eq!(s.read(&npub_b, &sha).await.unwrap().unwrap(), bytes);
+        assert_eq!(read_all(&s, &npub_a, &sha).await.unwrap(), bytes);
+        assert_eq!(read_all(&s, &npub_b, &sha).await.unwrap(), bytes);
 
         // One owner deletes: the other owner's copy survives.
         assert!(s.delete(&b, &sha).await.unwrap());
         assert!(s.find(&sha).await.is_some());
-        assert!(s.read(&npub_a, &sha).await.unwrap().is_some());
-        assert!(s.read(&npub_b, &sha).await.unwrap().is_none());
+        assert!(read_all(&s, &npub_a, &sha).await.is_some());
+        assert!(read_all(&s, &npub_b, &sha).await.is_none());
         assert!(!s.has(&b, &sha).await);
         assert!(s.has(&a, &sha).await);
         assert_eq!(s.list(&a).await.len(), 1);
@@ -556,7 +672,7 @@ mod tests {
         let bytes = b"atomic blob";
         s.put(&a, &sha, bytes, "text/plain").await.unwrap();
         let npub_a = npub_of(&a);
-        assert_eq!(s.read(&npub_a, &sha).await.unwrap().unwrap(), bytes);
+        assert_eq!(read_all(&s, &npub_a, &sha).await.unwrap(), bytes);
         let npub_dir =
             std::env::temp_dir().join(format!("nostrd-blossom-test-atomic-{}", std::process::id()));
         let dir = npub_dir.join(&npub_a);
@@ -565,6 +681,89 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, vec![sha], "no temp files may be left behind");
+    }
+
+    #[test]
+    fn local_store_refuses_uploads_when_disk_is_full() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (s, _db_path) = store("full").await;
+            let a = pk(1);
+            let sha = "cd".repeat(32);
+            // A margin above any real free space: the put is refused.
+            let dir = std::env::temp_dir()
+                .join(format!("nostrd-blossom-test-full-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            let full = crate::server::blossom::storage::BlobStore::new(
+                "local",
+                &dir,
+                u64::MAX,
+                None,
+                s.db.clone(),
+            )
+            .await
+            .unwrap();
+            let err = full.put(&a, &sha, b"x", "text/plain").await.unwrap_err();
+            assert!(
+                matches!(err, crate::error::Error::StorageFull),
+                "the upload must be refused with StorageFull: {err}"
+            );
+            // The guard runs before any write: neither a file nor an orphan
+            // mapping may be left behind.
+            assert!(
+                full.open_stream(&npub_of(&a), &sha, 0, 1)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "no file may be written for the refused upload"
+            );
+            assert!(
+                full.find(&sha).await.is_none(),
+                "no mapping may be left for the refused upload"
+            );
+            // The disabled guard (0) lets the upload through.
+            let sha2 = "ef".repeat(32);
+            assert!(
+                s.put(&a, &sha2, b"y", "text/plain").await.is_ok(),
+                "min_free_bytes = 0 must disable the guard"
+            );
+            s.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn local_open_stream_serves_full_and_ranges() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (s, _db_path) = store("stream").await;
+            let a = pk(1);
+            let sha = "12".repeat(32);
+            let data: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+            s.put(&a, &sha, &data, "application/octet-stream")
+                .await
+                .unwrap();
+            let npub = npub_of(&a);
+            // Full read: everything from offset 0.
+            let full = read_all(&s, &npub, &sha).await.unwrap();
+            assert_eq!(full, data);
+            // Range read: the caller reads at most `len` bytes after seek.
+            let mut file = match s.open_stream(&npub, &sha, 1_000, 1_000).await.unwrap() {
+                Some(crate::server::blossom::storage::BlobStream::Local(f)) => f,
+                other => panic!("expected a local stream, got {other:?}"),
+            };
+            use tokio::io::AsyncReadExt;
+            let mut buf = vec![0u8; 1_000];
+            file.read_exact(&mut buf).await.unwrap();
+            assert_eq!(buf, data[1_000..2_000], "the range must be exact");
+            // Nonexistent blob: None.
+            assert!(
+                s.open_stream(&npub, &"ab".repeat(32), 0, 10)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            s.db.shutdown();
+        });
     }
 
     #[tokio::test]
@@ -576,7 +775,7 @@ mod tests {
             std::env::temp_dir().join(format!("nostrd-blossom-test-reopen-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         {
-            let s = BlobStore::new("local", &dir, None, db).await.unwrap();
+            let s = BlobStore::new("local", &dir, 0, None, db).await.unwrap();
             let sha = "cd".repeat(32);
             s.put(&pk(1), &sha, b"x", "image/png").await.unwrap();
             s.put(&pk(2), &sha, b"x", "image/png").await.unwrap();
@@ -596,7 +795,7 @@ mod tests {
             262144,
         )
         .unwrap();
-        let s = BlobStore::new("local", &dir, None, db).await.unwrap();
+        let s = BlobStore::new("local", &dir, 0, None, db).await.unwrap();
         let sha = "cd".repeat(32);
         assert_eq!(s.find(&sha).await.unwrap().pubkey, pk(1));
         assert!(s.has(&pk(1), &sha).await);
@@ -625,7 +824,7 @@ mod tests {
             )
             .unwrap();
         }
-        let s = BlobStore::new("local", &dir, None, db).await.unwrap();
+        let s = BlobStore::new("local", &dir, 0, None, db).await.unwrap();
         let migrated = s.auto_migrate_legacy().await.unwrap();
         assert_eq!(migrated, 2, "both owners are mapped");
         assert!(s.has(&pk(1), &sha).await);
@@ -678,7 +877,7 @@ mod scan_debug {
             npub_from_dir(&npub_dir).is_ok(),
             "npub_from_dir must accept the bech32m npub"
         );
-        let s = LocalStore::new(&dir).await.unwrap();
+        let s = LocalStore::new(&dir, 0).await.unwrap();
         let entries = s.scan_legacy().await.unwrap();
         assert_eq!(entries.len(), 1, "scan must find the legacy meta");
         let _ = std::fs::remove_dir_all(&dir);

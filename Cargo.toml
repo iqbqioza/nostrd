@@ -9,6 +9,7 @@ repository = "https://github.com/iqbqioza/nostrd"
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
+bytes = "1"
 clap = { version = "4", features = ["derive"] }
 daemonize = "0.5"
 env_logger = "0.11"
@@ -25,7 +26,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 # S3/R2 (Cloudflare R2 is S3-compatible) storage for the Blossom file server;
 # rustls provides the TLS the S3 API requires.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 sha2 = "0.10"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal", "sync", "fs"] }
 tower = { version = "0.5", features = ["util"] }

@@ -395,6 +395,8 @@ host = ""                          # e.g. "media.example.com" (empty = disabled)
 storage = "local"                  # "local" or "s3" (Cloudflare R2 is S3-compatible)
 local_path = "./data/images"       # local storage: <local_path>/<npub1...>/<sha256>
 max_upload_bytes = 20971520        # 20 MiB max upload size
+min_free_bytes = 33554432         # refuse uploads (507) while the local disk has
+                                    # less than this many free bytes; 0 disables
 restrict_uploads = false            # only allowlisted pubkeys may upload
                                     # (list managed via 'nostrd blossom allow/deny')
 s3_endpoint = ""                   # e.g. "https://<account>.r2.cloudflarestorage.com"

@@ -65,6 +65,11 @@ pub struct BlossomConfig {
     /// Maximum accepted upload size in bytes (the HTTP body limit for
     /// `PUT /upload`).
     pub max_upload_bytes: usize,
+    /// Local-storage disk-full guard: uploads are refused while the free
+    /// space on the filesystem hosting `local_path` is below this many
+    /// bytes (a full disk would make the LMDB writer fail and risk
+    /// SIGBUS on memory-map writes). 0 disables the check.
+    pub min_free_bytes: u64,
     /// S3 endpoint (e.g. `https://<account>.r2.cloudflarestorage.com` for
     /// Cloudflare R2, `https://s3.amazonaws.com` for AWS).
     pub s3_endpoint: String,
@@ -87,6 +92,7 @@ impl Default for BlossomConfig {
             storage: "local".into(),
             local_path: PathBuf::from("./data/images"),
             max_upload_bytes: 20 * 1024 * 1024,
+            min_free_bytes: 32 * 1024 * 1024,
             s3_endpoint: String::new(),
             s3_region: String::new(),
             s3_bucket: String::new(),
@@ -1218,6 +1224,7 @@ fn known_config_keys() -> &'static [(&'static str, &'static [&'static str])] {
                 "storage",
                 "local_path",
                 "max_upload_bytes",
+                "min_free_bytes",
                 "s3_endpoint",
                 "s3_region",
                 "s3_bucket",

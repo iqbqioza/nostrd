@@ -221,6 +221,7 @@ nostrd doubles as a [Blossom](https://github.com/hzrd149/blossom) blob server on
 host = "media.example.com"          # this Host header serves only the Blossom routes
 storage = "local"                   # "local" or "s3" (Cloudflare R2 is S3-compatible)
 local_path = "./data/images"        # <local_path>/<npub1...>/<sha256>
+min_free_bytes = 33554432          # refuse uploads (507) when the disk is nearly full
 # storage = "s3" + s3_endpoint / s3_region / s3_bucket / s3_access_key / s3_secret_key
 restrict_uploads = false            # true = only allow-listed pubkeys may upload
 ```
