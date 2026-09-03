@@ -394,6 +394,32 @@ impl Relay {
         }
     }
 
+    /// Reloads the database-owned access state (Blossom upload allowlist,
+    /// relay pubkey deny/allow lists) at SIGHUP. A failed or timed-out
+    /// load keeps the previous lists: overwriting them with an empty
+    /// result would silently lift every ban (fail-open).
+    pub async fn reload_db_state(&self) {
+        match self.db.try_load_blossom_allow().await {
+            Some(list) => {
+                *self.blossom_allow.write().await = list;
+                log::info!("Blossom upload allowlist reloaded from the database");
+            }
+            None => log::warn!("Blossom upload allowlist reload failed; keeping the previous list"),
+        }
+        match self.db.try_load_relay_pubkeys().await {
+            Some((deny, allow)) => {
+                let mut access = self.access.write().await;
+                access.blocked_pubkeys = deny;
+                access.allowed_pubkeys = allow;
+                access.restrict_relay = self.config.read().await.access.restrict_relay;
+                log::info!("relay pubkey access lists reloaded from the database");
+            }
+            None => {
+                log::warn!("relay pubkey access lists reload failed; keeping the previous lists")
+            }
+        }
+    }
+
     pub fn has_relay_key(&self) -> bool {
         self.key.is_some()
     }
@@ -857,8 +883,90 @@ impl Relay {
 
 #[cfg(test)]
 mod tests {
+    use super::Relay;
     use super::StampClock;
     use super::validate::contains_secret_key;
+
+    /// Builds a relay with an empty database.
+    async fn build_relay() -> std::sync::Arc<Relay> {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir()
+            .join("nostrd-relay-dbstate")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        let mut cfg = crate::config::Config::default();
+        cfg.database.path = path;
+        let db = crate::db::DbClient::open(
+            &cfg.database,
+            true,
+            std::sync::Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
+        let config = std::sync::Arc::new(tokio::sync::RwLock::new(cfg));
+        let stats = crate::stats::Stats::new();
+        let relay = Relay::new(
+            config,
+            db,
+            stats,
+            "",
+            crate::relay::LiveBusConfig {
+                buffer: 1024,
+                batch_interval_ms: 10,
+                batch_size: 64,
+            },
+        )
+        .await;
+        std::sync::Arc::new(relay)
+    }
+
+    #[tokio::test]
+    async fn reload_db_state_applies_persisted_lists() {
+        let relay = build_relay().await;
+        relay
+            .db
+            .save_relay_pubkeys(&[("aa".repeat(32), "test".into())], &[])
+            .await;
+        relay.reload_db_state().await;
+        assert_eq!(
+            relay.access.read().await.blocked_pubkeys.len(),
+            1,
+            "the persisted deny list must be applied"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn reload_db_state_keeps_previous_lists_on_failure() {
+        let relay = build_relay().await;
+        // Mark the live lists: a failed reload must not overwrite them
+        // with an empty (fail-open) result.
+        relay
+            .access
+            .write()
+            .await
+            .blocked_pubkeys
+            .push(("bb".repeat(32), "marker".into()));
+        relay.blossom_allow.write().await.push("npub1marker".into());
+        // The reader thread is gone: every reload request is reported as
+        // failed.
+        relay.db.shutdown();
+        relay.reload_db_state().await;
+        assert_eq!(
+            relay.access.read().await.blocked_pubkeys.len(),
+            1,
+            "the previous deny list must survive a failed reload"
+        );
+        assert_eq!(
+            relay.blossom_allow.read().await.len(),
+            1,
+            "the previous allowlist must survive a failed reload"
+        );
+    }
 
     #[test]
     fn stamp_clock_is_strictly_monotonic() {

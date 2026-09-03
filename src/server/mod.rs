@@ -1160,23 +1160,11 @@ async fn reload_handler(
                     }
                     Err(e) => error!("config reload failed: {e}"),
                 }
-                // The Blossom upload allowlist lives in the database: the
-                // CLI (`nostrd blossom allow/deny`) writes it there and signals
-                // SIGHUP, so re-read it here independently of the config
-                // file (which may be untouched).
-                let list = relay.db.load_blossom_allow().await;
-                *relay.blossom_allow.write().await = list;
-                info!("Blossom upload allowlist reloaded from the database");
-                // The relay pubkey allow/deny lists are also database state
-                // (`nostrd relay allow/deny`): re-read them into the live
-                // access control.
-                let (deny, allow) = relay.db.load_relay_pubkeys().await;
-                let mut access = relay.access.write().await;
-                access.blocked_pubkeys = deny;
-                access.allowed_pubkeys = allow;
-                // `restrict_relay` is config-owned: apply the reloaded flag.
-                access.restrict_relay = relay.config.read().await.access.restrict_relay;
-                info!("relay pubkey access lists reloaded from the database");
+                // The Blossom upload allowlist and the relay pubkey
+                // deny/allow lists live in the database: re-read them (a
+                // failed load keeps the previous lists — see
+                // `Relay::reload_db_state`).
+                relay.reload_db_state().await;
             }
             _ = shutdown.changed() => break,
         }

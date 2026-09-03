@@ -336,6 +336,60 @@ impl DbClient {
         self.request_with(make, &self.read_tx).await
     }
 
+    /// Startup-only read: neither fails fast on a momentarily full queue
+    /// nor applies the response timeout. The persisted access control
+    /// (deny/allow lists, Blossom allowlist) must not silently degrade to
+    /// an empty value while the database is merely slow — an empty deny
+    /// list is fail-open. The reader thread always replies; a dead reader
+    /// leaves the relay waiting at startup (fail-stop) instead of
+    /// starting with empty security state.
+    async fn request_read_blocking<R: Default>(
+        &self,
+        make: impl FnOnce(oneshot::Sender<R>) -> Msg,
+    ) -> R {
+        let (tx, rx) = oneshot::channel();
+        let msg = make(tx);
+        self.pending_msgs
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.read_tx.send(msg).is_err() {
+            // The reader thread's receiver is gone: the relay is shutting
+            // down or the thread died. There is no state to load.
+            self.pending_msgs
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            log::error!("database reader is gone; cannot load persisted state");
+            return R::default();
+        }
+        match rx.await {
+            Ok(value) => value,
+            // The reply sender was dropped: the reader thread panicked
+            // while handling the message (it recovers and continues, but
+            // this state is lost). The caller logs the failure so a
+            // silently-empty security state is never the outcome.
+            Err(_) => {
+                log::error!("database reader failed to reply; persisted state unavailable");
+                R::default()
+            }
+        }
+    }
+
+    /// Read-only request that reports failure (`None`) instead of
+    /// degrading to a default value: used by the SIGHUP reloads, where
+    /// an empty result would overwrite the live deny/allow lists with
+    /// nothing (fail-open).
+    async fn request_read_result<R: Default>(
+        &self,
+        make: impl FnOnce(oneshot::Sender<R>) -> Msg,
+    ) -> Option<R> {
+        let rx = self.send_request(make, &self.read_tx)?;
+        if self.timeout_secs == 0 {
+            return rx.await.ok();
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(self.timeout_secs), rx)
+            .await
+            .ok()
+            .and_then(|r| r.ok())
+    }
+
     /// Sends a write request to the writer thread and waits for the reply
     /// *without* a response timeout. A write that reached the writer queue is
     /// guaranteed to be processed (the writer always replies, on commit,
@@ -739,19 +793,40 @@ impl DbClient {
     }
 
     /// Loads the persisted access control lists, if any.
+    /// Loads the persisted access control at startup: waits for the reader
+    /// (no timeout, no fail-fast) so a slow database cannot silently
+    /// degrade the security state to "empty = allow everyone".
     pub async fn load_access(&self) -> Option<crate::config::AccessControl> {
-        self.request_read(|reply| Msg::LoadAccess { reply }).await
-    }
-
-    /// Loads the persisted Blossom upload allowlist.
-    pub async fn load_blossom_allow(&self) -> Vec<String> {
-        self.request_read(|reply| Msg::LoadBlossomAllow { reply })
+        self.request_read_blocking(|reply| Msg::LoadAccess { reply })
             .await
     }
 
-    /// Loads the persisted relay pubkey access lists (deny, allow).
+    /// Loads the persisted Blossom upload allowlist at startup (see
+    /// [`Self::load_access`]).
+    pub async fn load_blossom_allow(&self) -> Vec<String> {
+        self.request_read_blocking(|reply| Msg::LoadBlossomAllow { reply })
+            .await
+    }
+
+    /// Loads the persisted relay pubkey access lists (deny, allow) at
+    /// startup (see [`Self::load_access`]).
     pub async fn load_relay_pubkeys(&self) -> crate::db::store::RelayPubkeyLists {
-        self.request_read(|reply| Msg::LoadRelayPubkeys { reply })
+        self.request_read_blocking(|reply| Msg::LoadRelayPubkeys { reply })
+            .await
+    }
+
+    /// Reload variant with failure reporting (`None` = the load failed or
+    /// timed out): the caller keeps the previous lists instead of
+    /// overwriting them with an empty (fail-open) result.
+    pub async fn try_load_blossom_allow(&self) -> Option<Vec<String>> {
+        self.request_read_result(|reply| Msg::LoadBlossomAllow { reply })
+            .await
+    }
+
+    /// Reload variant with failure reporting, see
+    /// [`Self::try_load_blossom_allow`].
+    pub async fn try_load_relay_pubkeys(&self) -> Option<crate::db::store::RelayPubkeyLists> {
+        self.request_read_result(|reply| Msg::LoadRelayPubkeys { reply })
             .await
     }
 

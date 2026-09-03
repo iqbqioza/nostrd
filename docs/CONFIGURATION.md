@@ -296,7 +296,7 @@ Every key is optional; a missing key uses the default shown below.
 
 **`max_indexed_words`** — How many words of each event's content are added to the NIP-50 search index. Higher values improve recall for long texts at a small storage cost.
 
-**`db_request_timeout_secs`** — How long a database request may wait before it fails (`0` = forever). Keeps the relay responsive when the storage is stuck. Write requests are not subject to the timeout (a false timeout would skip their side effects).
+**`db_request_timeout_secs`** — How long a database request may wait before it fails (`0` = forever). Keeps the relay responsive when the storage is stuck. Write requests are not subject to the timeout (a false timeout would skip their side effects). The startup loads of the persisted access state (deny/allow lists, Blossom allowlist) wait without a timeout and never fail fast: an empty result would silently lift every ban (fail-open). Their SIGHUP reloads keep the previous lists when a load fails.
 
 **`db_queue_msgs`** — When the database queue holds more than this many pending messages, new requests fail fast instead of piling up in memory.
 
