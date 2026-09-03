@@ -99,7 +99,7 @@ Every key is optional; a missing key uses the default shown below.
 
 **`post_policy`** — A URL where you describe your posting policy. Omitted when empty.
 
-**`private_key`** — The relay's own secret key (64 hex chars). It signs **relay-generated events**: NIP-29 group metadata (39000-39005), NIP-43 role/membership events. Without it, NIP-29 groups still accept moderation events but produce **no 39001/39002 snapshots**, and NIP-43 is unavailable (a warning is logged). Generate with `nostrd genkey`; keep it secret. Read once at startup — changing it requires a `restart`.
+**`private_key`** — The relay's own secret key (64 hex chars). It signs **relay-generated events**: NIP-29 group metadata (39000-39005), NIP-43 role/membership events. Without it, NIP-29 groups still accept moderation events but produce **no 39001/39002 snapshots**, and NIP-43 is unavailable (a warning is logged). Generate with `nostrd genkey`; keep it secret. Read once at startup — changing it requires a `restart`. The config file is created and kept at `0600` (`nostrd init` creates it that way; `nostrd genkey` enforces it after writing the key), so a loosely defaulted umask cannot leave secrets readable by other users.
 
 **`public_url`** — The relay's public address, e.g. `wss://relay.example.com`. Used to validate URL-bearing tags from clients: NIP-42 AUTH (`relay` tag), NIP-62 vanish (`relay` tag), NIP-98 admin auth (`u` tag). When empty, the relay falls back to `host:port`, which never matches a real client URL when binding `0.0.0.0`/`127.0.0.1` (a warning is logged). **Always set this.**
 
