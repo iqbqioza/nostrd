@@ -155,7 +155,7 @@ To generate a secret key, use the `nostrd genkey` command (see [5. Command Refer
 | Option | Description | Default |
 | --- | --- | --- |
 | `max_connections` | Maximum concurrent connections | `10000` |
-| `max_connections_per_ip` | Max connections per source IP (0 = unlimited) | `0` |
+| `max_connections_per_ip` | Max connections per source IP (0 = unlimited) | `64` |
 | `max_ws_message_size` | Max bytes per WebSocket message/frame | `1048576` (1 MB) |
 | `max_filters` | Max filters per REQ | `20` |
 | `max_subscriptions` | Max subscriptions per connection | `20` |
@@ -173,7 +173,10 @@ To generate a secret key, use the `nostrd genkey` command (see [5. Command Refer
 | `db_request_timeout_secs` | Database request timeout (0 = wait forever) | `30` |
 | `new_pubkey_min_age_secs` | Reject posts from accounts younger than this (spam defense, 0 = off) | `0` |
 | `max_out_queue_bytes` | Per-connection outgoing queue cap (bytes) | `262144` |
-| `ws_idle_timeout_secs` | Close idle connections after this many seconds (0 = off) | `0` |
+| `ws_idle_timeout_secs` | Close idle connections after this many seconds (0 = off) | `300` |
+| `http_read_timeout_secs` | Seconds to complete an HTTP request head (0 = disabled; slow-loris defense, applies to WS upgrades too) | `30` |
+| `max_conn_per_sec_per_ip` | Max new connections per second per source IP (0 = unlimited) | `0` |
+| `max_events_per_min_per_pubkey` | Max events a pubkey may publish per minute (0 = unlimited) | `0` |
 | `db_queue_msgs` / `db_queue_events` | Overload protection when the DB queue backs up | `4096` / `262144` |
 | `max_sub_bytes` | Total subscription filter bytes per connection | `524288` |
 | `group_late_publish_secs` | Reject NIP-29 group events older than this (0 = off) | `604800` (7 days) |
@@ -728,9 +731,9 @@ After editing the config file, reload it without a restart:
 kill -HUP $(cat nostrd.pid)
 ```
 
-Settings that take effect on reload: relay name/description, limits, NIP toggles (partially), NIP-40 on/off, API concurrency, ...
+Settings that take effect on reload: relay name/description, limits (except the HTTP-layer ones below), NIP toggles (partially), NIP-40 on/off, API concurrency, ...
 
-Settings that require a **restart**: `private_key`, `api_host`, `metrics_enabled`, LiveKit settings, `enabled_nips`/`disabled_nips`. The log warns when a change needs a restart.
+Settings that require a **restart**: `private_key`, `api_host`, `metrics_enabled`, LiveKit settings, `enabled_nips`/`disabled_nips`, and the HTTP-layer limits (`max_connections`, `http_read_timeout_secs`, `max_conn_per_sec_per_ip` — they shape the accept loop built at startup). The log warns when a change needs a restart.
 
 ---
 

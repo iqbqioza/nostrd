@@ -60,6 +60,13 @@ impl super::Relay {
         if !access.allows_kind(event.kind) {
             return Precheck::Reject("blocked: kind not allowed".into());
         }
+        // Spam defense: a pubkey may publish at most
+        // `limits.max_events_per_min_per_pubkey` events per minute
+        // (sliding 60-second window). Counted per accepted event before
+        // the database write.
+        if !self.publish_rate_allowed(cfg, &event.pubkey, now) {
+            return Precheck::Reject("rate-limited: too many events".into());
+        }
         // NIP-43: join requests carry an invite code, which this relay
         // never issues; every claim therefore fails (NIP-43 mandates an
         // OK reply).
@@ -357,8 +364,16 @@ mod tests {
     use tokio::sync::RwLock;
 
     fn signed(kind: u64, tags: Vec<Vec<String>>) -> Event {
+        signed_with_seed(3u8, kind, tags)
+    }
+
+    fn signed_other_key(kind: u64, tags: Vec<Vec<String>>) -> Event {
+        signed_with_seed(4u8, kind, tags)
+    }
+
+    fn signed_with_seed(seed: u8, kind: u64, tags: Vec<Vec<String>>) -> Event {
         let secp = Secp256k1::new();
-        let keypair = Keypair::from_seckey_slice(&secp, &[3u8; 32]).unwrap();
+        let keypair = Keypair::from_seckey_slice(&secp, &[seed; 32]).unwrap();
         let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
         let mut ev = Event {
             id: String::new(),
@@ -377,6 +392,135 @@ mod tests {
 
     #[test]
     fn vanished_pubkey_remains_visible_to_its_own_pubkey() {}
+
+    #[test]
+    fn publish_rate_limits_events_per_pubkey_per_minute() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut cfg = Config::default();
+            cfg.limits.max_events_per_min_per_pubkey = 3;
+            cfg.database.path = std::env::temp_dir().join("nostrd-rate-test");
+            let _ = std::fs::remove_dir_all(&cfg.database.path);
+            let db = crate::db::DbClient::open(
+                &cfg.database,
+                true,
+                Arc::new(Default::default()),
+                0,
+                128,
+                4096,
+                262144,
+            )
+            .unwrap();
+            let config = Arc::new(RwLock::new(cfg));
+            let relay = Arc::new(
+                Relay::new(
+                    config.clone(),
+                    db,
+                    crate::stats::Stats::new(),
+                    "",
+                    crate::relay::LiveBusConfig {
+                        buffer: 1024,
+                        batch_interval_ms: 10,
+                        batch_size: 64,
+                    },
+                )
+                .await,
+            );
+            let cfg = relay.config.read().await;
+            let access = AccessControl::default();
+            let now = unix_now();
+            // The first three events of the minute are accepted.
+            for i in 0..3 {
+                let ev = signed(1, vec![vec!["content".into(), format!("{i}")]]);
+                let out = relay.precheck(&cfg, &access, &ev, now, &[], None).await;
+                assert!(
+                    matches!(out, super::Precheck::Accept),
+                    "event {i} must be accepted under the limit"
+                );
+            }
+            // The fourth is rate-limited.
+            let ev = signed(1, vec![vec!["content".into(), "4".into()]]);
+            let out = relay.precheck(&cfg, &access, &ev, now, &[], None).await;
+            assert!(
+                matches!(out, super::Precheck::Reject(msg) if msg.contains("rate-limited")),
+                "the event over the limit must be rate-limited"
+            );
+            // A different pubkey has its own window.
+            let ev = signed_other_key(1, vec![]);
+            let out = relay.precheck(&cfg, &access, &ev, now, &[], None).await;
+            assert!(
+                matches!(out, super::Precheck::Accept),
+                "another pubkey is not limited by the first window"
+            );
+            // After the minute passes the window slides open again.
+            let ev = signed(1, vec![vec!["content".into(), "5".into()]]);
+            let out = relay
+                .precheck(&cfg, &access, &ev, now + 61, &[], None)
+                .await;
+            assert!(
+                matches!(out, super::Precheck::Accept),
+                "the window must slide open after 60 seconds"
+            );
+            drop(cfg);
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn publish_rate_unlimited_by_default_and_bounded_map() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut cfg = Config::default();
+            cfg.database.path = std::env::temp_dir().join("nostrd-rate-map-test");
+            let _ = std::fs::remove_dir_all(&cfg.database.path);
+            let db = crate::db::DbClient::open(
+                &cfg.database,
+                true,
+                Arc::new(Default::default()),
+                0,
+                128,
+                4096,
+                262144,
+            )
+            .unwrap();
+            let config = Arc::new(RwLock::new(cfg));
+            let relay = Arc::new(
+                Relay::new(
+                    config.clone(),
+                    db,
+                    crate::stats::Stats::new(),
+                    "",
+                    crate::relay::LiveBusConfig {
+                        buffer: 1024,
+                        batch_interval_ms: 10,
+                        batch_size: 64,
+                    },
+                )
+                .await,
+            );
+            // 0 = unlimited: the check never rejects and the map stays empty.
+            let cfg = Config::default();
+            assert!(relay.publish_rate_allowed(&cfg, &"a".repeat(64), unix_now()));
+            assert_eq!(
+                relay.publish_rate.lock().unwrap().len(),
+                0,
+                "no window is recorded when the limit is disabled"
+            );
+            // The map is bounded: with the limit on, many pubkeys evict the
+            // map instead of growing it.
+            let mut cfg = Config::default();
+            cfg.limits.max_events_per_min_per_pubkey = 1;
+            for i in 0..20_000u64 {
+                let pk = format!("{i:064x}");
+                assert!(relay.publish_rate_allowed(&cfg, &pk, unix_now()));
+            }
+            assert!(
+                relay.publish_rate.lock().unwrap().len() <= 10_000,
+                "the tracked-pubkey map must not exceed its bound"
+            );
+            relay.db.shutdown();
+        });
+    }
 
     #[test]
     fn git_kinds_follow_enable_git() {
