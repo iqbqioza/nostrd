@@ -243,6 +243,11 @@ fn npub_of(pubkey: &str) -> String {
 
 struct LocalStore {
     root: PathBuf,
+    /// The resolved root: every operation's parent directory is
+    /// canonicalized and must resolve under this path, so a symlinked
+    /// npub directory can never redirect reads, writes or deletes
+    /// outside the blob store (the symlink-escape guard).
+    canonical_root: PathBuf,
     /// Disk-full guard: uploads are refused while the free space on the
     /// filesystem hosting `root` is below this many bytes (0 disables).
     min_free_bytes: u64,
@@ -251,14 +256,34 @@ struct LocalStore {
 impl LocalStore {
     async fn new(root: &Path, min_free_bytes: u64) -> Result<LocalStore> {
         tokio::fs::create_dir_all(root).await?;
+        let canonical_root = tokio::fs::canonicalize(root).await?;
         Ok(LocalStore {
             root: root.to_path_buf(),
+            canonical_root,
             min_free_bytes,
         })
     }
 
     fn blob_path(&self, npub: &str, sha256: &str) -> PathBuf {
         self.root.join(npub).join(sha256)
+    }
+
+    /// Whether the blob's parent directory is a real directory inside the
+    /// canonical root. A symlinked npub directory — even one that stays
+    /// inside the root (the blob would land in another npub's directory)
+    /// — would resolve elsewhere and is refused. The final blob file
+    /// itself is protected by `O_NOFOLLOW` where it is opened.
+    async fn parent_within_root(&self, npub: &str) -> bool {
+        let dir = self.root.join(npub);
+        // The npub directory must not be a symlink itself.
+        match tokio::fs::symlink_metadata(&dir).await {
+            Ok(meta) if !meta.file_type().is_symlink() => {}
+            _ => return false,
+        }
+        match tokio::fs::canonicalize(&dir).await {
+            Ok(canonical) => canonical.starts_with(&self.canonical_root),
+            Err(_) => false,
+        }
     }
 
     /// Free bytes on the filesystem hosting the blob root, when statvfs
@@ -299,13 +324,43 @@ impl LocalStore {
     ) -> Result<()> {
         let dir = self.root.join(npub);
         tokio::fs::create_dir_all(&dir).await?;
+        // Symlink-escape guard: the (possibly pre-existing) npub
+        // directory must resolve inside the blob root, or the write
+        // would land in the symlink target's directory.
+        if !self.parent_within_root(npub).await {
+            return Err(crate::error::Error::Other(
+                "blossom storage directory is a symlink".into(),
+            ));
+        }
         // Atomic write: the bytes land in a temp file first and are moved
         // into place with a rename. A crash mid-write can then never leave
         // a truncated blob at the final path — the file is either complete
         // or absent (the LMDB mapping may already reference the sha, but a
         // missing file is a healable state, a truncated one is not).
+        // A stale temp is overwritten — a concurrent upload of the same
+        // bytes writes identical content, so no `create_new` exclusivity
+        // race can surface as a spurious failure — and O_NOFOLLOW keeps a
+        // planted symlink from redirecting the write (or truncating an
+        // external file through the link).
         let tmp_path = dir.join(format!(".{sha256}.tmp"));
-        if let Err(e) = tokio::fs::write(&tmp_path, bytes).await {
+        let write = {
+            use tokio::io::AsyncWriteExt;
+            let mut tmp = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(&tmp_path)
+                .await?;
+            let result = async {
+                tmp.write_all(bytes).await?;
+                tmp.flush().await
+            }
+            .await;
+            drop(tmp);
+            result
+        };
+        if let Err(e) = write {
             let _ = tokio::fs::remove_file(&tmp_path).await;
             return Err(e.into());
         }
@@ -326,9 +381,25 @@ impl LocalStore {
         start: u64,
         _len: u64,
     ) -> Result<Option<BlobStream>> {
-        let mut file = match tokio::fs::File::open(self.blob_path(npub, sha256)).await {
+        // Symlink-escape guard: a symlinked npub directory would resolve
+        // outside the root; a symlinked blob file would be followed by a
+        // plain open. Both are refused (the blob reads as missing).
+        if !self.parent_within_root(npub).await {
+            return Ok(None);
+        }
+        let mut file = match tokio::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(self.blob_path(npub, sha256))
+            .await
+        {
             Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    || e.raw_os_error() == Some(libc::ELOOP) =>
+            {
+                return Ok(None);
+            }
             Err(e) => return Err(e.into()),
         };
         use tokio::io::AsyncSeekExt;
@@ -337,6 +408,13 @@ impl LocalStore {
     }
 
     async fn delete(&self, npub: &str, sha256: &str) -> Result<bool> {
+        // Symlink-escape guard: with a symlinked npub directory, removing
+        // the blob would remove a file in the symlink target's directory.
+        // (A symlinked blob file itself is safe to remove — only the link
+        // is deleted.)
+        if !self.parent_within_root(npub).await {
+            return Ok(false);
+        }
         let path = self.blob_path(npub, sha256);
         let existed = tokio::fs::try_exists(&path).await.unwrap_or(false);
         let _ = tokio::fs::remove_file(&path).await;
@@ -352,7 +430,13 @@ impl LocalStore {
         let mut dirs = tokio::fs::read_dir(&self.root).await?;
         while let Some(entry) = dirs.next_entry().await? {
             let dir = entry.path();
-            if !dir.is_dir() {
+            // `file_type` does not follow symlinks: a symlinked npub
+            // directory (an attempt to point the migration at an
+            // external directory) is skipped, not scanned.
+            let Ok(ft) = entry.file_type().await else {
+                continue;
+            };
+            if !ft.is_dir() {
                 continue;
             }
             let Ok(pubkey) = npub_from_dir(&dir) else {
@@ -364,6 +448,11 @@ impl LocalStore {
                 Err(_) => continue,
             };
             while let Some(file) = files.next_entry().await? {
+                // A symlinked meta (an attempt to leak an external
+                // file's descriptor) is skipped, not read.
+                if !file.file_type().await.is_ok_and(|ft| ft.is_file()) {
+                    continue;
+                }
                 let name = file.file_name().to_string_lossy().into_owned();
                 let Some(sha) = name.strip_suffix(".meta.json") else {
                     continue;
@@ -388,6 +477,11 @@ impl LocalStore {
                 Err(_) => continue,
             };
             while let Some(file) = files.next_entry().await? {
+                // A symlinked blob (pointing at an external file) is
+                // skipped, not measured.
+                if !file.file_type().await.is_ok_and(|ft| ft.is_file()) {
+                    continue;
+                }
                 let name = file.file_name().to_string_lossy().into_owned();
                 if name.len() != 64 || hex::decode(&name).is_err() || via_meta.contains(&name) {
                     continue;
@@ -584,6 +678,15 @@ mod tests {
         (db, cfg.path)
     }
 
+    /// The local store behind the store (the symlink tests need its
+    /// paths, which are private to `LocalStore`).
+    fn local(s: &BlobStore) -> &LocalStore {
+        match &s.storage {
+            Storage::Local(l) => l,
+            Storage::S3(_) => panic!("local store only"),
+        }
+    }
+
     /// Reads a blob through the streaming path (open + collect).
     async fn read_all(store: &BlobStore, npub: &str, sha: &str) -> Option<Vec<u8>> {
         use futures_util::StreamExt as _;
@@ -762,6 +865,217 @@ mod tests {
                     .unwrap()
                     .is_none()
             );
+            s.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn open_refuses_symlinked_blob() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (s, _db_path) = store("symlink-read").await;
+            let a = pk(1);
+            let sha = "12".repeat(32);
+            let npub = npub_of(&a);
+            s.put(&a, &sha, b"real", "text/plain").await.unwrap();
+            // Replace the blob file with a symlink to an external file.
+            let external = std::env::temp_dir().join(format!(
+                "nostrd-blossom-symlink-external-{}",
+                std::process::id()
+            ));
+            std::fs::write(&external, b"secret").unwrap();
+            std::fs::remove_file(local(&s).blob_path(&npub, &sha)).unwrap();
+            std::os::unix::fs::symlink(&external, local(&s).blob_path(&npub, &sha)).unwrap();
+            // The symlink is refused: the blob reads as missing, and the
+            // external content is never served.
+            assert!(
+                s.open_stream(&npub, &sha, 0, 1).await.unwrap().is_none(),
+                "a symlinked blob must not be followed"
+            );
+            std::fs::remove_file(&external).unwrap();
+            s.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn delete_does_not_follow_symlinked_npub_dir() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (s, _db_path) = store("symlink-del").await;
+            let a = pk(1);
+            let sha = "34".repeat(32);
+            let npub = npub_of(&a);
+            s.put(&a, &sha, b"real", "text/plain").await.unwrap();
+            // Point the npub directory at an external directory.
+            let external = std::env::temp_dir()
+                .join(format!("nostrd-blossom-symlink-dir-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&external);
+            std::fs::create_dir_all(&external).unwrap();
+            std::fs::write(external.join("victim"), b"keep me").unwrap();
+            std::fs::remove_dir_all(local(&s).root.join(&npub)).unwrap();
+            std::os::unix::fs::symlink(&external, local(&s).root.join(&npub)).unwrap();
+            // The delete is refused: the external file must survive.
+            assert!(
+                !s.delete(&a, &sha).await.unwrap(),
+                "the delete must not touch the symlink target"
+            );
+            assert_eq!(
+                std::fs::read(external.join("victim")).unwrap(),
+                b"keep me",
+                "the symlink target's file must be untouched"
+            );
+            let _ = std::fs::remove_dir_all(&external);
+            s.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn put_refuses_symlinked_npub_dir() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (s, _db_path) = store("symlink-put").await;
+            let a = pk(1);
+            let sha = "56".repeat(32);
+            let npub = npub_of(&a);
+            // Point the npub directory at an external directory.
+            let external = std::env::temp_dir().join(format!(
+                "nostrd-blossom-symlink-write-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&external);
+            std::fs::create_dir_all(&external).unwrap();
+            std::os::unix::fs::symlink(&external, local(&s).root.join(&npub)).unwrap();
+            let err = s.put(&a, &sha, b"x", "text/plain").await.unwrap_err();
+            assert!(
+                err.to_string().contains("symlink"),
+                "the write must be refused: {err}"
+            );
+            assert!(
+                !external.join(&sha).exists() && !external.join(format!(".{sha}.tmp")).exists(),
+                "nothing may be written into the symlink target"
+            );
+            assert!(
+                s.open_stream(&npub, &sha, 0, 1).await.unwrap().is_none(),
+                "the blob must not be readable through the symlink"
+            );
+            let _ = std::fs::remove_dir_all(&external);
+            s.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn put_overwrites_stale_tmp_and_refuses_internal_symlink() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (s, _db_path) = store("symlink-stale").await;
+            let a = pk(1);
+            let sha = "78".repeat(32);
+            let npub = npub_of(&a);
+            // A stale temp (e.g. left by a crash) is overwritten, and a
+            // symlink planted at the temp path is never followed.
+            let tmp = local(&s).root.join(&npub).join(format!(".{sha}.tmp"));
+            s.put(&a, &sha, b"first", "text/plain").await.unwrap();
+            std::fs::write(&tmp, b"stale").unwrap();
+            s.put(&a, &sha, b"second", "text/plain").await.unwrap();
+            let mut file = match s.open_stream(&npub, &sha, 0, 6).await.unwrap() {
+                Some(crate::server::blossom::storage::BlobStream::Local(f)) => f,
+                other => panic!("expected a local stream, got {other:?}"),
+            };
+            use tokio::io::AsyncReadExt;
+            let mut buf = Vec::new();
+            file.read_to_end(&mut buf).await.unwrap();
+            assert_eq!(buf, b"second", "the stale temp must be overwritten");
+            // A symlink at the temp path: the write is refused, the link
+            // (not its target) is removed.
+            let external = std::env::temp_dir()
+                .join(format!("nostrd-blossom-symlink-tmp-{}", std::process::id()));
+            std::fs::write(&external, b"precious").unwrap();
+            // The second put's rename consumed the temp: plant a fresh
+            // symlink at the temp path.
+            let _ = std::fs::remove_file(&tmp);
+            std::os::unix::fs::symlink(&external, &tmp).unwrap();
+            let err = s.put(&a, &sha, b"third", "text/plain").await.unwrap_err();
+            assert!(
+                err.to_string().contains("symlink") || matches!(err, crate::error::Error::Io(_)),
+                "the write must not follow the temp symlink: {err}"
+            );
+            assert_eq!(
+                std::fs::read(&external).unwrap(),
+                b"precious",
+                "the symlink target must be untouched"
+            );
+            std::fs::remove_file(&external).unwrap();
+            s.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn migration_skips_symlinked_npub_dirs() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (s, _db_path) = store("symlink-mig").await;
+            // An external directory looks like a legacy store: it must
+            // not be scanned through a symlinked npub directory.
+            let external = std::env::temp_dir().join(format!(
+                "nostrd-blossom-symlink-migrate-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&external);
+            std::fs::create_dir_all(&external).unwrap();
+            std::fs::write(
+                external.join(format!("{}.meta.json", "ab".repeat(32))),
+                r#"{"mime":"text/plain","size":7,"uploaded":1}"#,
+            )
+            .unwrap();
+            let npub = "npub1external";
+            std::os::unix::fs::symlink(&external, local(&s).root.join(npub)).unwrap();
+            let mapped = s.auto_migrate_legacy().await.unwrap();
+            assert_eq!(
+                mapped, 0,
+                "the migration must not map files through a symlinked directory"
+            );
+            assert!(
+                s.find(&"ab".repeat(32)).await.is_none(),
+                "no mapping may reference the external file"
+            );
+            let _ = std::fs::remove_dir_all(&external);
+            s.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn migration_skips_symlinked_blob_files() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let (s, _db_path) = store("symlink-mig2").await;
+            let a = pk(1);
+            let npub = npub_of(&a);
+            let dir = local(&s).root.join(&npub);
+            std::fs::create_dir_all(&dir).unwrap();
+            // A symlinked blob (pointing at an external file) and a
+            // symlinked meta must not be mapped: their descriptors are
+            // not external metadata to leak.
+            let external = std::env::temp_dir().join(format!(
+                "nostrd-blossom-symlink-migrate2-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&external);
+            std::fs::write(&external, b"secret payload").unwrap();
+            std::os::unix::fs::symlink(&external, dir.join("ab".repeat(32))).unwrap();
+            let meta = std::env::temp_dir().join(format!(
+                "nostrd-blossom-symlink-migrate2-meta-{}",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&meta);
+            std::fs::write(&meta, r#"{"mime":"text/plain","size":999,"uploaded":1}"#).unwrap();
+            std::os::unix::fs::symlink(&meta, dir.join(format!("{}.meta.json", "cd".repeat(32))))
+                .unwrap();
+            let mapped = s.auto_migrate_legacy().await.unwrap();
+            assert_eq!(mapped, 0, "the migration must not map symlinked blob files");
+            assert!(s.find(&"ab".repeat(32)).await.is_none());
+            assert!(s.find(&"cd".repeat(32)).await.is_none());
+            let _ = std::fs::remove_file(&external);
+            let _ = std::fs::remove_file(&meta);
             s.db.shutdown();
         });
     }

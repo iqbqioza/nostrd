@@ -473,6 +473,8 @@ nostrd relay list                # show both lists and restrict_relay
 
 **`max_upload_bytes`** — The HTTP body limit for uploads. Note that `limits.max_ws_message_size` is unrelated (it governs WebSocket events).
 
+**`local_path`** — Local storage. The store refuses paths that a local attacker has replaced with symlinks (reads, writes and deletes never follow a symlinked blob file or npub directory), so the blob tree cannot be redirected outside the configured root.
+
 **`min_free_bytes`** — Local-storage disk-full guard. Before writing a blob, the relay checks the free space on the filesystem hosting `local_path` (the same `statvfs` check the LMDB writer uses) and refuses the upload with `507 Insufficient Storage` while the free space is below this margin — a full disk would otherwise fail the LMDB writer and risk SIGBUS on memory-map writes. `0` disables the check. The S3 backend has no local disk, so the guard only applies to `storage = "local"`.
 
 **S3 keys** — With `storage = "s3"`, `s3_endpoint`, `s3_bucket`, `s3_access_key` and `s3_secret_key` are required. The endpoint must be the *path-style* form (`https://s3.amazonaws.com` or `https://<account>.r2.cloudflarestorage.com`); the request signing follows AWS Signature Version 4.
