@@ -319,6 +319,23 @@ pub(crate) enum ScanKind {
     Negentropy,
 }
 
+/// Parses the sort tail `(created_at, id)` from an index key
+/// (`(prefix..., created_at, id)`). A key shorter than 40 bytes is
+/// corruption (a truncated or hand-crafted index entry): the scan fails
+/// loudly instead of panicking on the slice.
+fn index_tail(key: &[u8]) -> std::result::Result<([u8; 8], [u8; 32]), String> {
+    if key.len() < 40 {
+        return Err(format!("corrupt index key ({} bytes)", key.len()));
+    }
+    let created: [u8; 8] = key[key.len() - 40..key.len() - 32]
+        .try_into()
+        .expect("slice length checked above");
+    let id: [u8; 32] = key[key.len() - 32..]
+        .try_into()
+        .expect("slice length checked above");
+    Ok((created, id))
+}
+
 impl Store {
     /// Estimates the inverse document frequency weight of each search term
     /// from the word index: a term's document frequency is the number of
@@ -885,8 +902,7 @@ impl Store {
                     }
                 }
                 if let Some(key) = &head.next_key {
-                    let created: [u8; 8] = key[key.len() - 40..key.len() - 32].try_into().unwrap();
-                    let id: [u8; 32] = key[key.len() - 32..].try_into().unwrap();
+                    let (created, id) = index_tail(key).map_err(crate::error::Error::Other)?;
                     let better = if ascending {
                         best.as_ref()
                             .is_none_or(|(_, bc, bi)| (created, id) < (*bc, *bi))
@@ -1013,8 +1029,25 @@ fn is_deliverable(
 
 #[cfg(test)]
 mod tests {
-    use super::score;
+    use super::{index_tail, score};
     use crate::event::Event;
+
+    #[test]
+    fn index_tail_parses_and_rejects_corrupt_keys() {
+        let mut key = vec![0xAAu8; 16]; // prefix
+        key.extend_from_slice(&1u64.to_be_bytes());
+        key.extend_from_slice(&[0xBBu8; 32]);
+        let (created, id) = index_tail(&key).expect("a padded key parses");
+        assert_eq!(created, 1u64.to_be_bytes());
+        assert_eq!(id, [0xBBu8; 32]);
+        // A bare 40-byte tail (no prefix) parses too.
+        let bare: Vec<u8> = [2u64.to_be_bytes().as_slice(), &[0xCCu8; 32]].concat();
+        assert_eq!(index_tail(&bare).unwrap().0, 2u64.to_be_bytes());
+        // A truncated key is corruption: the scan must fail loudly, not
+        // panic on the slice.
+        assert!(index_tail(&bare[..39]).is_err());
+        assert!(index_tail(&[]).is_err());
+    }
 
     fn ev(content: &str, created: u64) -> Event {
         Event {
