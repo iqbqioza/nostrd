@@ -258,6 +258,8 @@ nostrd blossom list
 | `nostrd restart` | Stop and start again (reloads `nostrd.toml`) |
 | `nostrd stats` | Show live statistics of the running daemon |
 | `nostrd check` | Validate `nostrd.toml` and exit |
+| `nostrd blossom allow <pubkey>` / `deny <pubkey>` / `list` | Manage the Blossom upload allowlist (persisted in LMDB, applied on SIGHUP) |
+| `nostrd relay allow <pubkey>` / `deny <pubkey>` / `list` | Manage the relay pubkey allow/deny lists (persisted in LMDB, applied on SIGHUP) |
 
 All commands accept `--config <path>` (default `./nostrd.toml`).
 

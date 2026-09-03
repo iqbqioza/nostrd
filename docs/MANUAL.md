@@ -296,6 +296,8 @@ All commands accept `--config <path>` (default: `nostrd.toml`).
 | `nostrd stop` | Stop the running daemon |
 | `nostrd restart` | Stop and start again (re-reads the config) |
 | `nostrd stats` | Show live statistics |
+| `nostrd blossom allow <pubkey>` / `deny <pubkey>` / `list` | Manage the Blossom upload allowlist (persisted in LMDB; the running relay applies it on SIGHUP) |
+| `nostrd relay allow <pubkey>` / `deny <pubkey>` / `list` | Manage the relay pubkey allow/deny lists (persisted in LMDB; a denied pubkey is always rejected when publishing; the running relay applies changes on SIGHUP) |
 
 ### Inbox/outbox subscription filters
 

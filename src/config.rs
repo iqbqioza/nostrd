@@ -701,11 +701,28 @@ impl Config {
             ("blossom.host", self.blossom.host.as_str()),
         ] {
             if value.trim().is_empty() {
+                // A whitespace-only value is a config error: the runtime
+                // treats it as non-empty, and the split routes would be
+                // blocked on every host (the whole API silently 404s).
+                if !value.is_empty() {
+                    return Err(Error::Config(format!(
+                        "{name} must be a bare hostname or empty, got {value:?}"
+                    )));
+                }
                 continue;
             }
-            if value.contains('/') || bare_host_has_port(value.trim()) {
+            // A bare hostname must only contain hostname characters: a
+            // whitespace or control character (e.g. `api host` or a
+            // trailing newline) could never match a request Host header
+            // and would silently hide the whole API / Blossom server
+            // (404 on every request). IPv6 literals keep their brackets
+            // and colons; underscores are tolerated (common in practice).
+            let valid_chars = value.chars().all(|c| {
+                c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ':' | '[' | ']')
+            });
+            if value.contains('/') || !valid_chars || bare_host_has_port(value.trim()) {
                 return Err(Error::Config(format!(
-                    "{name} must be a bare hostname (no scheme, port or path), got {value:?}"
+                    "{name} must be a bare hostname (no scheme, port, path or whitespace), got {value:?}"
                 )));
             }
         }
@@ -894,7 +911,9 @@ impl Config {
 }
 
 /// Whether a bare hostname contains a `:` outside IPv6 brackets (i.e. a
-/// port). `[::1]` and `::1` are fine, `media.example.com:8080` is not.
+/// port). `[::1]` is fine; `media.example.com:8080` and the unbracketed
+/// `::1` (the host-split matching brackets IPv6 literals, so the
+/// unbracketed form could never match a Host header) are not.
 fn bare_host_has_port(host: &str) -> bool {
     host.contains(':') && !host.starts_with('[')
 }
@@ -1810,6 +1829,66 @@ mod tests {
             cfg.validate().is_err(),
             "map_size must not exceed map_max_size"
         );
+    }
+
+    #[test]
+    fn validation_rejects_hosts_with_invalid_characters() {
+        let mut cfg = Config::default();
+        // Valid hosts pass: a DNS name, an IPv6 literal, an underscore,
+        // on both split hosts.
+        for (host, name) in [
+            ("api.example.com", "server.api_host"),
+            ("[::1]", "server.api_host"),
+            ("my_host", "server.api_host"),
+            ("media.example.com", "blossom.host"),
+            ("[::1]", "blossom.host"),
+        ] {
+            if name == "server.api_host" {
+                cfg.server.api_host = host.into();
+            } else {
+                cfg.blossom.host = host.into();
+            }
+            assert!(cfg.validate().is_ok(), "{host} must be valid");
+        }
+        cfg.server.api_host = String::new();
+        cfg.blossom.host = String::new();
+        // Whitespace-only values are rejected too: the runtime treats
+        // them as non-empty and would block every API path (silent 404).
+        cfg.server.api_host = "   ".into();
+        assert!(
+            cfg.validate().is_err(),
+            "whitespace-only api_host must be rejected"
+        );
+        cfg.server.api_host = String::new();
+        cfg.blossom.host = " ".into();
+        assert!(
+            cfg.validate().is_err(),
+            "whitespace-only blossom.host must be rejected"
+        );
+        cfg.blossom.host = String::new();
+        // Whitespace (a silent 404 for the whole API), a scheme, a path
+        // and a port are all rejected.
+        for bad in [
+            "api host",
+            "api.example.com ",
+            "\tapi.example.com",
+            "https://api.x",
+            "api.x/",
+            "api.x:8080",
+        ] {
+            cfg.server.api_host = bad.into();
+            assert!(
+                cfg.validate().is_err(),
+                "{bad:?} must be rejected as an api_host"
+            );
+            cfg.server.api_host = String::new();
+            cfg.blossom.host = bad.into();
+            assert!(
+                cfg.validate().is_err(),
+                "{bad:?} must be rejected as a blossom.host"
+            );
+            cfg.blossom.host = String::new();
+        }
     }
 
     #[test]
