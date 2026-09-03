@@ -447,8 +447,15 @@ impl Cli {
             }
         }
 
+        // Write the key into the config atomically (a crash mid-write must
+        // not truncate the file) with the secret never world-readable,
+        // then restrict the config itself to 0600 — a shared or loosely
+        // defaulted umask must not leave the private key readable by
+        // other users on the host.
         let text = std::fs::read_to_string(&self.config)?;
-        std::fs::write(&self.config, set_private_key_in_text(&text, &key))?;
+        crate::config::write_text_atomic(&self.config, &set_private_key_in_text(&text, &key))?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&self.config, std::fs::Permissions::from_mode(0o600))?;
 
         // Print the relay's pubkey too: it is safe to share and useful for
         // advertising the relay's `self` identity (NIP-11).
@@ -740,6 +747,45 @@ mod tests {
     use super::*;
 
     const KEY: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+    #[test]
+    fn genkey_writes_private_key_with_0600_permissions() {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join("nostrd-genkey-test")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let config_path = dir.join("nostrd.toml");
+        std::fs::write(
+            &config_path,
+            "[relay]
+name = \"nostrd\"\n",
+        )
+        .unwrap();
+        let mut cli = Cli {
+            config: config_path.clone(),
+            command: Command::GenKey,
+            daemonized: false,
+        };
+        cli.prepare().unwrap();
+        let mode = std::os::unix::fs::PermissionsExt::mode(
+            &std::fs::metadata(&config_path).unwrap().permissions(),
+        ) & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a config with a private key must not be world-readable"
+        );
+        let text = std::fs::read_to_string(&config_path).unwrap();
+        let key_value = text
+            .lines()
+            .find(|l| l.starts_with("private_key"))
+            .map(|l| l.split('"').nth(1).unwrap_or(""))
+            .unwrap_or("");
+        assert_eq!(key_value.len(), 64, "a 64-hex key must have been written");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn replaces_existing_private_key_preserving_comments() {

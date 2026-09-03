@@ -288,7 +288,8 @@ All commands accept `--config <path>` (default: `nostrd.toml`).
 | Command | Description |
 | --- | --- |
 | `nostrd init` | Write a default config file (refuses to overwrite an existing one) |
-| `nostrd genkey` | Generate a secret key for NIP-29 groups and write it into `relay.private_key`. Asks for confirmation (y/N) if a key already exists. Also prints the public key (the NIP-11 `self`) |
+| `nostrd genkey` | Generate a secret key for NIP-29 groups and write it into `relay.private_key`. Asks for confirmation (y/N) if a key already exists. Also prints the public key (the NIP-11 `self`). The config file is restricted to `0600` after the write (it now contains a secret) |
+| `nostrd init` | Write a default `nostrd.toml` and exit. The file is created `0600` — it will hold secrets later (the private key, S3 keys, the management token) |
 | `nostrd check` | Validate the config file (run before starting) |
 | `nostrd start` | Start as a daemon (`--foreground` to run in the terminal) |
 | `nostrd stop` | Stop the running daemon |

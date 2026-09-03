@@ -446,6 +446,12 @@ impl Config {
         let toml = toml::to_string_pretty(&cfg)
             .map_err(|e| Error::Config(format!("cannot serialize config: {e}")))?;
         std::fs::write(path, toml)?;
+        // The file will hold secrets later (the relay private key, S3
+        // keys, the management token): create it 0600 so the operator's
+        // later edits cannot leave a 0644 config with secrets readable
+        // by other users.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         Ok(())
     }
 
@@ -1089,9 +1095,48 @@ pub(crate) fn set_relay_field_in_text(text: &str, field: &str, value: &str) -> S
 
 /// Writes `text` to `path` atomically (temp file + rename) so a crash in
 /// the middle of a write never leaves a truncated config file behind.
+/// The temp is created `0600` and the target's permissions are applied
+/// *after* the rename: the new content is never readable by others, not
+/// even during the write window, and a normal 0644 config stays 0644
+/// while a 0600 config (holding the relay private key) stays 0600.
+/// The stricter of two permission modes (bitwise AND keeps exactly the
+/// intersection): restoring a config's mode must never widen a
+/// concurrent `genkey`'s 0600 back to a stale 0644 capture.
+fn stricter_mode(captured: u32, current: u32) -> u32 {
+    captured & current
+}
+
 pub(crate) fn write_text_atomic(path: &Path, text: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, text)?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    file.write_all(text.as_bytes())?;
+    drop(file);
+    // Apply the final mode to the temp *before* the rename, intersecting
+    // the pre-write mode with the file's current mode: the intersection
+    // is the stricter of the two, so a concurrent `genkey` that set 0600
+    // cannot be widened back to a stale 0644 capture — while a plain
+    // (secret-free) 0644 config stays 0644. The temp's 0600 creation
+    // covers the window before this point, and a non-file target (the
+    // rename below fails) leaves the temp at 0600.
+    if let Ok(meta) = std::fs::metadata(path)
+        && meta.is_file()
+    {
+        let captured = meta.permissions().mode() & 0o777;
+        let current = std::fs::metadata(path)
+            .map(|m| PermissionsExt::mode(&m.permissions()) & 0o777)
+            .unwrap_or(captured);
+        let _ = std::fs::set_permissions(
+            &tmp,
+            std::fs::Permissions::from_mode(stricter_mode(captured, current)),
+        );
+    }
     std::fs::rename(&tmp, path)?;
     Ok(())
 }
@@ -1365,6 +1410,82 @@ mod tests {
         assert_eq!(loaded.limits.max_conn_per_sec_per_ip, 0);
         assert_eq!(loaded.limits.max_events_per_min_per_pubkey, 0);
         assert_eq!(loaded.limits.max_req_response_bytes, 32 * 1024 * 1024);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stricter_mode_never_widens_permissions() {
+        assert_eq!(stricter_mode(0o644, 0o600), 0o600);
+        assert_eq!(stricter_mode(0o600, 0o644), 0o600);
+        assert_eq!(stricter_mode(0o644, 0o644), 0o644);
+        assert_eq!(stricter_mode(0o600, 0o600), 0o600);
+    }
+
+    #[test]
+    fn write_default_creates_0600_config() {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join("nostrd-init-test")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nostrd.toml");
+        Config::write_default(&path).unwrap();
+        let mode = std::os::unix::fs::PermissionsExt::mode(
+            &std::fs::metadata(&path).unwrap().permissions(),
+        ) & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "a freshly created config must not be world-readable"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_text_atomic_preserves_target_permissions() {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join("nostrd-config-write-test")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nostrd.toml");
+        std::fs::write(&path, "a = 1").unwrap();
+        // A genkey-style 0600 config: the atomic rewrite (NIP-86
+        // `changerelay*` persistence) must not revert it to 0644.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        write_text_atomic(&path, "a = 2").unwrap();
+        let mode = std::os::unix::fs::PermissionsExt::mode(
+            &std::fs::metadata(&path).unwrap().permissions(),
+        ) & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "the atomic rewrite must preserve the secret file's permissions"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "a = 2");
+        // A plain (secret-free) 0644 config stays 0644.
+        let plain = dir.join("plain.toml");
+        std::fs::write(&plain, "a = 1").unwrap();
+        write_text_atomic(&plain, "a = 2").unwrap();
+        let mode = std::os::unix::fs::PermissionsExt::mode(
+            &std::fs::metadata(&plain).unwrap().permissions(),
+        ) & 0o777;
+        assert_eq!(mode, 0o644, "a plain config keeps its mode");
+        // When the rename cannot complete (the target is a directory),
+        // the leftover temp must still be 0600 — the content was never
+        // world-readable during the write.
+        let dir_target = dir.join("adir");
+        std::fs::create_dir(&dir_target).unwrap();
+        assert!(write_text_atomic(&dir_target, "x").is_err());
+        let mode = std::os::unix::fs::PermissionsExt::mode(
+            &std::fs::metadata(dir.join("adir.tmp"))
+                .unwrap()
+                .permissions(),
+        ) & 0o777;
+        assert_eq!(mode, 0o600, "the temp must never exceed 0600");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
