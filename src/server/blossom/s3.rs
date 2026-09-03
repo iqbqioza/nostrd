@@ -50,7 +50,9 @@ impl S3Client {
         format!("{}/{}/{}", self.endpoint, self.bucket, key)
     }
 
-    async fn send(
+    /// Sends a signed request and returns the raw response (the caller
+    /// reads the body — either fully, or streamed for large objects).
+    async fn request(
         &self,
         method: &str,
         key: &str,
@@ -58,7 +60,7 @@ impl S3Client {
         body: Option<&[u8]>,
         content_type: Option<&str>,
         extra_headers: &[(&str, &str)],
-    ) -> Result<(reqwest::StatusCode, Vec<u8>)> {
+    ) -> Result<reqwest::Response> {
         let url = self.url(key);
         let url = if query.is_empty() {
             url
@@ -104,10 +106,24 @@ impl S3Client {
         if let Some(bytes) = body {
             builder = builder.body(bytes.to_vec());
         }
-        let resp = builder
+        builder
             .send()
             .await
-            .map_err(|e| crate::error::Error::Other(format!("s3 request failed: {e}")))?;
+            .map_err(|e| crate::error::Error::Other(format!("s3 request failed: {e}")))
+    }
+
+    async fn send(
+        &self,
+        method: &str,
+        key: &str,
+        query: &str,
+        body: Option<&[u8]>,
+        content_type: Option<&str>,
+        extra_headers: &[(&str, &str)],
+    ) -> Result<(reqwest::StatusCode, Vec<u8>)> {
+        let resp = self
+            .request(method, key, query, body, content_type, extra_headers)
+            .await?;
         let status = resp.status();
         let bytes = resp
             .bytes()
@@ -197,6 +213,44 @@ impl S3Client {
             )));
         }
         Ok(Some(bytes))
+    }
+
+    /// Fetches the `bytes=start-(start+len-1)` range and returns the raw
+    /// response so the caller can stream the body instead of loading the
+    /// whole object into memory.
+    pub(crate) async fn get_object_range(
+        &self,
+        key: &str,
+        start: u64,
+        len: u64,
+    ) -> Result<Option<reqwest::Response>> {
+        // A zero-length blob (an empty upload is legal): fetch the whole
+        // object — an S3 "bytes=0-0" on an empty object is a 416.
+        let range = if len > 0 {
+            Some(format!(
+                "bytes={start}-{}",
+                start.saturating_add(len).saturating_sub(1)
+            ))
+        } else {
+            None
+        };
+        let resp = match &range {
+            Some(r) => {
+                self.request("GET", key, "", None, None, &[("Range", r)])
+                    .await?
+            }
+            None => self.request("GET", key, "", None, None, &[]).await?,
+        };
+        let status = resp.status();
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        if !status.is_success() {
+            return Err(crate::error::Error::Other(format!(
+                "s3 get failed: {status}"
+            )));
+        }
+        Ok(Some(resp))
     }
 
     pub(crate) async fn delete_object(&self, key: &str) -> Result<bool> {

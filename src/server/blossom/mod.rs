@@ -370,7 +370,89 @@ fn parse_range(header: &str, size: usize) -> Result<Option<(usize, usize)>, ()> 
     Ok(Some((start, end)))
 }
 
-/// `GET /<sha256>` — serve the blob (with RFC 7233 single-range support).
+/// Streams a local file in 64 KiB chunks (the `remaining` bound keeps a
+/// Range response from reading past the requested window).
+struct FileChunks {
+    file: tokio::fs::File,
+    remaining: u64,
+    buf: Vec<u8>,
+}
+
+impl futures_util::Stream for FileChunks {
+    type Item = Result<bytes::Bytes, std::io::Error>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        use tokio::io::AsyncReadExt;
+        let this = &mut *self;
+        let to_read = (this.buf.len() as u64).min(this.remaining) as usize;
+        if to_read == 0 {
+            return std::task::Poll::Ready(None);
+        }
+        let file = &mut this.file;
+        let read = std::task::ready!(std::pin::pin!(file.read(&mut this.buf[..to_read])).poll(_cx));
+        match read {
+            Ok(0) => std::task::Poll::Ready(None),
+            Ok(n) => {
+                this.remaining -= n as u64;
+                std::task::Poll::Ready(Some(Ok(bytes::Bytes::copy_from_slice(&this.buf[..n]))))
+            }
+            Err(e) => std::task::Poll::Ready(Some(Err(e))),
+        }
+    }
+}
+
+/// Caps an S3 response stream at `remaining` bytes: the mirror of
+/// [`FileChunks`] for providers that ignore or mangle the `Range` header
+/// (a 200-with-the-full-object response must not overrun the range).
+struct S3Chunks {
+    stream: std::pin::Pin<
+        Box<dyn futures_util::Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send>,
+    >,
+    remaining: u64,
+}
+
+impl S3Chunks {
+    fn new(resp: reqwest::Response, remaining: u64) -> S3Chunks {
+        S3Chunks {
+            stream: Box::pin(resp.bytes_stream()),
+            remaining,
+        }
+    }
+}
+
+impl futures_util::Stream for S3Chunks {
+    type Item = Result<bytes::Bytes, std::io::Error>;
+
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        if self.remaining == 0 {
+            return std::task::Poll::Ready(None);
+        }
+        let this = &mut *self;
+        let chunk = std::task::ready!(this.stream.as_mut().poll_next(cx));
+        match chunk {
+            Some(Ok(bytes)) => {
+                let take = (bytes.len() as u64).min(this.remaining) as usize;
+                this.remaining -= take as u64;
+                if take == 0 {
+                    return std::task::Poll::Ready(None);
+                }
+                std::task::Poll::Ready(Some(Ok(bytes.slice(..take))))
+            }
+            Some(Err(e)) => std::task::Poll::Ready(Some(Err(std::io::Error::other(e)))),
+            None => std::task::Poll::Ready(None),
+        }
+    }
+}
+
+/// `GET /<sha256>` — serve the blob, streamed from the storage backend
+/// (with RFC 7233 single-range support): a large blob is never loaded
+/// into memory in full.
 async fn get_blob(
     State(relay): State<Arc<Relay>>,
     headers: HeaderMap,
@@ -385,52 +467,78 @@ async fn get_blob(
     let Some(desc) = state.store.find(&sha).await else {
         return error(StatusCode::NOT_FOUND, "blob not found");
     };
-    match state.store.read(&desc.npub(), &sha).await {
-        Ok(Some(bytes)) => {
-            let size = bytes.len();
-            let base_headers = [
-                (axum::http::header::CONTENT_TYPE, desc.mime),
-                (axum::http::header::ETAG, format!("\"{sha}\"")),
-                (
-                    axum::http::header::CACHE_CONTROL,
-                    "public, max-age=31536000, immutable".to_string(),
-                ),
-                (axum::http::header::ACCEPT_RANGES, "bytes".to_string()),
-            ];
-            // BUD-01: RFC 7233 range requests (video/audio streaming).
-            let range = headers
-                .get(axum::http::header::RANGE)
-                .and_then(|v| v.to_str().ok())
-                .map(|r| parse_range(r, size));
-            match range {
-                Some(Err(())) => {
-                    // Unsatisfiable or malformed range: 416 with the
-                    // required `Content-Range: bytes */<size>`.
-                    let mut response = error(
-                        StatusCode::RANGE_NOT_SATISFIABLE,
-                        "requested byte range is not satisfiable",
-                    );
-                    response.headers_mut().insert(
-                        axum::http::header::CONTENT_RANGE,
-                        format!("bytes */{size}").parse().unwrap(),
-                    );
-                    response
+    let size = desc.size;
+    let npub = desc.npub();
+    let base_headers = [
+        (axum::http::header::CONTENT_TYPE, desc.mime),
+        (axum::http::header::ETAG, format!("\"{sha}\"")),
+        (
+            axum::http::header::CACHE_CONTROL,
+            "public, max-age=31536000, immutable".to_string(),
+        ),
+        (axum::http::header::ACCEPT_RANGES, "bytes".to_string()),
+    ];
+    // BUD-01: RFC 7233 range requests (video/audio streaming). A zero-byte
+    // blob (an empty upload is legal) has no bytes to serve: a full GET is
+    // an empty body, any Range is unsatisfiable (parse_range against
+    // size 0 always fails).
+    let range = headers
+        .get(axum::http::header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .map(|r| parse_range(r, size as usize));
+    let (start, end) = match range {
+        Some(Err(())) => {
+            // Unsatisfiable or malformed range: 416 with the required
+            // `Content-Range: bytes */<size>`.
+            let mut response = error(
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "requested byte range is not satisfiable",
+            );
+            response.headers_mut().insert(
+                axum::http::header::CONTENT_RANGE,
+                format!("bytes */{size}").parse().unwrap(),
+            );
+            return response;
+        }
+        Some(Ok(Some((start, end)))) => (start, end),
+        _ => (0, size.saturating_sub(1) as usize),
+    };
+    let len = if size == 0 {
+        0
+    } else {
+        (end - start + 1) as u64
+    };
+    match state
+        .store
+        .open_stream(&npub, &sha, start as u64, len)
+        .await
+    {
+        Ok(Some(stream)) => {
+            let body = match stream {
+                storage::BlobStream::Local(file) => axum::body::Body::from_stream(FileChunks {
+                    file,
+                    remaining: len,
+                    buf: vec![0u8; 64 * 1024],
+                }),
+                storage::BlobStream::S3(resp) => {
+                    axum::body::Body::from_stream(S3Chunks::new(resp, len))
                 }
-                Some(Ok(Some((start, end)))) => {
-                    let mut response = (
-                        StatusCode::PARTIAL_CONTENT,
-                        base_headers,
-                        bytes[start..=end].to_vec(),
-                    )
-                        .into_response();
-                    response.headers_mut().insert(
-                        axum::http::header::CONTENT_RANGE,
-                        format!("bytes {start}-{end}/{size}").parse().unwrap(),
-                    );
-                    response
-                }
-                _ => (StatusCode::OK, base_headers, bytes).into_response(),
+            };
+            // A response is 206 only for a genuine single satisfiable range: a
+            // multi-range or non-bytes Range header is ignored (RFC 7233)
+            // and serves the full blob with 200.
+            let mut response = if matches!(range, Some(Ok(Some(_)))) {
+                (StatusCode::PARTIAL_CONTENT, base_headers, body).into_response()
+            } else {
+                (StatusCode::OK, base_headers, body).into_response()
+            };
+            if let Some(Ok(Some((start, end)))) = range {
+                response.headers_mut().insert(
+                    axum::http::header::CONTENT_RANGE,
+                    format!("bytes {start}-{end}/{size}").parse().unwrap(),
+                );
             }
+            response
         }
         Ok(None) => error(StatusCode::NOT_FOUND, "blob not found"),
         Err(e) => error(
@@ -547,6 +655,9 @@ async fn put_blob(relay: Arc<Relay>, headers: HeaderMap, body: Bytes, verb: &str
             )
                 .into_response()
         }
+        Err(crate::error::Error::StorageFull) => {
+            error(StatusCode::INSUFFICIENT_STORAGE, "storage is full")
+        }
         Err(e) => error(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("storage error: {e}"),
@@ -613,6 +724,11 @@ async fn head_preflight(relay: Arc<Relay>, headers: HeaderMap, verb: &str) -> Re
             StatusCode::FORBIDDEN,
             "uploads are restricted to the configured allowlist",
         );
+    }
+    // The preflight must reflect the PUT outcome: a full disk would
+    // refuse the upload with 507, so the preflight does too.
+    if let Err(crate::error::Error::StorageFull) = state.store.check_space() {
+        return error(StatusCode::INSUFFICIENT_STORAGE, "storage is full");
     }
     StatusCode::OK.into_response()
 }
@@ -729,6 +845,7 @@ pub(crate) async fn build_state(cfg: &Config, _relay: &Relay) -> Option<Arc<Blos
     match BlobStore::new(
         &cfg.blossom.storage,
         &cfg.blossom.local_path,
+        cfg.blossom.min_free_bytes,
         s3,
         _relay.db.clone(),
     )
@@ -784,6 +901,56 @@ mod tests {
     use crate::event::Event;
     use secp256k1::{Keypair, Secp256k1, XOnlyPublicKey};
 
+    /// Builds a relay with the Blossom feature enabled on local storage.
+    async fn build_blossom_relay(min_free_bytes: u64) -> Arc<Relay> {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join("nostrd-blossom-handler")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut cfg = Config::default();
+        cfg.database.path = dir.join("db");
+        cfg.blossom.host = "media.example.com".into();
+        cfg.blossom.storage = "local".into();
+        cfg.blossom.local_path = dir.join("blobs");
+        cfg.blossom.min_free_bytes = min_free_bytes;
+        let db = crate::db::DbClient::open(
+            &cfg.database,
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
+        let config = Arc::new(tokio::sync::RwLock::new(cfg));
+        let stats = crate::stats::Stats::new();
+        let mut relay = Relay::new(
+            config,
+            db,
+            stats,
+            "",
+            crate::relay::LiveBusConfig {
+                buffer: 1024,
+                batch_interval_ms: 10,
+                batch_size: 64,
+            },
+        )
+        .await;
+        relay.start_live_bus();
+        let relay = Arc::new(relay);
+        let state = build_state(&relay.config.read().await.clone(), &relay).await;
+        *relay.blossom.write().await = state;
+        relay
+    }
+
+    fn sha256_hex(data: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(data))
+    }
+
     fn auth_event(
         secp: &Secp256k1<secp256k1::All>,
         created: u64,
@@ -817,6 +984,217 @@ mod tests {
         let id = ev.id_bytes().unwrap();
         ev.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
         ev
+    }
+
+    #[tokio::test]
+    async fn s3_chunks_caps_at_remaining_bytes() {
+        use futures_util::StreamExt as _;
+        let chunks: Vec<Result<bytes::Bytes, reqwest::Error>> = vec![
+            Ok(bytes::Bytes::from_static(&[1, 2, 3])),
+            Ok(bytes::Bytes::from_static(&[4, 5, 6, 7, 8])),
+            Ok(bytes::Bytes::from_static(&[9])),
+        ];
+        let stream = S3Chunks {
+            stream: Box::pin(futures_util::stream::iter(chunks)),
+            remaining: 7,
+        };
+        let mut out = Vec::new();
+        futures_util::pin_mut!(stream);
+        while let Some(chunk) = stream.next().await {
+            out.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(out, vec![1, 2, 3, 4, 5, 6, 7], "the cap is byte-exact");
+    }
+
+    #[tokio::test]
+    async fn get_blob_streams_full_and_ranges() {
+        let relay = build_blossom_relay(0).await;
+        let state = relay.blossom.read().await.clone().unwrap();
+        let data: Vec<u8> = (0..50_000u32).map(|i| (i % 251) as u8).collect();
+        let sha = sha256_hex(&data);
+        state
+            .store
+            .put(&"aa".repeat(32), &sha, &data, "application/octet-stream")
+            .await
+            .unwrap();
+        // Full GET: the whole blob, streamed.
+        let resp = get_blob(State(relay.clone()), HeaderMap::new(), AxPath(sha.clone())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()[axum::http::header::ACCEPT_RANGES], "bytes");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], &data[..]);
+        // Range GET: 206 with the exact bytes and Content-Range.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::RANGE,
+            "bytes=1000-1999".parse().unwrap(),
+        );
+        let resp = get_blob(State(relay.clone()), headers, AxPath(sha.clone())).await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            resp.headers()[axum::http::header::CONTENT_RANGE],
+            "bytes 1000-1999/50000"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], &data[1000..2000]);
+        // A multi-range header is ignored (RFC 7233): the full blob with 200,
+        // not a 206 without Content-Range.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::RANGE,
+            "bytes=1000-1999,5000-5999".parse().unwrap(),
+        );
+        let resp = get_blob(State(relay.clone()), headers, AxPath(sha.clone())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers().get(axum::http::header::CONTENT_RANGE),
+            None,
+            "an ignored range must not claim partial content"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&body[..], &data[..]);
+        // A non-bytes range unit is ignored the same way.
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::RANGE, "items=0-1".parse().unwrap());
+        let resp = get_blob(State(relay.clone()), headers, AxPath(sha.clone())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        // Unsatisfiable range: 416 with `Content-Range: bytes */`.
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::RANGE, "bytes=50000-".parse().unwrap());
+        let resp = get_blob(State(relay.clone()), headers, AxPath(sha.clone())).await;
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            resp.headers()[axum::http::header::CONTENT_RANGE],
+            "bytes */50000"
+        );
+        // Unknown blob: 404.
+        let resp = get_blob(
+            State(relay.clone()),
+            HeaderMap::new(),
+            AxPath("ab".repeat(32)),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        // Malformed hash: 400 (the host-split middleware would block such
+        // a path upstream, but the handler rejects it on its own).
+        let resp = get_blob(
+            State(relay.clone()),
+            HeaderMap::new(),
+            AxPath("notahexhash".into()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn get_blob_serves_empty_blob() {
+        let relay = build_blossom_relay(0).await;
+        let state = relay.blossom.read().await.clone().unwrap();
+        let sha = sha256_hex(b"");
+        state
+            .store
+            .put(&"aa".repeat(32), &sha, b"", "application/octet-stream")
+            .await
+            .unwrap();
+        // Full GET of a zero-byte blob: 200 with an empty body (a size-0
+        // subtraction must not underflow).
+        let resp = get_blob(State(relay.clone()), HeaderMap::new(), AxPath(sha.clone())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(body.is_empty());
+        // Any Range on an empty blob: 416.
+        let mut headers = HeaderMap::new();
+        headers.insert(axum::http::header::RANGE, "bytes=0-0".parse().unwrap());
+        let resp = get_blob(State(relay.clone()), headers, AxPath(sha.clone())).await;
+        assert_eq!(resp.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+        assert_eq!(
+            resp.headers()[axum::http::header::CONTENT_RANGE],
+            "bytes */0"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn preflight_reports_507_when_storage_is_full() {
+        let relay = build_blossom_relay(u64::MAX).await;
+        let sha = sha256_hex(b"x");
+        let now = unix_now();
+        let ev = auth_event(
+            relay.secp(),
+            now,
+            "upload",
+            Some(now + 300),
+            Some(&sha),
+            None,
+        );
+        let token = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&ev).unwrap());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Nostr {token}").parse().unwrap(),
+        );
+        headers.insert("x-sha-256", sha.parse().unwrap());
+        headers.insert("x-content-length", "1".parse().unwrap());
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain".parse().unwrap(),
+        );
+        let resp = head_preflight(relay.clone(), headers, "upload").await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::INSUFFICIENT_STORAGE,
+            "the preflight must mirror the PUT outcome on a full disk"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn upload_returns_507_when_storage_is_full() {
+        let relay = build_blossom_relay(u64::MAX).await;
+        let data = b"hello blossom";
+        let sha = sha256_hex(data);
+        let now = unix_now();
+        let ev = auth_event(
+            relay.secp(),
+            now,
+            "upload",
+            Some(now + 300),
+            Some(&sha),
+            None,
+        );
+        let token = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&ev).unwrap());
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Nostr {token}").parse().unwrap(),
+        );
+        headers.insert(
+            axum::http::header::CONTENT_TYPE,
+            "text/plain".parse().unwrap(),
+        );
+        let resp = upload(
+            State(relay.clone()),
+            headers,
+            axum::body::Bytes::from_static(data),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::INSUFFICIENT_STORAGE,
+            "a full disk must be reported as 507"
+        );
+        relay.db.shutdown();
     }
 
     #[test]

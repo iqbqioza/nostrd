@@ -555,6 +555,7 @@ host = "media.example.com"          # required — enables the feature
 storage = "local"                   # "local" or "s3"
 local_path = "./data/images"        # local storage root
 max_upload_bytes = 20971520         # 20 MiB
+min_free_bytes = 33554432         # refuse uploads when the disk has less free space
 restrict_uploads = false            # only allow-listed pubkeys may upload
 
 

@@ -456,6 +456,7 @@ nostrd relay list                # show both lists and restrict_relay
 | `storage` | string | `"local"` | Storage backend: `"local"` or `"s3"` (any S3-compatible service, including Cloudflare R2) |
 | `local_path` | string | `"./data/images"` | Local storage directory: `<local_path>/<npub1...>/<sha256>` |
 | `max_upload_bytes` | integer | `20971520` | Maximum accepted upload size (the `PUT /upload` body limit) |
+| `min_free_bytes` | integer | `33554432` | Local-storage disk-full guard: uploads are refused with `507` while the free space on the filesystem hosting `local_path` is below this many bytes (a full disk would otherwise risk SIGBUS on the LMDB memory map). `0` disables the check |
 | `s3_endpoint` | string | `""` | S3 endpoint, e.g. `https://<account>.r2.cloudflarestorage.com` for R2 |
 | `s3_region` | string | `""` | S3 region (R2 uses `"auto"`) |
 | `s3_bucket` | string | `""` | S3 bucket — the `bucket` of the `bucket/{npub1}/{file}` layout |
@@ -471,6 +472,8 @@ nostrd relay list                # show both lists and restrict_relay
 **`storage`** — `"local"` keeps files on the server disk; `"s3"` stores objects in an S3-compatible bucket (AWS S3 or Cloudflare R2). Both use the `bucket/{npub1xxx}/{file}` hierarchy: files are content-addressed by their SHA-256 and kept under the uploader's npub directory.
 
 **`max_upload_bytes`** — The HTTP body limit for uploads. Note that `limits.max_ws_message_size` is unrelated (it governs WebSocket events).
+
+**`min_free_bytes`** — Local-storage disk-full guard. Before writing a blob, the relay checks the free space on the filesystem hosting `local_path` (the same `statvfs` check the LMDB writer uses) and refuses the upload with `507 Insufficient Storage` while the free space is below this margin — a full disk would otherwise fail the LMDB writer and risk SIGBUS on memory-map writes. `0` disables the check. The S3 backend has no local disk, so the guard only applies to `storage = "local"`.
 
 **S3 keys** — With `storage = "s3"`, `s3_endpoint`, `s3_bucket`, `s3_access_key` and `s3_secret_key` are required. The endpoint must be the *path-style* form (`https://s3.amazonaws.com` or `https://<account>.r2.cloudflarestorage.com`); the request signing follows AWS Signature Version 4.
 
@@ -532,7 +535,7 @@ Editing the file and sending `kill -HUP $(cat nostrd.pid)` reloads it **without 
 | `relay.name`, `description`, `pubkey`, `contact`, `icon`, `post_policy`, `public_url`, `relay.reject_ephemeral`, `relay.enable_git` | `relay.private_key` |
 | most of `[limits]` (not the three below) | `relay.livekit_*`, `relay.enabled_nips` / `disabled_nips` |
 | NIP-40 on/off, API concurrency | `server.host`, `server.port`, `server.api_host`, `server.ws_paths`, `server.management_port`, `server.management_host`, `server.metrics_enabled` |
-| — | `database.path`, `database.purge_interval_secs`, `daemon.log_max_size_bytes`, `log_max_files`, `stats_interval_secs`, `db_request_timeout_secs`, `db_queue_msgs`, `db_queue_events`, `max_indexed_words`, `live_buffer`, `live_batch_size`, `live_batch_interval_ms`, `max_connections`, `http_read_timeout_secs`, `max_conn_per_sec_per_ip`, `blossom.host`, `blossom.storage`, `blossom.local_path`, `blossom.max_upload_bytes`, `blossom.s3_*` |
+| — | `database.path`, `database.purge_interval_secs`, `daemon.log_max_size_bytes`, `log_max_files`, `stats_interval_secs`, `db_request_timeout_secs`, `db_queue_msgs`, `db_queue_events`, `max_indexed_words`, `live_buffer`, `live_batch_size`, `live_batch_interval_ms`, `max_connections`, `http_read_timeout_secs`, `max_conn_per_sec_per_ip`, `blossom.host`, `blossom.storage`, `blossom.local_path`, `blossom.max_upload_bytes`, `blossom.min_free_bytes`, `blossom.s3_*` |
 
 `[access]` is **not** applied by a reload: the access lists are seeded once at startup and then managed at runtime via NIP-86.
 
