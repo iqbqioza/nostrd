@@ -2243,3 +2243,95 @@ fn search_finds_big_events() {
         assert_eq!(res2.len(), 1);
     });
 }
+
+#[test]
+fn startup_loads_bypass_fail_fast_and_timeout() {
+    // The startup loads must not silently degrade to empty when the
+    // queue is (momentarily) full or the reader is slow: an empty deny
+    // list would lift every persisted ban (fail-open). The blocking
+    // loads bypass the fail-fast threshold entirely (the passed cap is
+    // clamped to a minimum of 1 server-side) and still load the lists.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        0, // max_pending_msgs = 0 → every limited request fails fast
+        262144,
+    )
+    .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        db.save_relay_pubkeys(&[("aa".repeat(32), "test".into())], &[])
+            .await;
+        let (deny, _) = db.load_relay_pubkeys().await;
+        assert_eq!(
+            deny.len(),
+            1,
+            "the blocking startup load must not fail fast"
+        );
+        let allow = db.load_blossom_allow().await;
+        assert!(allow.is_empty(), "no blossom allowlist persisted");
+        db.shutdown();
+    });
+}
+
+#[test]
+fn reload_loads_report_failure() {
+    // The SIGHUP reloads report None instead of degrading: the caller
+    // keeps the previous lists. After the reader thread is gone, the
+    // requests cannot be served and must be reported as failed.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        db.shutdown();
+        assert!(
+            db.try_load_relay_pubkeys().await.is_none(),
+            "a failed reload must be reported as None"
+        );
+        assert!(
+            db.try_load_blossom_allow().await.is_none(),
+            "a failed reload must be reported as None"
+        );
+    });
+}
+
+#[test]
+fn reload_loads_report_success() {
+    // A healthy client returns the persisted lists.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        db.save_relay_pubkeys(&[("bb".repeat(32), "test".into())], &[])
+            .await;
+        db.save_access(crate::config::AccessControl {
+            restrict_relay: true,
+            ..Default::default()
+        })
+        .await;
+        let (deny, _) = db.try_load_relay_pubkeys().await.expect("loads");
+        assert_eq!(deny.len(), 1);
+        let allow = db.try_load_blossom_allow().await.expect("loads");
+        assert!(allow.is_empty());
+        db.shutdown();
+    });
+}
