@@ -72,6 +72,8 @@ pub struct Relay {
     /// The Blossom upload allowlist (normalized hex pubkeys), loaded from
     /// the relay database at startup and refreshed on SIGHUP.
     pub blossom_allow: Arc<tokio::sync::RwLock<Vec<String>>>,
+    /// Rate-limited audit trail of the management operations (NIP-86).
+    pub audit: crate::audit::AuditLog,
 }
 
 /// Issues strictly increasing timestamps for relay-generated events.
@@ -250,6 +252,7 @@ impl Relay {
             stamps: StampClock::new(),
             blossom: Arc::new(tokio::sync::RwLock::new(None)),
             blossom_allow: Arc::new(tokio::sync::RwLock::new(blossom_allow)),
+            audit: crate::audit::AuditLog::default(),
         }
     }
 

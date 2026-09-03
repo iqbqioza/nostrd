@@ -35,7 +35,11 @@ struct AdminState {
     shutdown: watch::Sender<bool>,
 }
 
-pub(crate) fn router(relay: Arc<Relay>, shutdown_tx: watch::Sender<bool>) -> Router {
+pub(crate) fn router(
+    relay: Arc<Relay>,
+    shutdown_tx: watch::Sender<bool>,
+    max_admin_body: usize,
+) -> Router {
     Router::new()
         .route("/admin/info", get(admin_info))
         .route("/admin/stats", get(admin_stats))
@@ -45,6 +49,7 @@ pub(crate) fn router(relay: Arc<Relay>, shutdown_tx: watch::Sender<bool>) -> Rou
         .route("/admin/allow_kind", post(allow_kind))
         .route("/admin/status/{id}", get(event_status))
         .route("/admin/shutdown", post(shutdown))
+        .layer(axum::extract::DefaultBodyLimit::max(max_admin_body))
         .layer(axum::middleware::from_fn(crate::server::cors_middleware))
         .with_state(Arc::new(AdminState {
             relay,
@@ -60,7 +65,7 @@ async fn check_auth(
     state: &AdminState,
     method: &str,
     uri: &axum::http::Uri,
-) -> std::result::Result<(), Response> {
+) -> std::result::Result<String, Response> {
     let relay = &state.relay;
     let cfg = relay.config.read().await;
 
@@ -76,7 +81,7 @@ async fn check_auth(
             .and_then(|v| v.strip_prefix("Bearer "))
             && super::ct_eq(token, &cfg.server.management_token)
         {
-            return Ok(());
+            return Ok("management-token".into());
         }
     }
 
@@ -98,7 +103,7 @@ async fn check_auth(
         );
         let url_ok =
             |tag: &str| nip98::matches_request_url(tag, &mgmt_identity, uri.path(), uri.query());
-        if nip98::verify(
+        if let Some(pubkey) = nip98::verify(
             auth,
             Some(&cfg.server.admin_pubkey),
             relay.secp(),
@@ -107,9 +112,8 @@ async fn check_auth(
             url_ok,
         )
         .await
-        .is_some()
         {
-            return Ok(());
+            return Ok(pubkey);
         }
         return Err(unauthorized("invalid NIP-98 auth"));
     }
@@ -119,6 +123,14 @@ async fn check_auth(
     } else {
         "management API disabled: set server.management_token or server.admin_pubkey"
     }))
+}
+
+/// Records a legacy management mutation in the relay's audit log.
+fn audit_legacy(state: &AdminState, identity: &str, action: &str, detail: &str) {
+    state
+        .relay
+        .audit
+        .log(format!("{action} {detail} by {identity}"));
 }
 
 fn unauthorized(msg: &str) -> Response {
@@ -165,9 +177,10 @@ async fn block_pubkey(
     headers: HeaderMap,
     Json(body): Json<PubkeyBody>,
 ) -> Response {
-    if let Err(resp) = check_auth(&headers, &state, "POST", &uri).await {
-        return resp;
-    }
+    let identity = match check_auth(&headers, &state, "POST", &uri).await {
+        Ok(identity) => identity,
+        Err(resp) => return resp,
+    };
     if hex::decode(&body.pubkey)
         .map(|b| b.len() != 32)
         .unwrap_or(true)
@@ -186,6 +199,7 @@ async fn block_pubkey(
     }
     drop(access);
     state.relay.persist_access().await;
+    audit_legacy(&state, &identity, "block_pubkey", &body.pubkey);
     Json(json!({ "ok": true, "blocked_pubkey": body.pubkey })).into_response()
 }
 
@@ -195,13 +209,15 @@ async fn allow_pubkey(
     headers: HeaderMap,
     Json(body): Json<PubkeyBody>,
 ) -> Response {
-    if let Err(resp) = check_auth(&headers, &state, "POST", &uri).await {
-        return resp;
-    }
+    let identity = match check_auth(&headers, &state, "POST", &uri).await {
+        Ok(identity) => identity,
+        Err(resp) => return resp,
+    };
     let mut access = state.relay.access.write().await;
     access.blocked_pubkeys.retain(|(p, _)| p != &body.pubkey);
     drop(access);
     state.relay.persist_access().await;
+    audit_legacy(&state, &identity, "allow_pubkey", &body.pubkey);
     Json(json!({ "ok": true, "allowed_pubkey": body.pubkey })).into_response()
 }
 
@@ -211,15 +227,17 @@ async fn block_kind(
     headers: HeaderMap,
     Json(body): Json<KindBody>,
 ) -> Response {
-    if let Err(resp) = check_auth(&headers, &state, "POST", &uri).await {
-        return resp;
-    }
+    let identity = match check_auth(&headers, &state, "POST", &uri).await {
+        Ok(identity) => identity,
+        Err(resp) => return resp,
+    };
     let mut access = state.relay.access.write().await;
     if !access.blocked_kinds.contains(&body.kind) {
         access.blocked_kinds.push(body.kind);
     }
     drop(access);
     state.relay.persist_access().await;
+    audit_legacy(&state, &identity, "block_kind", &body.kind.to_string());
     Json(json!({ "ok": true, "blocked_kind": body.kind })).into_response()
 }
 
@@ -229,13 +247,15 @@ async fn allow_kind(
     headers: HeaderMap,
     Json(body): Json<KindBody>,
 ) -> Response {
-    if let Err(resp) = check_auth(&headers, &state, "POST", &uri).await {
-        return resp;
-    }
+    let identity = match check_auth(&headers, &state, "POST", &uri).await {
+        Ok(identity) => identity,
+        Err(resp) => return resp,
+    };
     let mut access = state.relay.access.write().await;
     access.blocked_kinds.retain(|k| k != &body.kind);
     drop(access);
     state.relay.persist_access().await;
+    audit_legacy(&state, &identity, "allow_kind", &body.kind.to_string());
     Json(json!({ "ok": true, "allowed_kind": body.kind })).into_response()
 }
 
@@ -265,9 +285,121 @@ async fn shutdown(
     State(state): State<Arc<AdminState>>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(resp) = check_auth(&headers, &state, "POST", &uri).await {
-        return resp;
-    }
+    let identity = match check_auth(&headers, &state, "POST", &uri).await {
+        Ok(identity) => identity,
+        Err(resp) => return resp,
+    };
+    audit_legacy(&state, &identity, "shutdown", "");
     let _ = state.shutdown.send(true);
     Json(json!({ "ok": true, "shutting_down": true })).into_response()
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    /// Builds the management router against a relay with the bearer token
+    /// configured.
+    async fn build_mgmt_relay() -> std::sync::Arc<crate::relay::Relay> {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir()
+            .join("nostrd-nip86-legacy-test")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        let mut cfg = crate::config::Config::default();
+        cfg.database.path = path;
+        cfg.server.management_token = "test-token".into();
+        let db = crate::db::DbClient::open(
+            &cfg.database,
+            true,
+            std::sync::Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
+        let config = std::sync::Arc::new(tokio::sync::RwLock::new(cfg));
+        let stats = crate::stats::Stats::new();
+        let relay = crate::relay::Relay::new(
+            config,
+            db,
+            stats,
+            "",
+            crate::relay::LiveBusConfig {
+                buffer: 1024,
+                batch_interval_ms: 10,
+                batch_size: 64,
+            },
+        )
+        .await;
+        std::sync::Arc::new(relay)
+    }
+
+    #[tokio::test]
+    async fn body_over_admin_limit_is_413() {
+        let relay = build_mgmt_relay().await;
+        let router = router(
+            relay.clone(),
+            tokio::sync::watch::channel(false).0,
+            crate::config::Config::default().limits.max_admin_body_bytes,
+        );
+        let body = format!(
+            "{{\"pubkey\":\"{}\",\"pad\":\"{}\"}}",
+            "aa".repeat(32),
+            "x".repeat(crate::config::Config::default().limits.max_admin_body_bytes + 1)
+        );
+        let resp = router
+            .oneshot(
+                Request::post("/admin/block_pubkey")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "an oversized management body must be refused with 413"
+        );
+        assert!(
+            relay.audit.recent().is_empty(),
+            "the refused request must not be audited"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn legacy_mutations_are_audited() {
+        let relay = build_mgmt_relay().await;
+        let router = router(
+            relay.clone(),
+            tokio::sync::watch::channel(false).0,
+            crate::config::Config::default().limits.max_admin_body_bytes,
+        );
+        relay.audit.clear();
+        let resp = router
+            .oneshot(
+                Request::post("/admin/block_pubkey")
+                    .header(axum::http::header::AUTHORIZATION, "Bearer test-token")
+                    .header(axum::http::header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(format!(r#"{{"pubkey":"{}"}}"#, "ab".repeat(32))))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let recent = relay.audit.recent();
+        assert_eq!(recent.len(), 1, "the legacy mutation must be audited");
+        assert!(
+            recent[0].contains("block_pubkey") && recent[0].contains("management-token"),
+            "the audit entry must name the action and the identity: {}",
+            recent[0]
+        );
+        relay.db.shutdown();
+    }
 }

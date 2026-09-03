@@ -219,6 +219,7 @@ max_sub_id_len = 64
 # matching the NIP-11 `max_content_length` semantics. The byte size is
 # bounded by max_ws_message_size instead.
 max_content_bytes = 65536
+max_admin_body_bytes = 65536        # NIP-86 management RPC body limit
 
 # Maximum number of tags on an event.
 max_tags = 2000

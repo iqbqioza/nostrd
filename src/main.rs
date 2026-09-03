@@ -3,6 +3,7 @@
 //! See the `cli` module for the subcommands (`start`/`stop`/`restart`/
 //! `stats`/`check`/`init`) and `server` for the HTTP/WebSocket front.
 
+mod audit;
 mod cli;
 mod config;
 mod db;
