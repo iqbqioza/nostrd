@@ -240,7 +240,9 @@ impl Relay {
             live_rx: Some(live_rx),
             live_batch_interval_ms,
             live_batch_size,
-            groups: Arc::new(RwLock::new(GroupStore::default())),
+            groups: Arc::new(RwLock::new(GroupStore::with_cap(
+                config.read().await.limits.max_groups,
+            ))),
             roles: Arc::new(RwLock::new(RoleStore::default())),
             api_limit: ApiLimiter::new(api_max_concurrent),
             per_ip_connections: std::sync::Mutex::new(HashMap::new()),

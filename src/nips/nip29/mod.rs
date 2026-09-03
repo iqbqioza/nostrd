@@ -156,9 +156,27 @@ impl Group {
 pub struct GroupStore {
     pub groups: HashMap<String, Group>,
     deleted: HashSet<String>,
+    /// Cap on the store size (active groups + deleted markers): bounds the
+    /// in-memory state even when an attacker churns group ids. 0 =
+    /// unlimited.
+    max_groups: usize,
 }
 
 impl GroupStore {
+    pub fn with_cap(max_groups: usize) -> GroupStore {
+        GroupStore {
+            max_groups,
+            ..Default::default()
+        }
+    }
+
+    /// Whether another group may be created. The deleted markers count
+    /// toward the budget: they are kept forever (a deleted group must not
+    /// be resurrectable), so an unbounded number of distinct deletions
+    /// must not grow the store without limit either.
+    fn at_capacity(&self) -> bool {
+        self.max_groups > 0 && self.groups.len() + self.deleted.len() >= self.max_groups
+    }
     pub fn group(&self, id: &str) -> Option<&Group> {
         self.groups.get(id)
     }
@@ -180,6 +198,9 @@ impl GroupStore {
             // group to admit the user into), so it is rejected here like
             // every other moderation event for an unknown group.
             if event.kind == CREATE_GROUP {
+                if self.at_capacity() {
+                    return Err("restricted: group limit reached".into());
+                }
                 return Ok(());
             }
             return Err("restricted: unknown group".into());
@@ -392,7 +413,7 @@ impl GroupStore {
                 // The referenced events are deleted by the relay itself.
             }
             CREATE_GROUP => {
-                if !self.groups.contains_key(gid) {
+                if !self.groups.contains_key(gid) && !self.at_capacity() {
                     let mut group = Group::default();
                     group
                         .members

@@ -164,6 +164,7 @@ To generate a secret key, use the `nostrd genkey` command (see [5. Command Refer
 | `max_sub_id_len` | Max subscription id length | `64` |
 | `max_content_bytes` | Max event content length in **characters** (not bytes — non-ASCII text is fine) | `65536` |
 | `max_admin_body_bytes` | NIP-86 management RPC body limit (`413` beyond it) | `65536` |
+| `max_groups` | NIP-29 in-memory group store cap (active + deleted markers; `0` = unlimited) | `1000` |
 | `max_tags` | Max tags per event | `2000` |
 | `max_tag_value_bytes` | Max bytes per tag value | `1024` |
 | `max_created_at_future` | How many seconds of future timestamps are tolerated | `3600` |
