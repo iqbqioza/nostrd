@@ -220,6 +220,7 @@ max_sub_id_len = 64
 # bounded by max_ws_message_size instead.
 max_content_bytes = 65536
 max_admin_body_bytes = 65536        # NIP-86 management RPC body limit
+max_groups = 1000                  # NIP-29 group store cap (0 = unlimited)
 
 # Maximum number of tags on an event.
 max_tags = 2000

@@ -32,6 +32,63 @@ fn seeded() -> GroupStore {
 }
 
 #[test]
+fn group_cap_rejects_creates_over_the_limit() {
+    let mut store = GroupStore::with_cap(2);
+    let g1 = event(CREATE_GROUP, ADMIN, Some("g1"), vec![]);
+    let g2 = event(CREATE_GROUP, ADMIN, Some("g2"), vec![]);
+    let g3 = event(CREATE_GROUP, ADMIN, Some("g3"), vec![]);
+    assert!(store.validate_write(&g1).is_ok());
+    store.apply(&g1, "", 1, false);
+    assert!(store.validate_write(&g2).is_ok());
+    store.apply(&g2, "", 1, false);
+    assert_eq!(
+        store.validate_write(&g3).unwrap_err(),
+        "restricted: group limit reached",
+        "a create beyond the cap must be rejected"
+    );
+    // The apply path (the startup rebuild) must enforce the bound too:
+    // a legacy store larger than the cap cannot blow the memory.
+    store.apply(&g3, "", 1, false);
+    assert_eq!(store.groups.len(), 2, "the cap bounds the store size");
+    // A create of an EXISTING group (a metadata refresh) is unaffected.
+    assert!(store.validate_write(&g1).is_ok());
+}
+
+#[test]
+fn group_cap_counts_deleted_groups() {
+    let mut store = GroupStore::with_cap(2);
+    let g1 = event(CREATE_GROUP, ADMIN, Some("g1"), vec![]);
+    let g2 = event(CREATE_GROUP, ADMIN, Some("g2"), vec![]);
+    let g3 = event(CREATE_GROUP, ADMIN, Some("g3"), vec![]);
+    let del1 = event(DELETE_GROUP, ADMIN, Some("g1"), vec![]);
+    store.apply(&g1, "", 1, false);
+    store.apply(&g2, "", 1, false);
+    store.apply(&del1, "", 2, false);
+    // g1 is gone but its marker still counts: a new create is rejected.
+    assert_eq!(
+        store.validate_write(&g3).unwrap_err(),
+        "restricted: group limit reached",
+        "deleted groups must count toward the budget"
+    );
+    // Re-creating the DELETED g1 is refused on other grounds.
+    assert_eq!(
+        store.validate_write(&g1).unwrap_err(),
+        "blocked: the group has been deleted"
+    );
+}
+
+#[test]
+fn unlimited_group_cap_allows_any() {
+    let mut store = GroupStore::default();
+    for i in 0..100 {
+        let g = event(CREATE_GROUP, ADMIN, Some(&format!("g{i}")), vec![]);
+        assert!(store.validate_write(&g).is_ok());
+        store.apply(&g, "", 1, false);
+    }
+    assert_eq!(store.groups.len(), 100);
+}
+
+#[test]
 fn create_and_admin() {
     let store = seeded();
     let g = store.group("g1").unwrap();

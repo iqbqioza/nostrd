@@ -201,6 +201,11 @@ pub struct LimitsConfig {
     /// so a 64 KiB ceiling is generous and keeps the (publicly reachable
     /// `POST /` route) from buffering large bodies.
     pub max_admin_body_bytes: usize,
+    /// Cap on the in-memory NIP-29 group store: active groups plus
+    /// deleted-group markers (which are kept forever so a deleted group
+    /// cannot be resurrected). Creates beyond the cap are rejected with
+    /// `restricted: group limit reached`. 0 = unlimited.
+    pub max_groups: usize,
     /// Events whose created_at is more than this many seconds in the future
     /// are silently dropped (OK `mute:`) instead of rejected as invalid.
     pub max_created_at_future: u64,
@@ -366,6 +371,7 @@ impl Default for LimitsConfig {
             max_sub_id_len: 64,
             max_content_bytes: 64 * 1024,
             max_admin_body_bytes: 64 * 1024,
+            max_groups: 1_000,
             max_tags: 2_000,
             max_tag_value_bytes: 1_024,
             max_created_at_future: 60 * 60,
@@ -1209,6 +1215,7 @@ fn known_config_keys() -> &'static [(&'static str, &'static [&'static str])] {
                 "max_sub_id_len",
                 "max_content_bytes",
                 "max_admin_body_bytes",
+                "max_groups",
                 "max_tags",
                 "max_tag_value_bytes",
                 "max_created_at_future",
@@ -1397,6 +1404,7 @@ mod tests {
         assert_eq!(cfg.limits.max_conn_per_sec_per_ip, 0);
         assert_eq!(cfg.limits.max_events_per_min_per_pubkey, 0);
         assert_eq!(cfg.limits.max_admin_body_bytes, 64 * 1024);
+        assert_eq!(cfg.limits.max_groups, 1_000);
         assert_eq!(cfg.limits.max_req_response_bytes, 32 * 1024 * 1024);
         // The written default file loads back with the same values.
         let dir = std::env::temp_dir().join("nostrd-config-limits-test");
