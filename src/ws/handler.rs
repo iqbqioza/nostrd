@@ -265,7 +265,7 @@ impl super::Conn {
             cfg.limits.max_limit,
         );
         let search_enabled = cfg.nip_enabled(50);
-        let require_auth = cfg.server.require_auth;
+        let require_auth = cfg.relay.require_auth;
         let sub_bytes_limit = cfg.limits.max_sub_bytes;
         let eose_hint = cfg.nip_enabled(67);
         drop(cfg);
@@ -506,7 +506,7 @@ impl super::Conn {
             self.send_closed(sub_id, "error: counting is not enabled on this relay");
             return;
         }
-        if self.relay.config.read().await.server.require_auth && !self.is_authed() {
+        if self.relay.config.read().await.relay.require_auth && !self.is_authed() {
             self.send_closed(sub_id, "auth-required: please authenticate before counting");
             return;
         }
@@ -537,7 +537,7 @@ impl super::Conn {
             self.send_closed(sub_id, "invalid: too many filters");
             return;
         }
-        let count_limit = self.relay.config.read().await.limits.count_limit;
+        let count_limit = self.relay.config.read().await.limits.max_count;
         let mut count_filters = filters.clone();
         // NIP-50: when the search capability is disabled, strip `search` like
         // REQ does — otherwise COUNT would filter by terms a REQ would ignore

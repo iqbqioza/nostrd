@@ -32,7 +32,7 @@ pub fn relay_info(
         "software": env!("CARGO_PKG_REPOSITORY"),
         "version": env!("CARGO_PKG_VERSION"),
         "limitation": {
-            "max_message_length": limits.max_ws_message_size,
+            "max_message_length": limits.max_ws_message_bytes,
             "max_subscriptions": limits.max_subscriptions,
             "max_filters": limits.max_filters,
             "max_limit": limits.max_limit,
@@ -42,14 +42,14 @@ pub fn relay_info(
             // Only advertise the PoW floor when NIP-13 is enabled and it is
             // actually enforced; otherwise reporting `require_pow` would
             // claim a difficulty the relay never checks.
-            "min_pow_difficulty": if config.nip_enabled(13) { limits.require_pow } else { 0 },
-            "auth_required": config.server.require_auth,
+            "min_pow_difficulty": if config.nip_enabled(13) { config.relay.require_pow } else { 0 },
+            "auth_required": config.relay.require_auth,
             "payment_required": false,
             "restricted_writes": false,
             "created_at_lower_limit": 0,
             // NIP-11: an absolute unix timestamp. The relay accepts events up
             // to `max_created_at_future` seconds into the future.
-            "created_at_upper_limit": crate::util::unix_now() + limits.max_created_at_future,
+            "created_at_upper_limit": crate::util::unix_now() + limits.max_created_at_future_secs,
             "default_limit": limits.max_limit,
         },
         "relay_countries": [],
@@ -110,7 +110,7 @@ mod tests {
             .as_u64()
             .expect("upper limit is a number");
         let now = unix_now();
-        let max_future = Config::default().limits.max_created_at_future;
+        let max_future = Config::default().limits.max_created_at_future_secs;
         assert!(
             upper >= now + max_future.saturating_sub(1) && upper <= now + max_future + 1,
             "upper limit must be now + max_created_at_future, got {upper} vs now {now} + {max_future}"
@@ -166,7 +166,7 @@ mod tests {
                 "NIP-{expected} must be advertised"
             );
         }
-        // NIP-34 (git) is gated behind `relay.enable_git` (default false).
+        // NIP-34 (git) is gated behind `relay.enabled_git` (default false).
         assert!(
             !nips.contains(&34),
             "NIP-34 must not be advertised while enable_git is false"

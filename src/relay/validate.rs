@@ -61,7 +61,7 @@ impl super::Relay {
             return Precheck::Reject("blocked: kind not allowed".into());
         }
         // Spam defense: a pubkey may publish at most
-        // `limits.max_events_per_min_per_pubkey` events per minute
+        // `relay.max_events_per_min_per_pubkey` events per minute
         // (sliding 60-second window). Counted per accepted event before
         // the database write.
         if !self.publish_rate_allowed(cfg, &event.pubkey, now) {
@@ -160,9 +160,9 @@ impl super::Relay {
         {
             return Err("blocked: ephemeral events not allowed".into());
         }
-        // NIP-34 (git): the kinds are rejected unless `relay.enable_git`
+        // NIP-34 (git): the kinds are rejected unless `relay.enabled_git`
         // is set — the default keeps the relay free of patch payloads.
-        if !cfg.relay.enable_git && Config::is_git_kind(event.kind) {
+        if !cfg.relay.enabled_git && Config::is_git_kind(event.kind) {
             return Err("blocked: NIP-34 git events are disabled".into());
         }
         // NIP-01: each tag is an array of one or more strings.
@@ -201,7 +201,7 @@ impl super::Relay {
         // Events with a future created_at (beyond the tolerated skew) are
         // dropped silently with the NIP-01 `mute:` prefix instead of being
         // rejected as invalid.
-        if event.created_at > now.saturating_add(limits.max_created_at_future) {
+        if event.created_at > now.saturating_add(limits.max_created_at_future_secs) {
             return Err("mute: event creation date is in the future".into());
         }
 
@@ -224,8 +224,8 @@ impl super::Relay {
         }
 
         if cfg.nip_enabled(13)
-            && limits.require_pow > 0
-            && !nip13::verify(event, limits.require_pow)
+            && cfg.relay.require_pow > 0
+            && !nip13::verify(event, cfg.relay.require_pow)
         {
             return Err("pow: difficulty requirement not reached".into());
         }
@@ -276,7 +276,7 @@ impl super::Relay {
             return Err("restricted: repost of a protected event".into());
         }
 
-        if cfg.nip_enabled(42) && cfg.server.require_auth && authed.is_empty() {
+        if cfg.nip_enabled(42) && cfg.relay.require_auth && authed.is_empty() {
             return Err("auth-required: this relay requires authentication".into());
         }
 
@@ -398,7 +398,7 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let mut cfg = Config::default();
-            cfg.limits.max_events_per_min_per_pubkey = 3;
+            cfg.relay.max_events_per_min_per_pubkey = 3;
             cfg.database.path = std::env::temp_dir().join("nostrd-rate-test");
             let _ = std::fs::remove_dir_all(&cfg.database.path);
             let db = crate::db::DbClient::open(
@@ -509,7 +509,7 @@ mod tests {
             // The map is bounded: with the limit on, many pubkeys evict the
             // map instead of growing it.
             let mut cfg = Config::default();
-            cfg.limits.max_events_per_min_per_pubkey = 1;
+            cfg.relay.max_events_per_min_per_pubkey = 1;
             for i in 0..20_000u64 {
                 let pk = format!("{i:064x}");
                 assert!(relay.publish_rate_allowed(&cfg, &pk, unix_now()));
@@ -584,7 +584,7 @@ mod tests {
 
             // enable_git = true: the kinds are accepted.
             let mut cfg2 = Config::default();
-            cfg2.relay.enable_git = true;
+            cfg2.relay.enabled_git = true;
             cfg2.database.path = std::env::temp_dir().join("nostrd-git-test-enabled");
             let _ = std::fs::remove_dir_all(&cfg2.database.path);
             let db2 = crate::db::DbClient::open(

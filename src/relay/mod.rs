@@ -47,7 +47,7 @@ pub struct Relay {
     /// a single host cannot consume the whole connection budget.
     per_ip_connections: std::sync::Mutex<HashMap<String, usize>>,
     /// Per-pubkey sliding window of accepted event timestamps
-    /// (`limits.max_events_per_min_per_pubkey`). Bounded: the map is
+    /// (`relay.max_events_per_min_per_pubkey`). Bounded: the map is
     /// cleared when it reaches its cap instead of growing.
     publish_rate: std::sync::Mutex<HashMap<String, std::collections::VecDeque<u64>>>,
     /// Bumped whenever the blocked-IP list changes (NIP-86 blockip/
@@ -210,7 +210,7 @@ impl Relay {
                 }
             }
         };
-        let api_max_concurrent = config.read().await.limits.api_max_concurrent;
+        let api_max_concurrent = config.read().await.limits.max_api_concurrent;
         // Seed the access control: the persisted runtime state wins, so NIP-86
         // bans/allowlists survive restarts; the config `access` section seeds
         // the very first run only (when no runtime state exists yet). The
@@ -241,7 +241,7 @@ impl Relay {
             live_batch_interval_ms,
             live_batch_size,
             groups: Arc::new(RwLock::new(GroupStore::with_cap(
-                config.read().await.limits.max_groups,
+                config.read().await.relay.max_groups,
             ))),
             roles: Arc::new(RwLock::new(RoleStore::default())),
             api_limit: ApiLimiter::new(api_max_concurrent),
@@ -313,12 +313,12 @@ impl Relay {
     }
 
     /// Whether `pubkey` may publish another event under
-    /// `limits.max_events_per_min_per_pubkey` (a sliding 60-second window;
+    /// `relay.max_events_per_min_per_pubkey` (a sliding 60-second window;
     /// 0 = unlimited). The window map is bounded at 10,000 pubkeys — when
     /// the bound is reached the map is cleared, not grown.
     pub(crate) fn publish_rate_allowed(&self, cfg: &Config, pubkey: &str, now: u64) -> bool {
         const MAX_TRACKED_PUBKEYS: usize = 10_000;
-        let max = cfg.limits.max_events_per_min_per_pubkey;
+        let max = cfg.relay.max_events_per_min_per_pubkey;
         if max == 0 {
             return true;
         }
@@ -511,7 +511,7 @@ impl Relay {
         // persisted once an event actually stores, so a rejected first event
         // (expired/duplicate/invalid) cannot pre-warm the account-age clock.
         let mut persist_first_seen = false;
-        if cfg.limits.new_pubkey_min_age_secs > 0
+        if cfg.relay.new_pubkey_min_age_secs > 0
             && let Some(pubkey) = event.pubkey_bytes()
         {
             let first_seens = self.db.first_seen_batch(vec![pubkey]).await;
@@ -524,7 +524,7 @@ impl Relay {
                 );
             };
             persist_first_seen = created;
-            if !created && now.saturating_sub(first_seen) < cfg.limits.new_pubkey_min_age_secs {
+            if !created && now.saturating_sub(first_seen) < cfg.relay.new_pubkey_min_age_secs {
                 self.stats.bump(&self.stats.events_rejected, 1);
                 return (
                     PutOutcome::Invalid("restricted: your account is too new".into()),
@@ -673,7 +673,7 @@ impl Relay {
         let groups_enabled = cfg.nip_enabled(29);
         let roles_enabled = cfg.nip_enabled(43);
         let nip9_enabled = cfg.nip_enabled(9);
-        let min_age = cfg.limits.new_pubkey_min_age_secs;
+        let min_age = cfg.relay.new_pubkey_min_age_secs;
         drop(cfg);
         drop(access);
 

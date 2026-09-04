@@ -247,7 +247,7 @@ impl Store {
         // transaction created from it within this process.
         // The map is virtual address space: on 64-bit systems the growth
         // ceiling can be huge; on 32-bit systems LMDB is limited to ~2 GiB.
-        let mut map_max_size = (cfg.map_max_size as u64)
+        let mut map_max_size = (cfg.max_map_size as u64)
             .max(cfg.map_size as u64)
             .max(16 * 1024 * 1024);
         if usize::BITS < 64 {

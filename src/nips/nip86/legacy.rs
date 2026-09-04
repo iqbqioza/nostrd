@@ -73,19 +73,19 @@ async fn check_auth(
     // NIP-98 check (matching the JSON-RPC path) so both methods can be
     // configured at once instead of one silently disabling the other.
     let mut token_configured = false;
-    if !cfg.server.management_token.is_empty() {
+    if !cfg.rpc.management_token.is_empty() {
         token_configured = true;
         if let Some(token) = headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
-            && super::ct_eq(token, &cfg.server.management_token)
+            && super::ct_eq(token, &cfg.rpc.management_token)
         {
             return Ok("management-token".into());
         }
     }
 
-    if !cfg.server.admin_pubkey.is_empty() {
+    if !cfg.rpc.admin_pubkey.is_empty() {
         let auth = headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
@@ -97,15 +97,15 @@ async fn check_auth(
         // relay's main endpoint, so the authority is the management
         // host:port (the relay `public_url` does not apply here).
         let mgmt_identity = crate::nips::nip62::RelayIdentity::new(
-            &cfg.server.management_host,
-            cfg.server.management_port,
+            &cfg.rpc.management_host,
+            cfg.rpc.management_port,
             "",
         );
         let url_ok =
             |tag: &str| nip98::matches_request_url(tag, &mgmt_identity, uri.path(), uri.query());
         if let Some(pubkey) = nip98::verify(
             auth,
-            Some(&cfg.server.admin_pubkey),
+            Some(&cfg.rpc.admin_pubkey),
             relay.secp(),
             true,
             method,
@@ -121,7 +121,7 @@ async fn check_auth(
     Err(unauthorized(if token_configured {
         "invalid bearer token"
     } else {
-        "management API disabled: set server.management_token or server.admin_pubkey"
+        "management API disabled: set rpc.management_token or rpc.admin_pubkey"
     }))
 }
 
@@ -311,7 +311,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         let mut cfg = crate::config::Config::default();
         cfg.database.path = path;
-        cfg.server.management_token = "test-token".into();
+        cfg.rpc.management_token = "test-token".into();
         let db = crate::db::DbClient::open(
             &cfg.database,
             true,
@@ -345,12 +345,12 @@ mod tests {
         let router = router(
             relay.clone(),
             tokio::sync::watch::channel(false).0,
-            crate::config::Config::default().limits.max_admin_body_bytes,
+            crate::config::Config::default().rpc.max_admin_body_bytes,
         );
         let body = format!(
             "{{\"pubkey\":\"{}\",\"pad\":\"{}\"}}",
             "aa".repeat(32),
-            "x".repeat(crate::config::Config::default().limits.max_admin_body_bytes + 1)
+            "x".repeat(crate::config::Config::default().rpc.max_admin_body_bytes + 1)
         );
         let resp = router
             .oneshot(
@@ -379,7 +379,7 @@ mod tests {
         let router = router(
             relay.clone(),
             tokio::sync::watch::channel(false).0,
-            crate::config::Config::default().limits.max_admin_body_bytes,
+            crate::config::Config::default().rpc.max_admin_body_bytes,
         );
         relay.audit.clear();
         let resp = router

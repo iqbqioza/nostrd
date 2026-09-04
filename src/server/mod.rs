@@ -157,7 +157,7 @@ async fn build_router(
     // of them. The inbox and outbox paths give the relay distinct endpoints
     // for the inbox/outbox routing model.
     let ws_paths = relay.config.read().await.server.ws_paths.trim().to_string();
-    let max_admin_body = relay.config.read().await.limits.max_admin_body_bytes;
+    let max_admin_body = relay.config.read().await.rpc.max_admin_body_bytes;
     let mut app = Router::new()
         .route("/health", get(health_handler))
         .route("/relay/stats", get(stats_handler))
@@ -336,11 +336,8 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
 
     let mgmt = {
         let cfg = relay.config.read().await;
-        if cfg.server.management_port > 0 {
-            let mgmt_addr = (
-                cfg.server.management_host.clone(),
-                cfg.server.management_port,
-            );
+        if cfg.rpc.management_port > 0 {
+            let mgmt_addr = (cfg.rpc.management_host.clone(), cfg.rpc.management_port);
             let listener = bind_listener(&mgmt_addr, "management listening on http://").await?;
             Some((mgmt_addr, listener))
         } else {
@@ -349,7 +346,7 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
     };
 
     if let Some((addr, listener)) = mgmt {
-        let max_admin_body = relay.config.read().await.limits.max_admin_body_bytes;
+        let max_admin_body = relay.config.read().await.rpc.max_admin_body_bytes;
         let mgmt_app = nip86::router(relay.clone(), shutdown_tx.clone(), max_admin_body);
         let rx = shutdown_rx.clone();
         tasks.push(tokio::spawn(async move {
@@ -395,7 +392,7 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
             (cfg.limits.http_read_timeout_secs > 0)
                 .then(|| std::time::Duration::from_secs(cfg.limits.http_read_timeout_secs)),
             cfg.limits.max_connections,
-            IpConnLimiter::new(cfg.limits.max_conn_per_sec_per_ip),
+            IpConnLimiter::new(cfg.limits.max_connections_per_sec_per_ip),
         )
     };
     let _ = serve_limited(
@@ -622,17 +619,17 @@ async fn ws_handler(State(relay): State<Arc<Relay>>, request: Request) -> Respon
             // that hundreds of thousands of idle connections do not pin
             // megabytes each.
             let cfg = relay.config.read().await;
-            let max_msg = cfg.limits.max_ws_message_size;
+            let max_msg = cfg.limits.max_ws_message_bytes;
             // Initial read/write buffer size per connection (grows on
             // demand); bounded so that hundreds of thousands of idle
             // connections do not pin megabytes each.
-            let buffer_size = cfg.limits.buffer_size;
+            let buffer_size = cfg.database.db_buffer_size;
             // The outgoing buffer must fit the largest relay-generated
             // message: a NIP-77 NEG-MSG response carries every id of a
             // queried range as hex (up to neg_max_items ids), plus the JSON
             // envelope. Per-id worst case: 32 bytes as 64 hex chars, with
             // range headers amortized over the emitted ranges.
-            let neg_max = cfg.limits.neg_max_items;
+            let neg_max = cfg.limits.max_neg_items;
             let max_write = max_msg.max(neg_max.saturating_mul(80).saturating_add(64 * 1024));
             drop(cfg);
             upgrade
@@ -1010,7 +1007,7 @@ async fn reload_handler(
                             continue;
                         }
                         db.set_expiry_enabled(new_config.nip_enabled(40));
-                        api_limit.set_max(new_config.limits.api_max_concurrent);
+                        api_limit.set_max(new_config.limits.max_api_concurrent);
                         // The relay's signing key is fixed at startup: a
                         // reloaded private_key is not applied (NIP-29/NIP-43
                         // keep signing and NIP-11 `self` keeps advertising
@@ -1031,12 +1028,12 @@ async fn reload_handler(
                             ("server.port", old.server.port != new_config.server.port),
                             ("server.ws_paths", old.server.ws_paths != new_config.server.ws_paths),
                             (
-                                "server.management_port",
-                                old.server.management_port != new_config.server.management_port,
+                                "rpc.management_port",
+                                old.rpc.management_port != new_config.rpc.management_port,
                             ),
                             (
-                                "server.management_host",
-                                old.server.management_host != new_config.server.management_host,
+                                "rpc.management_host",
+                                old.rpc.management_host != new_config.rpc.management_host,
                             ),
                             (
                                 "server.metrics_enabled",
@@ -1094,13 +1091,13 @@ async fn reload_handler(
                                     != new_config.database.purge_interval_secs,
                             ),
                             (
-                                "daemon.log_max_size_bytes",
-                                old.daemon.log_max_size_bytes
-                                    != new_config.daemon.log_max_size_bytes,
+                                "daemon.max_log_size_bytes",
+                                old.daemon.max_log_size_bytes
+                                    != new_config.daemon.max_log_size_bytes,
                             ),
                             (
-                                "daemon.log_max_files",
-                                old.daemon.log_max_files != new_config.daemon.log_max_files,
+                                "daemon.max_log_files",
+                                old.daemon.max_log_files != new_config.daemon.max_log_files,
                             ),
                             (
                                 "daemon.stats_interval_secs",
@@ -1108,22 +1105,22 @@ async fn reload_handler(
                                     != new_config.daemon.stats_interval_secs,
                             ),
                             (
-                                "limits.db_request_timeout_secs",
-                                old.limits.db_request_timeout_secs
-                                    != new_config.limits.db_request_timeout_secs,
+                                "database.db_request_timeout_secs",
+                                old.database.db_request_timeout_secs
+                                    != new_config.database.db_request_timeout_secs,
                             ),
                             (
-                                "limits.db_queue_msgs",
-                                old.limits.db_queue_msgs != new_config.limits.db_queue_msgs,
+                                "database.max_db_queue_msgs",
+                                old.database.max_db_queue_msgs != new_config.database.max_db_queue_msgs,
                             ),
                             (
-                                "limits.db_queue_events",
-                                old.limits.db_queue_events != new_config.limits.db_queue_events,
+                                "database.max_db_queue_events",
+                                old.database.max_db_queue_events != new_config.database.max_db_queue_events,
                             ),
                             (
-                                "limits.max_indexed_words",
-                                old.limits.max_indexed_words
-                                    != new_config.limits.max_indexed_words,
+                                "database.max_indexed_words",
+                                old.database.max_indexed_words
+                                    != new_config.database.max_indexed_words,
                             ),
                             (
                                 "limits.live_buffer",
@@ -1148,9 +1145,9 @@ async fn reload_handler(
                                     != new_config.limits.http_read_timeout_secs,
                             ),
                             (
-                                "limits.max_conn_per_sec_per_ip",
-                                old.limits.max_conn_per_sec_per_ip
-                                    != new_config.limits.max_conn_per_sec_per_ip,
+                                "limits.max_connections_per_sec_per_ip",
+                                old.limits.max_connections_per_sec_per_ip
+                                    != new_config.limits.max_connections_per_sec_per_ip,
                             ),
                         ];
                         for (name, changed) in static_routes {

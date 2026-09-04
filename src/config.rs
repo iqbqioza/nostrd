@@ -16,7 +16,7 @@ pub const DEFAULT_CONFIG: &str = "nostrd.toml";
 /// (17/22/32/46/47/57/59/65/78/84/85/87/88/94) are advertised deliberately:
 /// the relay stores and serves their events (or forwards their ephemeral
 /// kinds), so clients rely on them. NIP-34 (git) is advertised only when
-/// `relay.enable_git` is set (the kinds are rejected otherwise). NIP-A3
+/// `relay.enabled_git` is set (the kinds are rejected otherwise). NIP-A3
 /// (kind 10133) is served but cannot be advertised: it is a `draft` with no
 /// integer identifier and NIP-11's `supported_nips` is an array of integer
 /// identifiers. The remaining file-storage NIPs (95/96 HTTP file storage)
@@ -33,6 +33,7 @@ pub const RELAY_NIPS: &[u16] = &[
 pub struct Config {
     pub relay: RelayConfig,
     pub server: ServerConfig,
+    pub rpc: RpcConfig,
     pub limits: LimitsConfig,
     pub database: DatabaseConfig,
     pub daemon: DaemonConfig,
@@ -131,7 +132,26 @@ pub struct RelayConfig {
     /// When true, NIP-34 git events (kinds 1617-1633, 30617/30618) are
     /// accepted and NIP-34 is advertised in the NIP-11 document. Default
     /// false: the kinds are rejected and NIP-34 is not advertised.
-    pub enable_git: bool,
+    pub enabled_git: bool,
+    /// Events must carry at least this many leading zero bits in their id
+    /// to be accepted (0 disables the check).
+    pub require_pow: u8,
+    /// Spam defense: a pubkey's first accepted event is recorded, and
+    /// events from pubkeys first seen less than this many seconds ago are
+    /// rejected with `restricted: your account is too new` (0 disables).
+    pub new_pubkey_min_age_secs: u64,
+    /// Spam defense: a pubkey may publish at most this many events per
+    /// minute (a sliding 60-second window). 0 disables the check.
+    pub max_events_per_min_per_pubkey: u64,
+    /// Cap on the in-memory NIP-29 group store (active groups plus
+    /// deleted-group markers). 0 = unlimited.
+    pub max_groups: usize,
+    /// When true, connections must complete a NIP-42 AUTH exchange before
+    /// they may publish or subscribe.
+    pub require_auth: bool,
+    /// Send a NIP-42 auth-request challenge when a connection arrives
+    /// without authentication.
+    pub send_auth_challenge: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -146,14 +166,6 @@ pub struct ServerConfig {
     /// (e.g. `api.example.com` vs `relay.example.com`). Empty = the API is
     /// served on every host, next to the WebSocket endpoint.
     pub api_host: String,
-    /// Separate local management port for NIP-86; 0 disables it.
-    pub management_port: u16,
-    pub management_host: String,
-    pub management_token: String,
-    /// Admin pubkey for NIP-98 authenticated management calls.
-    pub admin_pubkey: String,
-    pub require_auth: bool,
-    pub send_auth_challenge: bool,
     /// Expose Prometheus metrics on `GET /metrics` (text format). Served on
     /// the API host when one is configured; without `api_host` the metrics
     /// are public on every host.
@@ -179,6 +191,24 @@ pub struct ServerConfig {
     pub outbox_write_policy: String,
 }
 
+/// NIP-86 management RPC settings: the separate management port, the
+/// bearer token / admin pubkey authentication, and the request body
+/// limit.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RpcConfig {
+    /// Separate local management port for NIP-86; 0 disables it.
+    pub management_port: u16,
+    pub management_host: String,
+    pub management_token: String,
+    /// Admin pubkey for NIP-98 authenticated management calls.
+    pub admin_pubkey: String,
+    /// Body limit for the NIP-86 management RPC (the JSON-RPC handler and
+    /// the legacy management endpoints): requests are tiny method+params
+    /// documents, so a 64 KiB ceiling is generous.
+    pub max_admin_body_bytes: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LimitsConfig {
@@ -187,54 +217,22 @@ pub struct LimitsConfig {
     /// consume the whole connection budget (a socket flood from one IP
     /// would otherwise evict legitimate clients). 0 = no per-IP cap.
     pub max_connections_per_ip: usize,
-    pub max_ws_message_size: usize,
+    /// Maximum accepted WebSocket message size in bytes.
+    pub max_ws_message_bytes: usize,
     pub max_filters: usize,
     pub max_subscriptions: usize,
     pub max_limit: usize,
-    pub count_limit: usize,
+    /// NIP-45 COUNT: upper bound for the returned count.
+    pub max_count: usize,
     pub max_sub_id_len: usize,
     pub max_content_bytes: usize,
     pub max_tags: usize,
     pub max_tag_value_bytes: usize,
-    /// Body limit for the NIP-86 management RPC (JSON-RPC and the legacy
-    /// management endpoints): requests are tiny method+params documents,
-    /// so a 64 KiB ceiling is generous and keeps the (publicly reachable
-    /// `POST /` route) from buffering large bodies.
-    pub max_admin_body_bytes: usize,
-    /// Cap on the in-memory NIP-29 group store: active groups plus
-    /// deleted-group markers (which are kept forever so a deleted group
-    /// cannot be resurrected). Creates beyond the cap are rejected with
-    /// `restricted: group limit reached`. 0 = unlimited.
-    pub max_groups: usize,
     /// Events whose created_at is more than this many seconds in the future
     /// are silently dropped (OK `mute:`) instead of rejected as invalid.
-    pub max_created_at_future: u64,
-    pub require_pow: u8,
-    pub max_indexed_words: usize,
-    pub buffer_size: usize,
+    pub max_created_at_future_secs: u64,
     /// NIP-77: maximum number of records a single NEG-OPEN may process.
-    pub neg_max_items: usize,
-    /// Seconds a database request may wait before timing out (0 = wait
-    /// forever). A timeout keeps the relay responsive even when the storage
-    /// is stuck: the request fails with a clear error instead of hanging.
-    pub db_request_timeout_secs: u64,
-    /// Spam defense: a pubkey's first accepted event is recorded, and events
-    /// from pubkeys first seen less than this many seconds ago are rejected
-    /// with `restricted: your account is too new` (0 disables the check).
-    pub new_pubkey_min_age_secs: u64,
-    /// Maximum bytes of outgoing messages queued for a single connection
-    /// before new ones are dropped (protects memory against slow readers).
-    pub max_out_queue_bytes: usize,
-    /// Seconds a connection may stay idle (no inbound frames) before it is
-    /// closed. When non-zero the relay also sends periodic WebSocket PINGs so
-    /// an alive-but-silent subscriber keeps its slot and dead peers are
-    /// detected and reaped; 0 disables the idle timeout entirely.
-    pub ws_idle_timeout_secs: u64,
-    /// Overload protection: when the database thread's queue holds more than
-    /// this many pending messages (or `db_queue_events` events), new
-    /// database requests fail fast instead of accumulating in memory.
-    pub db_queue_msgs: usize,
-    pub db_queue_events: usize,
+    pub max_neg_items: usize,
     /// Maximum total bytes of subscription filters held by a single
     /// connection.
     pub max_sub_bytes: usize,
@@ -245,14 +243,22 @@ pub struct LimitsConfig {
     /// served at once. Requests beyond this limit fail fast with `503`
     /// instead of queuing, so a flood of API traffic cannot stall the
     /// WebSocket subscribers (which share the same database).
-    pub api_max_concurrent: usize,
+    pub max_api_concurrent: usize,
     /// REST API: upper bound for the `limit` query parameter (0 = no bound).
-    pub api_max_limit: usize,
+    pub max_api_limit: usize,
     /// REST API: upper bound for the `offset` query parameter (0 = no bound).
-    pub api_max_offset: usize,
+    pub max_api_offset: usize,
     /// REST API: maximum length of the `search` query parameter in bytes
     /// (0 = no bound).
-    pub api_max_search_bytes: usize,
+    pub max_api_search_bytes: usize,
+    /// Maximum bytes of outgoing messages queued for a single connection
+    /// before new ones are dropped (protects memory against slow readers).
+    pub max_out_queue_bytes: usize,
+    /// Seconds a connection may stay idle (no inbound frames) before it is
+    /// closed. When non-zero the relay also sends periodic WebSocket PINGs so
+    /// an alive-but-silent subscriber keeps its slot and dead peers are
+    /// detected and reaped; 0 disables the idle timeout entirely.
+    pub ws_idle_timeout_secs: u64,
     /// Live fan-out: events are accumulated and broadcast in batches of at
     /// most `live_batch_size` events every `live_batch_interval_ms`, so that
     /// idle connections wake up once per batch instead of once per event.
@@ -269,10 +275,7 @@ pub struct LimitsConfig {
     /// Per-IP cap on new connections per second (all protocols). A host
     /// opening sockets faster than this is refused until the window slides.
     /// 0 disables the check.
-    pub max_conn_per_sec_per_ip: u64,
-    /// Spam defense: a pubkey may publish at most this many events per
-    /// minute (a sliding 60-second window). 0 disables the check.
-    pub max_events_per_min_per_pubkey: u64,
+    pub max_connections_per_sec_per_ip: u64,
     /// Byte budget for a single REQ response (the stored events delivered
     /// for one subscription). Responses larger than this are cut off with
     /// a `CLOSED ... response too large` reply so a slow reader cannot
@@ -286,18 +289,33 @@ pub struct DatabaseConfig {
     pub path: PathBuf,
     pub max_dbs: u32,
     pub max_readers: u32,
-    /// Memory map size in bytes. The map is opened at `map_max_size` (a
+    /// Memory map size in bytes. The map is opened at `max_map_size` (a
     /// sparse virtual-address reservation), so this value only acts as a
-    /// floor: the actual map is never smaller than this or `map_max_size`.
+    /// floor: the actual map is never smaller than this or `max_map_size`.
     pub map_size: usize,
     /// Memory map ceiling in bytes. The map is opened at this size once and
     /// never resized at runtime: the reservation is virtual address space
     /// (sparse file), so physical memory and disk grow only with the data
     /// actually written.
-    pub map_max_size: usize,
+    pub max_map_size: usize,
     pub purge_interval_secs: u64,
     /// Enable the NIP-50 full-text word index.
     pub search_index: bool,
+    /// How many words of each event's content are added to the NIP-50
+    /// search index.
+    pub max_indexed_words: usize,
+    /// LMDB read/write buffer size (the `read_buffer_size` /
+    /// `write_buffer_size` of the environment).
+    pub db_buffer_size: usize,
+    /// Seconds a database request may wait before timing out (0 = wait
+    /// forever). A timeout keeps the relay responsive even when the storage
+    /// is stuck: the request fails with a clear error instead of hanging.
+    pub db_request_timeout_secs: u64,
+    /// Overload protection: when the database thread's queue holds more than
+    /// this many pending messages (or `max_db_queue_events` events), new
+    /// database requests fail fast instead of accumulating in memory.
+    pub max_db_queue_msgs: usize,
+    pub max_db_queue_events: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -309,11 +327,11 @@ pub struct DaemonConfig {
     pub stats_interval_secs: u64,
     /// Rotate the log file when it grows past this many bytes (0 disables
     /// rotation). The old file is renamed to `.1` and older backups shift up
-    /// to `log_max_files` backups.
-    pub log_max_size_bytes: u64,
+    /// to `max_log_files` backups.
+    pub max_log_size_bytes: u64,
     /// Number of rotated log backups to keep (each is the previous generation
     /// of the log file).
-    pub log_max_files: u32,
+    pub max_log_files: u32,
 }
 
 impl Default for RelayConfig {
@@ -333,7 +351,13 @@ impl Default for RelayConfig {
             enabled_nips: Vec::new(),
             disabled_nips: Vec::new(),
             reject_ephemeral: false,
-            enable_git: false,
+            enabled_git: false,
+            require_pow: 0,
+            new_pubkey_min_age_secs: 0,
+            max_events_per_min_per_pubkey: 0,
+            max_groups: 1_000,
+            require_auth: false,
+            send_auth_challenge: true,
         }
     }
 }
@@ -344,16 +368,22 @@ impl Default for ServerConfig {
             host: "127.0.0.1".into(),
             port: 8080,
             api_host: String::new(),
-            management_port: 0,
-            management_host: "127.0.0.1".into(),
-            management_token: String::new(),
-            admin_pubkey: String::new(),
-            require_auth: false,
-            send_auth_challenge: true,
             metrics_enabled: true,
             ws_paths: "root".into(),
             inbox_write_policy: "any".into(),
             outbox_write_policy: "any".into(),
+        }
+    }
+}
+
+impl Default for RpcConfig {
+    fn default() -> Self {
+        RpcConfig {
+            management_port: 0,
+            management_host: "127.0.0.1".into(),
+            management_token: String::new(),
+            admin_pubkey: String::new(),
+            max_admin_body_bytes: 64 * 1024,
         }
     }
 }
@@ -363,40 +393,30 @@ impl Default for LimitsConfig {
         LimitsConfig {
             max_connections: 10_000,
             max_connections_per_ip: 64,
-            max_ws_message_size: 1 << 20,
+            max_ws_message_bytes: 1 << 20,
             max_filters: 20,
             max_subscriptions: 20,
             max_limit: 500,
-            count_limit: 2_000,
+            max_count: 2_000,
             max_sub_id_len: 64,
             max_content_bytes: 64 * 1024,
-            max_admin_body_bytes: 64 * 1024,
-            max_groups: 1_000,
             max_tags: 2_000,
             max_tag_value_bytes: 1_024,
-            max_created_at_future: 60 * 60,
-            require_pow: 0,
-            max_indexed_words: 128,
-            buffer_size: 2_048,
-            neg_max_items: 100_000,
-            db_request_timeout_secs: 30,
-            new_pubkey_min_age_secs: 0,
+            max_created_at_future_secs: 60 * 60,
+            max_neg_items: 100_000,
+            max_sub_bytes: 1 << 20,
+            group_late_publish_secs: 3_600,
+            max_api_concurrent: 8,
+            max_api_limit: 5_000,
+            max_api_offset: 50_000,
+            max_api_search_bytes: 2_048,
             max_out_queue_bytes: 256 * 1024,
             ws_idle_timeout_secs: 300,
-            db_queue_msgs: 4_096,
-            db_queue_events: 262_144,
-            max_sub_bytes: 512 * 1024,
-            live_batch_interval_ms: 10,
-            live_batch_size: 64,
+            live_batch_interval_ms: 20,
+            live_batch_size: 32,
             live_buffer: 65_536,
-            group_late_publish_secs: 7 * 24 * 60 * 60,
-            api_max_concurrent: 32,
-            api_max_limit: 500,
-            api_max_offset: 10_000,
-            api_max_search_bytes: 1_024,
             http_read_timeout_secs: 30,
-            max_conn_per_sec_per_ip: 0,
-            max_events_per_min_per_pubkey: 0,
+            max_connections_per_sec_per_ip: 0,
             max_req_response_bytes: 32 * 1024 * 1024,
         }
     }
@@ -411,9 +431,14 @@ impl Default for DatabaseConfig {
             map_size: 1024 * 1024 * 1024,
             // 1 TiB of virtual address space; the actual disk usage grows
             // only with the stored data (sparse file).
-            map_max_size: 1024 * 1024 * 1024 * 1024,
+            max_map_size: 1024 * 1024 * 1024 * 1024,
             purge_interval_secs: 300,
             search_index: true,
+            max_indexed_words: 128,
+            db_buffer_size: 2_048,
+            db_request_timeout_secs: 30,
+            max_db_queue_msgs: 4_096,
+            max_db_queue_events: 262_144,
         }
     }
 }
@@ -425,8 +450,206 @@ impl Default for DaemonConfig {
             log_file: PathBuf::from("./nostrd.log"),
             stats_file: PathBuf::from("./nostrd.stats.json"),
             stats_interval_secs: 5,
-            log_max_size_bytes: 50 * 1024 * 1024,
-            log_max_files: 5,
+            max_log_size_bytes: 50 * 1024 * 1024,
+            max_log_files: 5,
+        }
+    }
+}
+
+/// Legacy config aliases: `(old section, old key, new section, new key)`.
+/// A config written for an older layout is accepted: the old value is
+/// applied to the new location with a deprecation warning (the warning
+/// also tells the operator which key to use next time).
+const LEGACY_ALIASES: &[(&str, &str, &str, &str)] = &[
+    ("relay", "enable_git", "relay", "enabled_git"),
+    ("server", "require_auth", "relay", "require_auth"),
+    (
+        "server",
+        "send_auth_challenge",
+        "relay",
+        "send_auth_challenge",
+    ),
+    ("server", "management_port", "rpc", "management_port"),
+    ("server", "management_host", "rpc", "management_host"),
+    ("server", "management_token", "rpc", "management_token"),
+    ("server", "admin_pubkey", "rpc", "admin_pubkey"),
+    ("limits", "require_pow", "relay", "require_pow"),
+    (
+        "limits",
+        "new_pubkey_min_age_secs",
+        "relay",
+        "new_pubkey_min_age_secs",
+    ),
+    (
+        "limits",
+        "max_events_per_min_per_pubkey",
+        "relay",
+        "max_events_per_min_per_pubkey",
+    ),
+    ("limits", "max_groups", "relay", "max_groups"),
+    (
+        "limits",
+        "max_ws_message_size",
+        "limits",
+        "max_ws_message_bytes",
+    ),
+    ("limits", "count_limit", "limits", "max_count"),
+    ("limits", "neg_max_items", "limits", "max_neg_items"),
+    (
+        "limits",
+        "max_created_at_future",
+        "limits",
+        "max_created_at_future_secs",
+    ),
+    (
+        "limits",
+        "max_conn_per_sec_per_ip",
+        "limits",
+        "max_connections_per_sec_per_ip",
+    ),
+    (
+        "limits",
+        "api_max_concurrent",
+        "limits",
+        "max_api_concurrent",
+    ),
+    ("limits", "api_max_limit", "limits", "max_api_limit"),
+    ("limits", "api_max_offset", "limits", "max_api_offset"),
+    (
+        "limits",
+        "api_max_search_bytes",
+        "limits",
+        "max_api_search_bytes",
+    ),
+    (
+        "limits",
+        "max_admin_body_bytes",
+        "rpc",
+        "max_admin_body_bytes",
+    ),
+    (
+        "limits",
+        "max_indexed_words",
+        "database",
+        "max_indexed_words",
+    ),
+    ("limits", "buffer_size", "database", "db_buffer_size"),
+    (
+        "limits",
+        "db_request_timeout_secs",
+        "database",
+        "db_request_timeout_secs",
+    ),
+    ("limits", "db_queue_msgs", "database", "max_db_queue_msgs"),
+    (
+        "limits",
+        "db_queue_events",
+        "database",
+        "max_db_queue_events",
+    ),
+    ("database", "map_max_size", "database", "max_map_size"),
+    (
+        "daemon",
+        "log_max_size_bytes",
+        "daemon",
+        "max_log_size_bytes",
+    ),
+    ("daemon", "log_max_files", "daemon", "max_log_files"),
+];
+
+/// A checked integer cast for the alias application: the legacy values
+/// were previously validated by serde's field types (a negative or
+/// overflowing value failed the whole config load), so an alias must not
+/// silently wrap one into a huge number. On failure the value degrades to
+/// the safe default (0) — the config validation rejects the resulting
+/// zero limits, and 0 means "disabled" for the policy knobs.
+fn alias_int<T: TryFrom<i64> + Default>(v: &toml::Value) -> T {
+    v.as_integer()
+        .and_then(|i| T::try_from(i).ok())
+        .unwrap_or_default()
+}
+
+/// Applies the legacy aliases found in `raw` to `cfg` and warns about
+/// each one. The old keys are recognized (never flagged as unknown) and
+/// their values land in the new locations.
+fn apply_legacy_aliases(raw: &str, cfg: &mut Config) {
+    let Ok(value) = raw.parse::<toml::Value>() else {
+        return;
+    };
+    let Some(table) = value.as_table() else {
+        return;
+    };
+    for (old_section, old_key, new_section, new_key) in LEGACY_ALIASES {
+        let Some(section) = table.get(*old_section).and_then(toml::Value::as_table) else {
+            continue;
+        };
+        let Some(v) = section.get(*old_key) else {
+            continue;
+        };
+        log::warn!(
+            "config key [{old_section}].{old_key} is deprecated; use [{new_section}].{new_key} instead — the value is still applied"
+        );
+        match (*old_section, *old_key) {
+            ("relay", "enable_git") => cfg.relay.enabled_git = v.as_bool().unwrap_or(false),
+            ("server", "require_auth") => cfg.relay.require_auth = v.as_bool().unwrap_or(false),
+            ("server", "send_auth_challenge") => {
+                cfg.relay.send_auth_challenge = v.as_bool().unwrap_or(false)
+            }
+            ("server", "management_port") => cfg.rpc.management_port = alias_int::<u16>(v),
+            ("server", "management_host") => {
+                cfg.rpc.management_host = v.as_str().unwrap_or("").to_string()
+            }
+            ("server", "management_token") => {
+                cfg.rpc.management_token = v.as_str().unwrap_or("").to_string()
+            }
+            ("server", "admin_pubkey") => {
+                cfg.rpc.admin_pubkey = v.as_str().unwrap_or("").to_string()
+            }
+            ("limits", "require_pow") => cfg.relay.require_pow = alias_int::<u8>(v),
+            ("limits", "new_pubkey_min_age_secs") => {
+                cfg.relay.new_pubkey_min_age_secs = alias_int::<u64>(v)
+            }
+            ("limits", "max_events_per_min_per_pubkey") => {
+                cfg.relay.max_events_per_min_per_pubkey = alias_int::<u64>(v)
+            }
+            ("limits", "max_groups") => cfg.relay.max_groups = alias_int::<usize>(v),
+            ("limits", "max_ws_message_size") => {
+                cfg.limits.max_ws_message_bytes = alias_int::<usize>(v)
+            }
+            ("limits", "count_limit") => cfg.limits.max_count = alias_int::<usize>(v),
+            ("limits", "neg_max_items") => cfg.limits.max_neg_items = alias_int::<usize>(v),
+            ("limits", "max_created_at_future") => {
+                cfg.limits.max_created_at_future_secs = alias_int::<u64>(v)
+            }
+            ("limits", "max_conn_per_sec_per_ip") => {
+                cfg.limits.max_connections_per_sec_per_ip = alias_int::<u64>(v)
+            }
+            ("limits", "api_max_concurrent") => {
+                cfg.limits.max_api_concurrent = alias_int::<usize>(v)
+            }
+            ("limits", "api_max_limit") => cfg.limits.max_api_limit = alias_int::<usize>(v),
+            ("limits", "api_max_offset") => cfg.limits.max_api_offset = alias_int::<usize>(v),
+            ("limits", "api_max_search_bytes") => {
+                cfg.limits.max_api_search_bytes = alias_int::<usize>(v)
+            }
+            ("limits", "max_admin_body_bytes") => {
+                cfg.rpc.max_admin_body_bytes = alias_int::<usize>(v)
+            }
+            ("limits", "max_indexed_words") => {
+                cfg.database.max_indexed_words = alias_int::<usize>(v)
+            }
+            ("limits", "buffer_size") => cfg.database.db_buffer_size = alias_int::<usize>(v),
+            ("limits", "db_request_timeout_secs") => {
+                cfg.database.db_request_timeout_secs = alias_int::<u64>(v)
+            }
+            ("limits", "db_queue_msgs") => cfg.database.max_db_queue_msgs = alias_int::<usize>(v),
+            ("limits", "db_queue_events") => {
+                cfg.database.max_db_queue_events = alias_int::<usize>(v)
+            }
+            ("database", "map_max_size") => cfg.database.max_map_size = alias_int::<usize>(v),
+            ("daemon", "log_max_size_bytes") => cfg.daemon.max_log_size_bytes = alias_int::<u64>(v),
+            ("daemon", "log_max_files") => cfg.daemon.max_log_files = alias_int::<u32>(v),
+            _ => {}
         }
     }
 }
@@ -435,8 +658,9 @@ impl Config {
     pub fn load(path: &Path) -> Result<Config> {
         let raw = std::fs::read_to_string(path)
             .map_err(|e| Error::Config(format!("cannot read {}: {e}", path.display())))?;
-        let cfg: Config = toml::from_str(&raw)
+        let mut cfg: Config = toml::from_str(&raw)
             .map_err(|e| Error::Config(format!("invalid {}: {e}", path.display())))?;
+        apply_legacy_aliases(&raw, &mut cfg);
         warn_unknown_fields(&raw);
         Ok(cfg)
     }
@@ -520,7 +744,7 @@ impl Config {
         if !access.allows_kind(kind) {
             return false;
         }
-        if !self.relay.enable_git && Self::is_git_kind(kind) {
+        if !self.relay.enabled_git && Self::is_git_kind(kind) {
             return false;
         }
         if self.relay.reject_ephemeral
@@ -647,7 +871,7 @@ impl Config {
             }
         };
         hex32(&self.relay.pubkey, "relay.pubkey")?;
-        hex32(&self.server.admin_pubkey, "server.admin_pubkey")?;
+        hex32(&self.rpc.admin_pubkey, "rpc.admin_pubkey")?;
 
         // Secret key: must be a valid secp256k1 secret key when set.
         if !self.relay.private_key.is_empty() {
@@ -688,9 +912,9 @@ impl Config {
                 self.server.outbox_write_policy
             )));
         }
-        if self.server.management_port > 0 && self.server.management_port == self.server.port {
+        if self.rpc.management_port > 0 && self.rpc.management_port == self.server.port {
             return Err(Error::Config(
-                "server.management_port must differ from server.port".into(),
+                "rpc.management_port must differ from server.port".into(),
             ));
         }
         // Host split hostnames must be bare hostnames: a scheme, path or
@@ -753,9 +977,9 @@ impl Config {
         }
 
         // Database layout.
-        if self.database.map_size > self.database.map_max_size {
+        if self.database.map_size > self.database.max_map_size {
             return Err(Error::Config(
-                "database.map_size must not exceed database.map_max_size".into(),
+                "database.map_size must not exceed database.max_map_size".into(),
             ));
         }
 
@@ -771,21 +995,37 @@ impl Config {
         let l = &self.limits;
         let nonzero = [
             ("limits.max_connections", l.max_connections),
-            ("limits.max_ws_message_size", l.max_ws_message_size),
+            ("limits.max_ws_message_bytes", l.max_ws_message_bytes),
             ("limits.max_filters", l.max_filters),
             ("limits.max_subscriptions", l.max_subscriptions),
             ("limits.max_limit", l.max_limit),
-            ("limits.count_limit", l.count_limit),
-            ("limits.neg_max_items", l.neg_max_items),
-            ("limits.buffer_size", l.buffer_size),
+            ("limits.max_count", l.max_count),
+            ("limits.max_neg_items", l.max_neg_items),
             ("limits.max_sub_bytes", l.max_sub_bytes),
-            ("limits.db_queue_msgs", l.db_queue_msgs),
-            ("limits.db_queue_events", l.db_queue_events),
-            ("limits.api_max_concurrent", l.api_max_concurrent),
+            ("limits.max_api_concurrent", l.max_api_concurrent),
             ("limits.live_buffer", l.live_buffer),
             ("limits.max_out_queue_bytes", l.max_out_queue_bytes),
-            ("limits.max_indexed_words", l.max_indexed_words),
         ];
+        let db_nonzero = [
+            ("database.db_buffer_size", self.database.db_buffer_size),
+            (
+                "database.max_indexed_words",
+                self.database.max_indexed_words,
+            ),
+            (
+                "database.max_db_queue_msgs",
+                self.database.max_db_queue_msgs,
+            ),
+            (
+                "database.max_db_queue_events",
+                self.database.max_db_queue_events,
+            ),
+        ];
+        for (name, value) in db_nonzero {
+            if value == 0 {
+                return Err(Error::Config(format!("{name} must be at least 1 (got 0)")));
+            }
+        }
         for (name, value) in nonzero {
             if value == 0 {
                 return Err(Error::Config(format!("{name} must be at least 1 (got 0)")));
@@ -841,20 +1081,20 @@ impl Config {
 
         // A very high PoW requirement makes every event infeasible to mine;
         // warn instead of silently disabling writes.
-        if l.require_pow >= 64 {
+        if self.relay.require_pow >= 64 {
             log::warn!(
-                "limits.require_pow = {} is practically unmineable; new events will be \
+                "config.relay.require_pow = {} is practically unmineable; new events will be \
                  rejected with 'pow: difficulty requirement not reached'",
-                l.require_pow
+                self.relay.require_pow
             );
         }
 
         // `require_auth` with `send_auth_challenge = false` is a total
         // lockout: the challenge is only ever sent on connect, so nobody can
         // authenticate and every REQ/EVENT/COUNT is refused.
-        if self.server.require_auth && !self.server.send_auth_challenge {
+        if self.relay.require_auth && !self.relay.send_auth_challenge {
             log::warn!(
-                "server.require_auth is true but server.send_auth_challenge is false: the \
+                "relay.require_auth is true but relay.send_auth_challenge is false: the \
                  AUTH challenge is never sent, so no client can authenticate and all \
                  REQ/EVENT/COUNT messages will be refused"
             );
@@ -1198,6 +1438,13 @@ fn known_config_keys() -> &'static [(&'static str, &'static [&'static str])] {
                 "enabled_nips",
                 "disabled_nips",
                 "reject_ephemeral",
+                "enabled_git",
+                "require_pow",
+                "new_pubkey_min_age_secs",
+                "max_events_per_min_per_pubkey",
+                "max_groups",
+                "require_auth",
+                "send_auth_challenge",
                 "enable_git",
                 "software",
                 "version",
@@ -1212,13 +1459,23 @@ fn known_config_keys() -> &'static [(&'static str, &'static [&'static str])] {
                 "ws_paths",
                 "inbox_write_policy",
                 "outbox_write_policy",
+                "metrics_enabled",
                 "management_port",
                 "management_host",
                 "management_token",
                 "admin_pubkey",
                 "require_auth",
                 "send_auth_challenge",
-                "metrics_enabled",
+            ],
+        ),
+        (
+            "rpc",
+            &[
+                "management_port",
+                "management_host",
+                "management_token",
+                "admin_pubkey",
+                "max_admin_body_bytes",
             ],
         ),
         (
@@ -1226,41 +1483,50 @@ fn known_config_keys() -> &'static [(&'static str, &'static [&'static str])] {
             &[
                 "max_connections",
                 "max_connections_per_ip",
-                "max_ws_message_size",
+                "max_ws_message_bytes",
                 "max_filters",
                 "max_subscriptions",
                 "max_limit",
-                "count_limit",
+                "max_count",
                 "max_sub_id_len",
                 "max_content_bytes",
-                "max_admin_body_bytes",
-                "max_groups",
                 "max_tags",
                 "max_tag_value_bytes",
-                "max_created_at_future",
-                "require_pow",
-                "max_indexed_words",
-                "buffer_size",
-                "neg_max_items",
-                "db_request_timeout_secs",
-                "new_pubkey_min_age_secs",
-                "max_out_queue_bytes",
-                "ws_idle_timeout_secs",
-                "db_queue_msgs",
-                "db_queue_events",
+                "max_created_at_future_secs",
+                "max_neg_items",
                 "max_sub_bytes",
                 "group_late_publish_secs",
-                "api_max_concurrent",
-                "api_max_limit",
-                "api_max_offset",
-                "api_max_search_bytes",
+                "max_api_concurrent",
+                "max_api_limit",
+                "max_api_offset",
+                "max_api_search_bytes",
+                "max_out_queue_bytes",
+                "ws_idle_timeout_secs",
                 "live_batch_interval_ms",
                 "live_batch_size",
                 "live_buffer",
                 "http_read_timeout_secs",
+                "max_connections_per_sec_per_ip",
+                "max_req_response_bytes",
+                "max_ws_message_size",
+                "count_limit",
+                "neg_max_items",
+                "api_max_concurrent",
+                "api_max_limit",
+                "api_max_offset",
+                "api_max_search_bytes",
+                "max_created_at_future",
+                "max_admin_body_bytes",
+                "max_groups",
+                "require_pow",
+                "max_indexed_words",
+                "buffer_size",
+                "db_request_timeout_secs",
+                "new_pubkey_min_age_secs",
+                "db_queue_msgs",
+                "db_queue_events",
                 "max_conn_per_sec_per_ip",
                 "max_events_per_min_per_pubkey",
-                "max_req_response_bytes",
             ],
         ),
         (
@@ -1270,9 +1536,15 @@ fn known_config_keys() -> &'static [(&'static str, &'static [&'static str])] {
                 "max_dbs",
                 "max_readers",
                 "map_size",
-                "map_max_size",
+                "max_map_size",
                 "purge_interval_secs",
                 "search_index",
+                "max_indexed_words",
+                "db_buffer_size",
+                "db_request_timeout_secs",
+                "max_db_queue_msgs",
+                "max_db_queue_events",
+                "map_max_size",
             ],
         ),
         (
@@ -1282,6 +1554,8 @@ fn known_config_keys() -> &'static [(&'static str, &'static [&'static str])] {
                 "log_file",
                 "stats_file",
                 "stats_interval_secs",
+                "max_log_size_bytes",
+                "max_log_files",
                 "log_max_size_bytes",
                 "log_max_files",
             ],
@@ -1381,6 +1655,127 @@ mod tests {
     }
 
     #[test]
+    fn legacy_aliases_apply_and_warn() {
+        // A config written for the old layout is accepted: every legacy
+        // key lands in its new location.
+        let raw = r#"
+[relay]
+enable_git = true
+[server]
+require_auth = true
+send_auth_challenge = false
+management_port = 9999
+management_host = "127.0.0.2"
+management_token = "old-token"
+admin_pubkey = "abababababababababababababababababababababababababababababababab"
+[limits]
+require_pow = 4
+new_pubkey_min_age_secs = 60
+max_events_per_min_per_pubkey = 30
+max_groups = 7
+max_ws_message_size = 4096
+count_limit = 123
+neg_max_items = 99
+max_created_at_future = 300
+max_conn_per_sec_per_ip = 5
+api_max_concurrent = 3
+api_max_limit = 11
+api_max_offset = 22
+api_max_search_bytes = 33
+max_admin_body_bytes = 1024
+max_indexed_words = 64
+buffer_size = 512
+db_request_timeout_secs = 9
+db_queue_msgs = 88
+db_queue_events = 77
+[database]
+map_max_size = 1073741824
+[daemon]
+log_max_size_bytes = 12345
+log_max_files = 2
+"#;
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let mut cfg = cfg;
+        apply_legacy_aliases(raw, &mut cfg);
+        assert!(cfg.relay.enabled_git);
+        assert!(cfg.relay.require_auth);
+        assert!(!cfg.relay.send_auth_challenge);
+        assert_eq!(cfg.rpc.management_port, 9999);
+        assert_eq!(cfg.rpc.management_host, "127.0.0.2");
+        assert_eq!(cfg.rpc.management_token, "old-token");
+        assert_eq!(cfg.rpc.admin_pubkey, "ab".repeat(32));
+        assert_eq!(cfg.relay.require_pow, 4);
+        assert_eq!(cfg.relay.new_pubkey_min_age_secs, 60);
+        assert_eq!(cfg.relay.max_events_per_min_per_pubkey, 30);
+        assert_eq!(cfg.relay.max_groups, 7);
+        assert_eq!(cfg.limits.max_ws_message_bytes, 4096);
+        assert_eq!(cfg.limits.max_count, 123);
+        assert_eq!(cfg.limits.max_neg_items, 99);
+        assert_eq!(cfg.limits.max_created_at_future_secs, 300);
+        assert_eq!(cfg.limits.max_connections_per_sec_per_ip, 5);
+        assert_eq!(cfg.limits.max_api_concurrent, 3);
+        assert_eq!(cfg.limits.max_api_limit, 11);
+        assert_eq!(cfg.limits.max_api_offset, 22);
+        assert_eq!(cfg.limits.max_api_search_bytes, 33);
+        assert_eq!(cfg.rpc.max_admin_body_bytes, 1024);
+        assert_eq!(cfg.database.max_indexed_words, 64);
+        assert_eq!(cfg.database.db_buffer_size, 512);
+        assert_eq!(cfg.database.db_request_timeout_secs, 9);
+        assert_eq!(cfg.database.max_db_queue_msgs, 88);
+        assert_eq!(cfg.database.max_db_queue_events, 77);
+        assert_eq!(cfg.database.max_map_size, 1 << 30);
+        assert_eq!(cfg.daemon.max_log_size_bytes, 12345);
+        assert_eq!(cfg.daemon.max_log_files, 2);
+    }
+
+    #[test]
+    fn legacy_aliases_do_not_wrap_invalid_values() {
+        // The old serde field types rejected a negative or overflowing
+        // value at load time; an alias must not silently wrap one into a
+        // huge number. Invalid values degrade to 0 (safe defaults).
+        let raw = "[limits]\ncount_limit = -5\nmax_groups = -1\nmanagement_port = 70000\n";
+        let cfg: Config = toml::from_str(raw).unwrap();
+        let mut cfg = cfg;
+        apply_legacy_aliases(raw, &mut cfg);
+        assert_eq!(
+            cfg.limits.max_count, 0,
+            "a negative count_limit must not wrap"
+        );
+        assert_eq!(
+            cfg.relay.max_groups, 0,
+            "a negative max_groups must not wrap"
+        );
+        assert_eq!(
+            cfg.rpc.management_port, 0,
+            "an overflowing port must not wrap"
+        );
+    }
+
+    #[test]
+    fn legacy_aliases_in_known_keys_are_not_unknown() {
+        // The legacy keys must be recognized by `warn_unknown_fields`:
+        // they are deprecated, not unknown.
+        let raw = "[limits]\ncount_limit = 5\n";
+        warn_unknown_fields(raw);
+        // (no assertion: the deprecated keys would produce a warning,
+        // never an "unknown config key" warning — the test guards the
+        // known-keys list via `known_keys_cover_every_serialized_field`
+        // and the alias table above.)
+        let known = known_config_keys();
+        for (old_section, old_key, _, _) in LEGACY_ALIASES {
+            let keys = known
+                .iter()
+                .find(|(s, _)| s == old_section)
+                .map(|(_, k)| *k)
+                .unwrap();
+            assert!(
+                keys.contains(old_key),
+                "legacy key [{old_section}].{old_key} must stay in the known-keys list"
+            );
+        }
+    }
+
+    #[test]
     fn blossom_allowlist_pubkey_validation() {
         assert!(is_pubkey_or_npub(&"a".repeat(64)));
         assert!(is_pubkey_or_npub(
@@ -1420,11 +1815,14 @@ mod tests {
         assert_eq!(cfg.limits.max_connections_per_ip, 64);
         assert_eq!(cfg.limits.ws_idle_timeout_secs, 300);
         assert_eq!(cfg.limits.http_read_timeout_secs, 30);
-        assert_eq!(cfg.limits.max_conn_per_sec_per_ip, 0);
-        assert_eq!(cfg.limits.max_events_per_min_per_pubkey, 0);
-        assert_eq!(cfg.limits.max_admin_body_bytes, 64 * 1024);
-        assert_eq!(cfg.limits.max_groups, 1_000);
+        assert_eq!(cfg.limits.max_connections_per_sec_per_ip, 0);
+        assert_eq!(cfg.relay.max_events_per_min_per_pubkey, 0);
+        assert_eq!(cfg.rpc.max_admin_body_bytes, 64 * 1024);
+        assert_eq!(cfg.relay.max_groups, 1_000);
         assert_eq!(cfg.limits.max_req_response_bytes, 32 * 1024 * 1024);
+        // The moved keys keep their pre-reorg defaults: the legacy
+        // `[server]` send_auth_challenge default was true.
+        assert!(!cfg.relay.require_auth && cfg.relay.send_auth_challenge);
         // The written default file loads back with the same values.
         let dir = std::env::temp_dir().join("nostrd-config-limits-test");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1434,8 +1832,8 @@ mod tests {
         assert_eq!(loaded.limits.max_connections_per_ip, 64);
         assert_eq!(loaded.limits.ws_idle_timeout_secs, 300);
         assert_eq!(loaded.limits.http_read_timeout_secs, 30);
-        assert_eq!(loaded.limits.max_conn_per_sec_per_ip, 0);
-        assert_eq!(loaded.limits.max_events_per_min_per_pubkey, 0);
+        assert_eq!(loaded.limits.max_connections_per_sec_per_ip, 0);
+        assert_eq!(loaded.relay.max_events_per_min_per_pubkey, 0);
         assert_eq!(loaded.limits.max_req_response_bytes, 32 * 1024 * 1024);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1566,7 +1964,7 @@ mod tests {
         }
         // `enable_git = true` advertises NIP-34.
         let mut cfg = Config::default();
-        cfg.relay.enable_git = true;
+        cfg.relay.enabled_git = true;
         assert!(
             cfg.effective_supported_nips(&access).contains(&34),
             "NIP-34 must be advertised when enable_git is true"
@@ -1684,7 +2082,7 @@ mod tests {
         // NIP-34: enabled via `enable_git`, and dropped when every git kind
         // is blocked.
         let mut cfg = Config::default();
-        cfg.relay.enable_git = true;
+        cfg.relay.enabled_git = true;
         let access = AccessControl {
             blocked_kinds: vec![
                 1617, 1618, 1619, 1621, 1622, 1630, 1631, 1632, 1633, 30617, 30618,
@@ -1816,15 +2214,15 @@ mod tests {
     fn validation_rejects_port_collision_and_map_layout() {
         let mut cfg = Config::default();
         cfg.server.port = 8080;
-        cfg.server.management_port = 8080;
+        cfg.rpc.management_port = 8080;
         assert!(
             cfg.validate().is_err(),
             "management_port must differ from port"
         );
-        cfg.server.management_port = 0;
+        cfg.rpc.management_port = 0;
 
         cfg.database.map_size = 1024 * 1024;
-        cfg.database.map_max_size = 512 * 1024;
+        cfg.database.max_map_size = 512 * 1024;
         assert!(
             cfg.validate().is_err(),
             "map_size must not exceed map_max_size"

@@ -59,7 +59,7 @@ pub(crate) fn db_error(errors: &Arc<std::sync::atomic::AtomicU64>, e: &crate::er
         e,
         crate::error::Error::Heed(heed::Error::Mdb(heed::MdbError::MapFull))
     ) {
-        log::error!("database map is full: increase database.map_max_size in nostrd.toml");
+        log::error!("database map is full: increase database.max_map_size in nostrd.toml");
     } else {
         log::error!("database error: {e}");
     }

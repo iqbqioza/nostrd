@@ -56,7 +56,7 @@ search_index = false   # halves the database size and saves CPU/IO
 | Setting | Effect | Measured |
 | --- | --- | --- |
 | `search_index = false` | Disables the NIP-50 word index — search still works (whole-word matching by scanning content) but is slower. Recommended when full-text search is not needed | 41.8 MB → **20.5 MB** per 10,000 events (each with 3 tags and 21 words) |
-| Defaults | Already tiny: `buffer_size = 2048`, bounded queues, no per-connection growth | No change needed for 512 MB |
+| Defaults | Already tiny: `db_buffer_size = 2048`, bounded queues, no per-connection growth | No change needed for 512 MB |
 
 If you need search on a tiny VPS, keep `search_index = true` and lower `max_indexed_words` (e.g. 32) instead — it caps the per-event word cost. All other defaults are already tuned for low memory: the per-connection buffers are small, the LMDB map never needs resizing at runtime, and the relay restarts instantly (no in-memory index to rebuild).
 
@@ -126,7 +126,13 @@ If anything is wrong, it tells you exactly what. It is strongly recommended to r
 | `enabled_nips` | Explicit allowlist of NIP numbers (empty = all enabled) | empty |
 | `disabled_nips` | List of NIP numbers to disable | empty |
 | `reject_ephemeral` | When `true`, reject NIP-01 ephemeral events (kinds 20000–29999), except the NIP-mandated kinds (`22242`, `27235`, `28934`/`28935`/`28936`, `24133`, `23194`/`23195`, `24242`, `21059`) | `false` |
-| `enable_git` | When `true`, accept NIP-34 git events (kinds 1617–1633, 30617/30618) and advertise NIP-34. Off by default: the kinds are rejected (`blocked: NIP-34 git events are disabled`) | `false` |
+| `enabled_git` | When `true`, accept NIP-34 git events (kinds 1617–1633, 30617/30618) and advertise NIP-34. Off by default: the kinds are rejected (`blocked: NIP-34 git events are disabled`) | `false` |
+| `require_pow` | Required proof-of-work difficulty in bits (0 = none) | `0` |
+| `new_pubkey_min_age_secs` | Reject posts from accounts younger than this (spam defense, 0 = off) | `0` |
+| `max_events_per_min_per_pubkey` | Max events a pubkey may publish per minute (0 = unlimited) | `0` |
+| `max_groups` | NIP-29 in-memory group store cap (active + deleted markers; `0` = unlimited) | `1000` |
+| `require_auth` | Require NIP-42 auth for everything (subscriptions and publishing) | `false` |
+| `send_auth_challenge` | Send an AUTH challenge on connect | `true` |
 
 To generate a secret key, use the `nostrd genkey` command (see [5. Command Reference](#5-command-reference)).
 
@@ -140,15 +146,18 @@ To generate a secret key, use the `nostrd genkey` command (see [5. Command Refer
 | `ws_paths` | Which paths serve the WebSocket endpoint (and the NIP-11 document): `root` (`/` only), `inbox-outbox` (only `/inbox` and `/outbox`), or `all` | `root` |
 | `inbox_write_policy` | Write policy for `/inbox`: `any` (the event must carry a `p` tag) or `relay` (the event must `p`-tag the relay's own pubkey) | `any` |
 | `outbox_write_policy` | Write policy for `/outbox`: `any` (the event must be authored by the connection's NIP-42-authenticated pubkey) or `relay` (only the relay's own events) | `any` |
+| `metrics_enabled` | Serve `/metrics` (Prometheus format) | `true` |
+
+> **Note**: `require_auth = true` combined with `send_auth_challenge = false` locks everyone out — nobody can authenticate. Avoid this combination.
+
+#### `[rpc]` — NIP-86 management RPC
+
+| Key | Description | Default |
+| --- | --- | --- |
 | `management_port` | Legacy management port (0 = disabled) | `0` |
 | `management_host` | Bind address for the management port | `127.0.0.1` |
 | `management_token` | Bearer token for the management API | empty |
 | `admin_pubkey` | Administrator public key for NIP-98 auth | empty |
-| `require_auth` | Require NIP-42 auth for everything (subscriptions and publishing) | `false` |
-| `send_auth_challenge` | Send an AUTH challenge on connect | `true` |
-| `metrics_enabled` | Serve `/metrics` (Prometheus format) | `true` |
-
-> **Note**: `require_auth = true` combined with `send_auth_challenge = false` locks everyone out — nobody can authenticate. Avoid this combination.
 
 #### `[limits]` — Limits
 
@@ -156,37 +165,28 @@ To generate a secret key, use the `nostrd genkey` command (see [5. Command Refer
 | --- | --- | --- |
 | `max_connections` | Maximum concurrent connections | `10000` |
 | `max_connections_per_ip` | Max connections per source IP (0 = unlimited) | `64` |
-| `max_ws_message_size` | Max bytes per WebSocket message/frame | `1048576` (1 MB) |
+| `max_ws_message_bytes` | Max bytes per WebSocket message/frame | `1048576` (1 MB) |
 | `max_filters` | Max filters per REQ | `20` |
 | `max_subscriptions` | Max subscriptions per connection | `20` |
 | `max_limit` | Ceiling for the REQ `limit` | `500` |
-| `count_limit` | Ceiling for COUNT aggregation | `2000` |
+| `max_count` | Ceiling for COUNT aggregation | `2000` |
 | `max_sub_id_len` | Max subscription id length | `64` |
 | `max_content_bytes` | Max event content length in **characters** (not bytes — non-ASCII text is fine) | `65536` |
-| `max_admin_body_bytes` | NIP-86 management RPC body limit (`413` beyond it) | `65536` |
-| `max_groups` | NIP-29 in-memory group store cap (active + deleted markers; `0` = unlimited) | `1000` |
 | `max_tags` | Max tags per event | `2000` |
 | `max_tag_value_bytes` | Max bytes per tag value | `1024` |
-| `max_created_at_future` | How many seconds of future timestamps are tolerated | `3600` |
-| `require_pow` | Required proof-of-work difficulty in bits (0 = none) | `0` |
-| `max_indexed_words` | Words indexed per event for search | `128` |
-| `buffer_size` | Initial per-connection buffer size | `2048` |
-| `neg_max_items` | Max records per NIP-77 negentropy sync | `100000` |
-| `db_request_timeout_secs` | Database request timeout (0 = wait forever) | `30` |
-| `new_pubkey_min_age_secs` | Reject posts from accounts younger than this (spam defense, 0 = off) | `0` |
+| `max_created_at_future_secs` | How many seconds of future timestamps are tolerated | `3600` |
+| `max_neg_items` | Max records per NIP-77 negentropy sync | `100000` |
 | `max_out_queue_bytes` | Per-connection outgoing queue cap (bytes) | `262144` |
 | `ws_idle_timeout_secs` | Close idle connections after this many seconds (0 = off) | `300` |
 | `http_read_timeout_secs` | Seconds to complete an HTTP request head (0 = disabled; slow-loris defense, applies to WS upgrades too) | `30` |
-| `max_conn_per_sec_per_ip` | Max new connections per second per source IP (0 = unlimited) | `0` |
-| `max_events_per_min_per_pubkey` | Max events a pubkey may publish per minute (0 = unlimited) | `0` |
+| `max_connections_per_sec_per_ip` | Max new connections per second per source IP (0 = unlimited) | `0` |
 | `max_req_response_bytes` | Byte budget for one REQ response (0 = unlimited; over it the subscription is closed with `CLOSED`) | `33554432` (32 MiB) |
-| `db_queue_msgs` / `db_queue_events` | Overload protection when the DB queue backs up | `4096` / `262144` |
 | `max_sub_bytes` | Total subscription filter bytes per connection | `524288` |
 | `group_late_publish_secs` | Reject NIP-29 group events older than this (0 = off) | `604800` (7 days) |
-| `api_max_concurrent` | Max concurrent REST API requests | `32` |
-| `api_max_limit` | Ceiling for the API `limit` parameter (0 = unlimited) | `500` |
-| `api_max_offset` | Ceiling for the API `offset` parameter (0 = unlimited) | `10000` |
-| `api_max_search_bytes` | Max `search` bytes for the API (0 = unlimited) | `1024` |
+| `max_api_concurrent` | Max concurrent REST API requests | `32` |
+| `max_api_limit` | Ceiling for the API `limit` parameter (0 = unlimited) | `500` |
+| `max_api_offset` | Ceiling for the API `offset` parameter (0 = unlimited) | `10000` |
+| `max_api_search_bytes` | Max `search` bytes for the API (0 = unlimited) | `1024` |
 | `live_batch_interval_ms` / `live_batch_size` | Live fan-out batching (ms / events) | `10` / `64` |
 | `live_buffer` | Live fan-out queue size | `65536` |
 
@@ -197,9 +197,13 @@ To generate a secret key, use the `nostrd genkey` command (see [5. Command Refer
 | `path` | Database directory | `./data` |
 | `max_dbs` / `max_readers` | Internal LMDB settings (usually leave as-is) | `32` / `128` |
 | `map_size` | Minimum memory-map size (bytes) | 1 GB |
-| `map_max_size` | Memory-map ceiling (bytes). **Raise this if you hit the "map is full" error** | 1 TB |
+| `max_map_size` | Memory-map ceiling (bytes). **Raise this if you hit the "map is full" error** | 1 TB |
 | `purge_interval_secs` | Interval for purging NIP-40 expired events | `300` |
 | `search_index` | Enable the NIP-50 full-text index | `true` |
+| `max_indexed_words` | Words indexed per event for search | `128` |
+| `db_buffer_size` | LMDB read/write buffer size (bytes) | `2048` |
+| `db_request_timeout_secs` | Database request timeout (0 = wait forever) | `30` |
+| `max_db_queue_msgs` / `max_db_queue_events` | Overload protection when the DB queue backs up | `4096` / `262144` |
 
 #### `[daemon]` — Daemon settings
 
@@ -209,8 +213,8 @@ To generate a secret key, use the `nostrd genkey` command (see [5. Command Refer
 | `log_file` | Log file path | `./nostrd.log` |
 | `stats_file` | Statistics file path | `./nostrd.stats.json` |
 | `stats_interval_secs` | Statistics write interval | `5` |
-| `log_max_size_bytes` | Log rotation size (0 = no rotation) | 50 MB |
-| `log_max_files` | Number of rotated log files to keep | `5` |
+| `max_log_size_bytes` | Log rotation size (0 = no rotation) | 50 MB |
+| `max_log_files` | Number of rotated log files to keep | `5` |
 
 #### `[access]` — Access control (also changeable at runtime via NIP-86)
 
@@ -369,7 +373,7 @@ curl "http://127.0.0.1:8080/api/v1/npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3ev
 
 | Parameter | Description |
 | --- | --- |
-| `limit` | Max results (default 100, capped by `api_max_limit`) |
+| `limit` | Max results (default 100, capped by `max_api_limit`) |
 | `offset` | Number of results to skip (pagination) |
 | `since` / `until` | Unix timestamp range |
 | `sort` | `asc` for oldest-first (default is newest-first) |
@@ -390,8 +394,8 @@ NIP-86 is a JSON-RPC API for managing the relay. **Authentication is required.**
 
 ### Authentication methods
 
-1. **Bearer token**: set `server.management_token` and send `Authorization: Bearer <token>`
-2. **NIP-98**: set `server.admin_pubkey` and send a NIP-98 auth event (kind 27235) signed by the admin key in `Authorization: Nostr <base64>` (a `payload` tag is required)
+1. **Bearer token**: set `rpc.management_token` and send `Authorization: Bearer <token>`
+2. **NIP-98**: set `rpc.admin_pubkey` and send a NIP-98 auth event (kind 27235) signed by the admin key in `Authorization: Nostr <base64>` (a `payload` tag is required)
 
 ### Calling the API
 
@@ -428,7 +432,7 @@ curl -X POST http://127.0.0.1:8080/ \
 
 ### Legacy management port
 
-If `server.management_port` is set, the legacy REST endpoints are available at `http://<management_host>:<port>/admin/...` (`/admin/info`, `/admin/stats`, `/admin/block_pubkey`, `/admin/allow_pubkey`, `/admin/block_kind`, `/admin/allow_kind`, `/admin/status/{id}`, `/admin/shutdown`). Same authentication.
+If `rpc.management_port` is set, the legacy REST endpoints are available at `http://<management_host>:<port>/admin/...` (`/admin/info`, `/admin/stats`, `/admin/block_pubkey`, `/admin/allow_pubkey`, `/admin/block_kind`, `/admin/allow_kind`, `/admin/status/{id}`, `/admin/shutdown`). Same authentication.
 
 ---
 
@@ -447,7 +451,7 @@ If `server.management_port` is set, the legacy REST endpoints are available at `
 | 29 | Relay-based groups |
 | 32 | Labeling (kind 1985, `#l`/`#L` indexed) |
 | 33 | Parameterized replaceable events |
-| 34 | git stuff (kinds 1617-1633, 30617/30618 — **opt-in** via `relay.enable_git`, off by default) |
+| 34 | git stuff (kinds 1617-1633, 30617/30618 — **opt-in** via `relay.enabled_git`, off by default) |
 | 40 | Expiration timestamp |
 | 42 | Client authentication |
 | 43 | Relay access metadata (roles) |
@@ -697,7 +701,7 @@ Each instance is managed with its own config: `nostrd --config /etc/nostrd/a.tom
 
 ### Logs
 
-The daemon writes to `daemon.log_file`. When the file grows past `log_max_size_bytes`, it rotates automatically (`nostrd.log.1`, `nostrd.log.2`, ... up to `log_max_files` generations).
+The daemon writes to `daemon.log_file`. When the file grows past `max_log_size_bytes`, it rotates automatically (`nostrd.log.1`, `nostrd.log.2`, ... up to `max_log_files` generations).
 
 ```bash
 # Follow the log
@@ -740,7 +744,7 @@ kill -HUP $(cat nostrd.pid)
 
 Settings that take effect on reload: relay name/description, limits (except the HTTP-layer ones below), NIP toggles (partially), NIP-40 on/off, API concurrency, ...
 
-Settings that require a **restart**: `private_key`, `api_host`, `metrics_enabled`, LiveKit settings, `enabled_nips`/`disabled_nips`, and the HTTP-layer limits (`max_connections`, `http_read_timeout_secs`, `max_conn_per_sec_per_ip` — they shape the accept loop built at startup). The log warns when a change needs a restart.
+Settings that require a **restart**: `private_key`, `api_host`, `metrics_enabled`, LiveKit settings, `enabled_nips`/`disabled_nips`, and the HTTP-layer limits (`max_connections`, `http_read_timeout_secs`, `max_connections_per_sec_per_ip` — they shape the accept loop built at startup). The log warns when a change needs a restart.
 
 ---
 

@@ -263,7 +263,7 @@ nostrd blossom list
 
 All commands accept `--config <path>` (default `./nostrd.toml`).
 
-Sending `SIGHUP` to the daemon reloads the configuration at runtime: most limits, server auth settings, the NIP toggles (including the NIP-40 toggle, applied live) and the REST API concurrency ceiling apply immediately. A few settings are captured at startup and require a full restart — the log warns when one of them changed: `server.host`, `server.port`, `server.api_host`, `server.ws_paths`, `server.management_port`, `server.management_host`, `server.metrics_enabled`, `database.path`, `database.purge_interval_secs`, `relay.private_key` (a reload warns that it is ignored), `relay.enabled_nips`/`disabled_nips`, `relay.livekit_*`, `blossom.host`/`storage`/`local_path`/`max_upload_bytes`/`s3_*`, `daemon.log_max_size_bytes`/`log_max_files`/`stats_interval_secs`, the database request timeouts/queue caps, `live_buffer`/`live_batch_size`/`live_batch_interval_ms`, `max_indexed_words`, and the HTTP-layer limits `max_connections`/`http_read_timeout_secs`/`max_conn_per_sec_per_ip` (they shape the accept loop built at startup). An invalid reloaded file is rejected (the old configuration stays in force). The access control lists are runtime-managed (NIP-86) and are **not** overwritten by a reload.
+Sending `SIGHUP` to the daemon reloads the configuration at runtime: most limits, server auth settings, the NIP toggles (including the NIP-40 toggle, applied live) and the REST API concurrency ceiling apply immediately. A few settings are captured at startup and require a full restart — the log warns when one of them changed: `server.host`, `server.port`, `server.api_host`, `server.ws_paths`, `rpc.management_port`, `rpc.management_host`, `server.metrics_enabled`, `database.path`, `database.purge_interval_secs`, `relay.private_key` (a reload warns that it is ignored), `relay.enabled_nips`/`disabled_nips`, `relay.livekit_*`, `blossom.host`/`storage`/`local_path`/`max_upload_bytes`/`s3_*`, `daemon.max_log_size_bytes`/`max_log_files`/`stats_interval_secs`, the database request timeouts/queue caps, `live_buffer`/`live_batch_size`/`live_batch_interval_ms`, `max_indexed_words`, and the HTTP-layer limits `max_connections`/`http_read_timeout_secs`/`max_connections_per_sec_per_ip` (they shape the accept loop built at startup). An invalid reloaded file is rejected (the old configuration stays in force). The access control lists are runtime-managed (NIP-86) and are **not** overwritten by a reload.
 
 ## Configuration
 
@@ -310,7 +310,7 @@ With `server.ws_paths = "inbox-outbox"` the relay's WebSocket endpoint is served
 
 ## NIP support
 
-All relay-side NIPs are implemented; client-side NIPs are stored and served as plain events. A subset of client-side NIPs that clients rely on (17, 22, 32, 46, 47, 57, 59, 65, 78, 84, 85, 87, 88, 94) is **deliberately** advertised in the NIP-11 document; the rest are not (per the spec: "Client-side NIPs SHOULD NOT be advertised"). NIP-34 (git) is opt-in via `relay.enable_git` — off by default, since patch payloads can be large. NIP-A3 (kind 10133) is served but cannot be advertised: it is a `draft` with no integer identifier, and NIP-11's `supported_nips` is an array of integer identifiers. The remaining file-storage NIPs (95/96 HTTP file storage) are excluded by design — NIP-94 file-metadata events are stored and served like any other event, and Blossom is provided by the dedicated [Blossom file server](#features).
+All relay-side NIPs are implemented; client-side NIPs are stored and served as plain events. A subset of client-side NIPs that clients rely on (17, 22, 32, 46, 47, 57, 59, 65, 78, 84, 85, 87, 88, 94) is **deliberately** advertised in the NIP-11 document; the rest are not (per the spec: "Client-side NIPs SHOULD NOT be advertised"). NIP-34 (git) is opt-in via `relay.enabled_git` — off by default, since patch payloads can be large. NIP-A3 (kind 10133) is served but cannot be advertised: it is a `draft` with no integer identifier, and NIP-11's `supported_nips` is an array of integer identifiers. The remaining file-storage NIPs (95/96 HTTP file storage) are excluded by design — NIP-94 file-metadata events are stored and served like any other event, and Blossom is provided by the dedicated [Blossom file server](#features).
 
 The advertised `supported_nips` list is **dynamic**: a NIP is dropped when all the kinds it defines are blocked by `blocked_kinds`/`allowed_kinds` (e.g. blocking kind 5 hides NIP-09), when `reject_ephemeral` rejects every kind it relies on, or when it is disabled via `enabled_nips`/`disabled_nips`. Runtime changes (NIP-86 `allowkind`/`disallowkind`, `SIGHUP` reloads) are reflected in the next NIP-11 fetch.
 
@@ -327,7 +327,7 @@ The advertised `supported_nips` list is **dynamic**: a NIP is dropped when all t
 | [29](https://github.com/nostr-protocol/nips/blob/master/29.md) | Relay-based groups (moderation events, relay-signed metadata, subgroups, invite codes, LiveKit rooms) |
 | [32](https://github.com/nostr-protocol/nips/blob/master/32.md) | Labeling (kind 1985; `#l`/`#L` tags are indexed) |
 | [33](https://github.com/nostr-protocol/nips/blob/master/33.md) | Parameterized replaceable events |
-| [34](https://github.com/nostr-protocol/nips/blob/master/34.md) | git stuff (kinds 1617-1633, 30617/30618 — **opt-in** via `relay.enable_git`; off by default) |
+| [34](https://github.com/nostr-protocol/nips/blob/master/34.md) | git stuff (kinds 1617-1633, 30617/30618 — **opt-in** via `relay.enabled_git`; off by default) |
 | [40](https://github.com/nostr-protocol/nips/blob/master/40.md) | Expiration timestamp |
 | [42](https://github.com/nostr-protocol/nips/blob/master/42.md) | Client authentication (AUTH) |
 | [43](https://github.com/nostr-protocol/nips/blob/master/43.md) | Relay access metadata and requests (roles, membership lists, join/leave) |
@@ -358,7 +358,7 @@ The advertised `supported_nips` list is **dynamic**: a NIP is dropped when all t
 
 - **Single database thread for writes**, with puts merged into batches that share one write transaction (one fsync per batch). Replies are sent only after a successful commit, so an `OK` implies durability.
 - **Dedicated reader threads** serve queries/counts/lookups without ever taking the write lock. If a commit is blocked (stalled disk, external lock holder), reads keep working. The REST API runs on its own reader thread with its own bounded queue, so an `/api/v1` flood can neither queue up behind nor delay WebSocket REQ/COUNT/NEG queries.
-- **Bounded queues everywhere** — the database request queue (fail-fast overload protection), the outgoing message queue (per-connection byte cap), the live fan-out channel and the negentropy item store are all capped. The REST API has its own concurrency limiter (`api_max_concurrent`) that fails fast with `503` when saturated.
+- **Bounded queues everywhere** — the database request queue (fail-fast overload protection), the outgoing message queue (per-connection byte cap), the live fan-out channel and the negentropy item store are all capped. The REST API has its own concurrency limiter (`max_api_concurrent`) that fails fast with `503` when saturated.
 - **The LMDB map is opened at its configured ceiling** and never resized at runtime: resizing would require that no read transactions are active, which cannot be guaranteed with concurrent reader threads. The reservation is a sparse virtual-address mapping, so physical memory and disk grow only with the data actually written.
 - **Scan engine** — multi-range filters (`authors`, `kinds`, `#tag`) are walked with a merged newest-first iterator so a per-filter `limit` applies to the union of all ranges; NIP-67 boundary handling never splits a `created_at` tie across pages. A per-scan work budget bounds the candidates examined so a filter matching nothing cannot walk an entire index range.
 - **Panic containment** — the database thread, the reader threads and every connection task are isolated; a fault in any of them is logged and does not take the relay down.
@@ -384,24 +384,31 @@ tens of MB of physical memory regardless of `map_size`.
 
 ```
 src/
-├── main.rs, cli.rs, config.rs   entry point, CLI, nostrd.toml
+├── main.rs, cli.rs, config.rs   entry point, CLI, nostrd.toml (validation,
+│                                legacy-key aliases, atomic rewrites)
+├── audit.rs, logging.rs         rate-limited NIP-86 audit log, rotating logger
 ├── util.rs, error.rs, event.rs, filter.rs, stats.rs
 ├── db/                          LMDB storage
 │   ├── mod.rs                   DbClient handle and request plumbing
 │   ├── threads.rs               dedicated writer/reader/API-reader threads
 │   ├── store.rs                 write path and index maintenance
 │   ├── removal.rs               deletions, bans, vanish, expiry purge
-│   └── scan.rs                  query engine (filters, merged walks, collectors)
+│   ├── scan.rs                  query engine (filters, merged walks, collectors)
+│   └── tests.rs                 database-level tests
 ├── relay/                       event acceptance and NIP-29/43 state
 │   ├── mod.rs                   accept paths, live fan-out
 │   ├── validate.rs              pre-acceptance checks (shared by both paths)
 │   └── roles.rs                 NIP-43 role administration
 ├── server/                      HTTP/WebSocket front end
-│   ├── mod.rs                   router, CORS, background tasks
+│   ├── mod.rs                   router, host split, CORS, background tasks
 │   ├── api.rs                   read-only REST API (/api/v1)
+│   ├── blossom/                 Blossom file server (BUD-01/02/05/06/11/12)
+│   │   ├── mod.rs               handlers, auth, range requests
+│   │   ├── storage.rs           local/S3 blob storage (streaming, disk guard)
+│   │   └── s3.rs                S3-compatible client (SigV4 signing)
 │   └── livekit.rs               NIP-29 LiveKit token endpoint
 ├── ws/                          connection handling
-│   ├── mod.rs                   connection loop and live delivery
+│   ├── mod.rs                   connection loop, live delivery, pending REQs
 │   ├── handler.rs               protocol message handlers
 │   └── negentropy.rs            NIP-77 NEG-OPEN/MSG/CLOSE
 └── nips/                        per-NIP modules (some split further, e.g.
