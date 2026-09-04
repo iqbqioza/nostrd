@@ -42,3 +42,6 @@ lto = "fat"
 codegen-units = 1
 strip = "symbols"
 panic = "unwind"
+
+[dev-dependencies]
+tokio-tungstenite = "0.29"
