@@ -33,6 +33,12 @@ pub struct Filter {
     pub search: Option<String>,
     #[serde(flatten)]
     pub tags: BTreeMap<String, Value>,
+    /// Cached tokenized search terms (the `search` string is immutable
+    /// after parsing, so the terms are computed once per filter and shared
+    /// across the filter's clones; the live delivery path matches every
+    /// event against them).
+    #[serde(skip)]
+    pub search_terms: std::sync::Arc<std::sync::OnceLock<Vec<String>>>,
 }
 
 impl Filter {
@@ -95,9 +101,13 @@ impl Filter {
         // first and the word index and the non-indexed fallback agree.
         if let Some(search) = self.search.as_deref()
             && !search.trim().is_empty()
-            && !crate::nips::nip50::matches_terms(&ev.content, &crate::nips::nip50::terms(search))
         {
-            return false;
+            let terms = self
+                .search_terms
+                .get_or_init(|| crate::nips::nip50::terms(search));
+            if !crate::nips::nip50::matches_terms(&ev.content, terms) {
+                return false;
+            }
         }
         self.tags.iter().all(|(name, value)| {
             // NIP-01: tag constraints are `#`-prefixed; any other key is an
@@ -107,11 +117,10 @@ impl Filter {
                 return true;
             }
             let tag_name = name.strip_prefix('#').unwrap_or(name);
-            let values = tag_string_values(value);
-            values.iter().any(|v| {
+            tag_values(value).any(|v| {
                 ev.tags
                     .iter()
-                    .any(|t| t.len() >= 2 && t[0] == tag_name && &t[1] == v)
+                    .any(|t| t.len() >= 2 && t[0] == tag_name && t[1] == v)
             })
         })
     }
@@ -121,17 +130,18 @@ impl Filter {
     }
 }
 
-/// The string values of a filter tag attribute (a single
-/// string or an array of strings); other value kinds yield nothing.
-pub(crate) fn tag_string_values(value: &Value) -> Vec<String> {
-    match value {
-        Value::String(s) => vec![s.clone()],
-        Value::Array(items) => items
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect(),
-        _ => Vec::new(),
-    }
+/// The string values of a filter tag attribute (a single string or an
+/// array of strings), borrowed — no per-event allocation: the live
+/// delivery path iterates these for every event × tag constraint, so
+/// cloning the values into `Vec<String>` was a hot-path allocation.
+pub(crate) fn tag_values(value: &Value) -> impl Iterator<Item = &str> {
+    value.as_str().into_iter().chain(
+        value
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str),
+    )
 }
 
 /// nostrd extension: the `inbox` and `outbox` filter keys expand into the
@@ -193,6 +203,44 @@ pub(crate) fn rewrite_inbox_outbox(value: &mut Value) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tag_values_borrows_without_allocating() {
+        let single = serde_json::json!("abc");
+        let values: Vec<&str> = tag_values(&single).collect();
+        assert_eq!(values, vec!["abc"]);
+        let array = serde_json::json!(["a", "b", 3]);
+        let values: Vec<&str> = tag_values(&array).collect();
+        assert_eq!(values, vec!["a", "b"]);
+        let other = serde_json::json!(7);
+        assert_eq!(tag_values(&other).count(), 0);
+        let empty: serde_json::Value = serde_json::json!([]);
+        assert_eq!(tag_values(&empty).count(), 0);
+    }
+
+    #[test]
+    fn search_terms_are_cached_and_shared() {
+        let filter: Filter =
+            serde_json::from_value(serde_json::json!({"search": "rust nostr"})).unwrap();
+        assert!(
+            filter.search_terms.get().is_none(),
+            "not computed before first use"
+        );
+        let mut ev = ev(1, vec![]);
+        ev.content = "I like rust".into();
+        assert!(filter.matches(&ev));
+        assert!(
+            filter.search_terms.get().is_some(),
+            "the terms must be computed once and cached"
+        );
+        // The cached terms are shared with clones (the hot live path
+        // clones filters into subscriptions).
+        let clone = filter.clone();
+        assert!(clone.search_terms.get().is_some());
+        let mut other = super::tests::ev(1, vec![]);
+        other.content = "nothing relevant".into();
+        assert!(!clone.matches(&other));
+    }
 
     fn ev(kind: u64, tags: Vec<Vec<String>>) -> Event {
         Event {

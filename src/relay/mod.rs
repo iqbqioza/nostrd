@@ -551,10 +551,8 @@ impl Relay {
         match outcome {
             PutOutcome::Stored | PutOutcome::Replaced | PutOutcome::Ephemeral => {
                 self.stats.bump(&self.stats.events_accepted, 1);
-                self.after_put(&event, now, nip9, nip43, nip29_enabled)
-                    .await;
-                let arc = Arc::new(event);
-                (outcome, Some(arc))
+                self.after_put(event, now, nip9, nip43, nip29_enabled).await;
+                (outcome, None)
             }
             PutOutcome::Duplicate => {
                 self.stats.bump(&self.stats.events_duplicate, 1);
@@ -762,7 +760,7 @@ impl Relay {
                     if is_new && let Some(pk) = event.pubkey_bytes() {
                         persist_first_seen.push(pk);
                     }
-                    self.after_put(&event, now, nip9_enabled, roles_enabled, groups_enabled)
+                    self.after_put(event, now, nip9_enabled, roles_enabled, groups_enabled)
                         .await;
                 }
                 PutOutcome::Duplicate => {
@@ -794,9 +792,11 @@ impl Relay {
 
     /// Shared side effects of a stored event: NIP-09 deletion handling,
     /// NIP-43 leave requests, NIP-29 group state and the live broadcast.
+    /// Takes the event by value so the broadcast can move it into the
+    /// live bus instead of deep-cloning it (the last use of the event).
     async fn after_put(
         &self,
-        event: &Event,
+        event: Event,
         now: u64,
         nip9: bool,
         nip43: bool,
@@ -806,8 +806,8 @@ impl Relay {
             let removed = self
                 .db
                 .apply_deletion(
-                    nip09::deletion_targets(event),
-                    nip09::deletion_addresses(event),
+                    nip09::deletion_targets(&event),
+                    nip09::deletion_addresses(&event),
                     Some(event.pubkey.clone()),
                     event.created_at,
                 )
@@ -824,16 +824,16 @@ impl Relay {
         if nip43 && event.kind == nip43::LEAVE {
             // NIP-43: leave requests (ephemeral kinds) update the member
             // list without being stored.
-            self.apply_leave_request(event).await;
+            self.apply_leave_request(&event).await;
         }
         let is_group_event = nip29_enabled
             && ((nip29::MOD_MIN..=nip29::MOD_MAX).contains(&event.kind)
                 || event.kind == nip29::JOIN
                 || event.kind == nip29::LEAVE);
         if is_group_event {
-            self.apply_group_event(event, now).await;
+            self.apply_group_event(&event, now).await;
         }
-        self.broadcast(event.clone());
+        self.broadcast(event);
     }
 
     /// NIP-62: deletes every event by `pubkey` and removes the pubkey from

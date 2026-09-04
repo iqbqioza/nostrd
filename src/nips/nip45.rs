@@ -60,10 +60,10 @@ pub fn hll(filters: &[Filter], events: &[Event]) -> Option<String> {
 /// same query.
 fn hll_offset(filter: &Filter) -> Option<usize> {
     let (_, value) = filter.tags.iter().find(|(n, _)| n.starts_with('#'))?;
-    let value = crate::filter::tag_string_values(value).into_iter().next()?;
-    let hex_string = if value.len() == 64 && hex::decode(&value).is_ok() {
-        value
-    } else if let Some((_kind, pubkey, _d)) = split_address(&value) {
+    let value = crate::filter::tag_values(value).next()?;
+    let hex_string = if value.len() == 64 && hex::decode(value).is_ok() {
+        value.to_string()
+    } else if let Some((_kind, pubkey, _d)) = split_address(value) {
         if pubkey.len() == 64 && hex::decode(pubkey).is_ok() {
             pubkey.to_string()
         } else {

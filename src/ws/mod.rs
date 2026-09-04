@@ -107,6 +107,10 @@ pub struct Conn {
     pub(crate) in_bytes: u64,
     pub(crate) out_msgs: u64,
     pub(crate) out_bytes_total: u64,
+    /// Per-connection counter of received EVENT messages, flushed into the
+    /// shared stats on disconnect like the other per-connection counters
+    /// (an event-rate hot path must not touch a shared cache line).
+    pub(crate) events_received_local: u64,
 }
 
 impl Conn {
@@ -225,8 +229,20 @@ impl Conn {
                 let Some(event) = front.events.front() else {
                     break;
                 };
-                let text = serde_json::to_string(&json!(["EVENT", front.sub_id, event]))
-                    .unwrap_or_default();
+                // Hand-rolled framing: `["EVENT", <sub_id>, <event>]`
+                // (the same one-pass construction `deliver_live` uses).
+                // The `json!` macro would deep-clone the event into a
+                // `Value` tree before serializing; serializing the
+                // sub-id string and the event separately and concatenating
+                // writes straight to the wire.
+                let event_json = serde_json::to_string(event).unwrap_or_default();
+                let sub_json = serde_json::to_string(&front.sub_id).unwrap_or_default();
+                let mut text = String::with_capacity(event_json.len() + sub_json.len() + 16);
+                text.push_str("[\"EVENT\",");
+                text.push_str(&sub_json);
+                text.push(',');
+                text.push_str(&event_json);
+                text.push(']');
                 let size = text.len();
                 // Strict byte cap after the first message: a single
                 // oversized event must still be delivered (dropping it
@@ -331,15 +347,34 @@ impl Conn {
     /// `true` when the frame exceeded the limit and the connection must
     /// close.
     async fn handle_frame(&mut self, frame: Message, max_msg_size: usize) -> bool {
-        let text = match frame {
-            Message::Text(text) => text.to_string(),
-            Message::Binary(data) => String::from_utf8_lossy(&data).into_owned(),
+        // Borrow the text instead of copying it: the handler only reads
+        // the frame, so the `Utf8Bytes` is passed by reference (the
+        // per-frame allocation and memcpy of the old `to_string()` are
+        // dropped entirely).
+        let text = match &frame {
+            Message::Text(text) => text.as_str(),
+            Message::Binary(data) => return self.handle_binary(data, max_msg_size).await,
             _ => return false,
         };
         if text.len() > max_msg_size {
             self.send_notice("error: message too large");
             return true;
         }
+        self.in_msgs += 1;
+        self.in_bytes += text.len() as u64;
+        self.handle_text(text).await;
+        false
+    }
+
+    /// Decodes a binary frame (bytes with lossy UTF-8 fallback) and feeds
+    /// it to the protocol handler. Returns `true` when the connection must
+    /// close.
+    async fn handle_binary(&mut self, data: &[u8], max_msg_size: usize) -> bool {
+        if data.len() > max_msg_size {
+            self.send_notice("error: message too large");
+            return true;
+        }
+        let text = String::from_utf8_lossy(data);
         self.in_msgs += 1;
         self.in_bytes += text.len() as u64;
         self.handle_text(&text).await;
@@ -444,6 +479,7 @@ pub async fn handle_connection(
         in_bytes: 0,
         out_msgs: 0,
         out_bytes_total: 0,
+        events_received_local: 0,
         pending_reqs: std::collections::VecDeque::new(),
     };
     conn.send_auth_challenge().await;
@@ -539,14 +575,24 @@ pub async fn handle_connection(
                 // frames cannot starve this connection's live delivery and
                 // outgoing flush (which only run in the outer select).
                 let mut too_large = false;
+                // A single `Sleep` deadline covers the whole window: the
+                // per-frame `timeout(1ms)` of the old loop created and
+                // destroyed a timer-wheel entry for every frame (and taxed
+                // every single-frame REQ/EVENT with a full millisecond).
+                let window = std::time::Instant::now()
+                    + std::time::Duration::from_millis(1);
+                let window_deadline = tokio::time::sleep_until(
+                    tokio::time::Instant::from_std(window),
+                );
+                tokio::pin!(window_deadline);
                 for _ in 0..EVENT_BATCH * 4 {
-                    let Ok(Some(Ok(frame))) = tokio::time::timeout(
-                        std::time::Duration::from_millis(1),
-                        receiver.next(),
-                    )
-                    .await
-                    else {
-                        break;
+                    let frame = tokio::select! {
+                        biased;
+                        frame = receiver.next() => match frame {
+                            Some(Ok(frame)) => frame,
+                            _ => break,
+                        },
+                        _ = &mut window_deadline => break,
                     };
                     last_activity = std::time::Instant::now();
                     if conn.handle_frame(frame, max_msg_size).await {
@@ -651,6 +697,10 @@ pub async fn handle_connection(
     conn.relay
         .stats
         .bump(&conn.relay.stats.bytes_out, conn.out_bytes_total);
+    conn.relay.stats.bump(
+        &conn.relay.stats.events_received,
+        conn.events_received_local,
+    );
 
     // Release the connection's accounting: any subscriptions still open at
     // disconnect were never CLOSE'd, so decrement them here (REQ
@@ -812,6 +862,7 @@ mod tests {
             in_bytes: 0,
             out_msgs: 0,
             out_bytes_total: 0,
+            events_received_local: 0,
         }
     }
 
@@ -1319,6 +1370,54 @@ mod tests {
             conn.relay.db.shutdown();
         });
     }
+    #[test]
+    fn first_token_extracts_the_verb_without_a_parse() {
+        assert_eq!(Conn::first_token("[\"EVENT\",{}]"), Some("EVENT"));
+        assert_eq!(Conn::first_token("[ \"REQ\", \"s\", {}]"), Some("REQ"));
+        assert_eq!(Conn::first_token("[\"PING\"]"), Some("PING"));
+        assert_eq!(Conn::first_token("[\"EVENT\""), Some("EVENT"));
+        assert_eq!(Conn::first_token("[123]"), None);
+        assert_eq!(Conn::first_token("\"REQ\""), None);
+        assert_eq!(Conn::first_token("not json"), None);
+        assert_eq!(Conn::first_token(""), None);
+    }
+
+    #[test]
+    fn event_dispatch_parses_once_and_queues() {
+        // The hot path parses the EVENT frame directly as a typed pair
+        // (single JSON pass) and queues it for batched acceptance.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let event = crate::event::Event {
+                id: "0".repeat(64),
+                pubkey: "ab".repeat(32),
+                created_at: unix_now(),
+                kind: 1,
+                tags: vec![],
+                content: "hello".into(),
+                sig: "0".repeat(128),
+            };
+            let payload = format!("[\"EVENT\",{}]", serde_json::to_string(&event).unwrap());
+            conn.handle_text(&payload).await;
+            assert_eq!(conn.pending_events.len(), 1, "the event must be queued");
+            assert_eq!(conn.pending_events[0].content, "hello");
+            assert_eq!(conn.events_received_local, 1, "the local counter must bump");
+            // A malformed EVENT falls back to the generic path and gets a
+            // NOTICE, not a crash.
+            conn.pending_events.clear();
+            conn.handle_text("[\"EVENT\",{\"id\":1}]").await;
+            assert!(conn.pending_events.is_empty());
+            assert!(
+                outgoing_json(&conn)
+                    .iter()
+                    .any(|m| m[0] == "NOTICE" || m[0] == "OK"),
+                "a malformed event must produce a diagnostic"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
     #[test]
     fn live_delivery_through_the_bus() {
         let rt = tokio::runtime::Runtime::new().unwrap();

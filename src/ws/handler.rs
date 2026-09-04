@@ -13,7 +13,35 @@ use crate::nips::{nip29, nip40, nip42, nip45, nip70};
 use crate::util::unix_now;
 
 impl super::Conn {
+    /// The verb of a JSON array message, extracted with a lightweight scan
+    /// (no full parse): `["EVENT", ...]` → `"EVENT"`. Returns `None` when
+    /// the text is not a string array.
+    pub(crate) fn first_token(text: &str) -> Option<&str> {
+        let rest = text.trim_start().strip_prefix('[')?.trim_start();
+        let rest = rest.strip_prefix('"')?;
+        let end = rest.find('"')?;
+        Some(&rest[..end])
+    }
+
     pub(crate) async fn handle_text(&mut self, text: &str) {
+        let Some(kind) = Self::first_token(text) else {
+            self.send_notice("error: expected an array message");
+            return;
+        };
+        // EVENT messages are queued and accepted in batches so the
+        // database commit cost is paid once per batch instead of once
+        // per event; the batch is flushed when it is full, when the
+        // socket is momentarily idle, or before any other message.
+        // Fast path: the message is parsed directly as a `(verb, event)`
+        // pair in a single JSON pass — the generic `Value` parse (and its
+        // per-message allocation) is skipped entirely for the hot path.
+        // The generic path is only taken for malformed messages (to emit
+        // the NOTICE).
+        if kind == "EVENT"
+            && let Ok((_, event)) = serde_json::from_str::<(String, Event)>(text)
+        {
+            return self.queue_event_value(event).await;
+        }
         let Ok(value) = serde_json::from_str::<Value>(text) else {
             self.send_notice("error: invalid json");
             return;
@@ -28,19 +56,10 @@ impl super::Conn {
         };
 
         match kind {
-            // EVENT messages are queued and accepted in batches so the
-            // database commit cost is paid once per batch instead of once
-            // per event; the batch is flushed when it is full, when the
-            // socket is momentarily idle, or before any other message.
+            // The EVENT arm is only reached for malformed EVENT messages
+            // (the valid ones returned above).
             "EVENT" => {
-                // Fast path: the message is parsed directly as a
-                // `(verb, event)` pair in a single JSON pass, avoiding the
-                // generic Value parse plus its clone. The generic path is
-                // only taken for malformed messages (to emit the NOTICE).
-                match serde_json::from_str::<(String, Event)>(text) {
-                    Ok((_, event)) => self.queue_event_value(event).await,
-                    Err(_) => self.queue_event(&msg[1..]).await,
-                }
+                self.queue_event(&msg[1..]).await;
             }
             "REQ" => {
                 self.flush_pending_events().await;
@@ -84,7 +103,7 @@ impl super::Conn {
 
     /// Queues an already-parsed event for batched acceptance.
     pub(crate) async fn queue_event_value(&mut self, event: Event) {
-        self.relay.stats.bump(&self.relay.stats.events_received, 1);
+        self.events_received_local += 1;
         // Path-specific write policy (nostrd): `/inbox` and `/outbox` are
         // restricted endpoints — see `write_policy_reason`.
         if let Some(reason) = self.write_policy_reason(&event).await {
@@ -99,15 +118,20 @@ impl super::Conn {
 
     /// The write policy of the endpoint this connection is on:
     /// `/outbox` accepts only events authored by the NIP-42-authenticated
-    /// pubkey of this connection (`server.outbox_write_policy = "any"`) or
+    /// pubkey of this connection (`relay.outbox_write_policy = "any"`) or
     /// only events authored by the relay's own pubkey (`"relay"`); `/inbox`
     /// accepts only events carrying a `p` tag — any recipient
-    /// (`server.inbox_write_policy = "any"`) or the relay itself
+    /// (`relay.inbox_write_policy = "any"`) or the relay itself
     /// (`"relay"`). Every other path is unrestricted.
     pub(crate) async fn write_policy_reason(&self, event: &Event) -> Option<String> {
-        // Clone the connection data so the future does not hold `&self`
-        // across the config await (the connection task's future must be
+        // Fast path: the vast majority of connections are on the default
+        // path — a cheap string comparison rejects them before any clone
+        // (the clones below exist only so the future does not hold `&self`
+        // across the config await; the connection task's future must be
         // `Send`).
+        if self.path != "/outbox" && self.path != "/inbox" {
+            return None;
+        }
         let path = self.path.clone();
         let authed = self.authed_pubkeys.clone();
         let relay = self.relay.clone();

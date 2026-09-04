@@ -726,7 +726,7 @@ impl Store {
             if tag_name.len() == 1 {
                 let name_byte = tag_name.as_bytes()[0];
                 let mut ranges: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-                for value in crate::filter::tag_string_values(values) {
+                for value in crate::filter::tag_values(values) {
                     if value.len() > TAG_VALUE_MAX {
                         continue;
                     }
