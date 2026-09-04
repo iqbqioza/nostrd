@@ -13,8 +13,8 @@ use heed::{Database, RoTxn};
 use super::store::{ID_LEN, Store, TAG_VALUE_MAX, created_key, kind_key, pubkey_key, tag_range};
 use crate::error::Result;
 use crate::event::Event;
-use crate::filter::Filter;
-use crate::nips::{nip40, nip50};
+use crate::filter::{EventFields, Filter};
+use crate::nips::nip50;
 
 /// A single NIP-77 negentropy record returned by a negentropy query. The
 /// visibility flags let the connection layer withhold NIP-70 protected
@@ -39,6 +39,7 @@ pub(crate) type NegItems = Vec<NegItem>;
 /// per-candidate checks stay readable.
 struct ScanContext<'tx> {
     events: Database<Bytes, Bytes>,
+    event_meta: Option<Database<Bytes, Bytes>>,
     deleted: Database<Bytes, Bytes>,
     banned: Database<Bytes, Bytes>,
     expiry_enabled: bool,
@@ -107,6 +108,14 @@ trait ScanCollector {
     /// collected: a page never splits a created_at tie across responses
     /// (NIP-01 ordering, NIP-67 boundary cursor).
     fn push(&mut self, event: Event, id: [u8; 32], limit: usize) -> bool;
+
+    /// Lightweight push for the negentropy collector: the candidate was
+    /// deserialized without its content. The event collectors never use
+    /// this path.
+    fn push_light(&mut self, event: &NegLight, id: [u8; 32], limit: usize) -> bool {
+        let _ = (event, id, limit);
+        unreachable!("push_light is only implemented by the negentropy collector")
+    }
     /// Sorts the collected records by the NIP-01 ordering (newest first,
     /// lowest id first on equal timestamps).
     fn sort_key(&mut self);
@@ -292,6 +301,49 @@ impl ScanCollector for ItemCollector {
         });
         true
     }
+    fn push_light(&mut self, event: &NegLight, id: [u8; 32], limit: usize) -> bool {
+        if self.items.len() >= limit {
+            match self.boundary {
+                Some(b) if b == event.created_at => {}
+                _ => return false,
+            }
+        } else if self.items.len() + 1 == limit {
+            self.boundary = Some(event.created_at());
+        }
+        let protected = event
+            .tags()
+            .iter()
+            .any(|t| t.first().map(String::as_str) == Some(crate::nips::nip70::PROTECTED_TAG));
+        let (gid, meta) = match crate::nips::nip29::group_id_any_light(event) {
+            Some(gid) => {
+                let meta = (crate::nips::nip29::GROUP_META..=crate::nips::nip29::GROUP_PINS)
+                    .contains(&event.kind());
+                (Some(gid.to_string()), meta)
+            }
+            None => (None, false),
+        };
+        let wrap_recipients = if event.kind() == crate::nips::nip62::GIFT_WRAP_KIND {
+            Some(
+                event
+                    .tags()
+                    .iter()
+                    .filter(|t| t.len() >= 2 && t[0] == "p")
+                    .map(|t| t[1].clone())
+                    .collect(),
+            )
+        } else {
+            None
+        };
+        self.items.push(NegItem {
+            created: event.created_at(),
+            id,
+            protected,
+            gid,
+            meta,
+            wrap_recipients,
+        });
+        true
+    }
     fn sort_key(&mut self) {
         self.items
             .sort_by(|a, b| b.created.cmp(&a.created).then_with(|| a.id.cmp(&b.id)));
@@ -337,16 +389,14 @@ fn index_tail(key: &[u8]) -> std::result::Result<([u8; 8], [u8; 32]), String> {
 }
 
 impl Store {
-    /// Estimates the inverse document frequency weight of each search term
-    /// from the word index: a term's document frequency is the number of
-    /// keys in its index range (each event contributes exactly one key per
-    /// unique word), counted up to [`DF_SAMPLE`]. Rarer terms get a higher
-    /// weight, so a query like "nostr bitcoin" ranks an event about both
-    /// topics above one that merely mentions the common word "nostr".
-    /// Without the word index every term is weighted equally.
-    fn term_weights(&self, rtxn: &RoTxn, terms: &[String]) -> Vec<f64> {
+    /// The document frequency of each search term, from the word index
+    /// (counted up to [`DF_SAMPLE`]; a term reaching the cap is a "common
+    /// term"). Terms are counted once per query and shared between the
+    /// index-walk exclusion ([`Self::scan_filter`]) and the relevance
+    /// weights, so a REQ does not pay the count twice.
+    fn term_dfs(&self, rtxn: &RoTxn, terms: &[String]) -> Vec<u64> {
         let Some(by_word) = self.by_word else {
-            return vec![1.0; terms.len()];
+            return vec![0; terms.len()];
         };
         terms
             .iter()
@@ -373,9 +423,23 @@ impl Store {
                         }
                     }
                 }
-                let df = df.max(1) as f64;
-                1.0 / (1.0 + df.ln())
+                df
             })
+            .collect()
+    }
+
+    /// Estimates the inverse document frequency weight of each search term
+    /// from the word index. Rarer terms get a higher weight, so a query
+    /// like "nostr bitcoin" ranks an event about both topics above one
+    /// that merely mentions the common word "nostr". Without the word
+    /// index every term is weighted equally.
+    fn term_weights(&self, rtxn: &RoTxn, terms: &[String]) -> Vec<f64> {
+        if self.by_word.is_none() {
+            return vec![1.0; terms.len()];
+        }
+        self.term_dfs(rtxn, terms)
+            .into_iter()
+            .map(|df| 1.0 / (1.0 + (df.max(1) as f64).ln()))
             .collect()
     }
 
@@ -423,6 +487,7 @@ impl Store {
             budget,
             hidden_slack,
             &mut out,
+            false,
         )?;
         Ok((out.events, more))
     }
@@ -454,6 +519,9 @@ impl Store {
             budget,
             0,
             &mut out,
+            // A search filter needs the content, which the light parse
+            // skips: those NEG queries fall back to the full path.
+            !filter.has_search(),
         )?;
         Ok((out.items, more))
     }
@@ -473,6 +541,7 @@ impl Store {
         budget: usize,
         hidden_slack: usize,
         out: &mut C,
+        light: bool,
     ) -> Result<bool> {
         let count_mode = matches!(kind, ScanKind::Count);
         // NIP-50 relevance ordering only applies when *every* filter of the
@@ -560,8 +629,15 @@ impl Store {
                 seen: &mut seen,
                 out,
             };
-            let stop =
-                self.scan_filter(&rtxn, &scan, &mut collect, budget, &mut examined, &mut more)?;
+            let stop = self.scan_filter(
+                &rtxn,
+                &scan,
+                &mut collect,
+                budget,
+                &mut examined,
+                &mut more,
+                light,
+            )?;
             if stop {
                 break;
             }
@@ -592,6 +668,7 @@ impl Store {
     }
 
     /// Returns `true` when the global collection cap was reached.
+    #[allow(clippy::too_many_arguments)]
     fn scan_filter<C: ScanCollector>(
         &self,
         rtxn: &RoTxn,
@@ -600,6 +677,7 @@ impl Store {
         budget: usize,
         examined: &mut usize,
         more: &mut bool,
+        light: bool,
     ) -> Result<bool> {
         let FilterScan {
             filter,
@@ -612,6 +690,7 @@ impl Store {
         let out = &mut *collect.out;
         let ctx = ScanContext {
             events: self.events,
+            event_meta: self.event_meta,
             deleted: self.deleted,
             banned: self.banned,
             expiry_enabled: self
@@ -621,7 +700,7 @@ impl Store {
         };
         let mut consider = |id: &[u8]| -> Result<bool> {
             consider_event(
-                &ctx, id, filter, terms, now, seen, out, limit, budget, examined,
+                &ctx, id, filter, terms, now, seen, out, limit, budget, examined, light,
             )
         };
 
@@ -664,8 +743,20 @@ impl Store {
             // ignored); such a query matches everything, like an empty
             // search would.
             if let Some(by_word) = self.by_word {
+                // A common term (df reaching the sampling cap) is dropped
+                // from the index walk: its range is the flood source that
+                // turns a one-word query into a seconds-long scan. The
+                // term stays in the per-event matching, so an event that
+                // contains it AND a rarer query term is still found via
+                // the rarer term's range; an event matching only common
+                // terms is not a candidate (such terms weigh ~0 in the
+                // relevance order anyway).
+                let dfs = self.term_dfs(rtxn, terms);
                 let mut ranges: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(terms.len());
-                for word in terms {
+                for (word, df) in terms.iter().zip(dfs.iter()) {
+                    if *df >= DF_SAMPLE {
+                        continue;
+                    }
                     let start = {
                         let mut v = word.as_bytes().to_vec();
                         v.push(0x00);
@@ -677,6 +768,11 @@ impl Store {
                         v
                     };
                     ranges.push((start, end));
+                }
+                // Every term was common: the query matches nothing worth
+                // scanning (the empty range set would match nothing).
+                if ranges.is_empty() {
+                    return Ok(out.full());
                 }
                 if !self.walk_merged(rtxn, by_word, &ranges, ascending, &mut consider, more)? {
                     return Ok(false);
@@ -871,7 +967,10 @@ impl Store {
         type RevIter<'a> = Box<dyn Iterator<Item = heed::Result<(&'a [u8], &'a [u8])>> + 'a>;
         struct Head<'a> {
             iter: RevIter<'a>,
-            next_key: Option<Vec<u8>>,
+            /// The next key with its parsed `(created_at, id)` tail: the
+            /// tail is parsed once per refill instead of once per head per
+            /// iteration.
+            next_key: Option<(Vec<u8>, [u8; 8], [u8; 32])>,
         }
         let mut heads: Vec<Head<'_>> = Vec::with_capacity(ranges.len());
         for (start, end) in ranges {
@@ -888,6 +987,7 @@ impl Store {
                 next_key: None,
             });
         }
+        let mut last_emitted: Option<([u8; 8], [u8; 32])> = None;
         loop {
             // The index keys are `(prefix..., created_at, id)`, so the
             // newest head is the one with the largest (created_at, id)
@@ -896,29 +996,45 @@ impl Store {
             for (i, head) in heads.iter_mut().enumerate() {
                 if head.next_key.is_none() {
                     match head.iter.next() {
-                        Some(Ok((key, _))) => head.next_key = Some(key.to_vec()),
+                        Some(Ok((key, _))) => {
+                            let (created, id) =
+                                index_tail(key).map_err(crate::error::Error::Other)?;
+                            head.next_key = Some((key.to_vec(), created, id));
+                        }
                         Some(Err(e)) => return Err(e.into()),
                         None => {}
                     }
                 }
-                if let Some(key) = &head.next_key {
-                    let (created, id) = index_tail(key).map_err(crate::error::Error::Other)?;
+                if let Some((_, created, id)) = &head.next_key {
                     let better = if ascending {
                         best.as_ref()
-                            .is_none_or(|(_, bc, bi)| (created, id) < (*bc, *bi))
+                            .is_none_or(|(_, bc, bi)| (*created, *id) < (*bc, *bi))
                     } else {
                         best.as_ref()
-                            .is_none_or(|(_, bc, bi)| (created, id) > (*bc, *bi))
+                            .is_none_or(|(_, bc, bi)| (*created, *id) > (*bc, *bi))
                     };
                     if better {
-                        best = Some((i, created, id));
+                        best = Some((i, *created, *id));
                     }
                 }
             }
-            let Some((i, _, _)) = best else {
+            let Some((i, created, id)) = best else {
                 return Ok(true);
             };
-            let key = heads[i].next_key.as_ref().expect("head was picked");
+            let (key, _, _) = heads[i].next_key.as_ref().expect("head was picked");
+            // The same event can appear in several ranges (e.g. a search
+            // term union); the merged walk emits in global order, so a
+            // repeat of the immediately previous id is the same event —
+            // skip the second emission instead of handing it to
+            // `consider` again (which would re-parse and re-check it).
+            if let Some((last_created, last_id)) = last_emitted
+                && last_created == created
+                && last_id == id
+            {
+                heads[i].next_key = None;
+                continue;
+            }
+            last_emitted = Some((created, id));
             let id = &key[key.len() - ID_LEN..];
             if !consider(id)? {
                 *more = true;
@@ -943,6 +1059,40 @@ fn prefix_end(prefix: &[u8]) -> Vec<u8> {
     v
 }
 
+/// A lightweight deserialization of a stored event for the negentropy
+/// path: the content (the dominant field, up to 64 KiB) and the
+/// signature are skipped entirely, leaving the fields the filter
+/// matching needs.
+#[derive(serde::Deserialize)]
+struct NegLight {
+    id: String,
+    pubkey: String,
+    created_at: u64,
+    kind: u64,
+    tags: Vec<Vec<String>>,
+}
+
+impl crate::filter::EventFields for NegLight {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn pubkey(&self) -> &str {
+        &self.pubkey
+    }
+    fn kind(&self) -> u64 {
+        self.kind
+    }
+    fn created_at(&self) -> u64 {
+        self.created_at
+    }
+    fn tags(&self) -> &[Vec<String>] {
+        &self.tags
+    }
+    fn content(&self) -> &str {
+        ""
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn consider_event<C: ScanCollector>(
     ctx: &ScanContext<'_>,
@@ -955,6 +1105,7 @@ fn consider_event<C: ScanCollector>(
     limit: usize,
     budget: usize,
     examined: &mut usize,
+    light: bool,
 ) -> Result<bool> {
     if out.full() {
         // The collection cap is reached: stop the scan (and any remaining
@@ -974,13 +1125,55 @@ fn consider_event<C: ScanCollector>(
     let Some(raw) = ctx.events.get(ctx.rtxn, id)? else {
         return Ok(true);
     };
+    let id = id.try_into().unwrap_or([0u8; 32]);
+    // Header-first rejection: the metadata index carries the kind,
+    // created_at, pubkey and expiration, so candidates failing those
+    // checks are dropped before the full JSON is deserialized. A missing
+    // header (a legacy event, or the index still being rebuilt) falls
+    // through to the full parse.
+    if let Some(meta) = ctx.event_meta
+        && let Some(header) = meta.get(ctx.rtxn, &id)?
+        && let Some((kind, created, _pubkey, exp)) = crate::db::store::decode_meta(header)
+    {
+        if let Some(kinds) = &filter.kinds
+            && !kinds.contains(&kind)
+        {
+            return Ok(true);
+        }
+        if let Some(since) = filter.since
+            && created < since
+        {
+            return Ok(true);
+        }
+        if let Some(until) = filter.until
+            && created > until
+        {
+            return Ok(true);
+        }
+        if ctx.expiry_enabled && exp != 0 && exp < now {
+            return Ok(true);
+        }
+    }
+    if light {
+        // The negentropy path deserializes the candidate without its
+        // content (the dominant field) and its signature.
+        let Ok(event) = serde_json::from_slice::<NegLight>(raw) else {
+            return Ok(true);
+        };
+        if !is_deliverable(ctx, &event, filter, terms, now)? {
+            return Ok(true);
+        }
+        if out.push_light(&event, id, limit) {
+            seen.insert(id.to_vec());
+        }
+        return Ok(true);
+    }
     let Ok(event) = serde_json::from_slice::<Event>(raw) else {
         return Ok(true);
     };
     if !is_deliverable(ctx, &event, filter, terms, now)? {
         return Ok(true);
     }
-    let id = id.try_into().unwrap_or([0u8; 32]);
     // Only record the event as seen when it was actually collected: an event
     // that hit this filter's limit (push failed) must still be available to
     // a later filter of the same REQ, e.g. `[{"limit":0},{"kinds":[1]}]`.
@@ -992,14 +1185,17 @@ fn consider_event<C: ScanCollector>(
     }
 }
 
-fn is_deliverable(
+fn is_deliverable<E: crate::filter::EventFields>(
     ctx: &ScanContext<'_>,
-    event: &Event,
+    event: &E,
     filter: &Filter,
     terms: &[String],
     now: u64,
 ) -> Result<bool> {
-    let Some(id) = event.id_bytes() else {
+    let Some(id) = hex::decode(event.id()).ok() else {
+        return Ok(false);
+    };
+    let Some(id): Option<[u8; 32]> = id.try_into().ok() else {
         return Ok(false);
     };
     if ctx.deleted.get(ctx.rtxn, &id)?.is_some() {
@@ -1009,7 +1205,11 @@ fn is_deliverable(
         return Ok(false);
     }
     if ctx.expiry_enabled
-        && let Some(exp) = nip40::expiry(event)
+        && let Some(exp) = event
+            .tags()
+            .iter()
+            .find(|t| t.len() >= 2 && t[0] == crate::nips::nip40::EXPIRATION_TAG)
+            .and_then(|t| t[1].parse::<u64>().ok())
         && exp < now
     {
         return Ok(false);
@@ -1020,7 +1220,7 @@ fn is_deliverable(
         // events matching every term first. Whole-word matching keeps the
         // index walk, the non-indexed fallback and the live delivery
         // consistent (see `nip50::matches_terms`).
-        if !crate::nips::nip50::matches_terms(&event.content, terms) {
+        if !crate::nips::nip50::matches_terms(event.content(), terms) {
             return Ok(false);
         }
     }

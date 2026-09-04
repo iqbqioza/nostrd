@@ -34,6 +34,36 @@ use crate::event::Event;
 use crate::nips::{nip33, nip40, nip50};
 
 pub(crate) const EVENTS: &str = "events";
+/// The lightweight per-event metadata index: id → fixed-length header
+/// (kind, created_at, pubkey, expiration). The scan checks these fields
+/// before deserializing the full JSON, so candidates failing the
+/// kind/since/until/author checks are rejected without the parse.
+pub(crate) const EVENT_META: &str = "event_meta";
+/// Length of an [`EVENT_META`] header: kind (8) + created_at (8) +
+/// pubkey (32) + expiration (8, 0 = none).
+pub(crate) const META_LEN: usize = 56;
+
+pub(crate) fn encode_meta(kind: u64, created: u64, pubkey: &[u8], expiry: u64) -> Vec<u8> {
+    let mut v = Vec::with_capacity(META_LEN);
+    v.extend_from_slice(&kind.to_be_bytes());
+    v.extend_from_slice(&created.to_be_bytes());
+    v.extend_from_slice(&pubkey[..32]);
+    v.extend_from_slice(&expiry.to_be_bytes());
+    v
+}
+
+/// Decodes a meta header into `(kind, created_at, pubkey, expiry)`.
+pub(crate) fn decode_meta(raw: &[u8]) -> Option<(u64, u64, [u8; 32], u64)> {
+    if raw.len() < META_LEN {
+        return None;
+    }
+    let kind = u64::from_be_bytes(raw[0..8].try_into().ok()?);
+    let created = u64::from_be_bytes(raw[8..16].try_into().ok()?);
+    let pubkey = raw[16..48].try_into().ok()?;
+    let expiry = u64::from_be_bytes(raw[48..56].try_into().ok()?);
+    Some((kind, created, pubkey, expiry))
+}
+
 pub(crate) const BY_CREATED: &str = "by_created";
 pub(crate) const BY_PUBKEY: &str = "by_pubkey";
 pub(crate) const BY_KIND: &str = "by_kind";
@@ -212,6 +242,7 @@ pub(crate) struct Store {
     pub(crate) by_kind: Database<Bytes, Bytes>,
     pub(crate) by_tag: Database<Bytes, Bytes>,
     pub(crate) by_word: Option<Database<Bytes, Bytes>>,
+    pub(crate) event_meta: Option<Database<Bytes, Bytes>>,
     pub(crate) deleted: Database<Bytes, Bytes>,
     pub(crate) expiry: Database<Bytes, Bytes>,
     pub(crate) replaceable: Database<Bytes, Bytes>,
@@ -282,6 +313,7 @@ impl Store {
         } else {
             None
         };
+        let event_meta = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(EVENT_META))?;
         let deleted = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(DELETED))?;
         let expiry = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(EXPIRY))?;
         let replaceable = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(REPLACEABLE))?;
@@ -306,6 +338,7 @@ impl Store {
             by_kind,
             by_tag,
             by_word,
+            event_meta: Some(event_meta),
             deleted,
             expiry,
             replaceable,
@@ -371,6 +404,7 @@ impl Store {
             by_kind: self.by_kind,
             by_tag: self.by_tag,
             by_word: self.by_word,
+            event_meta: self.event_meta,
             deleted: self.deleted,
             expiry: self.expiry,
             replaceable: self.replaceable,
@@ -847,6 +881,77 @@ impl Store {
         Ok(outcome)
     }
 
+    /// Whether the meta index must be rebuilt: an old database written by
+    /// a relay before the meta index existed has events but no meta
+    /// entries (the derived index is filled in the background at startup;
+    /// scans fall back to the full JSON parse until then).
+    pub(crate) fn meta_needs_rebuild(&self) -> Result<bool> {
+        let rtxn = self.env.read_txn()?;
+        let has_events = !self.by_created.is_empty(&rtxn)?;
+        let meta_empty = self
+            .event_meta
+            .is_none_or(|db| db.is_empty(&rtxn).unwrap_or(true));
+        Ok(has_events && meta_empty)
+    }
+
+    /// Rebuilds the [`EVENT_META`] index from the stored events (read and
+    /// write chunks, so a huge database never holds a giant transaction;
+    /// called once at startup when the index is stale).
+    pub(crate) fn rebuild_event_meta(&self) -> Result<usize> {
+        let Some(meta) = self.event_meta else {
+            return Ok(0);
+        };
+        let mut count = 0usize;
+        let mut last: Option<Vec<u8>> = None;
+        loop {
+            // Read a chunk with a read txn (parsing the headers), then
+            // write it with a fresh write txn: the heed iterator borrows
+            // the transaction, so the writes cannot share it.
+            let chunk = {
+                let rtxn = self.env.read_txn()?;
+                let range = (
+                    last.as_deref()
+                        .map(std::ops::Bound::Excluded)
+                        .unwrap_or(std::ops::Bound::Unbounded),
+                    std::ops::Bound::Unbounded,
+                );
+                let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(10_000);
+                for item in self.events.range(&rtxn, &range)? {
+                    let (id, raw) = item?;
+                    let Ok(event) = serde_json::from_slice::<Event>(raw) else {
+                        continue;
+                    };
+                    let Ok(pubkey) = hex::decode(&event.pubkey) else {
+                        continue;
+                    };
+                    let expiry = crate::nips::nip40::expiry(&event).unwrap_or(0);
+                    out.push((
+                        id.to_vec(),
+                        encode_meta(event.kind, event.created_at, &pubkey, expiry),
+                    ));
+                    if out.len() >= 10_000 {
+                        break;
+                    }
+                }
+                out
+            };
+            if chunk.is_empty() {
+                break;
+            }
+            let mut wtxn = self.env.write_txn()?;
+            for (id, header) in &chunk {
+                meta.put(&mut wtxn, id, header)?;
+            }
+            wtxn.commit()?;
+            count += chunk.len();
+            last = chunk.last().map(|(id, _)| id.clone());
+            if chunk.len() < 10_000 {
+                break;
+            }
+        }
+        Ok(count)
+    }
+
     fn put_indexes(
         &self,
         wtxn: &mut heed::RwTxn,
@@ -870,6 +975,10 @@ impl Store {
         }
         self.by_kind
             .put(wtxn, &kind_key(event.kind, created, id), b"")?;
+        if let Some(meta) = self.event_meta {
+            let expiry = crate::nips::nip40::expiry(event).unwrap_or(0);
+            meta.put(wtxn, id, &encode_meta(event.kind, created, pubkey, expiry))?;
+        }
         for tag in &event.tags {
             if indexable_tag(tag) {
                 let key = tag_key(tag[0].as_bytes()[0], tag[1].as_bytes(), created, id);
@@ -944,6 +1053,9 @@ impl Store {
         }
         self.by_kind
             .delete(wtxn, &kind_key(event.kind, event.created_at, id))?;
+        if let Some(meta) = self.event_meta {
+            meta.delete(wtxn, id)?;
+        }
         for tag in &event.tags {
             if indexable_tag(tag) {
                 self.by_tag.delete(

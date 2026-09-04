@@ -53,6 +53,9 @@ pub(crate) struct DbThreads {
 }
 
 /// Serves one read-only message on a dedicated reader thread. Returns
+/// The number of threads serving the WebSocket reader channel.
+pub(crate) const READER_THREADS: usize = 2;
+
 /// `true` when the thread must shut down.
 fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, msg: Msg) -> bool {
     match msg {
@@ -275,7 +278,7 @@ pub(crate) fn spawn(
     max_pending_events: usize,
 ) -> Result<DbThreads> {
     let (tx, mut rx) = mpsc::unbounded_channel();
-    let (read_tx, mut read_rx) = mpsc::unbounded_channel();
+    let (read_tx, read_rx) = mpsc::unbounded_channel();
     let (api_read_tx, mut api_read_rx) = mpsc::unbounded_channel();
     let thread_errors = Arc::clone(&errors);
     let pending_msgs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -285,36 +288,48 @@ pub(crate) fn spawn(
     let read_pending = Arc::clone(&pending_msgs);
     let api_pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let api_thread_pending = Arc::clone(&api_pending);
-    // Dedicated reader thread: serves Query/Count/NEG and the small
-    // lookups without ever taking the LMDB write lock.
+    // Dedicated reader threads: serve Query/Count/NEG and the small
+    // lookups without ever taking the LMDB write lock. Two threads share
+    // the channel (the receiver behind a mutex; each thread holds the
+    // lock only for the blocking recv, so a long scan on one thread does
+    // not stall the next query on the other), so a single heavy REQ no
+    // longer blocks every other subscriber's query. LMDB allows many
+    // concurrent read transactions, so the threads read the same data
+    // safely.
     {
-        let read_store = store.clone_for_reader();
-        let read_errors = Arc::clone(&errors);
-        std::thread::spawn(move || {
-            'reader: loop {
-                let Some(msg) = read_rx.blocking_recv() else {
-                    break;
-                };
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let shutdown = handle_read_msg(&read_store, &read_errors, msg);
-                    // `Msg::Shutdown` is sent directly (never through
-                    // `request_read`), so it was not counted; decrementing
-                    // for it would underflow the pending counter.
-                    if !shutdown {
-                        read_pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    shutdown
-                }));
-                match result {
-                    Ok(true) => break 'reader,
-                    Ok(false) => {}
-                    Err(_) => {
-                        log::error!("reader thread recovered from a panic");
-                        read_pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        let read_rx = std::sync::Arc::new(std::sync::Mutex::new(read_rx));
+        for _ in 0..READER_THREADS {
+            let read_store = store.clone_for_reader();
+            let read_errors = Arc::clone(&errors);
+            let read_rx = Arc::clone(&read_rx);
+            let read_pending = Arc::clone(&read_pending);
+            std::thread::spawn(move || {
+                'reader: loop {
+                    let Some(msg) = read_rx.lock().unwrap().blocking_recv() else {
+                        break;
+                    };
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let shutdown = handle_read_msg(&read_store, &read_errors, msg);
+                        // `Msg::Shutdown` is sent directly (never through
+                        // `request_read`), so it was not counted;
+                        // decrementing for it would underflow the pending
+                        // counter.
+                        if !shutdown {
+                            read_pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        shutdown
+                    }));
+                    match result {
+                        Ok(true) => break 'reader,
+                        Ok(false) => {}
+                        Err(_) => {
+                            log::error!("reader thread recovered from a panic");
+                            read_pending.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
                 }
-            }
-        });
+            });
+        }
     }
     // Dedicated REST API reader thread: serves `/api/v1` queries on its own
     // queue so an API flood can never queue behind (or in front of)
@@ -348,6 +363,17 @@ pub(crate) fn spawn(
         });
     }
     std::thread::spawn(move || {
+        // One-time rebuild of the lightweight metadata index: an older
+        // database has events but no meta entries. The rebuild runs on
+        // the writer thread before any puts (the single-writer lock is
+        // otherwise idle at startup); scans fall back to the full JSON
+        // parse until it completes.
+        if store.meta_needs_rebuild().unwrap_or(false) {
+            match store.rebuild_event_meta() {
+                Ok(n) => log::info!("event metadata index rebuilt ({n} events)"),
+                Err(e) => log::warn!("event metadata index rebuild failed: {e}"),
+            }
+        }
         // Puts are applied in batches sharing one write transaction so
         // that the LMDB commit cost (a full fsync by default) is paid
         // once per batch instead of once per event. Replies are only

@@ -2338,3 +2338,75 @@ fn reload_loads_report_success() {
         db.shutdown();
     });
 }
+
+#[test]
+fn event_meta_roundtrips_and_prefilters() {
+    use crate::db::store::{META_LEN, decode_meta, encode_meta};
+    // Header roundtrip.
+    let pubkey = [0x42u8; 32];
+    let header = encode_meta(30001, 1_600_000_000, &pubkey, 0);
+    assert_eq!(header.len(), META_LEN);
+    let (kind, created, pk, exp) = decode_meta(&header).unwrap();
+    assert_eq!((kind, created, exp), (30001, 1_600_000_000, 0));
+    assert_eq!(pk, pubkey);
+    assert!(decode_meta(&header[..META_LEN - 1]).is_none());
+    // The scan stores the meta alongside the event and a query whose
+    // kinds do not match is answered without the event.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let e = event(30001, "meta test", now, vec![]);
+        assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
+        let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [30001]})).unwrap();
+        let (res, _) = db.query(vec![f], 10, now).await;
+        assert_eq!(res.len(), 1);
+        let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap();
+        let (res, _) = db.query(vec![f], 10, now).await;
+        assert!(res.is_empty(), "kind mismatch must reject via the header");
+        db.shutdown();
+    });
+}
+
+#[test]
+fn event_meta_rebuilds_from_stored_events() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let expiry = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let store = crate::db::store::Store::open(&config(), expiry, 128).unwrap();
+        let _db = store.clone_for_reader();
+        let now = unix_now();
+        let mut ev = event(1, "rebuild", now, vec![]);
+        let id = ev.id_bytes().unwrap();
+        // Seed the store directly (the writer thread is not running).
+        let mut wtxn = store.env.write_txn().unwrap();
+        let raw = serde_json::to_vec(&ev).unwrap();
+        store.events.put(&mut wtxn, &id, &raw).unwrap();
+        store
+            .by_created
+            .put(&mut wtxn, &crate::db::store::created_key(now, &id), b"")
+            .unwrap();
+        wtxn.commit().unwrap();
+        ev.id = hex::encode(id);
+        // The meta index is empty: a rebuild must fill it.
+        assert!(store.meta_needs_rebuild().unwrap());
+        let count = store.rebuild_event_meta().unwrap();
+        assert_eq!(count, 1);
+        assert!(!store.meta_needs_rebuild().unwrap());
+        let meta = store.event_meta.unwrap();
+        let rtxn = store.env.read_txn().unwrap();
+        let raw = meta.get(&rtxn, &id).unwrap().unwrap();
+        let (kind, created, _, _) = crate::db::store::decode_meta(raw).unwrap();
+        assert_eq!(kind, 1);
+        assert_eq!(created, now);
+    });
+}

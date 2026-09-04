@@ -919,7 +919,11 @@ impl DbClient {
 
     pub fn shutdown(&self) {
         let _ = self.tx.send(Msg::Shutdown);
-        let _ = self.read_tx.send(Msg::Shutdown);
+        // One per reader thread (the WebSocket reader pool is shared
+        // behind a mutex; each thread consumes one shutdown message).
+        for _ in 0..crate::db::threads::READER_THREADS {
+            let _ = self.read_tx.send(Msg::Shutdown);
+        }
         let _ = self.api_read_tx.send(Msg::Shutdown);
     }
 }

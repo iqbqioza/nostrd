@@ -15,6 +15,40 @@ use crate::event::Event;
 /// authors in a single filter.
 pub const MAX_FILTER_MEMBERS: usize = 512;
 
+/// The event fields the in-memory filter matching reads. `Event`
+/// implements it directly; the negentropy path uses a lightweight
+/// deserialization that skips the content (the dominant field) and the
+/// signature.
+pub(crate) trait EventFields {
+    fn id(&self) -> &str;
+    fn pubkey(&self) -> &str;
+    fn kind(&self) -> u64;
+    fn created_at(&self) -> u64;
+    fn tags(&self) -> &[Vec<String>];
+    fn content(&self) -> &str;
+}
+
+impl EventFields for Event {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn pubkey(&self) -> &str {
+        &self.pubkey
+    }
+    fn kind(&self) -> u64 {
+        self.kind
+    }
+    fn created_at(&self) -> u64 {
+        self.created_at
+    }
+    fn tags(&self) -> &[Vec<String>] {
+        &self.tags
+    }
+    fn content(&self) -> &str {
+        &self.content
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Filter {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -55,16 +89,17 @@ impl Filter {
     }
 
     /// Performs an in-memory match (used for live events and final checks).
-    pub fn matches(&self, ev: &Event) -> bool {
+    pub fn matches<E: EventFields>(&self, ev: &E) -> bool {
         if let Some(ids) = &self.ids {
             // NIP-01: `ids` entries may be full ids or prefixes. Only
             // even-length, non-empty prefixes are matched, mirroring the
             // historical scan (which decodes hex) so live and stored results
             // agree; an empty or odd-length entry matches nothing.
+            let id_str = ev.id();
             let matches = ids.iter().any(|id| {
                 !id.is_empty()
                     && id.len() % 2 == 0
-                    && (id == &ev.id || (id.len() < ev.id.len() && ev.id.starts_with(id)))
+                    && (id == id_str || (id.len() < id_str.len() && id_str.starts_with(id)))
             });
             if !matches {
                 return false;
@@ -73,26 +108,26 @@ impl Filter {
         // NIP-26: events published under a delegation tag match filters on
         // the delegator's pubkey as well as on the event's own author.
         if let Some(authors) = &self.authors
-            && !authors.iter().any(|a| a == &ev.pubkey)
+            && !authors.iter().any(|a| a == ev.pubkey())
             && !ev
-                .tags
+                .tags()
                 .iter()
                 .any(|t| t.len() >= 2 && t[0] == "delegation" && authors.iter().any(|a| a == &t[1]))
         {
             return false;
         }
         if let Some(kinds) = &self.kinds
-            && !kinds.contains(&ev.kind)
+            && !kinds.contains(&ev.kind())
         {
             return false;
         }
         if let Some(since) = self.since
-            && ev.created_at < since
+            && ev.created_at() < since
         {
             return false;
         }
         if let Some(until) = self.until
-            && ev.created_at > until
+            && ev.created_at() > until
         {
             return false;
         }
@@ -105,7 +140,7 @@ impl Filter {
             let terms = self
                 .search_terms
                 .get_or_init(|| crate::nips::nip50::terms(search));
-            if !crate::nips::nip50::matches_terms(&ev.content, terms) {
+            if !crate::nips::nip50::matches_terms(ev.content(), terms) {
                 return false;
             }
         }
@@ -118,7 +153,7 @@ impl Filter {
             }
             let tag_name = name.strip_prefix('#').unwrap_or(name);
             tag_values(value).any(|v| {
-                ev.tags
+                ev.tags()
                     .iter()
                     .any(|t| t.len() >= 2 && t[0] == tag_name && t[1] == v)
             })

@@ -239,7 +239,7 @@ Every key is optional; a missing key uses the default shown below.
 | `max_tag_value_bytes` | integer | `1024` | Max bytes per tag value |
 | `max_created_at_future_secs` | integer | `3600` | Tolerated future skew of `created_at` (seconds) |
 | `require_pow` | integer | `0` | Required proof-of-work difficulty in leading zero bits |
-| `max_indexed_words` | integer | `128` | Words of content indexed for NIP-50 search |
+| `max_indexed_words` | integer | `32` | Words of content indexed for NIP-50 search |
 
 ### Database queue and overload protection
 
@@ -606,7 +606,7 @@ max_tags = 2000
 max_tag_value_bytes = 1024
 max_created_at_future_secs = 3600
 require_pow = 0
-max_indexed_words = 128
+max_indexed_words = 32
 db_buffer_size = 2048
 max_neg_items = 100000
 db_request_timeout_secs = 30

@@ -434,7 +434,7 @@ impl Default for DatabaseConfig {
             max_map_size: 1024 * 1024 * 1024 * 1024,
             purge_interval_secs: 300,
             search_index: true,
-            max_indexed_words: 128,
+            max_indexed_words: 32,
             db_buffer_size: 2_048,
             db_request_timeout_secs: 30,
             max_db_queue_msgs: 4_096,

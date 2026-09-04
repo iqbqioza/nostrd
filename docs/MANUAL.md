@@ -200,7 +200,7 @@ To generate a secret key, use the `nostrd genkey` command (see [5. Command Refer
 | `max_map_size` | Memory-map ceiling (bytes). **Raise this if you hit the "map is full" error** | 1 TB |
 | `purge_interval_secs` | Interval for purging NIP-40 expired events | `300` |
 | `search_index` | Enable the NIP-50 full-text index | `true` |
-| `max_indexed_words` | Words indexed per event for search | `128` |
+| `max_indexed_words` | Words indexed per event for search | `32` |
 | `db_buffer_size` | LMDB read/write buffer size (bytes) | `2048` |
 | `db_request_timeout_secs` | Database request timeout (0 = wait forever) | `30` |
 | `max_db_queue_msgs` / `max_db_queue_events` | Overload protection when the DB queue backs up | `4096` / `262144` |

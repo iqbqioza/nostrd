@@ -95,6 +95,26 @@ pub fn group_id_any(event: &Event) -> Option<&str> {
     }
 }
 
+/// Trait-based variant of [`group_id_any`] for the negentropy light path
+/// (the candidate was deserialized without its content).
+pub fn group_id_any_light<E: crate::filter::EventFields>(event: &E) -> Option<&str> {
+    match event.kind() {
+        GROUP_META..=GROUP_PINS => tag_value_light(event, D),
+        _ => tag_value_light(event, H),
+    }
+}
+
+fn tag_value_light<'a, E: crate::filter::EventFields>(
+    event: &'a E,
+    name: &'a str,
+) -> Option<&'a str> {
+    event
+        .tags()
+        .iter()
+        .find(|t| t.len() >= 2 && t[0] == name)
+        .map(|t| t[1].as_str())
+}
+
 /// The `previous` tag values of an event (NIP-29 timeline references).
 pub fn previous_tags(event: &Event) -> Vec<String> {
     tag_values(event, "previous").map(str::to_string).collect()
