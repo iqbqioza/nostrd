@@ -55,11 +55,13 @@ key = true         # boolean
 | Section | Purpose |
 | --- | --- |
 | `[relay]` | Identity, URLs and NIP toggles |
-| `[server]` | Network binding, API split, authentication |
+| `[server]` | Network binding, API split, metrics |
+| `[rpc]` | NIP-86 management RPC (port, auth, body limit) |
 | `[limits]` | All limits and overload protections |
-| `[database]` | LMDB storage |
+| `[database]` | LMDB storage, DB thread timeouts and queue caps, search index |
 | `[daemon]` | PID/log/stats files and rotation |
 | `[access]` | Initial access control lists (also changeable at runtime) |
+| `[blossom]` | Blossom file server (media hosting) |
 
 Every key is optional; a missing key uses the default shown below.
 
@@ -83,7 +85,10 @@ Every key is optional; a missing key uses the default shown below.
 | `enabled_nips` | array of integers | `[]` | Explicit NIP allowlist |
 | `disabled_nips` | array of integers | `[]` | NIPs to disable (ignored when `enabled_nips` is non-empty) |
 | `reject_ephemeral` | boolean | `false` | When `true`, NIP-01 ephemeral events (kinds 20000-29999) are rejected (`blocked: ephemeral events not allowed`) |
-| `enable_git` | boolean | `false` | When `true`, NIP-34 git events (kinds 1617-1633, 30617/30618) are accepted and NIP-34 is advertised. Default `false`: the kinds are rejected (`blocked: NIP-34 git events are disabled`) and NIP-34 is not advertised |
+| `enabled_git` | boolean | `false` | When `true`, NIP-34 git events (kinds 1617-1633, 30617/30618) are accepted and NIP-34 is advertised. Default `false`: the kinds are rejected (`blocked: NIP-34 git events are disabled`) and NIP-34 is not advertised |
+| `max_events_per_min_per_pubkey` | integer | `0` | Publish rate limit per pubkey (events per minute; `0` = no limit) |
+| `require_auth` | boolean | `false` | Require NIP-42 authentication for all REQ/EVENT/COUNT/NEG |
+| `send_auth_challenge` | boolean | `true` | Send the AUTH challenge on connect |
 
 ### Key details
 
@@ -111,11 +116,23 @@ Every key is optional; a missing key uses the default shown below.
 
 **`enabled_nips`** — An explicit allowlist of NIP numbers. When non-empty, **only** these NIPs are advertised (NIP-11) and their relay-side behavior is active; `disabled_nips` is ignored. Requires a `restart` to change.
 
-**`disabled_nips`** — Removes specific NIPs from the default set. For example `[50]` disables search (REQ/COUNT/API `search` is then ignored), `[28]` disables public-chat semantics. Requires a `restart` to change. Only relay-side NIPs are relevant: [1, 9, 11, 13, 17, 22, 26, 29, 32, 33, 34, 40, 42, 43, 45, 46, 47, 50, 57, 59, 62, 65, 66, 67, 70, 77, 78, 84, 85, 86, 87, 88, 94, 98] (NIP-28 is a behavior gate only — it is never advertised; NIP-A3 is a `draft` without an integer identifier, so it cannot appear in `supported_nips`; NIP-34 git events additionally require `relay.enable_git`).
+**`disabled_nips`** — Removes specific NIPs from the default set. For example `[50]` disables search (REQ/COUNT/API `search` is then ignored), `[28]` disables public-chat semantics. Requires a `restart` to change. Only relay-side NIPs are relevant: [1, 9, 11, 13, 17, 22, 26, 29, 32, 33, 34, 40, 42, 43, 45, 46, 47, 50, 57, 59, 62, 65, 66, 67, 70, 77, 78, 84, 85, 86, 87, 88, 94, 98] (NIP-28 is a behavior gate only — it is never advertised; NIP-A3 is a `draft` without an integer identifier, so it cannot appear in `supported_nips`; NIP-34 git events additionally require `relay.enabled_git`).
 
 **`reject_ephemeral`** — When `true`, NIP-01 ephemeral events (kinds `20000-29999`) are rejected at publish time with `blocked: ephemeral events not allowed`. Exempt kinds that NIPs require to be relayed are still forwarded: `22242` (NIP-42 AUTH), `27235` (NIP-98 HTTP auth), `28934`/`28935`/`28936` (NIP-43 JOIN/Invite/LEAVE), `24133` (NIP-46 Nostr Connect), `23194`/`23195` (NIP-47 wallet request/response), `24242` (BUD-02 Blossom), `21059` (NIP-59 ephemeral gift wrap). Takes effect immediately on `SIGHUP` reload and on the next publish.
 
-**`enable_git`** — When `true`, NIP-34 git events (kinds `1617`-`1633`, `30617`/`30618`) are accepted and NIP-34 is advertised in the NIP-11 document. Default `false`: the kinds are rejected with `blocked: NIP-34 git events are disabled` (patch payloads can be large, so this is opt-in) and NIP-34 stays out of `supported_nips`. Takes effect immediately on `SIGHUP` reload and on the next publish.
+**`enabled_git`** — When `true`, NIP-34 git events (kinds `1617`-`1633`, `30617`/`30618`) are accepted and NIP-34 is advertised in the NIP-11 document. Default `false`: the kinds are rejected with `blocked: NIP-34 git events are disabled` (patch payloads can be large, so this is opt-in) and NIP-34 stays out of `supported_nips`. Takes effect immediately on `SIGHUP` reload and on the next publish.
+
+**`require_pow`** — The required proof-of-work difficulty: the event id must start with at least this many zero bits (NIP-13), enforced only when NIP-13 is enabled. High values (≥ 64) make publishing practically impossible — the relay warns.
+
+**`new_pubkey_min_age_secs`** — Spam defense: a pubkey's first accepted event is recorded, and events from pubkeys first seen less than this many seconds ago are rejected with `restricted: your account is too new`. `0` disables the check.
+
+**`max_events_per_min_per_pubkey`** — A pubkey may publish at most this many events per minute (sliding 60-second window); the excess is rejected with `rate-limited: too many events`. The window is bounded at 10,000 tracked pubkeys (the map is cleared, never grown). `0` = unlimited.
+
+**`max_groups`** — The cap on the in-memory NIP-29 group store. The store keeps the active groups plus a marker per deleted group (the marker is permanent so a deleted group cannot be resurrected), so without a cap an attacker could churn group ids and grow the memory without limit. The cap counts both, and group creation beyond it is rejected with `restricted: group limit reached` (both on the live write path and during the startup rebuild). `0` disables the cap. Read at startup — changing it requires a `restart`.
+
+**`require_auth`** — When `true`, the relay refuses REQ/EVENT/COUNT/NEG messages with `auth-required:` unless the connection has completed NIP-42 AUTH. Useful for a private relay. Applied per connection.
+
+**`send_auth_challenge`** — When `true`, every new connection receives a NIP-42 auth-request challenge. `require_auth = true` with `send_auth_challenge = false` locks everyone out — the relay warns about the combination at startup.
 
 ### Behavior notes
 
@@ -128,19 +145,29 @@ Every key is optional; a missing key uses the default shown below.
 
 ---
 
-## 4. `[server]` — server settings
+## 4. `[rpc]` — NIP-86 management RPC
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `management_port` | integer | `0` | Legacy management API port (`0` = disabled; must differ from `server.port`) |
+| `management_host` | string | `"127.0.0.1"` | Bind address of the management port |
+| `management_token` | string | `""` | Bearer token for the management APIs |
+| `admin_pubkey` | string (64 hex) | `""` | Administrator pubkey for NIP-98 management auth |
+| `max_admin_body_bytes` | integer | `65536` | Body limit for the NIP-86 management RPC (`POST /` and the legacy management port); oversized requests are refused with `413` |
+
+### Key details
+
+**`management_port`** — A separate port for the legacy management REST API (`/admin/...`). `0` disables it. Must differ from `server.port`.
+
+**`max_admin_body_bytes`** — The request body limit for the NIP-86 management RPC: the JSON-RPC handler mounted on the relay's public `POST /` routes and the legacy management port. NIP-86 requests are tiny method+params documents, so the 64 KiB default is generous while keeping the publicly reachable route from buffering large bodies. Management mutations are recorded in a rate-limited audit log (at most 600 entries per minute, then a single per-window summary line) with the authenticated identity.
+
+## 5. `[server]` — server settings
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `host` | string | `"127.0.0.1"` | Bind address. `0.0.0.0` (or `::`) accepts connections from anywhere |
 | `port` | integer | `8080` | Port (1–65535). Port 80 requires root |
 | `api_host` | string | `""` | Hostname dedicated to the REST API (must be a bare hostname — no scheme, port, path or whitespace; validated at `nostrd check`/startup) |
-| `management_port` | integer | `0` | Legacy management API port (`0` = disabled; must differ from `port`) |
-| `management_host` | string | `"127.0.0.1"` | Bind address of the management port |
-| `management_token` | string | `""` | Bearer token for the management APIs |
-| `admin_pubkey` | string (64 hex) | `""` | Administrator pubkey for NIP-98 management auth |
-| `require_auth` | boolean | `false` | Require NIP-42 authentication for all REQ/EVENT/COUNT/NEG |
-| `send_auth_challenge` | boolean | `true` | Send the AUTH challenge on connect |
 | `metrics_enabled` | boolean | `true` | Serve Prometheus metrics at `/metrics` |
 | `ws_paths` | string | `"root"` | WebSocket endpoint paths: `root` (`/` only), `inbox-outbox`, or `all` |
 | `inbox_write_policy` | string | `"any"` | Write policy for `/inbox`: `any` or `relay` |
@@ -164,10 +191,6 @@ Every key is optional; a missing key uses the default shown below.
 
 **`admin_pubkey`** — The administrator's public key for NIP-98 authentication: management calls must carry a valid NIP-98 auth event (kind 27235, with a `payload` tag, a `u` tag matching the relay URL, signed by this key). Empty = NIP-98 authentication is disabled.
 
-**`require_auth`** — When `true`, the relay refuses REQ/EVENT/COUNT/NEG messages with `auth-required:` unless the connection has completed NIP-42 AUTH. Useful for a private relay. Applied per connection.
-
-**`send_auth_challenge`** — When `true` (default), every new connection is greeted with `["AUTH", "<challenge>"]` so clients can authenticate proactively. Set `false` to stay quiet (clients may then only authenticate when refused).
-
 **`metrics_enabled`** — When `true`, serves Prometheus-formatted metrics at `/metrics` (no authentication). Fixed at startup — requires a `restart`.
 
 ### Behavior notes
@@ -178,7 +201,7 @@ Every key is optional; a missing key uses the default shown below.
 
 ---
 
-## 5. `[limits]` — limits and protections
+## 6. `[limits]` — limits and protections
 
 ### Connections and messages
 
@@ -186,12 +209,12 @@ Every key is optional; a missing key uses the default shown below.
 | --- | --- | --- | --- |
 | `max_connections` | integer | `10000` | Maximum concurrent connections (must be ≥ 1) |
 | `max_connections_per_ip` | integer | `64` | Max connections per source IP (`0` = no per-IP cap) |
-| `max_ws_message_size` | integer | `1048576` | Max bytes per WebSocket message/frame |
-| `buffer_size` | integer | `2048` | Initial per-connection buffer size (bytes) |
+| `max_ws_message_bytes` | integer | `1048576` | Max bytes per WebSocket message/frame |
+| `db_buffer_size` | integer | `2048` | Initial per-connection buffer size (bytes) |
 | `max_out_queue_bytes` | integer | `262144` | Per-connection outgoing queue cap (bytes) |
 | `ws_idle_timeout_secs` | integer | `300` | Close idle connections after this long (`0` = never) |
 | `http_read_timeout_secs` | integer | `30` | Seconds to deliver a complete HTTP request head before the connection is closed (`0` = disabled; slow-loris defense — applies to WebSocket upgrades too) |
-| `max_conn_per_sec_per_ip` | integer | `0` | Max new connections per second per source IP (`0` = unlimited) |
+| `max_connections_per_sec_per_ip` | integer | `0` | Max new connections per second per source IP (`0` = unlimited) |
 | `max_events_per_min_per_pubkey` | integer | `0` | Max events a pubkey may publish per minute (`0` = unlimited) |
 | `max_req_response_bytes` | integer | `33554432` | Byte budget for one REQ response (`0` = unlimited); beyond it the subscription is closed with `CLOSED` |
 
@@ -202,7 +225,7 @@ Every key is optional; a missing key uses the default shown below.
 | `max_filters` | integer | `20` | Max filters per REQ |
 | `max_subscriptions` | integer | `20` | Max subscriptions per connection (REQ and NEG) |
 | `max_limit` | integer | `500` | Ceiling for the REQ `limit` |
-| `count_limit` | integer | `2000` | Ceiling for COUNT results |
+| `max_count` | integer | `2000` | Ceiling for COUNT results |
 | `max_sub_id_len` | integer | `64` | Max subscription id length |
 | `max_sub_bytes` | integer | `524288` | Total subscription filter bytes per connection |
 
@@ -211,11 +234,10 @@ Every key is optional; a missing key uses the default shown below.
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `max_content_bytes` | integer | `65536` | Max event content length in **characters** |
-| `max_admin_body_bytes` | integer | `65536` | Body limit for the NIP-86 management RPC (`POST /` and the legacy management port); oversized requests are refused with `413` |
 | `max_groups` | integer | `1000` | Cap on the in-memory NIP-29 group store (active groups + deleted-group markers). Creates beyond it are rejected with `restricted: group limit reached`. `0` = unlimited |
 | `max_tags` | integer | `2000` | Max tags per event |
 | `max_tag_value_bytes` | integer | `1024` | Max bytes per tag value |
-| `max_created_at_future` | integer | `3600` | Tolerated future skew of `created_at` (seconds) |
+| `max_created_at_future_secs` | integer | `3600` | Tolerated future skew of `created_at` (seconds) |
 | `require_pow` | integer | `0` | Required proof-of-work difficulty in leading zero bits |
 | `max_indexed_words` | integer | `128` | Words of content indexed for NIP-50 search |
 
@@ -223,10 +245,9 @@ Every key is optional; a missing key uses the default shown below.
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
-| `db_request_timeout_secs` | integer | `30` | Seconds a database request may wait before failing (`0` = forever) |
-| `db_queue_msgs` | integer | `4096` | Max queued messages before failing fast |
-| `db_queue_events` | integer | `262144` | Max queued events before failing fast |
-| `neg_max_items` | integer | `100000` | Max records per NIP-77 negentropy sync |
+| `max_db_queue_msgs` | integer | `4096` | Max queued messages before failing fast |
+| `max_db_queue_events` | integer | `262144` | Max queued events before failing fast |
+| `max_neg_items` | integer | `100000` | Max records per NIP-77 negentropy sync |
 | `live_buffer` | integer | `65536` | Live fan-out queue size |
 
 ### Anti-spam
@@ -240,10 +261,10 @@ Every key is optional; a missing key uses the default shown below.
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
-| `api_max_concurrent` | integer | `32` | Max concurrent `/api/v1` requests (503 beyond this) |
-| `api_max_limit` | integer | `500` | Ceiling for the API `limit` parameter (`0` = no bound) |
-| `api_max_offset` | integer | `10000` | Ceiling for the API `offset` parameter (`0` = no bound) |
-| `api_max_search_bytes` | integer | `1024` | Max bytes of the API `search` parameter (`0` = no bound) |
+| `max_api_concurrent` | integer | `32` | Max concurrent `/api/v1` requests (503 beyond this) |
+| `max_api_limit` | integer | `500` | Ceiling for the API `limit` parameter (`0` = no bound) |
+| `max_api_offset` | integer | `10000` | Ceiling for the API `offset` parameter (`0` = no bound) |
+| `max_api_search_bytes` | integer | `1024` | Max bytes of the API `search` parameter (`0` = no bound) |
 
 ### Live fan-out
 
@@ -258,9 +279,7 @@ Every key is optional; a missing key uses the default shown below.
 
 **`max_connections_per_ip`** — The number of simultaneous connections allowed from a single source IP. Prevents one host from consuming the whole connection budget. `0` = unlimited.
 
-**`max_ws_message_size`** — The maximum size of a single WebSocket message/frame in bytes. Oversized frames are rejected at the protocol layer and the connection is closed with a `message too large` notice. Also the effective ceiling for any single event.
-
-**`buffer_size`** — The initial read/write buffer size per connection (bytes). It grows on demand; a small value keeps hundreds of thousands of idle connections cheap.
+**`max_ws_message_bytes`** — The maximum size of a single WebSocket message/frame in bytes. Oversized frames are rejected at the protocol layer and the connection is closed with a `message too large` notice. Also the effective ceiling for any single event.
 
 **`max_out_queue_bytes`** — The per-connection cap on queued outgoing bytes, protecting memory against slow readers. REQ responses are pumped through the queue in bounded chunks (see `max_req_response_bytes`), so they cannot pin more than the cap either; EOSE and CLOSED messages are tiny and take the uncapped path. Live traffic is dropped when full (recoverable by re-subscribing).
 
@@ -270,9 +289,7 @@ Every key is optional; a missing key uses the default shown below.
 
 **`http_read_timeout_secs`** — Seconds a connection has to deliver a complete HTTP request head (the request line and headers) before it is closed. This closes slow-loris sockets that trickle bytes without ever completing a request — the attack would otherwise pin file descriptors and memory. Applies to every HTTP connection, WebSocket upgrades included (an upgrade request is a normal HTTP request head). `0` disables the timeout.
 
-**`max_conn_per_sec_per_ip`** — Maximum number of new connections a single source IP may open per second (sliding window). Sockets beyond the window are refused immediately. `0` = unlimited.
-
-**`max_events_per_min_per_pubkey`** — A pubkey may publish at most this many events per minute (sliding 60-second window); the excess is rejected with `rate-limited: too many events`. The window is bounded at 10,000 tracked pubkeys (the map is cleared, never grown). `0` = unlimited.
+**`max_connections_per_sec_per_ip`** — Maximum number of new connections a single source IP may open per second (sliding window). Sockets beyond the window are refused immediately. `0` = unlimited.
 
 **`max_filters`** — The maximum number of filters a single REQ (or COUNT) may carry. Violations get a `CLOSED ... too many filters` reply. This also bounds scanning work per REQ.
 
@@ -280,7 +297,7 @@ Every key is optional; a missing key uses the default shown below.
 
 **`max_limit`** — The ceiling for the `limit` value in filters. Clients asking for more get at most this many events per filter, with the NIP-67 `["EOSE", sub, ["more"]]` hint when more events exist.
 
-**`count_limit`** — The ceiling for COUNT results. When the count is cut at this value, the response carries `"approximate": true`.
+**`max_count`** — The ceiling for COUNT results. When the count is cut at this value, the response carries `"approximate": true`.
 
 **`max_sub_id_len`** — The maximum length of a subscription id. Longer ids are refused.
 
@@ -288,27 +305,13 @@ Every key is optional; a missing key uses the default shown below.
 
 **`max_content_bytes`** — The maximum length of an event's `content` field, counted in **characters** (not bytes), matching the NIP-11 `max_content_length` definition. Events above it are rejected with `invalid: content too large`.
 
-**`max_admin_body_bytes`** — The request body limit for the NIP-86 management RPC: the JSON-RPC handler mounted on the relay's public `POST /` routes and the legacy management port. NIP-86 requests are tiny method+params documents, so the 64 KiB default is generous while keeping the publicly reachable route from buffering large bodies. Management mutations are recorded in a rate-limited audit log (at most 600 entries per minute, then a single per-window summary line) with the authenticated identity.
-
-**`max_groups`** — The cap on the in-memory NIP-29 group store. The store keeps the active groups plus a marker per deleted group (the marker is permanent so a deleted group cannot be resurrected), so without a cap an attacker could churn group ids and grow the memory without limit. The cap counts both, and group creation beyond it is rejected with `restricted: group limit reached` (both on the live write path and during the startup rebuild). `0` disables the cap. Read at startup — changing it requires a `restart`.
-
 **`max_tags`** — The maximum number of tags per event. Violations are rejected with `invalid: too many tags`.
 
 **`max_tag_value_bytes`** — The maximum size (bytes) of a single tag value. Longer values are rejected with `invalid: tag value too large`.
 
-**`max_created_at_future`** — How far into the future an event's `created_at` may be. Beyond this the event is **silently dropped** (`OK false` with `mute: event creation date is in the future`) instead of being rejected as invalid.
+**`max_created_at_future_secs`** — How far into the future an event's `created_at` may be. Beyond this the event is **silently dropped** (`OK false` with `mute: event creation date is in the future`) instead of being rejected as invalid.
 
-**`require_pow`** — The required proof-of-work difficulty: the event id must start with at least this many zero bits (NIP-13), enforced only when NIP-13 is enabled. High values (≥ 64) make publishing practically impossible — the relay warns.
-
-**`max_indexed_words`** — How many words of each event's content are added to the NIP-50 search index. Higher values improve recall for long texts at a small storage cost.
-
-**`db_request_timeout_secs`** — How long a database request may wait before it fails (`0` = forever). Keeps the relay responsive when the storage is stuck. Write requests are not subject to the timeout (a false timeout would skip their side effects). The startup loads of the persisted access state (deny/allow lists, Blossom allowlist) wait without a timeout and never fail fast: an empty result would silently lift every ban (fail-open). Their SIGHUP reloads keep the previous lists when a load fails.
-
-**`db_queue_msgs`** — When the database queue holds more than this many pending messages, new requests fail fast instead of piling up in memory.
-
-**`db_queue_events`** — Like `db_queue_msgs`, but counts the events inside queued batches (the memory-dominant part). Whichever limit is hit first applies.
-
-**`neg_max_items`** — The maximum number of records a single NIP-77 negentropy sync may process. Larger syncs are refused with a `NEG-ERR`.
+**`max_neg_items`** — The maximum number of records a single NIP-77 negentropy sync may process. Larger syncs are refused with a `NEG-ERR`.
 
 **`live_buffer`** — The size of the fan-out queue between the relay and the broadcaster. On overflow, events are dropped for live delivery (they stay available via subscriptions).
 
@@ -316,13 +319,13 @@ Every key is optional; a missing key uses the default shown below.
 
 **`group_late_publish_secs`** — NIP-29: group events older than this many seconds are rejected (`invalid: event is too old for this group`), preventing re-writing of group history. `0` = disabled.
 
-**`api_max_concurrent`** — The maximum number of `/api/v1` requests served at once. Beyond it, new requests get `503 server is busy` immediately instead of queueing.
+**`max_api_concurrent`** — The maximum number of `/api/v1` requests served at once. Beyond it, new requests get `503 server is busy` immediately instead of queueing.
 
-**`api_max_limit`** — The ceiling for the API's `limit` parameter. Requests above it are silently clamped down. `0` = no bound.
+**`max_api_limit`** — The ceiling for the API's `limit` parameter. Requests above it are silently clamped down. `0` = no bound.
 
-**`api_max_offset`** — The ceiling for the API's `offset` parameter. Requests above it are rejected with a `400` explaining the limit. `0` = no bound.
+**`max_api_offset`** — The ceiling for the API's `offset` parameter. Requests above it are rejected with a `400` explaining the limit. `0` = no bound.
 
-**`api_max_search_bytes`** — The maximum length (bytes) of the API's `search` parameter. Longer values are rejected with a `400`. `0` = no bound.
+**`max_api_search_bytes`** — The maximum length (bytes) of the API's `search` parameter. Longer values are rejected with a `400`. `0` = no bound.
 
 **`live_batch_interval_ms`** — How often (milliseconds) accumulated live events are flushed to subscribers (clamped to 1-1000).
 
@@ -330,15 +333,15 @@ Every key is optional; a missing key uses the default shown below.
 
 ### Behavior notes
 
-- **`max_created_at_future`** uses the NIP-01 `mute:` prefix — the event is silently dropped, not rejected as invalid.
+- **`max_created_at_future_secs`** uses the NIP-01 `mute:` prefix — the event is silently dropped, not rejected as invalid.
 - **`max_out_queue_bytes`** protects against slow readers; REQ responses are never dropped by it (see key details).
 - **`new_pubkey_min_age_secs`**: the first-seen timestamp is only recorded when an event actually stores, so failed first events cannot pre-warm the account-age clock.
-- **`api_max_limit`** clamps silently; **`api_max_offset`** and **`api_max_search_bytes`** reject with a clear `400` error message.
+- **`max_api_limit`** clamps silently; **`max_api_offset`** and **`max_api_search_bytes`** reject with a clear `400` error message.
 - COUNT with hidden events (NIP-70/59/29) reports the *visible* count, preserving privacy.
 
 ---
 
-## 6. `[database]` — database settings
+## 7. `[database]` — database settings
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -346,7 +349,7 @@ Every key is optional; a missing key uses the default shown below.
 | `max_dbs` | integer | `32` | LMDB max named databases (must be ≥ 16) |
 | `max_readers` | integer | `128` | LMDB max concurrent readers (must be ≥ 8) |
 | `map_size` | integer | `1073741824` (1 GB) | Floor for the memory map size (bytes) |
-| `map_max_size` | integer | `1099511627776` (1 TB) | Memory-map ceiling (bytes) |
+| `max_map_size` | integer | `1099511627776` (1 TB) | Memory-map ceiling (bytes) |
 | `purge_interval_secs` | integer | `300` | NIP-40 purge interval (seconds) |
 | `search_index` | boolean | `true` | Enable the NIP-50 word index |
 
@@ -360,16 +363,22 @@ Every key is optional; a missing key uses the default shown below.
 
 **`map_size`** — The floor for the memory map size in bytes. The map is opened at least this large (1 GB default).
 
-**`map_max_size`** — The memory-map ceiling in bytes. The map is opened at this size as a **sparse virtual reservation** — physical disk grows only with the data actually written, so a large ceiling costs nothing until used. When the map fills, writes fail with `database map is full: increase database.map_max_size` (reads keep working). Must be ≥ `map_size`.
+**`max_map_size`** — The memory-map ceiling in bytes. The map is opened at this size as a **sparse virtual reservation** — physical disk grows only with the data actually written, so a large ceiling costs nothing until used. When the map fills, writes fail with `database map is full: increase database.max_map_size` (reads keep working). Must be ≥ `map_size`.
 
 **`purge_interval_secs`** — How often (seconds) NIP-40 expired events are physically removed from the database. Expired events are hidden from queries even between purges.
 
 **`search_index`** — When `true`, event content is word-indexed for fast NIP-50 search. When `false`, search still works (whole-word matching against content) but scans are slower. Toggling takes effect at startup. For a tiny VPS (0.25 vCPU / 512 MB) set `search_index = false` — it **halves the database** (41.8 MB → 20.5 MB per 10,000 events with 3 tags and 21 words in testing) and saves CPU/IO; see the Manual's [Low-spec Tuning](MANUAL.md#low-spec-vps-025-vcpu--512-mb).
+**`db_buffer_size`** — The LMDB environment's read/write buffer size in bytes (the `read_buffer_size`/`write_buffer_size` of the opened environment).
+**`max_indexed_words`** — How many words of each event's content are added to the NIP-50 search index. Higher values improve recall for long texts at a small storage cost.
+**`db_request_timeout_secs`** — How long a database request may wait before it fails (`0` = forever). Keeps the relay responsive when the storage is stuck. Write requests are not subject to the timeout (a false timeout would skip their side effects). The startup loads of the persisted access state (deny/allow lists, Blossom allowlist) wait without a timeout and never fail fast: an empty result would silently lift every ban (fail-open). Their SIGHUP reloads keep the previous lists when a load fails.
+**`max_db_queue_msgs`** — When the database queue holds more than this many pending messages, new requests fail fast instead of piling up in memory.
+**`max_db_queue_events`** — Like `max_db_queue_msgs`, but counts the events inside queued batches (the memory-dominant part). Whichever limit is hit first applies.
+
 
 ### Behavior notes
 
-- The memory map is never resized at runtime: raising `map_max_size` requires a `restart`.
-- `map_size` must not exceed `map_max_size` (`nostrd check` rejects the combination).
+- The memory map is never resized at runtime: raising `max_map_size` requires a `restart`.
+- `map_size` must not exceed `max_map_size` (`nostrd check` rejects the combination).
 - Search semantics are the same with or without the index: whole-word matching (see the troubleshooting guide).
 
 ### Upgrades are automatic and instant
@@ -383,7 +392,7 @@ Every key is optional; a missing key uses the default shown below.
 
 ---
 
-## 7. `[daemon]` — daemon settings
+## 8. `[daemon]` — daemon settings
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -391,22 +400,22 @@ Every key is optional; a missing key uses the default shown below.
 | `log_file` | string | `"./nostrd.log"` | Log file path |
 | `stats_file` | string | `"./nostrd.stats.json"` | Statistics file path |
 | `stats_interval_secs` | integer | `5` | Statistics write interval (seconds) |
-| `log_max_size_bytes` | integer | `52428800` (50 MB) | Log rotation size (`0` = no rotation) |
-| `log_max_files` | integer | `5` | Rotated log generations to keep |
+| `max_log_size_bytes` | integer | `52428800` (50 MB) | Log rotation size (`0` = no rotation) |
+| `max_log_files` | integer | `5` | Rotated log generations to keep |
 
 ### Key details
 
 **`pid_file`** — Where the daemon writes its process id. `stop`/`restart` use it to signal the daemon. A stale entry (dead process, or a pid reused by a different program) is detected and ignored.
 
-**`log_file`** — Where the daemon writes its log. Rotated when it grows past `log_max_size_bytes`.
+**`log_file`** — Where the daemon writes its log. Rotated when it grows past `max_log_size_bytes`.
 
 **`stats_file`** — Where live statistics are written (atomically, via temp-file + rename) every `stats_interval_secs` seconds. Read by `nostrd stats`; the same data is served at `/relay/stats`.
 
 **`stats_interval_secs`** — How often the statistics file is refreshed (≥ 1).
 
-**`log_max_size_bytes`** — Rotate the log when it reaches this size (`0` = never rotate). The current file becomes `.1`, older backups shift up.
+**`max_log_size_bytes`** — Rotate the log when it reaches this size (`0` = never rotate). The current file becomes `.1`, older backups shift up.
 
-**`log_max_files`** — How many rotated generations to keep (`.1`, `.2`, ... `.N`); older backups are discarded.
+**`max_log_files`** — How many rotated generations to keep (`.1`, `.2`, ... `.N`); older backups are discarded.
 
 ### Behavior notes
 
@@ -415,7 +424,7 @@ Every key is optional; a missing key uses the default shown below.
 
 ---
 
-## 8. `[access]` — access control
+## 9. `[access]` — access control
 
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -477,7 +486,7 @@ nostrd relay list                # show both lists and restrict_relay
 
 **`storage`** — `"local"` keeps files on the server disk; `"s3"` stores objects in an S3-compatible bucket (AWS S3 or Cloudflare R2). Both use the `bucket/{npub1xxx}/{file}` hierarchy: files are content-addressed by their SHA-256 and kept under the uploader's npub directory.
 
-**`max_upload_bytes`** — The HTTP body limit for uploads. Note that `limits.max_ws_message_size` is unrelated (it governs WebSocket events).
+**`max_upload_bytes`** — The HTTP body limit for uploads. Note that `limits.max_ws_message_bytes` is unrelated (it governs WebSocket events).
 
 **`local_path`** — Local storage. The store refuses paths that a local attacker has replaced with symlinks (reads, writes and deletes never follow a symlinked blob file or npub directory), so the blob tree cannot be redirected outside the configured root.
 
@@ -508,7 +517,7 @@ Each `allow`/`deny` writes the database and reloads the running daemon (SIGHUP),
 
 ---
 
-## 9. Validation rules
+## 10. Validation rules
 
 `nostrd check` (and startup) rejects invalid configurations with a clear message:
 
@@ -517,11 +526,11 @@ Each `allow`/`deny` writes the database and reloads the running daemon (SIGHUP),
 | `pubkey`/`admin_pubkey`/access pubkeys must be 64 hex chars | `relay.pubkey must be 64 hex characters (32 bytes)` |
 | `private_key` must be a valid secp256k1 secret key | `relay.private_key is not a valid secp256k1 secret key` |
 | `port` must be 1–65535 | `server.port must be between 1 and 65535` |
-| `management_port` must differ from `port` | `server.management_port must differ from server.port` |
+| `management_port` must differ from `port` | `rpc.management_port must differ from server.port` |
 | `api_host` / `blossom.host` must be bare hostnames | `server.api_host must be a bare hostname (no scheme, port or path), got "https://..."` |
 | `api_host` must differ from `blossom.host` | `server.api_host and blossom.host must be different hostnames` |
 | blocked IPs must parse | `access.blocked_ips contains an invalid IP address: "..."` |
-| `map_size` ≤ `map_max_size` | `database.map_size must not exceed database.map_max_size` |
+| `map_size` ≤ `max_map_size` | `database.map_size must not exceed database.max_map_size` |
 | Core limits must be ≥ 1 | `limits.max_connections must be at least 1 (got 0)` |
 | Paths must not be empty | `database.path must not be empty` |
 
@@ -540,10 +549,10 @@ Editing the file and sending `kill -HUP $(cat nostrd.pid)` reloads it **without 
 
 | Applies on SIGHUP | Requires `nostrd restart` |
 | --- | --- |
-| `relay.name`, `description`, `pubkey`, `contact`, `icon`, `post_policy`, `public_url`, `relay.reject_ephemeral`, `relay.enable_git` | `relay.private_key` |
+| `relay.name`, `description`, `pubkey`, `contact`, `icon`, `post_policy`, `public_url`, `relay.reject_ephemeral`, `relay.enabled_git` | `relay.private_key` |
 | most of `[limits]` (the restart-column entries below apply on restart only) | `relay.livekit_*`, `relay.enabled_nips` / `disabled_nips` |
-| NIP-40 on/off, API concurrency | `server.host`, `server.port`, `server.api_host`, `server.ws_paths`, `server.management_port`, `server.management_host`, `server.metrics_enabled` |
-| — | `database.path`, `database.purge_interval_secs`, `daemon.log_max_size_bytes`, `log_max_files`, `stats_interval_secs`, `db_request_timeout_secs`, `db_queue_msgs`, `db_queue_events`, `max_indexed_words`, `live_buffer`, `live_batch_size`, `live_batch_interval_ms`, `max_connections`, `http_read_timeout_secs`, `max_conn_per_sec_per_ip`, `max_admin_body_bytes`, `max_groups`, `blossom.host`, `blossom.storage`, `blossom.local_path`, `blossom.max_upload_bytes`, `blossom.min_free_bytes`, `blossom.s3_*` |
+| NIP-40 on/off, API concurrency | `server.host`, `server.port`, `server.api_host`, `server.ws_paths`, `rpc.management_port`, `rpc.management_host`, `server.metrics_enabled` |
+| — | `database.path`, `database.purge_interval_secs`, `daemon.max_log_size_bytes`, `max_log_files`, `stats_interval_secs`, `database.db_request_timeout_secs`, `max_db_queue_msgs`, `max_db_queue_events`, `max_indexed_words`, `live_buffer`, `live_batch_size`, `live_batch_interval_ms`, `max_connections`, `http_read_timeout_secs`, `max_connections_per_sec_per_ip`, `rpc.max_admin_body_bytes`, `relay.max_groups`, `blossom.host`, `blossom.storage`, `blossom.local_path`, `blossom.max_upload_bytes`, `blossom.min_free_bytes`, `blossom.s3_*` |
 
 `[access]` is **not** applied by a reload: the access lists are seeded once at startup and then managed at runtime via NIP-86.
 
@@ -569,7 +578,7 @@ livekit_api_secret = ""
 enabled_nips = []
 disabled_nips = []
 reject_ephemeral = false
-enable_git = false
+enabled_git = false
 
 [server]
 host = "0.0.0.0"
@@ -586,34 +595,34 @@ metrics_enabled = true
 [limits]
 max_connections = 10000
 max_connections_per_ip = 64
-max_ws_message_size = 1048576
+max_ws_message_bytes = 1048576
 max_filters = 20
 max_subscriptions = 20
 max_limit = 500
-count_limit = 2000
+max_count = 2000
 max_sub_id_len = 64
 max_content_bytes = 65536
 max_tags = 2000
 max_tag_value_bytes = 1024
-max_created_at_future = 3600
+max_created_at_future_secs = 3600
 require_pow = 0
 max_indexed_words = 128
-buffer_size = 2048
-neg_max_items = 100000
+db_buffer_size = 2048
+max_neg_items = 100000
 db_request_timeout_secs = 30
 new_pubkey_min_age_secs = 0
 max_out_queue_bytes = 262144
 ws_idle_timeout_secs = 300
-db_queue_msgs = 4096
-db_queue_events = 262144
+max_db_queue_msgs = 4096
+max_db_queue_events = 262144
 max_sub_bytes = 524288
 group_late_publish_secs = 604800
-api_max_concurrent = 32
-api_max_limit = 500
-api_max_offset = 10000
-api_max_search_bytes = 1024
+max_api_concurrent = 32
+max_api_limit = 500
+max_api_offset = 10000
+max_api_search_bytes = 1024
 http_read_timeout_secs = 30
-max_conn_per_sec_per_ip = 0
+max_connections_per_sec_per_ip = 0
 max_events_per_min_per_pubkey = 0
 max_req_response_bytes = 33554432
 live_batch_interval_ms = 10
@@ -625,7 +634,7 @@ path = "./data"
 max_dbs = 32
 max_readers = 128
 map_size = 1073741824
-map_max_size = 1099511627776
+max_map_size = 1099511627776
 purge_interval_secs = 300
 search_index = true
 
@@ -634,8 +643,8 @@ pid_file = "./nostrd.pid"
 log_file = "./nostrd.log"
 stats_file = "./nostrd.stats.json"
 stats_interval_secs = 5
-log_max_size_bytes = 52428800
-log_max_files = 5
+max_log_size_bytes = 52428800
+max_log_files = 5
 
 [access]
 restrict_relay = false

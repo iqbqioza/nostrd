@@ -511,23 +511,23 @@ async fn rpc_authenticated(
     uri: &axum::http::Uri,
 ) -> Option<String> {
     let cfg = relay.config.read().await;
-    if !cfg.server.management_token.is_empty()
+    if !cfg.rpc.management_token.is_empty()
         && let Some(token) = headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "))
-        && ct_eq(token, &cfg.server.management_token)
+        && ct_eq(token, &cfg.rpc.management_token)
     {
         return Some("management-token".into());
     }
-    if !cfg.server.admin_pubkey.is_empty()
+    if !cfg.rpc.admin_pubkey.is_empty()
         && let Some(auth) = headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.strip_prefix("Nostr "))
         && let Some(pubkey) = nip98::verify(
             auth,
-            Some(&cfg.server.admin_pubkey),
+            Some(&cfg.rpc.admin_pubkey),
             relay.secp(),
             true,
             "POST",
@@ -546,7 +546,7 @@ mod tests {
     use crate::config::Config;
     use crate::relay::Relay;
 
-    /// A relay with `server.management_token` configured (the bearer
+    /// A relay with `rpc.management_token` configured (the bearer
     /// token path, so the tests need no NIP-98 signing).
     async fn build_admin_relay() -> std::sync::Arc<Relay> {
         build_admin_relay_with_key(None).await
@@ -563,7 +563,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         let mut cfg = Config::default();
         cfg.database.path = path;
-        cfg.server.management_token = "test-token".into();
+        cfg.rpc.management_token = "test-token".into();
         if let Some(key) = key {
             cfg.relay.enabled_nips = vec![43];
             cfg.relay.private_key = key.to_string();

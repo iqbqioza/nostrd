@@ -77,7 +77,7 @@ Author identifiers (`{npub1...}`) may also be given as a **64-hex pubkey** (case
 
 - `since` / `until` bound the range (unix seconds); without them the **whole period** is covered, from the earliest stored event of that author and kind to now (an author with no events returns an empty list).
 - Every month in the range is reported, zero-filled, oldest first; the range is capped at **1200 months** (exceeding it returns `400`, as does `until < since`).
-- `approximate: true` marks a month whose count hit the collection limit (`limits.count_limit`), mirroring NIP-45.
+- `approximate: true` marks a month whose count hit the collection limit (`limits.max_count`), mirroring NIP-45.
 - The same visibility rules as the rest of the API apply (protected events, gift wraps and private/hidden group content are withheld).
 
 ### `server.api_host` (host-based routing)
@@ -128,12 +128,12 @@ All parameters are optional and passed as URL query strings.
 
 | Parameter | Type | Description |
 | --- | --- | --- |
-| `limit` | integer | Max results (default `100` for npub queries; capped by `limits.api_max_limit`; `0` in the config means "no bound") |
-| `offset` | integer | Number of visible results to skip (pagination; capped by `limits.api_max_offset` — exceeding it returns `400`) |
+| `limit` | integer | Max results (default `100` for npub queries; capped by `limits.max_api_limit`; `0` in the config means "no bound") |
+| `offset` | integer | Number of visible results to skip (pagination; capped by `limits.max_api_offset` — exceeding it returns `400`) |
 | `since` | integer | Only events with `created_at >= since` |
 | `until` | integer | Only events with `created_at <= until` |
 | `sort` | string | `asc` or `ascending` = oldest first; anything else (default) = newest first |
-| `search` | string | NIP-50 full-text search on content (whole-word matching; length capped by `limits.api_max_search_bytes` — exceeding it returns `400`) |
+| `search` | string | NIP-50 full-text search on content (whole-word matching; length capped by `limits.max_api_search_bytes` — exceeding it returns `400`) |
 | `e` | string | Require an `e` tag with this value |
 | `p` | string | Require a `p` tag with this value |
 | `t` | string | Require a `t` tag with this value |
@@ -216,9 +216,9 @@ Errors return a JSON body with an `error` field:
 | --- | --- |
 | `invalid identifier: ...` | The NIP-19 identifier cannot be decoded (400) |
 | `the endpoint requires an npub1 identifier or a 64-hex pubkey` | A kind path given with a note1/nevent1/naddr1 identifier, or an unrecognized path (400) |
-| `offset exceeds the maximum of 10000` | `offset` above `api_max_offset` (400) |
-| `search exceeds the maximum of 1024 bytes` | `search` longer than `api_max_search_bytes` (400) |
-| `server is busy, try again shortly` | Too many concurrent API requests (`api_max_concurrent` reached) (503) |
+| `offset exceeds the maximum of 10000` | `offset` above `max_api_offset` (400) |
+| `search exceeds the maximum of 1024 bytes` | `search` longer than `max_api_search_bytes` (400) |
+| `server is busy, try again shortly` | Too many concurrent API requests (`max_api_concurrent` reached) (503) |
 | `not found` | The path does not exist, or the Host header does not match `api_host` (404) |
 
 ---
@@ -281,5 +281,5 @@ curl "http://127.0.0.1:8080/api/v1/npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3ev
 
 ## Related
 
-- [Manual (MANUAL.md)](MANUAL.md) — configuration reference for the API limits (`api_max_concurrent`, `api_max_limit`, `api_max_offset`, `api_max_search_bytes`)
+- [Manual (MANUAL.md)](MANUAL.md) — configuration reference for the API limits (`max_api_concurrent`, `max_api_limit`, `max_api_offset`, `max_api_search_bytes`)
 - [Troubleshooting (TROUBLESHOOTING.md)](TROUBLESHOOTING.md)

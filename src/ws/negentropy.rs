@@ -85,12 +85,12 @@ impl super::Conn {
         };
         // NIP-42: an auth-requiring relay applies the same policy to
         // negentropy subscriptions as to REQ subscriptions.
-        if self.relay.config.read().await.server.require_auth && !self.is_authed() {
+        if self.relay.config.read().await.relay.require_auth && !self.is_authed() {
             self.send_neg_err(&sub_id, "auth-required: please authenticate before syncing");
             return;
         }
 
-        let max_items = self.relay.config.read().await.limits.neg_max_items;
+        let max_items = self.relay.config.read().await.limits.max_neg_items;
         let max_subs = self.relay.config.read().await.limits.max_subscriptions;
         if self.neg.len() >= max_subs {
             self.send_neg_err(&sub_id, "error: too many subscriptions");

@@ -114,30 +114,30 @@ fn error_response(status: StatusCode, message: &str) -> (StatusCode, Json<Value>
 /// and over-long `search` terms are rejected.
 fn bound_params(params: &mut ApiParams, cfg: &Config) -> Result<(), (StatusCode, String)> {
     let limits = &cfg.limits;
-    if limits.api_max_limit > 0
+    if limits.max_api_limit > 0
         && let Some(limit) = params.limit
-        && limit > limits.api_max_limit
+        && limit > limits.max_api_limit
     {
-        params.limit = Some(limits.api_max_limit);
+        params.limit = Some(limits.max_api_limit);
     }
-    if limits.api_max_offset > 0
+    if limits.max_api_offset > 0
         && let Some(offset) = params.offset
-        && offset > limits.api_max_offset
+        && offset > limits.max_api_offset
     {
         return Err((
             StatusCode::BAD_REQUEST,
-            format!("offset exceeds the maximum of {}", limits.api_max_offset),
+            format!("offset exceeds the maximum of {}", limits.max_api_offset),
         ));
     }
-    if limits.api_max_search_bytes > 0
+    if limits.max_api_search_bytes > 0
         && let Some(ref search) = params.search
-        && search.len() > limits.api_max_search_bytes
+        && search.len() > limits.max_api_search_bytes
     {
         return Err((
             StatusCode::BAD_REQUEST,
             format!(
                 "search exceeds the maximum of {} bytes",
-                limits.api_max_search_bytes
+                limits.max_api_search_bytes
             ),
         ));
     }
@@ -328,8 +328,8 @@ pub async fn api_handler(
         } => {
             let hex_pk = hex::encode(pubkey);
             // `bound_params` already capped `params.limit` at
-            // `limits.api_max_limit` when one is configured; there is no
-            // hardcoded ceiling here (a configured `api_max_limit: 0` means
+            // `limits.max_api_limit` when one is configured; there is no
+            // hardcoded ceiling here (a configured `max_api_limit: 0` means
             // "no bound").
             let limit = params.limit.unwrap_or(100);
             // No per-filter `limit`: see the Pubkey handler.
@@ -374,8 +374,8 @@ pub async fn api_kind_handler(
     };
     {
         // `bound_params` already capped `params.limit` at
-        // `limits.api_max_limit` when one is configured; there is no
-        // hardcoded ceiling here (a configured `api_max_limit: 0` means
+        // `limits.max_api_limit` when one is configured; there is no
+        // hardcoded ceiling here (a configured `max_api_limit: 0` means
         // "no bound").
         let limit = params.limit.unwrap_or(100);
         // No per-filter `limit`: query_and_respond fetches `limit+offset+1`
@@ -467,7 +467,7 @@ pub async fn api_monthly_handler(
             Json(json!({ "error": "server is busy, try again shortly" })),
         );
     };
-    let count_limit = relay.config.read().await.limits.count_limit;
+    let count_limit = relay.config.read().await.limits.max_count;
 
     let mut month_counts = Vec::with_capacity(months.len());
     let mut total = 0u64;
@@ -559,7 +559,7 @@ pub async fn api_count_handler(
             Json(json!({ "error": "server is busy, try again shortly" })),
         );
     };
-    let count_limit = relay.config.read().await.limits.count_limit;
+    let count_limit = relay.config.read().await.limits.max_count;
     let now = unix_now();
     let mut filter = apply_params(Filter::default(), &params);
     if !relay.config.read().await.nip_enabled(50) {
@@ -608,7 +608,7 @@ pub async fn api_kinds_handler(
             Json(json!({ "error": "server is busy, try again shortly" })),
         );
     };
-    let count_limit = relay.config.read().await.limits.count_limit;
+    let count_limit = relay.config.read().await.limits.max_count;
     let now = unix_now();
     let filter: Filter = serde_json::from_value(json!({ "authors": [hex_pk] })).expect("static");
     let (events, more) = relay.db.api_count(vec![filter], count_limit, now).await;
@@ -679,7 +679,7 @@ pub async fn api_daily_handler(
             Json(json!({ "error": "server is busy, try again shortly" })),
         );
     };
-    let count_limit = relay.config.read().await.limits.count_limit;
+    let count_limit = relay.config.read().await.limits.max_count;
 
     let mut day_counts = Vec::with_capacity(days_in_month as usize);
     let mut total = 0u64;
@@ -775,7 +775,7 @@ pub async fn api_stats_handler(
             Json(json!({ "error": "server is busy, try again shortly" })),
         );
     };
-    let count_limit = relay.config.read().await.limits.count_limit;
+    let count_limit = relay.config.read().await.limits.max_count;
     let now = unix_now();
     let filter: Filter = serde_json::from_value(json!({ "authors": [hex_pk] })).expect("static");
 
@@ -875,7 +875,7 @@ pub async fn api_hourly_handler(
             Json(json!({ "error": "server is busy, try again shortly" })),
         );
     };
-    let count_limit = relay.config.read().await.limits.count_limit;
+    let count_limit = relay.config.read().await.limits.max_count;
 
     let mut hour_counts = Vec::with_capacity(24);
     let mut total = 0u64;

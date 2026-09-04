@@ -20,11 +20,11 @@
 # server auth settings, the NIP toggles (including the NIP-40 toggle, applied
 # live) and the REST API concurrency ceiling apply immediately. A few settings
 # are captured at startup and require a full restart: live_buffer /
-# live_batch_size / live_batch_interval_ms, server.api_host, server.
-# management_port, server.metrics_enabled, relay.private_key (a reload warns
-# that it is ignored), relay.livekit_url, daemon.log_max_size_bytes /
-# log_max_files, the database request timeouts and queue caps,
-# purge_interval_secs, stats_interval_secs and max_indexed_words.
+# live_batch_size / live_batch_interval_ms, server.api_host,
+# rpc.management_port, server.metrics_enabled, relay.private_key (a reload
+# warns that it is ignored), relay.livekit_url, daemon.max_log_size_bytes /
+# max_log_files, the database request timeouts and queue caps,
+# purge_interval_secs, stats_interval_secs and database.max_indexed_words.
 # An invalid reloaded file is rejected (the old configuration stays in force).
 # =============================================================================
 
@@ -87,6 +87,36 @@ disabled_nips = []
 # forwarded live to subscribers.
 reject_ephemeral = false
 
+# When true, NIP-34 git events (kinds 1617-1633, 30617/30618) are accepted
+# and NIP-34 is advertised. Default false: the kinds are rejected.
+enabled_git = false
+
+# NIP-13 proof-of-work difficulty required for new events (0 disables).
+require_pow = 0
+
+# Spam defense: events from pubkeys first seen less than this many seconds
+# ago are rejected with `restricted: your account is too new`. 0 disables.
+new_pubkey_min_age_secs = 0
+
+# Spam defense: a pubkey may publish at most this many events per minute
+# (sliding 60-second window; the excess gets `rate-limited: too many
+# events`). 0 disables the check.
+max_events_per_min_per_pubkey = 0
+
+# Cap on the in-memory NIP-29 group store (active groups + deleted-group
+# markers). Creates beyond it are rejected; 0 = unlimited.
+max_groups = 1000
+
+# Require every connection to perform the NIP-42 AUTH flow before REQ and
+# EVENT messages are honored.
+require_auth = false
+
+# Send the NIP-42 AUTH challenge to every new connection. The challenge is
+# only ever sent at connect time, so `require_auth = true` with this set to
+# false is a total lockout (no client can authenticate); `nostrd check`
+# warns about the combination.
+send_auth_challenge = true
+
 # -----------------------------------------------------------------------------
 # Network server
 # -----------------------------------------------------------------------------
@@ -114,30 +144,6 @@ api_host = ""
 # the client scheme via `X-Forwarded-Proto` (ws/wss/http/https are all
 # accepted), so Cloudflare Tunnel and similar setups work out of the box.
 # For those setups set relay.public_url to the public wss:// address.
-
-# Separate localhost management port for the legacy NIP-86 REST endpoints;
-# 0 disables the management server entirely. The NIP-86 JSON-RPC API is
-# always served on the relay's own HTTP endpoint.
-management_port = 0
-management_host = "127.0.0.1"
-
-# Bearer token that authorizes NIP-86 management calls
-# (Authorization: Bearer <token>). Empty disables this method.
-management_token = ""
-
-# Admin pubkey that authorizes NIP-86 management calls via a NIP-98 event
-# (Authorization: Nostr <base64 event>). Empty disables this method.
-admin_pubkey = ""
-
-# Require every connection to perform the NIP-42 AUTH flow before REQ and
-# EVENT messages are honored.
-require_auth = false
-
-# Send the NIP-42 AUTH challenge to every new connection. The challenge is
-# only ever sent at connect time, so `require_auth = true` with this set to
-# false is a total lockout (no client can authenticate); `nostrd check` warns
-# about the combination.
-send_auth_challenge = true
 
 # Expose Prometheus metrics on GET /metrics (text format). Served on the API
 # host when one is configured; without api_host the metrics are public on
@@ -173,6 +179,25 @@ outbox_write_policy = "any"
 # -----------------------------------------------------------------------------
 # Limits (anti-abuse and resource bounds)
 # -----------------------------------------------------------------------------
+[rpc]
+# Separate localhost management port for the legacy NIP-86 REST endpoints;
+# 0 disables the management server entirely. The NIP-86 JSON-RPC API is
+# always served on the relay's own HTTP endpoint.
+management_port = 0
+management_host = "127.0.0.1"
+
+# Bearer token that authorizes NIP-86 management calls
+# (Authorization: Bearer <token>). Empty disables this method.
+management_token = ""
+
+# Admin pubkey that authorizes NIP-86 management calls via a NIP-98 event
+# (Authorization: Nostr <base64 event>). Empty disables this method.
+admin_pubkey = ""
+
+# Body limit for the NIP-86 management RPC (JSON-RPC and the legacy
+# management endpoints); oversized requests are refused with 413.
+max_admin_body_bytes = 65536
+
 [limits]
 # Maximum number of concurrent connections (WebSocket and HTTP).
 max_connections = 10000
@@ -184,7 +209,7 @@ max_connections_per_ip = 64
 
 # Maximum number of new connections a single source IP may open per second
 # (sliding window; sockets beyond it are refused immediately). 0 = unlimited.
-max_conn_per_sec_per_ip = 0
+max_connections_per_sec_per_ip = 0
 
 # Seconds a connection has to deliver a complete HTTP request head (the
 # request line and headers) before it is closed: closes slow-loris sockets
@@ -193,7 +218,7 @@ max_conn_per_sec_per_ip = 0
 http_read_timeout_secs = 30
 
 # Maximum size in bytes of a single incoming WebSocket message.
-max_ws_message_size = 1048576
+max_ws_message_bytes = 1048576
 
 # Maximum number of filters in a single REQ/COUNT message.
 max_filters = 20
@@ -210,18 +235,15 @@ max_limit = 500
 
 # Cap for the number of events counted by a NIP-45 COUNT (results beyond the
 # cap are reported with `"approximate": true`).
-count_limit = 2000
+max_count = 2000
 
 # Maximum length of a subscription id.
 max_sub_id_len = 64
 
 # Maximum number of characters (unicode) of an event's `content` field,
 # matching the NIP-11 `max_content_length` semantics. The byte size is
-# bounded by max_ws_message_size instead.
+# bounded by max_ws_message_bytes instead.
 max_content_bytes = 65536
-max_admin_body_bytes = 65536        # NIP-86 management RPC body limit
-max_groups = 1000                  # NIP-29 group store cap (0 = unlimited)
-
 # Maximum number of tags on an event.
 max_tags = 2000
 
@@ -230,33 +252,13 @@ max_tag_value_bytes = 1024
 
 # Events whose created_at is more than this many seconds in the future are
 # silently dropped with an OK `mute:` prefix instead of rejected.
-max_created_at_future = 3600
-
-# NIP-13 proof-of-work difficulty required for new events (0 disables).
-require_pow = 0
-
-# Maximum number of content words indexed for NIP-50 search per event.
-max_indexed_words = 128
-
-# Initial size in bytes of each connection's WebSocket read/write buffers
-# (they grow on demand). Keep small so that many idle connections do not
-# pin megabytes each.
-buffer_size = 2048
+max_created_at_future_secs = 3600
 
 # NIP-77: maximum number of records a single NEG-OPEN may process; queries
 # exceeding this are rejected with a NEG-ERR carrying the cap.
-neg_max_items = 100000
-
-# Seconds a database request may wait before timing out (0 = wait forever).
-# A timeout keeps the relay responsive even when the storage is stuck: the
-# request fails with a clear error instead of hanging the connection.
-db_request_timeout_secs = 30
+max_neg_items = 100000
 
 # Spam defense: a pubkey's first accepted event is recorded, and events from
-# pubkeys first seen less than this many seconds ago are rejected with
-# `restricted: your account is too new`. 0 disables the check.
-new_pubkey_min_age_secs = 0
-
 # Maximum bytes of outgoing messages queued per connection before new ones
 # are dropped (protects memory against slow readers).
 max_out_queue_bytes = 262144
@@ -269,23 +271,12 @@ max_out_queue_bytes = 262144
 ws_idle_timeout_secs = 300
 
 # Spam defense: a pubkey may publish at most this many events per minute
-# (sliding 60-second window; the excess gets `rate-limited: too many events`).
-# 0 disables the check.
-max_events_per_min_per_pubkey = 0
-
 # Byte budget for a single REQ response: the stored events are pumped to the
 # socket in bounded chunks as it drains, so a slow reader cannot pin more
 # than max_out_queue_bytes in the queue — or more than this budget per
 # response. Beyond the budget the subscription is closed with
 # `CLOSED ... response too large`. 0 disables the budget.
 max_req_response_bytes = 33554432
-
-# Overload protection: when the database thread's queue holds more than this
-# many pending messages (or db_queue_events pending events), new database
-# requests fail fast instead of accumulating in memory. Keeps the relay up
-# under sustained overload instead of running out of memory.
-db_queue_msgs = 4096
-db_queue_events = 262144
 
 # Maximum total bytes of subscription filters held per connection.
 max_sub_bytes = 524288
@@ -310,19 +301,19 @@ live_buffer = 65536
 # Maximum number of concurrent `/api/v1` queries served at once. Requests
 # beyond this limit fail fast with a 503 instead of queuing up behind
 # WebSocket work.
-api_max_concurrent = 32
+max_api_concurrent = 32
 
 # Upper bound for the `limit` query parameter (0 = no bound). Larger values
 # are clamped down to this ceiling.
-api_max_limit = 500
+max_api_limit = 500
 
 # Upper bound for the `offset` query parameter (0 = no bound). Larger values
 # are rejected with a 400.
-api_max_offset = 10000
+max_api_offset = 10000
 
 # Maximum length in bytes of the `search` query parameter (0 = no bound).
 # Longer values are rejected with a 400.
-api_max_search_bytes = 1024
+max_api_search_bytes = 1024
 
 # -----------------------------------------------------------------------------
 # Database (LMDB via heed)
@@ -339,7 +330,7 @@ max_readers = 128
 
 # Memory map size in bytes. The map is a virtual address space reservation
 # backed by a sparse file: physical memory and disk usage grow only with the
-# data actually stored. The map is opened at map_max_size (or map_size,
+# data actually stored. The map is opened at max_map_size (or map_size,
 # whichever is larger) and never resized at runtime: resizing would require
 # that no read transactions are active, which cannot be guaranteed while the
 # shared reader and the REST API reader threads hold concurrent read
@@ -348,7 +339,7 @@ map_size = 1073741824
 
 # Real ceiling of the memory map in bytes. On 32-bit systems it is capped at
 # 2 GiB.
-map_max_size = 1099511627776
+max_map_size = 1099511627776
 
 # Interval in seconds between NIP-40 expired-event purge runs.
 purge_interval_secs = 300
@@ -356,6 +347,17 @@ purge_interval_secs = 300
 # Build the NIP-50 full-text word index (searches still work without it via
 # a full scan, but are slower).
 search_index = true
+
+# LMDB read/write buffer size in bytes.
+db_buffer_size = 2048
+
+# Seconds a database request may wait before timing out (0 = forever).
+db_request_timeout_secs = 30
+
+# Overload protection: when the database thread's queue holds more than
+# these many pending messages/events, new requests fail fast.
+max_db_queue_msgs = 4096
+max_db_queue_events = 262144
 
 # -----------------------------------------------------------------------------
 # Daemon
@@ -375,10 +377,10 @@ stats_interval_secs = 5
 
 # Rotate the log file when it grows past this many bytes (0 disables
 # rotation). The current file is renamed to .1 and older backups shift up.
-log_max_size_bytes = 52428800
+max_log_size_bytes = 52428800
 
 # Number of rotated log backups to keep.
-log_max_files = 5
+max_log_files = 5
 
 # -----------------------------------------------------------------------------
 # Access control (seeded from this file on the very first run). NIP-86

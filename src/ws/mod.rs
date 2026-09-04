@@ -282,7 +282,7 @@ impl Conn {
     pub(crate) async fn send_auth_challenge(&mut self) {
         let enabled = {
             let cfg = self.relay.config.read().await;
-            cfg.nip_enabled(42) && cfg.server.send_auth_challenge
+            cfg.nip_enabled(42) && cfg.relay.send_auth_challenge
         };
         if enabled {
             self.send_json(nip42::auth_message(&self.challenge));
@@ -387,7 +387,7 @@ pub async fn handle_connection(
     ) = {
         let cfg = relay.config.read().await;
         (
-            cfg.limits.max_ws_message_size,
+            cfg.limits.max_ws_message_bytes,
             cfg.limits.max_out_queue_bytes,
             cfg.limits.max_req_response_bytes,
             cfg.nip_enabled(40),

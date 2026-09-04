@@ -166,8 +166,8 @@ impl Cli {
         }
         crate::logging::install_file_logger(
             cfg.daemon.log_file.clone(),
-            cfg.daemon.log_max_size_bytes,
-            cfg.daemon.log_max_files,
+            cfg.daemon.max_log_size_bytes,
+            cfg.daemon.max_log_files,
         )
         .map_err(|e| {
             Error::Config(format!(
@@ -484,10 +484,10 @@ fn open_db(cfg: &Config) -> Result<crate::db::DbClient> {
         &cfg.database,
         cfg.nip_enabled(40),
         std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        cfg.limits.db_request_timeout_secs,
-        cfg.limits.max_indexed_words,
-        cfg.limits.db_queue_msgs,
-        cfg.limits.db_queue_events,
+        cfg.database.db_request_timeout_secs,
+        cfg.database.max_indexed_words,
+        cfg.database.max_db_queue_msgs,
+        cfg.database.max_db_queue_events,
     )
 }
 
@@ -584,7 +584,7 @@ fn open_db_env(cfg: &Config) -> Result<heed::Env> {
     // commands must be able to run on a fresh install too (e.g. before
     // the first start).
     std::fs::create_dir_all(&cfg.database.path)?;
-    let mut map_size = (cfg.database.map_max_size as u64)
+    let mut map_size = (cfg.database.max_map_size as u64)
         .max(cfg.database.map_size as u64)
         .max(16 * 1024 * 1024);
     if usize::BITS < 64 {

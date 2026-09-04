@@ -487,7 +487,7 @@ fn map_grows_beyond_initial_size() {
     // sparse virtual reservation, so `map_size` only acts as a floor.
     let cfg = DatabaseConfig {
         map_size: 256 * 1024,
-        map_max_size: 32 * 1024 * 1024,
+        max_map_size: 32 * 1024 * 1024,
         ..config()
     };
     let db = DbClient::open(
@@ -1037,7 +1037,7 @@ fn schema_upgrade_creates_missing_tables_instantly() {
             heed::EnvOpenOptions::new()
                 .max_dbs(32)
                 .max_readers(cfg.max_readers.max(8))
-                .map_size(cfg.map_max_size.max(cfg.map_size))
+                .map_size(cfg.max_map_size.max(cfg.map_size))
                 .open(&cfg.path)
                 .unwrap()
         };
@@ -1105,7 +1105,7 @@ fn legacy_access_blob_pubkeys_migrate_to_dedicated_key() {
         std::fs::create_dir_all(dir).unwrap();
         // The env must be opened with the same map size as DbClient::open
         // (LMDB refuses a different map size at reopen).
-        let map_size = cfg.map_max_size.max(cfg.map_size);
+        let map_size = cfg.max_map_size.max(cfg.map_size);
         let env = unsafe {
             heed::EnvOpenOptions::new()
                 .max_dbs(cfg.max_dbs.max(16))

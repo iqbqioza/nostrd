@@ -113,8 +113,8 @@ enabled_nips = [1, 50]   # lists are wrapped in [ ]
 | `relay.private_key is empty while NIP-29 is enabled...` | Groups need a secret key. Run `nostrd genkey` |
 | `unknown config key [relay].software is ignored` | An unused legacy key (or a typo) in the config. Check the key name |
 | `unknown config section [serve] is ignored` | A typo in a section name (e.g. `[serve]` instead of `[server]`). Fix it |
-| `server.require_auth is true but server.send_auth_challenge is false...` | This combination locks everyone out. Change one of the two |
-| `limits.require_pow = 64 ... practically unmineable` | The PoW requirement is so high nobody can post. Lower `require_pow` |
+| `relay.require_auth is true but relay.send_auth_challenge is false...` | This combination locks everyone out. Change one of the two |
+| `relay.require_pow = 64 ... practically unmineable` | The PoW requirement is so high nobody can post. Lower `require_pow` |
 | `livekit_url is set but livekit_api_key/livekit_api_secret are empty` | LiveKit credentials are incomplete |
 
 ---
@@ -155,9 +155,9 @@ When using Cloudflare Tunnel:
 
 ### 2-4. `error: message too large` and the connection closes
 
-**Cause**: A single message exceeds `max_ws_message_size` (default 1 MB).
+**Cause**: A single message exceeds `max_ws_message_bytes` (default 1 MB).
 
-**Fix**: Raise `limits.max_ws_message_size` if you need larger events — but also check the client's own limits.
+**Fix**: Raise `limits.max_ws_message_bytes` if you need larger events — but also check the client's own limits.
 
 ### 2-5. `too many subscriptions` / `too many filters` errors
 
@@ -167,9 +167,9 @@ When using Cloudflare Tunnel:
 
 ### 2-6. New connections are refused under load
 
-**Cause**: `max_connections` (default 10000) was reached, the per-IP cap (`max_connections_per_ip`, default 64) kicked in, or the per-second connection rate limit (`max_conn_per_sec_per_ip`) refused the burst. The caps apply to every connection — WebSocket and plain HTTP alike.
+**Cause**: `max_connections` (default 10000) was reached, the per-IP cap (`max_connections_per_ip`, default 64) kicked in, or the per-second connection rate limit (`max_connections_per_sec_per_ip`) refused the burst. The caps apply to every connection — WebSocket and plain HTTP alike.
 
-**Fix**: Review and adjust the settings. `max_connections_per_ip = 0` disables the per-IP cap (be careful about floods); `max_conn_per_sec_per_ip = 0` disables the rate limit. These three settings require a restart.
+**Fix**: Review and adjust the settings. `max_connections_per_ip = 0` disables the per-IP cap (be careful about floods); `max_connections_per_sec_per_ip = 0` disables the rate limit. These three settings require a restart.
 
 ### 2-7. Connections drop after a while
 
@@ -207,7 +207,7 @@ When publishing fails, the 4th element of the `OK` message explains why. The com
 | `invalid: content too large` | Content exceeds `max_content_bytes` (default 64K characters). Shorten it or raise the limit |
 | `invalid: too many tags` | More tags than `max_tags` (default 2000) |
 | `invalid: tag value too large` | A tag value exceeds `max_tag_value_bytes` (default 1 KB) |
-| `mute: event creation date is in the future` | Timestamp too far in the future (beyond `max_created_at_future`) |
+| `mute: event creation date is in the future` | Timestamp too far in the future (beyond `max_created_at_future_secs`) |
 | `mute: event contains secret key material` | The content or tags contain an nsec-looking string. **Never post secret keys.** Remove the string and the event is accepted |
 | `duplicate: event already stored` | The same event is already stored (normal) |
 | `blocked: pubkey not allowed` | The pubkey is banned (`banpubkey`) or outside the allowlist |
@@ -217,7 +217,7 @@ When publishing fails, the 4th element of the `OK` message explains why. The com
 | `blocked: event has been deleted` | Re-publishing a deleted event |
 | `invalid: event has expired` | The NIP-40 expiration has passed |
 | `pow: difficulty requirement not reached` | The event does not meet `require_pow` |
-| `auth-required: ...` | Authentication is required (when `require_auth` is on) |
+| `auth-required: ...` | Authentication is required (when `relay.require_auth` is on) |
 | `restricted: ...` | Access restrictions (groups, account age, ...) |
 | `restricted: your account is too new` | The account was created within `new_pubkey_min_age_secs`. Wait and retry |
 | `restricted: unknown group` | The group does not exist (create it first) |
@@ -346,11 +346,11 @@ The host, path and query must still match exactly, so the tolerance cannot be us
 
 ## 5. Database and Disk
 
-### 5-1. `database map is full: increase database.map_max_size`
+### 5-1. `database map is full: increase database.max_map_size`
 
 **Cause**: The LMDB memory-map ceiling (default 1 TB of virtual address space; actual disk usage grows with data) was reached — effectively, the database is full.
 
-**Fix**: Raise `database.map_max_size` and `restart`.
+**Fix**: Raise `database.max_map_size` and `restart`.
 
 ### 5-2. `disk is full: refusing to commit N events`
 
@@ -362,11 +362,11 @@ The host, path and query must still match exactly, so the tolerance cannot be us
 df -h /path/to/data
 ```
 
-### 5-3. `nostrd check` reports `map_size must not exceed map_max_size`
+### 5-3. `nostrd check` reports `map_size must not exceed max_map_size`
 
-**Cause**: `database.map_size` is larger than `map_max_size`.
+**Cause**: `database.map_size` is larger than `max_map_size`.
 
-**Fix**: Set `map_size` at or below `map_max_size` (the defaults are fine).
+**Fix**: Set `map_size` at or below `max_map_size` (the defaults are fine).
 
 ### 5-4. Checking the database size
 
@@ -397,9 +397,9 @@ cp -a ./data ./data-backup
 
 ### 6-2. The log grows without bound
 
-**Cause**: `log_max_size_bytes` is 0 (rotation disabled).
+**Cause**: `max_log_size_bytes` is 0 (rotation disabled).
 
-**Fix**: Set `log_max_size_bytes = 52428800` (50 MB) and `log_max_files = 5`. Rotation is automatic.
+**Fix**: Set `max_log_size_bytes = 52428800` (50 MB) and `max_log_files = 5`. Rotation is automatic.
 
 ### 6-3. Changes to the config do not take effect after reload
 

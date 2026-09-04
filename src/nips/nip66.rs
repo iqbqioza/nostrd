@@ -50,7 +50,7 @@ pub(crate) fn relay_discovery_event(
     }
     // NIP-66: requirements per the NIP-11 `limitation` object, with `!`
     // prefixing false values.
-    if cfg.server.require_auth {
+    if cfg.relay.require_auth {
         tags.push(vec!["R".into(), "auth".into()]);
     } else {
         tags.push(vec!["R".into(), "!auth".into()]);
@@ -59,7 +59,7 @@ pub(crate) fn relay_discovery_event(
     // NIP-66's `R` keys cover auth, writes, pow and payment: the relay
     // never restricts writes, so the requirement is negated.
     tags.push(vec!["R".into(), "!writes".into()]);
-    if cfg.nip_enabled(13) && cfg.limits.require_pow > 0 {
+    if cfg.nip_enabled(13) && cfg.relay.require_pow > 0 {
         tags.push(vec!["R".into(), "pow".into()]);
     } else {
         tags.push(vec!["R".into(), "!pow".into()]);
