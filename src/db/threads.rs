@@ -50,12 +50,10 @@ pub(crate) struct DbThreads {
     pub(crate) max_pending_msgs: usize,
     pub(crate) max_pending_events: usize,
     pub(crate) max_api_pending: usize,
+    pub(crate) reader_threads: usize,
 }
 
 /// Serves one read-only message on a dedicated reader thread. Returns
-/// The number of threads serving the WebSocket reader channel.
-pub(crate) const READER_THREADS: usize = 2;
-
 /// `true` when the thread must shut down.
 fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, msg: Msg) -> bool {
     match msg {
@@ -291,6 +289,7 @@ pub(crate) fn spawn(
     request_timeout_secs: u64,
     max_pending_msgs: usize,
     max_pending_events: usize,
+    reader_threads: usize,
 ) -> Result<DbThreads> {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let (read_tx, read_rx) = mpsc::unbounded_channel();
@@ -313,7 +312,7 @@ pub(crate) fn spawn(
     // safely.
     {
         let read_rx = std::sync::Arc::new(std::sync::Mutex::new(read_rx));
-        for _ in 0..READER_THREADS {
+        for _ in 0..reader_threads {
             let read_store = store.clone_for_reader();
             let read_errors = Arc::clone(&errors);
             let read_rx = Arc::clone(&read_rx);
@@ -875,5 +874,6 @@ pub(crate) fn spawn(
         max_pending_msgs: max_pending_msgs.max(1),
         max_pending_events: max_pending_events.max(1),
         max_api_pending: max_pending_msgs.max(1),
+        reader_threads,
     })
 }

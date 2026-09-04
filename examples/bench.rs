@@ -112,12 +112,19 @@ async fn ingest(url: &str, n: usize) {
             // timestamps would produce identical ids, and the relay would
             // deduplicate the whole burst into one stored event.
             let ev = sign_event(&secp, &keypair, 1, &format!("bench {sent}"), now);
+            let t0 = std::time::Instant::now();
             sink.send(frame(&format!(r#"["EVENT",{ev}]"#)))
                 .await
                 .expect("send");
+            if t0.elapsed() > std::time::Duration::from_secs(2) {
+                eprintln!("SLOW send #{sent}: {:.0}ms", t0.elapsed().as_millis());
+            }
             sent += 1;
         }
-        tokio::time::sleep(Duration::from_millis(1)).await;
+        // No sleep: a continuous stream lets the relay's batch window
+        // coalesce the whole burst (and the whole test) into as few
+        // commits as possible.
+        tokio::task::yield_now().await;
     }
     let dt = t0.elapsed();
     let (got, ok_true, first_reason) = tokio::time::timeout(Duration::from_secs(30), drain)
@@ -318,11 +325,60 @@ async fn search(url: &str, term: &str) {
     println!("search: {events} events in {:.3}s", dt.as_secs_f64());
 }
 
-#[tokio::main]
+/// `parallel-req <conns> <term>`: issue the same search REQ from `conns`
+/// concurrent connections and measure until every EOSE arrived. A single
+/// heavy scan runs on one reader thread, so more reader threads
+/// (database.reader_threads) shorten the tail latency.
+async fn parallel_req(url: &str, conns: usize, term: &str) {
+    let t0 = Instant::now();
+    let mut handles = Vec::with_capacity(conns);
+    for _ in 0..conns {
+        let url = url.to_string();
+        let term = term.to_string();
+        handles.push(tokio::spawn(async move {
+            let ws = connect(&url).await;
+            let (mut sink, mut stream) = ws.split();
+            sink.send(frame(&format!(
+                r#"["REQ","p",{{"kinds":[1],"search":"{term}"}}]"#
+            )))
+            .await
+            .unwrap();
+            let started = Instant::now();
+            loop {
+                match tokio::time::timeout(Duration::from_secs(30), stream.next()).await {
+                    Ok(Some(Ok(msg))) if msg.is_text() => {
+                        if msg.to_text().unwrap().contains("\"EOSE\"") {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            started.elapsed()
+        }));
+    }
+    let mut worst = Duration::ZERO;
+    let mut total = Duration::ZERO;
+    for h in handles {
+        let dt = h.await.unwrap();
+        total += dt;
+        worst = worst.max(dt);
+    }
+    println!(
+        "parallel-req: {conns} concurrent scans, worst {:.0}ms, avg {:.0}ms (total wall {:.0}ms)",
+        worst.as_millis(),
+        total.as_millis() / conns as u128,
+        t0.elapsed().as_millis()
+    );
+}
+
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
-        eprintln!("usage: bench <ws://host:port> <ingest N | fanout S P | req N | search TERM>");
+        eprintln!(
+            "usage: bench <ws://host:port> <ingest N | fanout S P | req N | search TERM | parallel-req C TERM>"
+        );
         std::process::exit(1);
     }
     let url = &args[1];
@@ -338,6 +394,7 @@ async fn main() {
         }
         "req" => req(url, args[3].parse().expect("N")).await,
         "search" => search(url, &args[3]).await,
+        "parallel-req" => parallel_req(url, args[3].parse().expect("C"), &args[4]).await,
         other => {
             eprintln!("unknown scenario {other}");
             std::process::exit(1);

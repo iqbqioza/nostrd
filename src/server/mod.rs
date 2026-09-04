@@ -383,7 +383,7 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
         shutdown_rx.clone(),
     )));
 
-    let (header_timeout, max_connections, per_sec_per_ip) = {
+    let (header_timeout, max_connections, per_sec_per_ip, recv_buf_kb) = {
         let cfg = relay.config.read().await;
         (
             // 0 = disabled (the documented convention): hyper treats
@@ -393,6 +393,7 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
                 .then(|| std::time::Duration::from_secs(cfg.limits.http_read_timeout_secs)),
             cfg.limits.max_connections,
             IpConnLimiter::new(cfg.limits.max_connections_per_sec_per_ip),
+            cfg.limits.socket_recv_buffer_kb,
         )
     };
     let _ = serve_limited(
@@ -401,6 +402,7 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
         max_connections,
         header_timeout,
         per_sec_per_ip,
+        recv_buf_kb,
         shutdown_rx,
     )
     .await;
@@ -837,6 +839,7 @@ async fn serve_limited(
     max_connections: usize,
     header_timeout: Option<std::time::Duration>,
     per_sec_per_ip: Option<IpConnLimiter>,
+    recv_buf_kb: u32,
     mut shutdown: watch::Receiver<bool>,
 ) {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -886,7 +889,7 @@ async fn serve_limited(
                 // (64 KiB → 32 KiB) at a million connections.
                 let _ = stream.set_nodelay(true);
                 unsafe {
-                    set_sock_opt(&stream, libc::SO_RCVBUF, 16 * 1024);
+                    set_sock_opt(&stream, libc::SO_RCVBUF, (recv_buf_kb * 1024) as i32);
                     set_sock_opt(&stream, libc::SO_SNDBUF, 16 * 1024);
                 }
 
@@ -1233,6 +1236,7 @@ mod tests {
             max_connections,
             header_timeout,
             per_sec,
+            16,
             rx,
         ));
         (addr, tx, handle)

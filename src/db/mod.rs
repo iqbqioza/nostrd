@@ -289,6 +289,9 @@ pub struct DbClient {
     max_pending_msgs: usize,
     max_pending_events: usize,
     max_api_pending: usize,
+    /// How many threads serve the WebSocket reader queue (from
+    /// `database.reader_threads`); used to fan the shutdown messages out.
+    reader_threads: usize,
 }
 
 impl DbClient {
@@ -308,6 +311,7 @@ impl DbClient {
         // blob — copy them over so existing bans/allowlists survive.
         store.migrate_access_pubkeys()?;
         log::info!("access control migration check complete");
+        let reader_threads = cfg.reader_threads.clamp(1, 64);
         let threads = threads::spawn(
             store,
             expiry,
@@ -315,6 +319,7 @@ impl DbClient {
             request_timeout_secs,
             max_pending_msgs,
             max_pending_events,
+            reader_threads,
         )?;
         Ok(DbClient {
             tx: threads.tx,
@@ -329,6 +334,7 @@ impl DbClient {
             max_pending_msgs: threads.max_pending_msgs,
             max_pending_events: threads.max_pending_events,
             max_api_pending: threads.max_api_pending,
+            reader_threads: threads.reader_threads,
         })
     }
 
@@ -653,10 +659,24 @@ impl DbClient {
             .await
     }
 
-    /// Stores a batch of events in a single write transaction.
+    /// Stores a batch of events in a single write transaction. Used by the
+    /// tests; the relay itself goes through [`Self::put_batch_deferred`].
+    #[allow(dead_code)]
     pub async fn put_batch(&self, events: Vec<(Event, u64)>) -> Vec<PutOutcome> {
         self.request_write(|reply| Msg::PutBatch { events, reply })
             .await
+    }
+
+    /// Queues a batch for the writer and returns the reply receiver
+    /// without awaiting it: the connection can keep reading frames while
+    /// the writer commits, instead of stalling on the commit (and letting
+    /// the socket buffer decide the batch size). Returns `None` when the
+    /// queue is full (the batch was not queued).
+    pub fn put_batch_deferred(
+        &self,
+        events: Vec<(Event, u64)>,
+    ) -> Option<tokio::sync::oneshot::Receiver<Vec<PutOutcome>>> {
+        self.send_request(|reply| Msg::PutBatch { events, reply }, &self.tx)
     }
 
     /// NIP-77: returns only `(created_at, id)` records of the matching
@@ -937,7 +957,7 @@ impl DbClient {
         let _ = self.tx.send(Msg::Shutdown);
         // One per reader thread (the WebSocket reader pool is shared
         // behind a mutex; each thread consumes one shutdown message).
-        for _ in 0..crate::db::threads::READER_THREADS {
+        for _ in 0..self.reader_threads {
             let _ = self.read_tx.send(Msg::Shutdown);
         }
         let _ = self.api_read_tx.send(Msg::Shutdown);

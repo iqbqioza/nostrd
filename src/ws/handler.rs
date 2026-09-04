@@ -5,8 +5,6 @@
 use axum::extract::ws::Message;
 use serde_json::{Value, json};
 
-use super::EVENT_BATCH;
-
 use crate::event::Event;
 use crate::filter::Filter;
 use crate::nips::{nip29, nip40, nip42, nip45, nip70};
@@ -110,10 +108,11 @@ impl super::Conn {
             self.send_ok(&event.id, false, &reason);
             return;
         }
+        // The connection loop queues the batch at the end of its sliding
+        // window (and resolves it on a spawned task while reading keeps
+        // going); a mid-window synchronous flush here would serialize the
+        // connection on every commit.
         self.pending_events.push(event);
-        if self.pending_events.len() >= EVENT_BATCH {
-            self.flush_pending_events().await;
-        }
     }
 
     /// The write policy of the endpoint this connection is on:

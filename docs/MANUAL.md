@@ -166,6 +166,7 @@ To generate a secret key, use the `nostrd genkey` command (see [5. Command Refer
 | `max_connections` | Maximum concurrent connections | `10000` |
 | `max_connections_per_ip` | Max connections per source IP (0 = unlimited) | `64` |
 | `max_ws_message_bytes` | Max bytes per WebSocket message/frame | `1048576` (1 MB) |
+| `socket_recv_buffer_kb` | Per-connection kernel receive buffer (KiB, `0` = kernel default). Larger values let a fast publisher's burst absorb into one batch while the relay commits it (higher ingest throughput); the buffer only uses real memory while data is queued, so idle connections cost nothing | `64` |
 | `max_filters` | Max filters per REQ | `20` |
 | `max_subscriptions` | Max subscriptions per connection | `20` |
 | `max_limit` | Ceiling for the REQ `limit` | `500` |
@@ -200,6 +201,7 @@ To generate a secret key, use the `nostrd genkey` command (see [5. Command Refer
 | `max_map_size` | Memory-map ceiling (bytes). **Raise this if you hit the "map is full" error** | 1 TB |
 | `purge_interval_secs` | Interval for purging NIP-40 expired events | `300` |
 | `search_index` | Enable the NIP-50 full-text index | `true` |
+| `reader_threads` | Threads serving WebSocket REQ/COUNT/NEG scans (parallelize query serving across cores; LMDB read transactions never take the write lock) | `2` |
 | `max_indexed_words` | Words indexed per event for search | `32` |
 | `db_buffer_size` | LMDB read/write buffer size (bytes) | `2048` |
 | `db_request_timeout_secs` | Database request timeout (0 = wait forever) | `30` |

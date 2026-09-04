@@ -219,6 +219,13 @@ pub struct LimitsConfig {
     pub max_connections_per_ip: usize,
     /// Maximum accepted WebSocket message size in bytes.
     pub max_ws_message_bytes: usize,
+    /// Per-connection kernel receive buffer (KiB, 0 = kernel default).
+    /// Larger buffers let the relay absorb a publishing burst while it
+    /// commits a batch, which keeps the batch size (and the number of
+    /// commits) high for a fast publisher. The buffer only consumes real
+    /// kernel memory while data is actually queued, so a large value does
+    /// not cost idle connections anything.
+    pub socket_recv_buffer_kb: u32,
     pub max_filters: usize,
     pub max_subscriptions: usize,
     pub max_limit: usize,
@@ -299,6 +306,11 @@ pub struct DatabaseConfig {
     /// actually written.
     pub max_map_size: usize,
     pub purge_interval_secs: u64,
+    /// How many threads serve the WebSocket reader queue (REQ/COUNT/NEG
+    /// scans and the small lookups). More threads parallelize query
+    /// serving across cores; the scans share LMDB read transactions, so
+    /// they never take the write lock.
+    pub reader_threads: usize,
     /// Enable the NIP-50 full-text word index.
     pub search_index: bool,
     /// How many words of each event's content are added to the NIP-50
@@ -394,6 +406,7 @@ impl Default for LimitsConfig {
             max_connections: 10_000,
             max_connections_per_ip: 64,
             max_ws_message_bytes: 1 << 20,
+            socket_recv_buffer_kb: 64,
             max_filters: 20,
             max_subscriptions: 20,
             max_limit: 500,
@@ -433,6 +446,7 @@ impl Default for DatabaseConfig {
             // only with the stored data (sparse file).
             max_map_size: 1024 * 1024 * 1024 * 1024,
             purge_interval_secs: 300,
+            reader_threads: 2,
             search_index: true,
             max_indexed_words: 32,
             db_buffer_size: 2_048,
@@ -1032,6 +1046,7 @@ impl Config {
         ];
         let db_nonzero = [
             ("database.db_buffer_size", self.database.db_buffer_size),
+            ("database.reader_threads", self.database.reader_threads),
             (
                 "database.max_indexed_words",
                 self.database.max_indexed_words,
@@ -1045,6 +1060,11 @@ impl Config {
                 self.database.max_db_queue_events,
             ),
         ];
+        if !(1..=64).contains(&self.database.reader_threads) {
+            return Err(Error::Config(
+                "database.reader_threads must be between 1 and 64".into(),
+            ));
+        }
         for (name, value) in db_nonzero {
             if value == 0 {
                 return Err(Error::Config(format!("{name} must be at least 1 (got 0)")));
@@ -1508,6 +1528,7 @@ fn known_config_keys() -> &'static [(&'static str, &'static [&'static str])] {
                 "max_connections",
                 "max_connections_per_ip",
                 "max_ws_message_bytes",
+                "socket_recv_buffer_kb",
                 "max_filters",
                 "max_subscriptions",
                 "max_limit",
@@ -1544,6 +1565,7 @@ fn known_config_keys() -> &'static [(&'static str, &'static [&'static str])] {
                 "max_groups",
                 "require_pow",
                 "max_indexed_words",
+                "reader_threads",
                 "buffer_size",
                 "db_request_timeout_secs",
                 "new_pubkey_min_age_secs",
@@ -1562,6 +1584,7 @@ fn known_config_keys() -> &'static [(&'static str, &'static [&'static str])] {
                 "map_size",
                 "max_map_size",
                 "purge_interval_secs",
+                "reader_threads",
                 "search_index",
                 "max_indexed_words",
                 "db_buffer_size",

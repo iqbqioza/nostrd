@@ -584,6 +584,19 @@ pub async fn handle_connection(
                 None => std::future::pending().await,
             }
         };
+        // Wakes the top-of-loop drain (which flushes the outgoing queue)
+        // shortly after anything was queued: a client that is blocked
+        // sending EVENTs cannot receive the OKs that unblock it unless the
+        // relay actually sends them, and without this branch the loop
+        // would wait for the next inbound frame (which never comes while
+        // the peer is blocked).
+        let flush_wake = async {
+            if conn.outgoing.is_empty() {
+                std::future::pending().await
+            } else {
+                tokio::time::sleep(tokio::time::Duration::from_millis(1)).await
+            }
+        };
         let incoming_fut = async {
             match &mut idle_sleep {
                 Some(sleep) => {
@@ -674,10 +687,14 @@ pub async fn handle_connection(
                 // per-frame `timeout(1ms)` of the old loop created and
                 // destroyed a timer-wheel entry for every frame (and taxed
                 // every single-frame REQ/EVENT with a full millisecond).
-                let window = std::time::Instant::now()
-                    + std::time::Duration::from_millis(1);
+                // The deadline is *sliding*: each frame resets it, so a
+                // continuous burst coalesces into one window (and one
+                // database commit), while an idle client still gets its
+                // OK within ~1 ms. The frame cap (EVENT_BATCH * 4) bounds
+                // the window when a client floods faster than the relay
+                // can drain.
                 let window_deadline = tokio::time::sleep_until(
-                    tokio::time::Instant::from_std(window),
+                    tokio::time::Instant::now() + tokio::time::Duration::from_millis(5),
                 );
                 tokio::pin!(window_deadline);
                 for _ in 0..EVENT_BATCH * 4 {
@@ -694,6 +711,11 @@ pub async fn handle_connection(
                         too_large = true;
                         break;
                     }
+                    // Slide the window: the next frame extends the batch
+                    // instead of starting a new window (and a new commit).
+                    window_deadline
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + tokio::time::Duration::from_millis(1));
                 }
                 if too_large {
                     break;
@@ -720,6 +742,12 @@ pub async fn handle_connection(
                 // inbound frame, which resets the idle timeout), so an idle
                 // subscriber stays connected while a dead peer is reaped.
                 let _ = sender.send(Message::Ping(vec![].into())).await;
+            }
+            _ = flush_wake => {
+                // The outgoing queue holds OKs (or REQ responses) that
+                // must reach the peer for its send path to unblock: wake
+                // the top-of-loop drain promptly instead of waiting for
+                // the next inbound frame.
             }
             live_batch = live_fut => {
                 match live_batch {
