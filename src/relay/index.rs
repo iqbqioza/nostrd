@@ -51,8 +51,8 @@ impl FilterComponents {
         {
             return FilterComponents::All;
         }
-        let kinds = filter.kinds.clone().unwrap_or_default();
-        let authors = filter
+        let kinds: Vec<u64> = filter.kinds.clone().unwrap_or_default();
+        let authors: Vec<[u8; 32]> = filter
             .authors
             .as_ref()
             .map(|authors| {
@@ -68,7 +68,7 @@ impl FilterComponents {
                     .collect()
             })
             .unwrap_or_default();
-        let tags = filter
+        let tags: Vec<(String, String)> = filter
             .tags
             .iter()
             .filter(|(name, _)| name.starts_with('#'))
@@ -77,6 +77,14 @@ impl FilterComponents {
                 crate::filter::tag_values(value).map(move |v| (tag_name.clone(), v.to_string()))
             })
             .collect();
+        if kinds.is_empty() && authors.is_empty() && tags.is_empty() {
+            // The filter constrains only ids/since/until/search, which the
+            // index cannot narrow: treat it as match-everything so its
+            // live delivery is not lost. The per-connection filter match
+            // remains the final check, so widening the candidate set here
+            // is always safe.
+            return FilterComponents::All;
+        }
         FilterComponents::Indexed {
             kinds,
             authors,
@@ -115,15 +123,18 @@ impl SubscriptionIndex {
     /// Removes a connection from every entry.
     pub(crate) fn unregister(&mut self, conn: u64) {
         self.all.remove(&conn);
-        for set in self.kinds.values_mut() {
+        self.kinds.retain(|_, set| {
             set.remove(&conn);
-        }
-        for set in self.authors.values_mut() {
+            !set.is_empty()
+        });
+        self.authors.retain(|_, set| {
             set.remove(&conn);
-        }
-        for set in self.tags.values_mut() {
+            !set.is_empty()
+        });
+        self.tags.retain(|_, set| {
             set.remove(&conn);
-        }
+            !set.is_empty()
+        });
     }
 
     /// The candidate connections for an event (the union of the index
@@ -139,9 +150,30 @@ impl SubscriptionIndex {
         {
             out.extend(set.iter().copied());
         }
+        // NIP-26: an event published under a delegation tag matches
+        // filters on the delegator's pubkey too (see `Filter::matches`),
+        // so those connections must be woken as well.
         for tag in &event.tags {
             if tag.len() >= 2
-                && tag[0].len() == 1
+                && tag[0] == "delegation"
+                && let Ok(bytes) = hex::decode(&tag[1])
+                && bytes.len() == 32
+            {
+                let mut delegator = [0u8; 32];
+                delegator.copy_from_slice(&bytes);
+                if let Some(set) = self.authors.get(&delegator) {
+                    out.extend(set.iter().copied());
+                }
+            }
+        }
+        // The index stores every `#`-prefixed tag constraint, single-letter
+        // or not (NIP-01 tags are usually one letter, but `#emoji`,
+        // `#subject` etc. are valid too): the lookup must not restrict the
+        // tag name length, or multi-letter-tag-only subscriptions would
+        // never be woken.
+        for tag in &event.tags {
+            if tag.len() >= 2
+                && !tag[0].is_empty()
                 && let Some(set) = self.tags.get(&(tag[0].clone(), tag[1].clone()))
             {
                 out.extend(set.iter().copied());
@@ -237,5 +269,58 @@ mod tests {
             FilterComponents::of(&empty),
             FilterComponents::All
         ));
+    }
+
+    #[test]
+    fn filter_with_only_unindexable_constraints_is_all() {
+        // Regression: a filter constraining only ids/since/until/search
+        // used to register nothing in the index, so its live delivery was
+        // silently lost. Such filters must be treated as match-everything
+        // (the per-connection filter match is the final check).
+        let f: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"since": 1_600_000_000})).unwrap();
+        assert!(matches!(FilterComponents::of(&f), FilterComponents::All));
+        let f: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"ids": ["ab".repeat(32)]})).unwrap();
+        assert!(matches!(FilterComponents::of(&f), FilterComponents::All));
+        let f: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"search": "nostr"})).unwrap();
+        assert!(matches!(FilterComponents::of(&f), FilterComponents::All));
+        // An actually indexable constraint stays indexed.
+        let f: crate::filter::Filter =
+            serde_json::from_value(serde_json::json!({"since": 1_600_000_000, "kinds": [1]}))
+                .unwrap();
+        assert!(matches!(
+            FilterComponents::of(&f),
+            FilterComponents::Indexed { .. }
+        ));
+    }
+
+    #[test]
+    fn candidates_wake_delegation_subscribers() {
+        // NIP-26: a delegated event matches filters on the delegator's
+        // pubkey, so the delegator's subscribers must be woken.
+        let mut index = SubscriptionIndex::default();
+        index.register(
+            7,
+            &[FilterComponents::Indexed {
+                kinds: vec![],
+                authors: vec![[0xaa; 32]],
+                tags: vec![],
+            }],
+        );
+        let mut e = ev(
+            1,
+            vec![vec!["delegation".into(), "aa".repeat(32), "sig".into()]],
+        );
+        e.pubkey = "bb".repeat(32);
+        let candidates = index.candidates(&e);
+        assert!(
+            candidates.contains(&7),
+            "a delegated event wakes the delegator's subscribers"
+        );
+        // An event without a delegation tag does not.
+        let e = ev(1, vec![]);
+        assert!(index.candidates(&e).is_empty());
     }
 }

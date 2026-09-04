@@ -300,8 +300,19 @@ impl GroupStore {
 
     /// Applies a stored event to the group state and returns the unsigned
     /// relay-generated events to publish (empty when `emit` is false, e.g.
-    /// during startup rebuild).
-    pub fn apply(&mut self, event: &Event, relay_pubkey: &str, now: u64, emit: bool) -> Vec<Event> {
+    /// during startup rebuild). `ignore_capacity` lets the startup rebuild
+    /// restore every group that was actually stored: a group dropped by the
+    /// capacity limit must not become "unknown" (its private content would
+    /// turn world-readable), and the limit still applies to new creations
+    /// at runtime.
+    pub fn apply(
+        &mut self,
+        event: &Event,
+        relay_pubkey: &str,
+        now: u64,
+        emit: bool,
+        ignore_capacity: bool,
+    ) -> Vec<Event> {
         let Some(gid) = group_id(event) else {
             return Vec::new();
         };
@@ -433,7 +444,7 @@ impl GroupStore {
                 // The referenced events are deleted by the relay itself.
             }
             CREATE_GROUP => {
-                if !self.groups.contains_key(gid) && !self.at_capacity() {
+                if !self.groups.contains_key(gid) && (ignore_capacity || !self.at_capacity()) {
                     let mut group = Group::default();
                     group
                         .members
@@ -624,7 +635,7 @@ impl GroupStore {
             ))
         });
         for event in events {
-            self.apply(&event, "", unix_now(), false);
+            self.apply(&event, "", unix_now(), false, true);
         }
     }
 }

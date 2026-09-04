@@ -577,7 +577,11 @@ async fn ws_handler(State(relay): State<Arc<Relay>>, request: Request) -> Respon
             .await
             .blocked_ips
             .iter()
-            .any(|(blocked, _)| blocked.parse::<std::net::IpAddr>().is_ok_and(|b| b == ip))
+            .any(|(blocked, _)| {
+                blocked
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|b| b == crate::util::normalize_ip(ip))
+            })
     {
         return StatusCode::FORBIDDEN.into_response();
     }
@@ -646,7 +650,9 @@ async fn ws_handler(State(relay): State<Arc<Relay>>, request: Request) -> Respon
                     handle_connection(
                         socket,
                         relay,
-                        peer_ip.unwrap_or_else(|| "0.0.0.0".parse().unwrap()),
+                        peer_ip
+                            .map(crate::util::normalize_ip)
+                            .unwrap_or_else(|| "0.0.0.0".parse().unwrap()),
                         path,
                     )
                 })
@@ -1059,6 +1065,14 @@ async fn reload_handler(
                             ),
                             ("relay.enabled_nips", old.relay.enabled_nips != new_config.relay.enabled_nips),
                             ("relay.disabled_nips", old.relay.disabled_nips != new_config.relay.disabled_nips),
+                            (
+                                "database.map_size",
+                                old.database.map_size != new_config.database.map_size,
+                            ),
+                            (
+                                "database.max_map_size",
+                                old.database.max_map_size != new_config.database.max_map_size,
+                            ),
                             (
                                 "blossom.host",
                                 old.blossom.host != new_config.blossom.host,

@@ -54,6 +54,11 @@ const SUPPORTED_METHODS: &[&str] = &[
     "listeventsneedingmoderation",
 ];
 
+/// Maximum length of a NIP-43 role id accepted through the NIP-86 RPC:
+/// the id lands in a stored relay event and the in-memory role map, so it
+/// must not be able to grow to the full RPC body size.
+const MAX_ROLE_ID_LEN: usize = 64;
+
 fn rpc_ok(result: Value) -> Response {
     (StatusCode::OK, Json(json!({ "result": result }))).into_response()
 }
@@ -292,6 +297,11 @@ pub async fn rpc_handler(
             let Some(id) = params.first().and_then(Value::as_str) else {
                 return rpc_err("invalid params");
             };
+            if id.len() > MAX_ROLE_ID_LEN {
+                return rpc_err(&format!(
+                    "role id exceeds the maximum of {MAX_ROLE_ID_LEN} characters"
+                ));
+            }
             let label = params.get(1).and_then(Value::as_str).unwrap_or("");
             let description = params.get(2).and_then(Value::as_str).unwrap_or("");
             let color = params.get(3).and_then(Value::as_str).unwrap_or("");
@@ -312,6 +322,11 @@ pub async fn rpc_handler(
             let Some(id) = params.first().and_then(Value::as_str) else {
                 return rpc_err("invalid params");
             };
+            if id.len() > MAX_ROLE_ID_LEN {
+                return rpc_err(&format!(
+                    "role id exceeds the maximum of {MAX_ROLE_ID_LEN} characters"
+                ));
+            }
             let label = params.get(1).and_then(Value::as_str).unwrap_or("");
             let description = params.get(2).and_then(Value::as_str).unwrap_or("");
             let color = params.get(3).and_then(Value::as_str).unwrap_or("");
@@ -364,6 +379,9 @@ pub async fn rpc_handler(
             ) else {
                 return rpc_err("invalid params");
             };
+            if !is_pubkey(pubkey) {
+                return rpc_err("invalid pubkey");
+            }
             relay.unassign_role(pubkey, role).await;
             audit!(&relay, &identity, "unassignrole", params);
             rpc_ok(json!(true))

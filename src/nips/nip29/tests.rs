@@ -25,9 +25,9 @@ const OTHER: &str = "ccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 fn seeded() -> GroupStore {
     let mut store = GroupStore::default();
     let create = event(CREATE_GROUP, ADMIN, Some("g1"), vec![]);
-    store.apply(&create, "", 1, false);
+    store.apply(&create, "", 1, false, false);
     let put_user = event(9000, ADMIN, Some("g1"), vec![vec![P.into(), OTHER.into()]]);
-    store.apply(&put_user, "", 1, false);
+    store.apply(&put_user, "", 1, false, false);
     store
 }
 
@@ -38,9 +38,9 @@ fn group_cap_rejects_creates_over_the_limit() {
     let g2 = event(CREATE_GROUP, ADMIN, Some("g2"), vec![]);
     let g3 = event(CREATE_GROUP, ADMIN, Some("g3"), vec![]);
     assert!(store.validate_write(&g1).is_ok());
-    store.apply(&g1, "", 1, false);
+    store.apply(&g1, "", 1, false, false);
     assert!(store.validate_write(&g2).is_ok());
-    store.apply(&g2, "", 1, false);
+    store.apply(&g2, "", 1, false, false);
     assert_eq!(
         store.validate_write(&g3).unwrap_err(),
         "restricted: group limit reached",
@@ -48,7 +48,7 @@ fn group_cap_rejects_creates_over_the_limit() {
     );
     // The apply path (the startup rebuild) must enforce the bound too:
     // a legacy store larger than the cap cannot blow the memory.
-    store.apply(&g3, "", 1, false);
+    store.apply(&g3, "", 1, false, false);
     assert_eq!(store.groups.len(), 2, "the cap bounds the store size");
     // A create of an EXISTING group (a metadata refresh) is unaffected.
     assert!(store.validate_write(&g1).is_ok());
@@ -61,9 +61,9 @@ fn group_cap_counts_deleted_groups() {
     let g2 = event(CREATE_GROUP, ADMIN, Some("g2"), vec![]);
     let g3 = event(CREATE_GROUP, ADMIN, Some("g3"), vec![]);
     let del1 = event(DELETE_GROUP, ADMIN, Some("g1"), vec![]);
-    store.apply(&g1, "", 1, false);
-    store.apply(&g2, "", 1, false);
-    store.apply(&del1, "", 2, false);
+    store.apply(&g1, "", 1, false, false);
+    store.apply(&g2, "", 1, false, false);
+    store.apply(&del1, "", 2, false, false);
     // g1 is gone but its marker still counts: a new create is rejected.
     assert_eq!(
         store.validate_write(&g3).unwrap_err(),
@@ -83,7 +83,7 @@ fn unlimited_group_cap_allows_any() {
     for i in 0..100 {
         let g = event(CREATE_GROUP, ADMIN, Some(&format!("g{i}")), vec![]);
         assert!(store.validate_write(&g).is_ok());
-        store.apply(&g, "", 1, false);
+        store.apply(&g, "", 1, false, false);
     }
     assert_eq!(store.groups.len(), 100);
 }
@@ -123,7 +123,7 @@ fn put_user_roles_from_p_tag_extras() {
             "secretary".into(),
         ]],
     );
-    store.apply(&put, "", 1, false);
+    store.apply(&put, "", 1, false, false);
     let group = store.group("g1").unwrap();
     assert_eq!(
         group.members.get(USER).unwrap(),
@@ -136,14 +136,14 @@ fn put_user_roles_from_p_tag_extras() {
 fn restricted_groups() {
     let mut store = seeded();
     let edit = event(9002, ADMIN, Some("g1"), vec![vec!["restricted".into()]]);
-    store.apply(&edit, "", 1, false);
+    store.apply(&edit, "", 1, false, false);
     let msg_by_user = event(1, USER, Some("g1"), vec![]);
     assert!(store.validate_write(&msg_by_user).is_err());
     // Join requests to an open group (not `closed`) are honored: the
     // user is admitted without privileges.
     let join = event(JOIN, USER, Some("g1"), vec![]);
     assert!(store.validate_write(&join).is_ok());
-    store.apply(&join, "", 1, false);
+    store.apply(&join, "", 1, false, false);
     assert!(store.group("g1").unwrap().is_member(USER));
     assert!(!store.group("g1").unwrap().is_admin(USER));
     // A member of a restricted group may post.
@@ -156,7 +156,7 @@ fn restricted_groups() {
     );
     // Removing the user restores the restriction.
     let remove = event(9001, ADMIN, Some("g1"), vec![vec![P.into(), USER.into()]]);
-    store.apply(&remove, "", 1, false);
+    store.apply(&remove, "", 1, false, false);
     assert!(store.validate_write(&msg_by_user).is_err());
 }
 
@@ -169,7 +169,7 @@ fn invite_code_admits() {
         Some("g1"),
         vec![vec![CODE.into(), "abc".into()]],
     );
-    store.apply(&invite, "", 1, false);
+    store.apply(&invite, "", 1, false, false);
     let join = event(
         JOIN,
         USER,
@@ -177,7 +177,7 @@ fn invite_code_admits() {
         vec![vec![CODE.into(), "abc".into()]],
     );
     assert!(store.validate_write(&join).is_ok());
-    store.apply(&join, "", 1, false);
+    store.apply(&join, "", 1, false, false);
     assert!(store.group("g1").unwrap().is_member(USER));
 }
 
@@ -190,7 +190,7 @@ fn invalid_invite_code_is_final() {
         Some("g1"),
         vec![vec![CODE.into(), "abc".into()]],
     );
-    store.apply(&invite, "", 1, false);
+    store.apply(&invite, "", 1, false, false);
     // A wrong code is rejected even on an otherwise open group.
     let join = event(
         JOIN,
@@ -204,7 +204,7 @@ fn invalid_invite_code_is_final() {
     );
     // A closed group honors a valid invite code.
     let edit = event(9002, ADMIN, Some("g1"), vec![vec!["closed".into()]]);
-    store.apply(&edit, "", 1, false);
+    store.apply(&edit, "", 1, false, false);
     let join = event(
         JOIN,
         USER,
@@ -225,10 +225,10 @@ fn put_user_roles_replace_previous_roles() {
         Some("g1"),
         vec![vec![P.into(), USER.into(), "ceo".into()]],
     );
-    store.apply(&put, "", 1, false);
+    store.apply(&put, "", 1, false, false);
     assert!(store.group("g1").unwrap().is_admin(USER));
     let demote = event(9000, ADMIN, Some("g1"), vec![vec![P.into(), USER.into()]]);
-    store.apply(&demote, "", 1, false);
+    store.apply(&demote, "", 1, false, false);
     let group = store.group("g1").unwrap();
     assert!(group.is_member(USER));
     assert!(
@@ -276,6 +276,7 @@ fn last_admin_cannot_be_demoted() {
         "",
         1,
         false,
+        false,
     );
     let demote_user = event(9000, ADMIN, Some("g1"), vec![vec![P.into(), USER.into()]]);
     assert!(
@@ -291,7 +292,7 @@ fn closed_group_rejects_joins() {
     // kind:9000.
     let mut store = seeded();
     let edit = event(9002, ADMIN, Some("g1"), vec![vec!["closed".into()]]);
-    store.apply(&edit, "", 1, false);
+    store.apply(&edit, "", 1, false, false);
     let join = event(JOIN, USER, Some("g1"), vec![]);
     assert!(store.validate_write(&join).is_err());
 }
@@ -301,7 +302,7 @@ fn subgroups() {
     let mut store = seeded();
     // Create a second group and move g1 under it.
     let create2 = event(CREATE_GROUP, ADMIN, Some("g2"), vec![]);
-    store.apply(&create2, "", 1, false);
+    store.apply(&create2, "", 1, false, false);
     let adopt = event(
         9002,
         ADMIN,
@@ -309,7 +310,7 @@ fn subgroups() {
         vec![vec!["parent".into(), "g2".into()]],
     );
     assert!(store.validate_write(&adopt).is_ok());
-    store.apply(&adopt, "", 1, false);
+    store.apply(&adopt, "", 1, false, false);
     assert_eq!(store.group("g1").unwrap().parent.as_deref(), Some("g2"));
     assert_eq!(store.group("g2").unwrap().children, vec!["g1"]);
 
@@ -339,7 +340,7 @@ fn subgroups() {
 
     // Deleting a child removes it from the parent's child list.
     let delete_child = event(DELETE_GROUP, ADMIN, Some("g1"), vec![]);
-    store.apply(&delete_child, "", 1, false);
+    store.apply(&delete_child, "", 1, false, false);
     assert!(store.group("g1").is_none());
     assert!(store.group("g2").unwrap().children.is_empty());
 }
@@ -348,15 +349,15 @@ fn subgroups() {
 fn deleted_group_content_is_hidden() {
     let mut store = seeded();
     let edit = event(9002, ADMIN, Some("g1"), vec![vec!["private".into()]]);
-    store.apply(&edit, "", 1, false);
+    store.apply(&edit, "", 1, false, false);
     let msg = event(1, ADMIN, Some("g1"), vec![]);
-    let meta = store.apply(&msg, "", 1, true);
+    let meta = store.apply(&msg, "", 1, true, false);
     // Before deletion: hidden from outsiders, visible to members.
     assert!(!store.visible_to(&msg, None));
     assert!(store.visible_to(&msg, Some(ADMIN)));
     // After deletion: the history must not become public.
     let delete = event(DELETE_GROUP, ADMIN, Some("g1"), vec![]);
-    store.apply(&delete, "", 1, false);
+    store.apply(&delete, "", 1, false, false);
     assert!(!store.visible_to(&msg, None));
     assert!(!store.visible_to(&msg, Some(ADMIN)));
     for m in &meta {
@@ -368,14 +369,14 @@ fn deleted_group_content_is_hidden() {
 fn private_groups_hide_from_non_members() {
     let mut store = seeded();
     let edit = event(9002, ADMIN, Some("g1"), vec![vec!["private".into()]]);
-    store.apply(&edit, "", 1, false);
+    store.apply(&edit, "", 1, false, false);
     let msg = event(1, ADMIN, Some("g1"), vec![]);
     let outsider = "d".repeat(64);
     assert!(!store.visible_to(&msg, Some(&outsider)));
     assert!(store.visible_to(&msg, Some(ADMIN)));
     // OTHER is a member and may read private groups.
     assert!(store.visible_to(&msg, Some(OTHER)));
-    let meta = store.apply(&msg, "", 1, true);
+    let meta = store.apply(&msg, "", 1, true, false);
     for m in &meta {
         assert!(!store.visible_to(m, Some(&outsider)));
     }
@@ -412,7 +413,7 @@ fn rebuild_order_applies_create_before_member_ops() {
 
     let mut store = GroupStore::default();
     for e in &events {
-        store.apply(e, "", 1, false);
+        store.apply(e, "", 1, false, false);
     }
     let g = store.group("g1").unwrap();
     assert!(g.is_member(OTHER), "the member op and join must both apply");
@@ -501,7 +502,7 @@ fn livekit_tag_and_single_parent() {
         vec![vec!["livekit".into()], vec!["supported_kinds".into()]],
     );
     assert!(store.validate_write(&edit).is_ok());
-    let meta = store.apply(&edit, "", 1, true);
+    let meta = store.apply(&edit, "", 1, true, false);
     let meta_ev = meta
         .iter()
         .find(|e| e.kind == GROUP_META)

@@ -71,7 +71,7 @@ const SEARCH_BUDGET_MAX: usize = 100_000;
 /// index walk and the relevance ranking both stop here, so a pathological
 /// query (e.g. a 1000-byte search string) cannot fan out into hundreds of
 /// index ranges.
-const SEARCH_MAX_TERMS: usize = 32;
+pub(crate) const SEARCH_MAX_TERMS: usize = 32;
 
 /// How many word-index keys are counted per term to estimate its document
 /// frequency for the IDF weight: beyond this the term is "common" and its
@@ -428,18 +428,14 @@ impl Store {
             .collect()
     }
 
-    /// Estimates the inverse document frequency weight of each search term
-    /// from the word index. Rarer terms get a higher weight, so a query
+    /// The inverse document frequency weight of each search term from its
+    /// document frequency. Rarer terms get a higher weight, so a query
     /// like "nostr bitcoin" ranks an event about both topics above one
-    /// that merely mentions the common word "nostr". Without the word
-    /// index every term is weighted equally.
-    fn term_weights(&self, rtxn: &RoTxn, terms: &[String]) -> Vec<f64> {
-        if self.by_word.is_none() {
-            return vec![1.0; terms.len()];
-        }
-        self.term_dfs(rtxn, terms)
-            .into_iter()
-            .map(|df| 1.0 / (1.0 + (df.max(1) as f64).ln()))
+    /// that merely mentions the common word "nostr". A missing word index
+    /// leaves every term equally weighted.
+    fn weights_from_dfs(dfs: &[u64]) -> Vec<f64> {
+        dfs.iter()
+            .map(|df| 1.0 / (1.0 + (*df.max(&1) as f64).ln()))
             .collect()
     }
 
@@ -567,9 +563,33 @@ impl Store {
         let mut more = false;
         // Union of every search filter's terms, for the relevance ordering,
         // and the response cap of the search results (min of the search
-        // filters' limits, bounded by the relay's max_limit).
+        // filters' limits, bounded by the relay's max_limit). Built once,
+        // before the scan loop, so the document frequencies below cover
+        // exactly the terms the walk exclusion and the ranking use.
         let mut all_terms: Vec<String> = Vec::new();
+        for filter in filters {
+            if let Some(search) = filter.search.as_deref()
+                && !search.trim().is_empty()
+            {
+                for t in crate::nips::nip50::terms(search) {
+                    if !all_terms.contains(&t) {
+                        all_terms.push(t);
+                        if all_terms.len() >= SEARCH_MAX_TERMS {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
         let mut search_take = max_limit;
+        // The document frequencies of the query's search terms are counted
+        // once and shared between the index-walk exclusion (common terms
+        // dropped from the walk) and the relevance weights.
+        let all_dfs: Vec<u64> = if all_terms.is_empty() {
+            Vec::new()
+        } else {
+            self.term_dfs(&rtxn, &all_terms)
+        };
 
         for filter in filters {
             if out.full() {
@@ -602,14 +622,6 @@ impl Store {
                 // are not candidates; the most common terms (last, in
                 // token order) are dropped first.
                 let terms: Vec<String> = terms.into_iter().take(SEARCH_MAX_TERMS).collect();
-                for t in &terms {
-                    if !all_terms.contains(t) {
-                        all_terms.push(t.clone());
-                        if all_terms.len() >= SEARCH_MAX_TERMS {
-                            break;
-                        }
-                    }
-                }
                 if let Some(l) = filter.limit {
                     search_take = search_take.min(l);
                 }
@@ -637,6 +649,8 @@ impl Store {
                 &mut examined,
                 &mut more,
                 light,
+                &all_dfs,
+                &all_terms,
             )?;
             if stop {
                 break;
@@ -647,7 +661,7 @@ impl Store {
                 // NIP-50: results are ordered by search relevance (weighted
                 // by each term's inverse document frequency), not by
                 // created_at, and the limit is applied after that ordering.
-                let weights = self.term_weights(&rtxn, &all_terms);
+                let weights = Self::weights_from_dfs(&all_dfs);
                 out.sort_relevance(&all_terms, &weights);
                 let take = search_take.min(max_limit);
                 if out.len() > take {
@@ -678,6 +692,8 @@ impl Store {
         examined: &mut usize,
         more: &mut bool,
         light: bool,
+        all_dfs: &[u64],
+        all_terms: &[String],
     ) -> Result<bool> {
         let FilterScan {
             filter,
@@ -751,7 +767,22 @@ impl Store {
                 // the rarer term's range; an event matching only common
                 // terms is not a candidate (such terms weigh ~0 in the
                 // relevance order anyway).
-                let dfs = self.term_dfs(rtxn, terms);
+                // The per-filter terms are normally a subset of `all_terms`
+                // (the query-wide set), so their document frequencies come
+                // from the shared count instead of a second index walk. A
+                // pathological REQ with more than SEARCH_MAX_TERMS terms in
+                // total falls back to df=0 (no common-term exclusion: the
+                // walk widens but stays bounded by the work budget).
+                let dfs: Vec<u64> = terms
+                    .iter()
+                    .map(|t| {
+                        all_terms
+                            .iter()
+                            .position(|a| a == t)
+                            .map(|i| all_dfs[i])
+                            .unwrap_or(0)
+                    })
+                    .collect();
                 let mut ranges: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(terms.len());
                 for (word, df) in terms.iter().zip(dfs.iter()) {
                     if *df >= DF_SAMPLE {

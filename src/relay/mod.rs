@@ -26,6 +26,11 @@ use crate::nips::nip43::{self, RoleStore};
 use crate::stats::Stats;
 use crate::util::unix_now;
 
+/// Per-connection live-delivery queue capacity (in batches): a
+/// connection that stops reading drops live batches instead of
+/// accumulating them (the old broadcast channel's lag semantics).
+pub(crate) const LIVE_QUEUE_CAPACITY: usize = 64;
+
 pub struct Relay {
     pub config: Arc<RwLock<Config>>,
     pub access: Arc<RwLock<AccessControl>>,
@@ -42,9 +47,7 @@ pub struct Relay {
     /// to the candidate connections' bounded queues (dropped when full,
     /// the same backpressure semantics as the old broadcast).
     pub conn_queues: std::sync::Arc<
-        std::sync::Mutex<
-            std::collections::HashMap<u64, mpsc::UnboundedSender<crate::ws::LiveBatch>>,
-        >,
+        std::sync::Mutex<std::collections::HashMap<u64, mpsc::Sender<crate::ws::LiveBatch>>>,
     >,
     /// Connection id counter: the id identifies a connection in the
     /// subscription index and the queue map.
@@ -318,18 +321,30 @@ impl Relay {
                 // check; the per-connection queues drop when full (the
                 // same backpressure as the old broadcast).
                 let conns = {
-                    let index = sub_index.read().unwrap();
+                    let index = sub_index.read().unwrap_or_else(|p| p.into_inner());
                     let mut conns = std::collections::HashSet::new();
                     for (event, _) in batch.iter() {
                         conns.extend(index.candidates(event));
                     }
                     conns
                 };
-                let queues = conn_queues.lock().unwrap();
-                for conn in conns {
-                    if let Some(queue) = queues.get(&conn) {
-                        let _ = queue.send(batch.clone());
-                    }
+                // Collect the candidate senders under the lock, then drop
+                // the lock before delivering: the sends never block
+                // (`try_send`), so holding the map lock during the
+                // fan-out would only delay connections joining/leaving.
+                let senders: Vec<mpsc::Sender<crate::ws::LiveBatch>> = {
+                    let queues = conn_queues.lock().unwrap_or_else(|p| p.into_inner());
+                    conns
+                        .iter()
+                        .filter_map(|conn| queues.get(conn).cloned())
+                        .collect()
+                };
+                for sender in senders {
+                    // `try_send` on the bounded queue: a slow connection
+                    // that stops reading drops the batch instead of
+                    // accumulating it in memory (the same lag semantics
+                    // as the old broadcast channel).
+                    let _ = sender.try_send(batch.clone());
                 }
             };
             loop {
@@ -548,6 +563,10 @@ impl Relay {
                 drop(cfg);
                 drop(access);
                 self.vanish_pubkey(pubkey).await;
+                // A vanish request is accepted like any other event (the
+                // OK:true is sent): count it so the accepted/rejected
+                // accounting stays consistent with the OKs.
+                self.stats.bump(&self.stats.events_accepted, 1);
                 return (PutOutcome::Stored, None);
             }
             crate::relay::validate::Precheck::Accept => {}
@@ -833,6 +852,9 @@ impl Relay {
             if let Some(pubkey) = event.pubkey_bytes() {
                 self.vanish_pubkey(pubkey).await;
             }
+            // Same accounting as the single-event path: a vanish is
+            // accepted (its OK:true is sent) and counts as accepted.
+            self.stats.bump(&self.stats.events_accepted, 1);
             results[slot] = (id, PutOutcome::Stored);
         }
 
@@ -898,6 +920,12 @@ impl Relay {
                 group.members.remove(&pubkey_hex);
             }
         }
+        // NIP-43 role assignments hold pubkeys too: a vanished author
+        // must not keep its roles.
+        if self.config.read().await.nip_enabled(43) {
+            let mut roles = self.roles.write().await;
+            roles.assignments.remove(&pubkey_hex);
+        }
     }
 
     /// Applies a stored NIP-29 event to the group state and publishes the
@@ -909,11 +937,13 @@ impl Relay {
         // must still be distinguishable, or the NIP-01 id tie-break could
         // let a stale, later-committed version win.
         let stamp = self.stamp_floor(now.max(event.created_at.saturating_add(1)));
-        let generated =
-            self.groups
-                .write()
-                .await
-                .apply(event, &relay_pubkey, stamp, self.has_relay_key());
+        let generated = self.groups.write().await.apply(
+            event,
+            &relay_pubkey,
+            stamp,
+            self.has_relay_key(),
+            false,
+        );
 
         if event.kind == 9005 {
             // Group moderation delete-event: admins may delete events, but

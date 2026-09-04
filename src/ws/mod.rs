@@ -91,7 +91,7 @@ pub struct Conn {
     /// closes, so connections without active subscriptions are never woken
     /// by live events. A duplicate delivery of an event that is both in the
     /// query result and live is harmless (clients deduplicate by id).
-    pub(crate) live: Option<tokio::sync::mpsc::UnboundedReceiver<LiveBatch>>,
+    pub(crate) live: Option<tokio::sync::mpsc::Receiver<LiveBatch>>,
     /// The connection's id in the relay's live subscription index and
     /// delivery-queue map.
     pub(crate) conn_id: u64,
@@ -341,6 +341,10 @@ struct ConnectionGuard {
     relay: Arc<Relay>,
     stats: Arc<Stats>,
     peer_ip: std::net::IpAddr,
+    /// The connection's live-index id, unregistered on drop so a panic in
+    /// the connection handling cannot leave a dead entry (the bus would
+    /// keep trying to deliver to a gone connection forever).
+    conn_id: u64,
 }
 
 impl Drop for ConnectionGuard {
@@ -349,6 +353,16 @@ impl Drop for ConnectionGuard {
             .connections_active
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         self.relay.release_connection(&self.peer_ip);
+        self.relay
+            .sub_index
+            .write()
+            .unwrap_or_else(|p| p.into_inner())
+            .unregister(self.conn_id);
+        self.relay
+            .conn_queues
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&self.conn_id);
     }
 }
 
@@ -365,6 +379,12 @@ impl Conn {
         let text = match &frame {
             Message::Text(text) => text.as_str(),
             Message::Binary(data) => return self.handle_binary(data, max_msg_size).await,
+            // A WS-level ping must be answered with a pong (the keep-alive
+            // PING below relies on the peer doing the same).
+            Message::Ping(data) => {
+                self.send(Message::Pong(data.clone()));
+                return false;
+            }
             _ => return false,
         };
         if text.len() > max_msg_size {
@@ -416,10 +436,14 @@ pub async fn handle_connection(
         let _ = socket.close().await;
         return;
     }
+    let conn_id = relay
+        .next_conn_id
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let _guard = ConnectionGuard {
         relay: relay.clone(),
         stats: relay.stats.clone(),
         peer_ip,
+        conn_id,
     };
 
     let (mut sender, mut receiver) = socket.split();
@@ -464,6 +488,9 @@ pub async fn handle_connection(
     let mut ping: Option<tokio::time::Interval> = idle.map(|d| {
         let mut interval = tokio::time::interval(Duration::from_secs((d.as_secs() / 3).max(5)));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // The first tick of a fresh interval fires immediately: reset it so
+        // a connect burst does not PING every connection at once.
+        interval.reset();
         interval
     });
 
@@ -475,15 +502,16 @@ pub async fn handle_connection(
         .ip_blocks_version
         .load(std::sync::atomic::Ordering::Relaxed);
 
-    let conn_id = relay
-        .next_conn_id
-        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let idle_jitter = Duration::from_millis(conn_id % 2000);
     let idle_sleep: Option<tokio::time::Sleep> =
         idle.map(|d| tokio::time::sleep_until(tokio::time::Instant::now() + d + idle_jitter));
     let mut idle_sleep = idle_sleep.map(Box::pin);
-    let (live_tx, live_rx) = tokio::sync::mpsc::unbounded_channel();
-    relay.conn_queues.lock().unwrap().insert(conn_id, live_tx);
+    let (live_tx, live_rx) = tokio::sync::mpsc::channel(crate::relay::LIVE_QUEUE_CAPACITY);
+    relay
+        .conn_queues
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(conn_id, live_tx);
     let mut conn = Conn {
         relay,
         conn_id,
@@ -602,7 +630,10 @@ pub async fn handle_connection(
                                 .await
                                 .blocked_ips
                                 .iter()
-                                .any(|(b, _)| b.parse::<std::net::IpAddr>().is_ok_and(|b| b == peer_ip));
+                                .any(|(b, _)| {
+                                    b.parse::<std::net::IpAddr>()
+                                        .is_ok_and(|b| b == crate::util::normalize_ip(peer_ip))
+                                });
                             if blocked {
                                 break;
                             }
@@ -610,11 +641,20 @@ pub async fn handle_connection(
                         if conn.handle_frame(frame, max_msg_size).await {
                             break;
                         }
-                        // Refresh the cached NIP-40/NIP-42 flags so config
-                        // reloads take effect for live delivery.
-                        let cfg = conn.relay.config.read().await;
-                        conn.expiry_enabled = cfg.nip_enabled(40);
-                        conn.giftwrap_restricted = cfg.nip_enabled(42);
+                        // Refresh the cached NIP-40/NIP-42 flags only when
+                        // the config actually changed (the version bumps on
+                        // every SIGHUP reload): the hot frame path never
+                        // takes the shared config lock.
+                        let version = conn
+                            .relay
+                            .config_version
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        if version != conn.config_version {
+                            conn.config_version = version;
+                            let cfg = conn.relay.config.read().await;
+                            conn.expiry_enabled = cfg.nip_enabled(40);
+                            conn.giftwrap_restricted = cfg.nip_enabled(42);
+                        }
                     }
                 }
                 // Batch window: keep reading for a moment so consecutive
@@ -740,9 +780,13 @@ pub async fn handle_connection(
     conn.relay
         .sub_index
         .write()
-        .unwrap()
+        .unwrap_or_else(|p| p.into_inner())
         .unregister(conn.conn_id);
-    conn.relay.conn_queues.lock().unwrap().remove(&conn.conn_id);
+    conn.relay
+        .conn_queues
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&conn.conn_id);
 
     // Flush the per-connection counters into the shared stats once, so the
     // hot per-message path never contends on the shared atomics.
@@ -909,8 +953,12 @@ mod tests {
         let conn_id = relay
             .next_conn_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let (live_tx, live_rx) = tokio::sync::mpsc::unbounded_channel();
-        relay.conn_queues.lock().unwrap().insert(conn_id, live_tx);
+        let (live_tx, live_rx) = tokio::sync::mpsc::channel(crate::relay::LIVE_QUEUE_CAPACITY);
+        relay
+            .conn_queues
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(conn_id, live_tx);
         Conn {
             relay,
             conn_id,
@@ -2052,6 +2100,47 @@ mod tests {
                     .contains("deletion request must reference"),
                 "the reason must explain the rejection"
             );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn live_index_survives_close_and_resubscribe() {
+        // Regression: closing the last subscription used to drop the live
+        // receiver (the old design), which the per-connection index delivery
+        // never recreated — a resubscribed connection silently stopped
+        // receiving live events.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            conn.handle_req(&[json!("a"), json!({"kinds": [1]})]).await;
+            conn.handle_close(&[json!("a")]);
+            // The connection is unregistered after the close.
+            assert!(
+                conn.relay
+                    .sub_index
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .candidates(&signed_note(conn.relay.secp(), "x", now, vec![]))
+                    .is_empty(),
+                "no subscriptions after CLOSE"
+            );
+            // Resubscribe: the live receiver must still be alive and the
+            // connection must be a candidate again.
+            conn.handle_req(&[json!("b"), json!({"kinds": [1]})]).await;
+            assert!(
+                conn.live.is_some(),
+                "live receiver survives a CLOSE + REQ cycle"
+            );
+            let ev = signed_note(conn.relay.secp(), "resubscribed", now, vec![]);
+            conn.relay.broadcast(ev);
+            let received = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                conn.live.as_mut().unwrap().recv(),
+            )
+            .await;
+            assert!(received.is_ok(), "live delivery resumes after CLOSE + REQ");
             conn.relay.db.shutdown();
         });
     }

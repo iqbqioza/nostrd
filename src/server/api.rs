@@ -551,8 +551,13 @@ pub async fn api_query_handler(
 /// "approximate": bool}`.
 pub async fn api_count_handler(
     State(relay): State<Arc<Relay>>,
-    Query(params): Query<ApiParams>,
+    Query(mut params): Query<ApiParams>,
 ) -> (StatusCode, Json<Value>) {
+    let cfg = relay.config.read().await;
+    if let Err((status, msg)) = bound_params(&mut params, &cfg) {
+        return error_response(status, &msg);
+    }
+    drop(cfg);
     let Some(_permit) = relay.api_limit.try_acquire() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -924,7 +929,7 @@ pub async fn api_hourly_handler(
 pub async fn api_related_handler(
     State(relay): State<Arc<Relay>>,
     Path(hex_id): Path<String>,
-    Query(params): Query<ApiParams>,
+    Query(mut params): Query<ApiParams>,
 ) -> (StatusCode, Json<Value>) {
     if hex_id.len() != 64 || hex::decode(&hex_id).is_err() {
         return error_response(
@@ -932,6 +937,14 @@ pub async fn api_related_handler(
             "the id must be a 64-character hex string",
         );
     }
+    // Bound the query parameters like every other handler: without the
+    // cap an unauthenticated request could collect and serialize the
+    // whole scan budget (~200k events) and OOM the relay.
+    let cfg = relay.config.read().await;
+    if let Err((status, msg)) = bound_params(&mut params, &cfg) {
+        return error_response(status, &msg);
+    }
+    drop(cfg);
     let no_tags = excluded_tags(&params);
     let limit = params.limit.unwrap_or(100);
     let filters: Vec<Filter> = vec![

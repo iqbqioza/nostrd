@@ -137,9 +137,17 @@ impl Filter {
         if let Some(search) = self.search.as_deref()
             && !search.trim().is_empty()
         {
-            let terms = self
-                .search_terms
-                .get_or_init(|| crate::nips::nip50::terms(search));
+            let terms = self.search_terms.get_or_init(|| {
+                // Cap the terms like the scan path does: the live
+                // delivery applies them to every event, so an
+                // uncapped search string would force O(terms × event
+                // words) comparisons per event (a CPU-DoS vector
+                // against every live event on the relay).
+                crate::nips::nip50::terms(search)
+                    .into_iter()
+                    .take(crate::db::SEARCH_MAX_TERMS)
+                    .collect()
+            });
             if !crate::nips::nip50::matches_terms(ev.content(), terms) {
                 return false;
             }

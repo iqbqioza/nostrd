@@ -10,6 +10,10 @@
 
 mod removal;
 mod scan;
+
+/// The cap on search terms per filter, shared by the scan path and the
+/// live delivery (`pub(crate)` re-export because `scan` is private).
+pub(crate) use scan::SEARCH_MAX_TERMS;
 pub(crate) mod store;
 #[cfg(test)]
 mod tests;

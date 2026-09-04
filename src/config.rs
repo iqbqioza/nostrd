@@ -1004,6 +1004,7 @@ impl Config {
             ("limits.max_sub_bytes", l.max_sub_bytes),
             ("limits.max_api_concurrent", l.max_api_concurrent),
             ("limits.live_buffer", l.live_buffer),
+            ("limits.live_batch_size", l.live_batch_size),
             ("limits.max_out_queue_bytes", l.max_out_queue_bytes),
         ];
         let db_nonzero = [

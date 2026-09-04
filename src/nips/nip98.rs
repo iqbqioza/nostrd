@@ -114,7 +114,7 @@ fn authority_matches(authority: &str, identity: &crate::nips::nip62::RelayIdenti
     let our_authority = crate::nips::nip62::authority_of(identity);
     let (our_host, our_port) = crate::nips::nip62::split_host_port(&our_authority);
     let (tag_host, tag_port) = crate::nips::nip62::split_host_port(authority);
-    if tag_host != our_host {
+    if !tag_host.eq_ignore_ascii_case(our_host) {
         return false;
     }
     match (tag_port, our_port) {

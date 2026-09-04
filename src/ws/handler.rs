@@ -217,7 +217,6 @@ impl super::Conn {
 
     /// Queues an EVENT message for batched acceptance (generic path).
     pub(crate) async fn queue_event(&mut self, rest: &[Value]) {
-        self.relay.stats.bump(&self.relay.stats.events_received, 1);
         if rest.is_empty() {
             self.send_notice("error: EVENT requires an event object");
             return;
@@ -444,12 +443,8 @@ impl super::Conn {
             self.send_notice("error: CLOSE requires a subscription id");
             return;
         };
+        // `remove_subscription` re-syncs the live index.
         self.remove_subscription(sub_id);
-        // Drop the live receiver with the last subscription so
-        // connection without active subscriptions are never woken.
-        if self.subs.is_empty() {
-            self.live = None;
-        }
     }
 
     /// Re-derives the connection's entries in the live subscription
@@ -462,7 +457,11 @@ impl super::Conn {
             .values()
             .flat_map(|(filters, _, _)| filters.iter().map(crate::relay::FilterComponents::of))
             .collect();
-        let mut index = self.relay.sub_index.write().unwrap();
+        let mut index = self
+            .relay
+            .sub_index
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
         index.unregister(self.conn_id);
         index.register(self.conn_id, &components);
     }
@@ -572,6 +571,11 @@ impl super::Conn {
                     return;
                 }
             }
+        }
+        // NIP-45: COUNT requires at least one filter.
+        if filters.is_empty() {
+            self.send_closed(sub_id, "invalid: COUNT requires at least one filter");
+            return;
         }
         if filters.iter().any(|f| f.too_many_members()) {
             self.send_closed(sub_id, "invalid: too many ids or authors in a filter");

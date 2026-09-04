@@ -64,6 +64,14 @@ impl super::Conn {
             Ok(mut filter) => {
                 // Negentropy needs every matching record, not a capped page.
                 filter.limit = None;
+                // NIP-50 disabled: strip the search like REQ/COUNT/API do,
+                // otherwise a NEG-OPEN would return a subset of what a REQ
+                // with the same filter returns, and the peer would treat
+                // the missing events as absent on this relay (and may
+                // delete them locally).
+                if !self.relay.config.read().await.nip_enabled(50) {
+                    filter.search = None;
+                }
                 filter
             }
             Err(_) => {
@@ -123,7 +131,14 @@ impl super::Conn {
                     if item.protected && !self.is_authed() {
                         return false;
                     }
-                    if item.wrap_recipients.is_some()
+                    // NIP-59/NIP-17: gift wraps are only served to their
+                    // recipients when NIP-42 is enabled (the same gate as
+                    // the REQ path's `gift_wrap_visible`): with NIP-42
+                    // disabled the wraps are public, and withholding them
+                    // from NEG would make a syncing peer delete its local
+                    // copies.
+                    if self.giftwrap_restricted
+                        && item.wrap_recipients.is_some()
                         && !self.authed_pubkeys.iter().any(|pk| {
                             item.wrap_recipients
                                 .as_ref()
@@ -244,7 +259,27 @@ impl super::Conn {
         }
         state.rounds_left -= 1;
         match nip77::respond(&state.items, &message) {
-            Ok(response) => self.send_neg_msg(&sub_id, &response),
+            Ok(response) => {
+                // Bound the response like the REQ path's
+                // `max_req_response_bytes`: a mode-2 reply returns every
+                // id of the range (up to ~6 MiB of hex for 100k items),
+                // and 128 rounds would otherwise amplify one connection
+                // into hundreds of MiB of bandwidth.
+                let budget = self.req_response_bytes;
+                let over_budget = budget > 0 && response.len() as u64 > budget;
+                if over_budget {
+                    if let Some(state) = self.neg.remove(&sub_id) {
+                        self.neg_total = self.neg_total.saturating_sub(state.items.len());
+                        self.release_neg_stats_subscription();
+                    }
+                    self.send_neg_err(
+                        &sub_id,
+                        "blocked: negentropy response too large (increase limits.max_req_response_bytes)",
+                    );
+                    return;
+                }
+                self.send_neg_msg(&sub_id, &response)
+            }
             Err(reason) => {
                 if let Some(state) = self.neg.remove(&sub_id) {
                     self.neg_total = self.neg_total.saturating_sub(state.items.len());
