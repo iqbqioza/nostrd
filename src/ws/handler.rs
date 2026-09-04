@@ -366,7 +366,7 @@ impl super::Conn {
                     .unwrap_or_default()
             })
             .sum();
-        let replacing = self.subs.get(sub_id).map(|(_, bytes)| *bytes);
+        let replacing = self.subs.get(sub_id).map(|(_, bytes, _)| *bytes);
         let next_total = self
             .sub_bytes
             .saturating_sub(replacing.unwrap_or(0))
@@ -376,8 +376,17 @@ impl super::Conn {
             return;
         }
         self.sub_bytes = next_total;
-        self.subs
-            .insert(sub_id.to_string(), (stored.clone(), sub_bytes));
+        self.subs.insert(
+            sub_id.to_string(),
+            (
+                stored.clone(),
+                sub_bytes,
+                // The serialized sub id: the live path wraps every
+                // matching event with it, so it is encoded once per
+                // subscription instead of once per event.
+                serde_json::to_string(sub_id).unwrap_or_default(),
+            ),
+        );
         // Subscribe to live events *before* running the query, so no event
         // stored between the query and the subscription is missed (a
         // duplicate delivery of an event that is both in the query result
@@ -447,7 +456,7 @@ impl super::Conn {
     /// Releases a subscription (and any negentropy state held under the
     /// same id): its filter bytes, its live slot and its negentropy items.
     pub(crate) fn remove_subscription(&mut self, sub_id: &str) {
-        if let Some((_, bytes)) = self.subs.remove(sub_id) {
+        if let Some((_, bytes, _)) = self.subs.remove(sub_id) {
             self.sub_bytes = self.sub_bytes.saturating_sub(bytes);
             self.relay
                 .stats
@@ -647,7 +656,12 @@ impl super::Conn {
     /// caller skips the lock otherwise); `expiry_enabled` is a per-connection
     /// cache refreshed whenever a message arrives, so the hot live path does
     /// not acquire the shared config lock once per batch per connection.
-    pub(crate) fn deliver_live(&mut self, event: &Event, groups: Option<&nip29::GroupStore>) {
+    pub(crate) fn deliver_live(
+        &mut self,
+        event: &Event,
+        event_json: &str,
+        groups: Option<&nip29::GroupStore>,
+    ) {
         // Fast path: most connections have no subscriptions.
         if self.subs.is_empty() {
             return;
@@ -681,28 +695,24 @@ impl super::Conn {
         let matching: Vec<String> = self
             .subs
             .iter()
-            .filter(|(_, (filters, _))| filters.iter().any(|f| f.matches(event)))
+            .filter(|(_, (filters, _, _))| filters.iter().any(|f| f.matches(event)))
             .map(|(sub_id, _)| sub_id.clone())
             .collect();
         if matching.is_empty() {
             return;
         }
-        // Serialize the event once and wrap it per subscription: the JSON
-        // of a large event would otherwise be encoded once per matching
-        // subscription (a hot path on busy relays).
-        let Ok(event_json) = serde_json::to_string(event) else {
-            return;
-        };
-        let mut out = String::with_capacity(event_json.len() + 32);
+        // The event JSON is shared (encoded once by the live bus) and the
+        // sub id JSON is cached per subscription: the wrap below only
+        // concatenates strings.
         for sub_id in matching {
-            let Ok(sub_json) = serde_json::to_string(&sub_id) else {
+            let Some((_, _, sub_json)) = self.subs.get(&sub_id) else {
                 continue;
             };
-            out.clear();
+            let mut out = String::with_capacity(event_json.len() + sub_json.len() + 16);
             out.push_str("[\"EVENT\",");
-            out.push_str(&sub_json);
+            out.push_str(sub_json);
             out.push(',');
-            out.push_str(&event_json);
+            out.push_str(event_json);
             out.push(']');
             self.send(Message::Text(std::mem::take(&mut out).into()));
         }

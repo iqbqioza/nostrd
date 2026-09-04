@@ -16,6 +16,9 @@ fn config() -> DatabaseConfig {
     let _ = std::fs::remove_dir_all(&path);
     DatabaseConfig {
         path,
+        // Small memory map for the parallel test run (see the ws tests).
+        map_size: 16 * 1024 * 1024,
+        max_map_size: 256 * 1024 * 1024,
         ..Default::default()
     }
 }

@@ -399,6 +399,8 @@ mod tests {
         rt.block_on(async {
             let mut cfg = Config::default();
             cfg.relay.max_events_per_min_per_pubkey = 3;
+            cfg.database.map_size = 16 * 1024 * 1024;
+            cfg.database.max_map_size = 256 * 1024 * 1024;
             cfg.database.path = std::env::temp_dir().join("nostrd-rate-test");
             let _ = std::fs::remove_dir_all(&cfg.database.path);
             let db = crate::db::DbClient::open(
@@ -471,6 +473,8 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let mut cfg = Config::default();
+            cfg.database.map_size = 16 * 1024 * 1024;
+            cfg.database.max_map_size = 256 * 1024 * 1024;
             cfg.database.path = std::env::temp_dir().join("nostrd-rate-map-test");
             let _ = std::fs::remove_dir_all(&cfg.database.path);
             let db = crate::db::DbClient::open(
@@ -529,6 +533,8 @@ mod tests {
             // Default config (enable_git = false): every NIP-34 kind is
             // rejected.
             let mut cfg = Config::default();
+            cfg.database.map_size = 16 * 1024 * 1024;
+            cfg.database.max_map_size = 256 * 1024 * 1024;
             cfg.database.path = std::env::temp_dir().join("nostrd-git-test-disabled");
             let _ = std::fs::remove_dir_all(&cfg.database.path);
             let db = crate::db::DbClient::open(
@@ -635,6 +641,8 @@ mod tests {
         rt.block_on(async {
             // Default config: ephemeral events are allowed.
             let mut cfg = Config::default();
+            cfg.database.map_size = 16 * 1024 * 1024;
+            cfg.database.max_map_size = 256 * 1024 * 1024;
             cfg.database.path = std::env::temp_dir().join("nostrd-ephemeral-test-allow");
             let _ = std::fs::remove_dir_all(&cfg.database.path);
             let db = crate::db::DbClient::open(
@@ -791,6 +799,8 @@ mod tests {
         rt.block_on(async {
             let mut cfg = Config::default();
             cfg.relay.reject_ephemeral = true;
+            cfg.database.map_size = 16 * 1024 * 1024;
+            cfg.database.max_map_size = 256 * 1024 * 1024;
             cfg.database.path = std::env::temp_dir().join("nostrd-ephemeral-validate-base");
             let _ = std::fs::remove_dir_all(&cfg.database.path);
             let db = crate::db::DbClient::open(
@@ -844,6 +854,8 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let mut cfg = Config::default();
+            cfg.database.map_size = 16 * 1024 * 1024;
+            cfg.database.max_map_size = 256 * 1024 * 1024;
             cfg.database.path = std::env::temp_dir().join("nostrd-vanish-test");
             let _ = std::fs::remove_dir_all(&cfg.database.path);
             let db = crate::db::DbClient::open(

@@ -1160,6 +1160,12 @@ async fn reload_handler(
                         }
                         drop(old);
                         *config.write().await = new_config;
+                        // Bump the config version: connections refresh
+                        // their cached NIP-40/NIP-42 flags on the next
+                        // live batch (see `Conn::config_version`).
+                        relay
+                            .config_version
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         info!("configuration reloaded from {}", config_path.display());
                     }
                     Err(e) => error!("config reload failed: {e}"),

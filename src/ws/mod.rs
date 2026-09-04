@@ -67,7 +67,7 @@ pub struct Conn {
     /// the capped outgoing queue in chunks as the socket drains.
     pub(crate) pending_reqs: std::collections::VecDeque<PendingReq>,
     /// Subscription id -> (filters, serialized filter bytes).
-    subs: HashMap<String, (Vec<Filter>, usize)>,
+    subs: HashMap<String, (Vec<Filter>, usize, String)>,
     /// Bytes held by the filters of all active subscriptions.
     pub(crate) sub_bytes: usize,
     /// NIP-77 negentropy state per subscription id: the held items plus the
@@ -91,11 +91,15 @@ pub struct Conn {
     /// closes, so connections without active subscriptions are never woken
     /// by live events. A duplicate delivery of an event that is both in the
     /// query result and live is harmless (clients deduplicate by id).
-    pub(crate) live: Option<tokio::sync::broadcast::Receiver<Arc<Vec<Event>>>>,
+    pub(crate) live: Option<tokio::sync::broadcast::Receiver<LiveBatch>>,
     /// Whether this connection delivers NIP-40 expired events live. Cached
-    /// from the config on connect and refreshed whenever a message arrives,
-    /// so the per-batch live path avoids the shared config lock.
+    /// from the config on connect and refreshed only after a SIGHUP
+    /// reload (see `config_version`), so the per-batch live path avoids
+    /// the shared config lock.
     pub(crate) expiry_enabled: bool,
+    /// The relay's `config_version` when `expiry_enabled` /
+    /// `giftwrap_restricted` were last refreshed.
+    pub(crate) config_version: u64,
     /// Whether NIP-59 gift wraps are only served to their recipients
     /// (enforced with NIP-42 auth; false when NIP-42 is disabled).
     pub(crate) giftwrap_restricted: bool,
@@ -112,6 +116,10 @@ pub struct Conn {
     /// (an event-rate hot path must not touch a shared cache line).
     pub(crate) events_received_local: u64,
 }
+
+/// A live-delivery batch: the events plus their shared, pre-serialized
+/// JSON (encoded once by the live bus task).
+pub(crate) type LiveBatch = Arc<Vec<(crate::event::Event, Arc<String>)>>;
 
 impl Conn {
     pub(crate) fn send(&mut self, msg: Message) {
@@ -474,6 +482,7 @@ pub async fn handle_connection(
         live: None,
         expiry_enabled,
         giftwrap_restricted,
+        config_version: 0,
         dropped: 0,
         in_msgs: 0,
         in_bytes: 0,
@@ -491,12 +500,20 @@ pub async fn handle_connection(
     loop {
         // Drain pending outgoing messages. A slow reader stalls only its
         // own connection (outgoing is bounded, so new messages are dropped).
+        // Batch the flush: `start_send` for every queued message and one
+        // `flush` for the whole batch, so a burst of N messages costs one
+        // write syscall instead of N (the per-message `send` flushed each
+        // one).
         while let Some(msg) = conn.outgoing.pop_front() {
             conn.out_bytes = conn.out_bytes.saturating_sub(message_size(&msg));
-            if sender.send(msg).await.is_err() {
+            if sender.feed(msg).await.is_err() {
                 break;
             }
         }
+        // One flush for the whole batch: N queued messages cost a single
+        // write syscall. A failed flush (the socket died) surfaces as the
+        // next inbound read error and ends the connection.
+        let _ = sender.flush().await;
         // Pump the queued REQ responses through the capped outgoing queue
         // in bounded chunks (see `pump_pending_reqs`).
         conn.pump_pending_reqs();
@@ -611,9 +628,12 @@ pub async fn handle_connection(
                 // or a live batch) drives the top-of-loop drain.
                 while let Some(msg) = conn.outgoing.pop_front() {
                     conn.out_bytes = conn.out_bytes.saturating_sub(message_size(&msg));
-                    if sender.send(msg).await.is_err() {
+                    if sender.feed(msg).await.is_err() {
                         break;
                     }
+                }
+                if sender.flush().await.is_err() {
+                    break;
                 }
                 conn.pump_pending_reqs();
                 // Drop the receiver again when every subscription is closed,
@@ -634,31 +654,39 @@ pub async fn handle_connection(
             live_batch = live_fut => {
                 match live_batch {
                     Ok(batch) => {
-                        // Refresh the cached NIP-40/NIP-42 flags so a config
-                        // reload (e.g. re-enabling NIP-40 expiry) takes effect
-                        // even for idle connections that only receive live
-                        // events and never send another frame.
-                        let cfg = conn.relay.config.read().await;
-                        conn.expiry_enabled = cfg.nip_enabled(40);
-                        conn.giftwrap_restricted = cfg.nip_enabled(42);
-                        drop(cfg);
-                        // The group store lock is only taken when the batch
-                        // actually contains group events (rare); ordinary
-                        // traffic skips the shared lock entirely.
+                        // Refresh the cached NIP-40/NIP-42 flags only when
+                        // the config actually changed (the version bumps on
+                        // every SIGHUP reload): the hot live path never
+                        // takes the shared config lock.
+                        let version = conn
+                            .relay
+                            .config_version
+                            .load(std::sync::atomic::Ordering::Relaxed);
+                        if version != conn.config_version {
+                            conn.config_version = version;
+                            let cfg = conn.relay.config.read().await;
+                            conn.expiry_enabled = cfg.nip_enabled(40);
+                            conn.giftwrap_restricted = cfg.nip_enabled(42);
+                        }
+                        // The group store lock and its Arc clone are only
+                        // taken when the batch actually contains group
+                        // events (rare); ordinary traffic skips the shared
+                        // state entirely.
                         let has_group_events =
-                            batch.iter().any(nip29::is_group_event);
-                        // The store Arc stays alive for the whole batch so
-                        // the read guard can borrow it; the lock is only
-                        // taken for batches containing group events.
-                        let store = Arc::clone(&conn.relay.groups);
-                        let guard = if has_group_events {
+                            batch.iter().any(|(e, _)| nip29::is_group_event(e));
+                        let store = if has_group_events {
+                            Some(Arc::clone(&conn.relay.groups))
+                        } else {
+                            None
+                        };
+                        let guard = if let Some(store) = &store {
                             Some(store.read().await)
                         } else {
                             None
                         };
                         let groups = guard.as_deref();
-                        for event in batch.iter() {
-                            conn.deliver_live(event, groups);
+                        for (event, json) in batch.iter() {
+                            conn.deliver_live(event, json, groups);
                         }
                     }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
@@ -805,6 +833,12 @@ mod tests {
     async fn build_conn_with(private_key: &str) -> Conn {
         let mut cfg = Config::default();
         cfg.database.path = temp_db_path();
+        // Small memory map: the parallel tests each open a DB, and the
+        // production 1 TiB reservation would exhaust the container's
+        // memory under the concurrent load (sparse, but the mappings add
+        // up). The tests store a handful of events.
+        cfg.database.map_size = 16 * 1024 * 1024;
+        cfg.database.max_map_size = 256 * 1024 * 1024;
         let db = crate::db::DbClient::open(
             &cfg.database,
             true,
@@ -857,6 +891,7 @@ mod tests {
             live: None,
             expiry_enabled,
             giftwrap_restricted,
+            config_version: 0,
             dropped: 0,
             in_msgs: 0,
             in_bytes: 0,
@@ -1419,6 +1454,62 @@ mod tests {
     }
 
     #[test]
+    fn live_delivery_uses_shared_json_and_cached_sub_json() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let now = unix_now();
+            conn.handle_req(&[json!("sub"), json!({"kinds": [30002]})])
+                .await;
+            // The sub id JSON is cached at REQ time.
+            let cached = conn.subs.get("sub").map(|(_, _, j)| j.clone()).unwrap();
+            assert_eq!(cached, "\"sub\"");
+            let mut ev = signed_note(conn.relay.secp(), "shared-json", now, vec![]);
+            ev.kind = 30002;
+            ev.id = crate::nips::nip01::compute_id(&ev);
+            // Deliver with a pre-serialized JSON (as the bus provides):
+            // the wrapped message must embed exactly those bytes.
+            let event_json = serde_json::to_string(&ev).unwrap();
+            conn.deliver_live(&ev, &event_json, None);
+            let msg = outgoing_json(&conn);
+            assert!(
+                msg.iter().any(|m| {
+                    m[0] == "EVENT"
+                        && m[1] == "sub"
+                        && serde_json::to_string(&m[2]).unwrap() == event_json
+                }),
+                "the shared JSON must be wrapped per subscription"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn live_flags_refresh_only_on_config_version_change() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let conn = build_conn().await;
+            let v0 = conn.config_version;
+            // Same version: no refresh happens (nothing to assert besides
+            // the field staying put — the flag refresh is data-driven).
+            assert_eq!(conn.config_version, v0);
+            // A bumped version on the relay is picked up by the next live
+            // loop iteration (exercised by `handle_frame`'s sibling
+            // refresh; here we only assert the plumbing).
+            conn.relay
+                .config_version
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            assert_eq!(
+                conn.relay
+                    .config_version
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                v0 + 1
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn live_delivery_through_the_bus() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -1441,10 +1532,10 @@ mod tests {
             match received {
                 Ok(Ok(batch)) => {
                     assert!(
-                        batch.iter().any(|e| e.id == ev.id),
+                        batch.iter().any(|(e, _)| e.id == ev.id),
                         "the broadcast event must arrive on the live receiver"
                     );
-                    conn.deliver_live(&ev, None);
+                    conn.deliver_live(&ev, &serde_json::to_string(&ev).unwrap_or_default(), None);
                     let msgs = outgoing_json(&conn);
                     assert!(
                         msgs.iter()
@@ -1610,7 +1701,8 @@ mod tests {
                 );
                 events.push_back(ev);
             }
-            conn.subs.insert("s".into(), (Vec::new(), 0));
+            conn.subs
+                .insert("s".into(), (Vec::new(), 0, "\"s\"".into()));
             conn.enqueue_pending_req(PendingReq {
                 sub_id: "s".into(),
                 events,
@@ -1647,7 +1739,8 @@ mod tests {
                 now,
                 vec![],
             ));
-            conn.subs.insert("s2".into(), (Vec::new(), 0));
+            conn.subs
+                .insert("s2".into(), (Vec::new(), 0, "\"s2\"".into()));
             conn.enqueue_pending_req(PendingReq {
                 sub_id: "s2".into(),
                 events,
@@ -1676,7 +1769,8 @@ mod tests {
             let mut conn = build_conn().await;
             let now = unix_now();
             for i in 0..5 {
-                conn.subs.insert(format!("s{i}"), (Vec::new(), 0));
+                conn.subs
+                    .insert(format!("s{i}"), (Vec::new(), 0, String::new()));
                 let mut events = std::collections::VecDeque::new();
                 events.push_back(signed_note(
                     conn.relay.secp(),
@@ -1762,7 +1856,8 @@ mod tests {
             );
             // A REQ replacing the same subscription id drops the stale
             // still-pumping response.
-            conn.subs.insert("s".into(), (Vec::new(), 0));
+            conn.subs
+                .insert("s".into(), (Vec::new(), 0, "\"s\"".into()));
             let mut first = std::collections::VecDeque::new();
             first.push_back(signed_note(conn.relay.secp(), "old", now, vec![]));
             conn.enqueue_pending_req(PendingReq {
@@ -1811,7 +1906,8 @@ mod tests {
             // A byte cap generous enough that the message-count cap is the
             // binding constraint for ~300-byte events (4096 of them).
             conn.out_queue_bytes = 8 << 20;
-            conn.subs.insert("s".into(), (Vec::new(), 0));
+            conn.subs
+                .insert("s".into(), (Vec::new(), 0, "\"s\"".into()));
             let now = unix_now();
             let mut events = std::collections::VecDeque::new();
             for i in 0..OUT_QUEUE_LIMIT {

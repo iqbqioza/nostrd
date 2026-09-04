@@ -30,10 +30,14 @@ pub struct Relay {
     pub stats: Arc<Stats>,
     /// Batched live events: the bus task accumulates events and broadcasts
     /// `Arc<Vec<Event>>` batches so that idle connections wake up once per
-    /// batch instead of once per event.
-    pub live: broadcast::Sender<Arc<Vec<Event>>>,
-    live_tx: mpsc::Sender<Event>,
-    live_rx: Option<mpsc::Receiver<Event>>,
+    /// batch instead of once per event. Each event carries its
+    /// pre-serialized JSON (encoded once by the bus task and shared via
+    /// `Arc`), so `N` subscribers do not serialize the same event `N`
+    /// times.
+    pub live: broadcast::Sender<crate::ws::LiveBatch>,
+    live_tx: mpsc::Sender<(Event, Arc<String>)>,
+    live_rx: Option<mpsc::Receiver<(Event, Arc<String>)>>,
+    /// The relay's config version, bumped on every SIGHUP reload.
     live_batch_interval_ms: u64,
     live_batch_size: usize,
     pub groups: Arc<RwLock<GroupStore>>,
@@ -55,6 +59,10 @@ pub struct Relay {
     /// connect and re-check the list (and close) when it changed, so a
     /// newly blocked IP's existing connections are dropped too.
     pub ip_blocks_version: AtomicU64,
+    /// Bumped on every SIGHUP config reload: connections cache the NIP-40/
+    /// NIP-42 flags against this version and refresh them only when it
+    /// changes, so the hot live path never takes the shared config lock.
+    pub config_version: std::sync::atomic::AtomicU64,
     /// The relay's own keypair (from `relay.private_key`), used to sign
     /// NIP-29 and NIP-43 relay-generated events.
     key: Option<Keypair>,
@@ -248,6 +256,7 @@ impl Relay {
             per_ip_connections: std::sync::Mutex::new(HashMap::new()),
             publish_rate: std::sync::Mutex::new(HashMap::new()),
             ip_blocks_version: AtomicU64::new(0),
+            config_version: AtomicU64::new(0),
             key,
             secp,
             config_path: Arc::new(tokio::sync::RwLock::new(None)),
@@ -278,8 +287,8 @@ impl Relay {
             let mut interval =
                 tokio::time::interval(tokio::time::Duration::from_millis(interval_ms));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let mut batch: Vec<Event> = Vec::with_capacity(batch_size);
-            let flush = |batch: &mut Vec<Event>| {
+            let mut batch: Vec<(Event, Arc<String>)> = Vec::with_capacity(batch_size);
+            let flush = |batch: &mut Vec<(Event, Arc<String>)>| {
                 if batch.is_empty() {
                     return;
                 }
@@ -288,8 +297,8 @@ impl Relay {
             loop {
                 tokio::select! {
                     event = rx.recv() => match event {
-                        Some(event) => {
-                            batch.push(event);
+                        Some((event, json)) => {
+                            batch.push((event, json));
                             if batch.len() >= batch_size {
                                 flush(&mut batch);
                             }
@@ -307,9 +316,11 @@ impl Relay {
 
     /// Queues an event for live delivery to subscribers. The event is
     /// dropped (never stored) when the live buffer is full, as it remains
-    /// available through subscriptions.
+    /// available through subscriptions. The JSON is encoded once here —
+    /// every subscriber shares the same serialization.
     pub fn broadcast(&self, event: Event) {
-        let _ = self.live_tx.try_send(event);
+        let json = Arc::new(serde_json::to_string(&event).unwrap_or_default());
+        let _ = self.live_tx.try_send((event, json));
     }
 
     /// Whether `pubkey` may publish another event under
@@ -902,6 +913,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         let mut cfg = crate::config::Config::default();
         cfg.database.path = path;
+        cfg.database.map_size = 16 * 1024 * 1024;
+        cfg.database.max_map_size = 256 * 1024 * 1024;
         let db = crate::db::DbClient::open(
             &cfg.database,
             true,
