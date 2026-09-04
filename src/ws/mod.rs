@@ -91,7 +91,10 @@ pub struct Conn {
     /// closes, so connections without active subscriptions are never woken
     /// by live events. A duplicate delivery of an event that is both in the
     /// query result and live is harmless (clients deduplicate by id).
-    pub(crate) live: Option<tokio::sync::broadcast::Receiver<LiveBatch>>,
+    pub(crate) live: Option<tokio::sync::mpsc::UnboundedReceiver<LiveBatch>>,
+    /// The connection's id in the relay's live subscription index and
+    /// delivery-queue map.
+    pub(crate) conn_id: u64,
     /// Whether this connection delivers NIP-40 expired events live. Cached
     /// from the config on connect and refreshed only after a SIGHUP
     /// reload (see `config_version`), so the per-batch live path avoids
@@ -465,8 +468,15 @@ pub async fn handle_connection(
         .ip_blocks_version
         .load(std::sync::atomic::Ordering::Relaxed);
 
+    let conn_id = relay
+        .next_conn_id
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let (live_tx, live_rx) = tokio::sync::mpsc::unbounded_channel();
+    relay.conn_queues.lock().unwrap().insert(conn_id, live_tx);
     let mut conn = Conn {
         relay,
+        conn_id,
+        live: Some(live_rx),
         path,
         outgoing: std::collections::VecDeque::new(),
         out_bytes: 0,
@@ -479,7 +489,6 @@ pub async fn handle_connection(
         challenge,
         authed_pubkeys: Vec::new(),
         pending_events: Vec::new(),
-        live: None,
         expiry_enabled,
         giftwrap_restricted,
         config_version: 0,
@@ -636,14 +645,6 @@ pub async fn handle_connection(
                     break;
                 }
                 conn.pump_pending_reqs();
-                // Drop the receiver again when every subscription is closed,
-                // so connections without active subscriptions are never
-                // woken by live events. (Subscribing happens in `handle_req`
-                // *before* the query, so no stored event can fall into the
-                // gap between the query and the subscription.)
-                if conn.live.is_some() && conn.subs.is_empty() {
-                    conn.live = None;
-                }
             }
             _ = ping_fut => {
                 // Keep-alive: a healthy client answers with a PONG (an
@@ -653,7 +654,7 @@ pub async fn handle_connection(
             }
             live_batch = live_fut => {
                 match live_batch {
-                    Ok(batch) => {
+                    Some(batch) => {
                         // Refresh the cached NIP-40/NIP-42 flags only when
                         // the config actually changed (the version bumps on
                         // every SIGHUP reload): the hot live path never
@@ -689,8 +690,7 @@ pub async fn handle_connection(
                             conn.deliver_live(event, json, groups);
                         }
                     }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    None => break,
                 }
             }
         }
@@ -710,6 +710,16 @@ pub async fn handle_connection(
         }
     }
     let _ = sender.close().await;
+
+    // Remove the connection from the live subscription index and the
+    // delivery-queue map (the queue sender is dropped with the map entry;
+    // the bus task's `send` then fails and the connection is skipped).
+    conn.relay
+        .sub_index
+        .write()
+        .unwrap()
+        .unregister(conn.conn_id);
+    conn.relay.conn_queues.lock().unwrap().remove(&conn.conn_id);
 
     // Flush the per-connection counters into the shared stats once, so the
     // hot per-message path never contends on the shared atomics.
@@ -873,8 +883,14 @@ mod tests {
                 cfg.nip_enabled(42),
             )
         };
+        let conn_id = relay
+            .next_conn_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (live_tx, live_rx) = tokio::sync::mpsc::unbounded_channel();
+        relay.conn_queues.lock().unwrap().insert(conn_id, live_tx);
         Conn {
             relay,
+            conn_id,
             path: "/".into(),
             outgoing: std::collections::VecDeque::new(),
             out_bytes: 0,
@@ -888,7 +904,7 @@ mod tests {
             challenge: "test-challenge".into(),
             authed_pubkeys: Vec::new(),
             pending_events: Vec::new(),
-            live: None,
+            live: Some(live_rx),
             expiry_enabled,
             giftwrap_restricted,
             config_version: 0,
@@ -1485,6 +1501,48 @@ mod tests {
     }
 
     #[test]
+    fn live_index_delivers_only_to_candidate_connections() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn_a = build_conn().await;
+            let mut conn_b = build_conn().await;
+            let now = unix_now();
+            conn_a
+                .handle_req(&[json!("a"), json!({"kinds": [30001]})])
+                .await;
+            conn_b
+                .handle_req(&[json!("b"), json!({"kinds": [1]})])
+                .await;
+            // Both connections are in the index (their kinds), but a
+            // kind-30001 event's candidate set contains only conn_a.
+            let mut ev = signed_note(conn_a.relay.secp(), "candidate-check", now, vec![]);
+            ev.kind = 30001;
+            ev.id = crate::nips::nip01::compute_id(&ev);
+            conn_a.relay.broadcast(ev.clone());
+            let received_a = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                conn_a.live.as_mut().unwrap().recv(),
+            )
+            .await;
+            assert!(
+                received_a.is_ok(),
+                "the matching connection receives the batch"
+            );
+            // conn_b's queue stays silent (nothing is sent to it).
+            let received_b = tokio::time::timeout(
+                std::time::Duration::from_millis(300),
+                conn_b.live.as_mut().unwrap().recv(),
+            )
+            .await;
+            assert!(
+                received_b.is_err(),
+                "a non-matching connection must not be woken"
+            );
+            conn_a.relay.db.shutdown();
+        });
+    }
+
+    #[test]
     fn live_flags_refresh_only_on_config_version_change() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -1530,7 +1588,7 @@ mod tests {
             )
             .await;
             match received {
-                Ok(Ok(batch)) => {
+                Ok(Some(batch)) => {
                     assert!(
                         batch.iter().any(|(e, _)| e.id == ev.id),
                         "the broadcast event must arrive on the live receiver"

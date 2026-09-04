@@ -1,8 +1,11 @@
 //! The relay: event acceptance (single and batched), live
 //! broadcasting, NIP-29/NIP-43 group and role state, and the
+//! live-delivery subscription index.
 //! relay-generated event publishing. Event validation lives in
 //! [`validate`].
 
+mod index;
+pub(crate) use index::{FilterComponents, SubscriptionIndex};
 mod roles;
 mod validate;
 
@@ -12,7 +15,7 @@ use secp256k1::{Keypair, Secp256k1, XOnlyPublicKey};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicIsize, AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::RwLock;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 
 use crate::config::{AccessControl, Config};
 use crate::db::{DbClient, PutOutcome};
@@ -28,16 +31,26 @@ pub struct Relay {
     pub access: Arc<RwLock<AccessControl>>,
     pub db: DbClient,
     pub stats: Arc<Stats>,
-    /// Batched live events: the bus task accumulates events and broadcasts
-    /// `Arc<Vec<Event>>` batches so that idle connections wake up once per
-    /// batch instead of once per event. Each event carries its
-    /// pre-serialized JSON (encoded once by the bus task and shared via
-    /// `Arc`), so `N` subscribers do not serialize the same event `N`
-    /// times.
-    pub live: broadcast::Sender<crate::ws::LiveBatch>,
+    /// The live subscription index: filter components (kinds, authors,
+    /// tags) → connection ids. The bus task looks up the candidate
+    /// connections for each event batch and delivers only to them, so an
+    /// event wakes the connections that can match it instead of every
+    /// subscriber (the per-connection filter match remains the final
+    /// check).
+    pub sub_index: std::sync::Arc<std::sync::RwLock<crate::relay::SubscriptionIndex>>,
+    /// Per-connection live-delivery queues: the bus task sends each batch
+    /// to the candidate connections' bounded queues (dropped when full,
+    /// the same backpressure semantics as the old broadcast).
+    pub conn_queues: std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<u64, mpsc::UnboundedSender<crate::ws::LiveBatch>>,
+        >,
+    >,
+    /// Connection id counter: the id identifies a connection in the
+    /// subscription index and the queue map.
+    pub next_conn_id: std::sync::atomic::AtomicU64,
     live_tx: mpsc::Sender<(Event, Arc<String>)>,
     live_rx: Option<mpsc::Receiver<(Event, Arc<String>)>>,
-    /// The relay's config version, bumped on every SIGHUP reload.
     live_batch_interval_ms: u64,
     live_batch_size: usize,
     pub groups: Arc<RwLock<GroupStore>>,
@@ -202,7 +215,6 @@ impl Relay {
         private_key_hex: &str,
         live_bus: LiveBusConfig,
     ) -> Relay {
-        let (live, _) = broadcast::channel(4096);
         let (live_tx, live_rx) = mpsc::channel(live_bus.buffer.max(16));
         let live_batch_interval_ms = live_bus.batch_interval_ms.clamp(1, 1000);
         let live_batch_size = live_bus.batch_size.max(1);
@@ -243,7 +255,11 @@ impl Relay {
             access: Arc::new(RwLock::new(access)),
             db,
             stats,
-            live,
+            sub_index: std::sync::Arc::new(std::sync::RwLock::new(SubscriptionIndex::default())),
+            conn_queues: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            next_conn_id: std::sync::atomic::AtomicU64::new(1),
             live_tx,
             live_rx: Some(live_rx),
             live_batch_interval_ms,
@@ -280,7 +296,8 @@ impl Relay {
         let Some(mut rx) = self.live_rx.take() else {
             return;
         };
-        let tx = self.live.clone();
+        let sub_index = std::sync::Arc::clone(&self.sub_index);
+        let conn_queues = std::sync::Arc::clone(&self.conn_queues);
         let interval_ms = self.live_batch_interval_ms;
         let batch_size = self.live_batch_size;
         tokio::spawn(async move {
@@ -292,7 +309,28 @@ impl Relay {
                 if batch.is_empty() {
                     return;
                 }
-                let _ = tx.send(Arc::new(std::mem::take(batch)));
+                let batch = Arc::new(std::mem::take(batch));
+                // Deliver to the candidate connections only: the
+                // subscription index maps each event's components to the
+                // connections that could match, so an event wakes the
+                // subscribers that can see it instead of all of them.
+                // The per-connection filter match remains the final
+                // check; the per-connection queues drop when full (the
+                // same backpressure as the old broadcast).
+                let conns = {
+                    let index = sub_index.read().unwrap();
+                    let mut conns = std::collections::HashSet::new();
+                    for (event, _) in batch.iter() {
+                        conns.extend(index.candidates(event));
+                    }
+                    conns
+                };
+                let queues = conn_queues.lock().unwrap();
+                for conn in conns {
+                    if let Some(queue) = queues.get(&conn) {
+                        let _ = queue.send(batch.clone());
+                    }
+                }
             };
             loop {
                 tokio::select! {

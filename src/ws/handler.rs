@@ -387,13 +387,12 @@ impl super::Conn {
                 serde_json::to_string(sub_id).unwrap_or_default(),
             ),
         );
-        // Subscribe to live events *before* running the query, so no event
-        // stored between the query and the subscription is missed (a
-        // duplicate delivery of an event that is both in the query result
-        // and live is harmless: clients deduplicate by id).
-        if self.live.is_none() {
-            self.live = Some(self.relay.live.subscribe());
-        }
+        // Register the subscription in the live index *before* running
+        // the query, so no event stored between the query and the
+        // subscription is missed (a duplicate delivery of an event that
+        // is both in the query result and live is harmless: clients
+        // deduplicate by id).
+        self.sync_live_index();
         if replacing.is_none() {
             self.relay
                 .stats
@@ -453,6 +452,21 @@ impl super::Conn {
         }
     }
 
+    /// Re-derives the connection's entries in the live subscription
+    /// index from its current subscriptions. Called after every REQ /
+    /// CLOSE / sub replacement: the index maps filter components to
+    /// connections, and the bus delivers only to the candidate set.
+    pub(crate) fn sync_live_index(&self) {
+        let components: Vec<crate::relay::FilterComponents> = self
+            .subs
+            .values()
+            .flat_map(|(filters, _, _)| filters.iter().map(crate::relay::FilterComponents::of))
+            .collect();
+        let mut index = self.relay.sub_index.write().unwrap();
+        index.unregister(self.conn_id);
+        index.register(self.conn_id, &components);
+    }
+
     /// Releases a subscription (and any negentropy state held under the
     /// same id): its filter bytes, its live slot and its negentropy items.
     pub(crate) fn remove_subscription(&mut self, sub_id: &str) {
@@ -469,6 +483,7 @@ impl super::Conn {
                 self.neg_total = self.neg_total.saturating_sub(state.items.len());
                 self.release_neg_stats_subscription();
             }
+            self.sync_live_index();
         }
     }
 
