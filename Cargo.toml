@@ -44,4 +44,4 @@ strip = "symbols"
 panic = "unwind"
 
 [dev-dependencies]
-tokio-tungstenite = "0.29"
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
