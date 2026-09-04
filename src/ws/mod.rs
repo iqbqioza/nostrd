@@ -454,6 +454,13 @@ pub async fn handle_connection(
         None
     };
     let mut last_activity = std::time::Instant::now();
+    // A single persistent idle deadline (reset in place on every inbound
+    // frame): the per-iteration `timeout(remaining)` of the old loop
+    // created and destroyed a timer-wheel entry every pass — for live-
+    // active connections that was dozens of times per second. The jitter
+    // (derived from the connection id, so no RNG) spreads the deadlines
+    // of a large simultaneous cohort instead of timing them all out in
+    // the same instant.
     let mut ping: Option<tokio::time::Interval> = idle.map(|d| {
         let mut interval = tokio::time::interval(Duration::from_secs((d.as_secs() / 3).max(5)));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -471,6 +478,10 @@ pub async fn handle_connection(
     let conn_id = relay
         .next_conn_id
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let idle_jitter = Duration::from_millis(conn_id % 2000);
+    let idle_sleep: Option<tokio::time::Sleep> =
+        idle.map(|d| tokio::time::sleep_until(tokio::time::Instant::now() + d + idle_jitter));
+    let mut idle_sleep = idle_sleep.map(Box::pin);
     let (live_tx, live_rx) = tokio::sync::mpsc::unbounded_channel();
     relay.conn_queues.lock().unwrap().insert(conn_id, live_tx);
     let mut conn = Conn {
@@ -540,19 +551,32 @@ pub async fn handle_connection(
             }
         };
         let incoming_fut = async {
-            match idle {
-                Some(d) => {
-                    // Remaining time until the idle deadline, measured from the
-                    // last inbound frame (only the incoming branch updates
-                    // `last_activity`, so pings/live batches cannot mask a dead
-                    // peer).
-                    let remaining = d.saturating_sub(last_activity.elapsed());
-                    match tokio::time::timeout(remaining, receiver.next()).await {
-                        Ok(x) => Ok(x),
-                        Err(_) => Err(()),
+            match &mut idle_sleep {
+                Some(sleep) => {
+                    // The deadline is measured from the last inbound frame
+                    // (only the incoming branch updates `last_activity`, so
+                    // pings/live batches cannot mask a dead peer); a frame
+                    // advanced the deadline, so reset the single Sleep in
+                    // place.
+                    let target = tokio::time::Instant::from_std(last_activity)
+                        + idle.expect("idle_sleep is Some only when idle is Some")
+                        + idle_jitter;
+                    if sleep.as_mut().deadline() != target {
+                        sleep.as_mut().reset(target);
+                    }
+                    tokio::select! {
+                        biased;
+                        _ = sleep.as_mut() => Err(()),
+                        frame = receiver.next() => match frame {
+                            Some(Ok(frame)) => Ok(frame),
+                            _ => Err(()),
+                        },
                     }
                 }
-                None => Ok(receiver.next().await),
+                None => match receiver.next().await {
+                    Some(Ok(frame)) => Ok(frame),
+                    _ => Err(()),
+                },
             }
         };
         tokio::select! {
@@ -560,9 +584,8 @@ pub async fn handle_connection(
                 match incoming {
                     // Idle timeout (ws_idle_timeout_secs): no inbound frames.
                     Err(_) => break,
-                    Ok(Some(Ok(Message::Close(_)))) | Ok(None) => break,
-                    Ok(Some(Err(_))) => break,
-                    Ok(Some(Ok(frame))) => {
+                    Ok(Message::Close(_)) => break,
+                    Ok(frame) => {
                         last_activity = std::time::Instant::now();
                         // Re-check the blocked-IP list when it changed since
                         // connect: a newly blocked IP's existing connections

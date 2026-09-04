@@ -748,7 +748,28 @@ Settings that require a **restart**: `private_key`, `api_host`, `metrics_enabled
 
 ---
 
-## 14. When You Are Stuck
+## 14. Large-Scale Deployments
+
+The relay is designed to scale to hundreds of thousands of connections
+on a single host (the live delivery wakes only the subscribers that can
+match an event, and the per-connection memory is kept small). Pushing
+into the millions requires host-level tuning:
+
+| Setting | Value | Why |
+| --- | --- | --- |
+| `ulimit -n` / systemd `LimitNOFILE` | ≥ 2× the target connections (+1000) | Every connection holds an fd |
+| `net.core.somaxconn` | ≥ 1024 | Pending accept queue for connection bursts |
+| `net.ipv4.tcp_mem` / `net.ipv4.tcp_rmem` / `tcp_wmem` | tuned to the host RAM | The relay sets 16 KiB per socket direction; the kernel defaults must still cover the aggregate |
+| `net.ipv4.tcp_fin_timeout` | low (e.g. 10) | Reclaims TIME_WAIT sockets faster |
+| `vm.overcommit_memory` | 1 or 2 | The LMDB map is a large sparse virtual reservation (see `database.max_map_size`) |
+
+Per-connection kernel memory is ~32 KiB (16 KiB per direction, set by
+the relay) and user space ~10 KiB (the task, the connection state, the
+WebSocket buffer), so a million connections need roughly 40 GiB of
+kernel + user memory on top of the database. The WebSocket reader pool
+has two threads; a single heavy REQ no longer stalls every query.
+
+## 15. When You Are Stuck
 
 See [Troubleshooting (TROUBLESHOOTING.md)](TROUBLESHOOTING.md) for common errors and their fixes.
 

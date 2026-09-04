@@ -870,10 +870,15 @@ async fn serve_limited(
                 // Keep per-connection kernel buffers small so that hundreds
                 // of thousands of idle connections do not pin gigabytes of
                 // kernel memory (see the same tuning in `ws_handler`).
+                // 16 KiB per direction: the incoming buffer only needs a
+                // few frames (the batch window reads 1 ms at a time) and
+                // the outgoing path flushes eagerly, so the smaller kernel
+                // buffers roughly halve the per-connection kernel memory
+                // (64 KiB → 32 KiB) at a million connections.
                 let _ = stream.set_nodelay(true);
                 unsafe {
-                    set_sock_opt(&stream, libc::SO_RCVBUF, 32 * 1024);
-                    set_sock_opt(&stream, libc::SO_SNDBUF, 32 * 1024);
+                    set_sock_opt(&stream, libc::SO_RCVBUF, 16 * 1024);
+                    set_sock_opt(&stream, libc::SO_SNDBUF, 16 * 1024);
                 }
 
                 let app = app.clone();
