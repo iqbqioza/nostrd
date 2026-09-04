@@ -391,7 +391,49 @@ mod tests {
     }
 
     #[test]
-    fn vanished_pubkey_remains_visible_to_its_own_pubkey() {}
+    fn vanished_pubkey_rejects_new_events() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut cfg = Config::default();
+            cfg.database.map_size = 16 * 1024 * 1024;
+            cfg.database.max_map_size = 256 * 1024 * 1024;
+            cfg.database.path = std::env::temp_dir().join("nostrd-vanish-test");
+            let _ = std::fs::remove_dir_all(&cfg.database.path);
+            let db = crate::db::DbClient::open(
+                &cfg.database,
+                true,
+                Arc::new(Default::default()),
+                0,
+                128,
+                4096,
+                262144,
+            )
+            .unwrap();
+            let config = Arc::new(RwLock::new(cfg));
+            let mut relay = Relay::new(
+                config.clone(),
+                db,
+                crate::stats::Stats::new(),
+                "",
+                crate::relay::LiveBusConfig {
+                    buffer: 1024,
+                    batch_interval_ms: 10,
+                    batch_size: 64,
+                },
+            )
+            .await;
+            relay.start_live_bus();
+            let relay = Arc::new(relay);
+            let vanished = signed_with_seed(42u8, 1, vec![]);
+            relay.vanish_pubkey(vanished.pubkey_bytes().unwrap()).await;
+            let outcome = relay.accept_event(vanished, &[], None).await.0;
+            assert!(
+                matches!(&outcome, crate::db::PutOutcome::Invalid(reason) if reason.contains("vanish")),
+                "a vanished pubkey's new events are rejected: {outcome:?}"
+            );
+            relay.db.shutdown();
+        });
+    }
 
     #[test]
     fn publish_rate_limits_events_per_pubkey_per_minute() {

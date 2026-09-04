@@ -27,6 +27,9 @@ impl Store {
         request_created: u64,
         group: Option<&str>,
     ) -> Result<usize> {
+        // Disk-full guard: a removal still writes (the deleted marker),
+        // so the same SIGBUS protection as the put path applies.
+        self.disk_full_error()?;
         let mut wtxn = self.env.write_txn()?;
         let mut removed = 0usize;
 
@@ -141,6 +144,7 @@ impl Store {
     /// NIP-86 banevent: marks the event as banned, removes it from storage
     /// and rejects future re-publication.
     pub(crate) fn apply_ban(&self, id: &[u8], reason: &str) -> Result<bool> {
+        self.disk_full_error()?;
         let mut wtxn = self.env.write_txn()?;
         self.banned.put(&mut wtxn, id, reason.as_bytes())?;
         let removed = if self.events.get(&wtxn, id)?.is_some() {
@@ -231,6 +235,7 @@ impl Store {
     /// deletion requests and NIP-59 gift wraps that p-tag it) and records the
     /// pubkey so that no future event from it is accepted.
     pub(crate) fn apply_vanish(&self, pubkey: &[u8]) -> Result<usize> {
+        self.disk_full_error()?;
         let mut wtxn = self.env.write_txn()?;
         self.vanish.put(&mut wtxn, pubkey, b"")?;
 
@@ -335,6 +340,16 @@ impl Store {
     }
 
     pub(crate) fn purge_expired(&self, now: u64) -> Result<usize> {
+        // NIP-40 disabled: nothing is expired. Stale entries written while
+        // it was enabled are removed by `remove_event` (which deletes the
+        // entry regardless of the toggle), so re-enabling the feature can
+        // never resurrect a purged event through a stale key.
+        if !self
+            .expiry_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(0);
+        }
         let mut wtxn = self.env.write_txn()?;
         let since_key = created_key(0, &[0u8; ID_LEN]);
         let until_key = created_key(now, &[0xffu8; ID_LEN]);

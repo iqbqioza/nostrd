@@ -91,14 +91,10 @@ pub async fn rpc_handler(
     // NIP-86 `blockip` also applies to this endpoint: a blocked peer must
     // not reach the management RPC (the WebSocket handler already refuses
     // its connections).
-    if relay
-        .access
-        .read()
-        .await
-        .blocked_ips
-        .iter()
-        .any(|(b, _)| b.parse::<std::net::IpAddr>().is_ok_and(|b| b == peer.ip()))
-    {
+    if relay.access.read().await.blocked_ips.iter().any(|(b, _)| {
+        b.parse::<std::net::IpAddr>()
+            .is_ok_and(|b| b == crate::util::normalize_ip(peer.ip()))
+    }) {
         return StatusCode::FORBIDDEN.into_response();
     }
     // The spec requires the JSON-RPC content type (parameters such as

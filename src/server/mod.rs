@@ -861,8 +861,11 @@ async fn serve_limited(
                     continue;
                 };
                 // Per-IP connection rate limit (slow-loris / socket flood).
+                // The address is normalized like every other per-IP
+                // accounting: a dual-stack listener reports IPv4 peers as
+                // ::ffff:a.b.c.d, which must not dodge the per-second cap.
                 if let Some(limiter) = &per_sec_per_ip
-                    && !limiter.allow(peer.ip(), crate::util::unix_now())
+                    && !limiter.allow(crate::util::normalize_ip(peer.ip()), crate::util::unix_now())
                 {
                     continue;
                 }
@@ -1080,6 +1083,10 @@ async fn reload_handler(
                             (
                                 "blossom.storage",
                                 old.blossom.storage != new_config.blossom.storage,
+                            ),
+                            (
+                                "blossom.min_free_bytes",
+                                old.blossom.min_free_bytes != new_config.blossom.min_free_bytes,
                             ),
                             (
                                 "blossom.local_path",

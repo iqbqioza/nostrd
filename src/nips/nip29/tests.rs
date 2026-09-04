@@ -21,6 +21,8 @@ fn event(kind: u64, pubkey: &str, h: Option<&str>, tags: Vec<Vec<String>>) -> Ev
 const ADMIN: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const USER: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const OTHER: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+/// A second admin (distinct from ADMIN) for the last-admin guard tests.
+const ADMIN2: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
 
 fn seeded() -> GroupStore {
     let mut store = GroupStore::default();
@@ -528,4 +530,62 @@ fn livekit_tag_and_single_parent() {
         store.validate_write(&double_parent).unwrap_err(),
         "restricted: at most one parent tag is allowed"
     );
+}
+
+#[test]
+fn last_admin_cannot_be_demoted_or_removed() {
+    // The guard covers every path that removes an admin: a 9000 without
+    // roles, a 9000 with an all-empty role list, a 9001 remove-user, and
+    // a LEAVE by the last admin.
+    let mut store = seeded();
+    // Give the group a second admin.
+    let grant = event(
+        9000,
+        ADMIN,
+        Some("g1"),
+        vec![vec![P.into(), ADMIN2.into(), "mod".into()]],
+    );
+    assert!(store.validate_write(&grant).is_ok());
+    store.apply(&grant, "", 2, false, false);
+
+    // ADMIN demotes ADMIN2 (not the last admin): allowed.
+    let demote = event(9000, ADMIN, Some("g1"), vec![vec![P.into(), ADMIN2.into()]]);
+    assert!(store.validate_write(&demote).is_ok());
+    store.apply(&demote, "", 3, false, false);
+
+    // Demoting the last admin with a bare p tag: refused.
+    let demote_last = event(9000, ADMIN, Some("g1"), vec![vec![P.into(), ADMIN.into()]]);
+    assert!(store.validate_write(&demote_last).is_err());
+    // An all-empty role list is a demotion too: refused.
+    let empty_roles = event(
+        9000,
+        ADMIN,
+        Some("g1"),
+        vec![vec![P.into(), ADMIN.into(), "".into()]],
+    );
+    assert!(
+        store.validate_write(&empty_roles).is_err(),
+        "an all-empty role list must not bypass the last-admin guard"
+    );
+    // Removing the last admin with 9001: refused.
+    let remove_last = event(9001, ADMIN, Some("g1"), vec![vec![P.into(), ADMIN.into()]]);
+    assert!(store.validate_write(&remove_last).is_err());
+    // The last admin leaving: refused.
+    let leave = event(9022, ADMIN, Some("g1"), vec![]);
+    assert!(store.validate_write(&leave).is_err());
+    // Removing a non-last admin is fine.
+    let grant2 = event(
+        9000,
+        ADMIN,
+        Some("g1"),
+        vec![vec![P.into(), ADMIN2.into(), "mod".into()]],
+    );
+    store.apply(&grant2, "", 4, false, false);
+    let remove2 = event(
+        9001,
+        ADMIN2,
+        Some("g1"),
+        vec![vec![P.into(), ADMIN2.into()]],
+    );
+    assert!(store.validate_write(&remove2).is_ok());
 }

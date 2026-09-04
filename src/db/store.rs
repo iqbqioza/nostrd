@@ -82,6 +82,12 @@ pub(crate) const BLOSSOM: &str = "blossom";
 pub(crate) const CREATED_LEN: usize = 8;
 pub(crate) const ID_LEN: usize = 32;
 pub(crate) const TAG_VALUE_MAX: usize = 1024;
+/// Longest tag value that fits an index key under LMDB's key-size limit:
+/// `name(1) + sep(1) + len(4) + value + created(8) + id(32)`.
+pub(crate) const TAG_INDEX_VALUE_MAX: usize = MAX_INDEX_KEY - 1 - 1 - 4 - CREATED_LEN - ID_LEN;
+/// Longest search term that fits a word-index key under the same limit:
+/// `word + sep(1) + created(8) + id(32)`.
+pub(crate) const WORD_INDEX_MAX: usize = MAX_INDEX_KEY - 1 - CREATED_LEN - ID_LEN;
 /// LMDB's maximum key size (`MDB_MAXKEYSIZE`). Index keys longer than this
 /// are rejected with `MDB_BAD_VALSIZE`, which would abort the *entire* write
 /// batch and reject every connection's events in the drain window. Over-long
@@ -369,6 +375,18 @@ impl Store {
 
     /// Free bytes on the filesystem hosting the data directory, when
     /// statvfs succeeds.
+    /// Returns an error when the disk is too full to safely write to the
+    /// memory map (writing to a full disk raises SIGBUS and kills the
+    /// process): every writing path must refuse to commit below the margin.
+    pub(crate) fn disk_full_error(&self) -> Result<()> {
+        if let Some(free) = self.free_space()
+            && free < DISK_FREE_MARGIN
+        {
+            return Err(crate::error::Error::StorageFull);
+        }
+        Ok(())
+    }
+
     pub(crate) fn free_space(&self) -> Option<u64> {
         let path = self.env.path();
         let dir = if path.is_file() {
@@ -423,6 +441,7 @@ impl Store {
     /// whole `AccessControl` is serialized as JSON so NIP-86 mutations
     /// survive restarts.
     pub(crate) fn save_access(&self, access: &crate::config::AccessControl) -> Result<()> {
+        self.disk_full_error()?;
         let data = serde_json::to_vec(access)?;
         let mut wtxn = self.env.write_txn()?;
         self.access.put(&mut wtxn, b"access", &data)?;
@@ -1069,11 +1088,11 @@ impl Store {
                 )?;
             }
         }
-        if self
-            .expiry_enabled
-            .load(std::sync::atomic::Ordering::Relaxed)
-            && let Some(exp) = nip40::expiry(&event)
-        {
+        // The expiry entry is deleted regardless of the NIP-40 toggle: a
+        // stale key would otherwise survive a removal performed while the
+        // feature was disabled and keep purging a re-published event with
+        // the same id forever.
+        if let Some(exp) = nip40::expiry(&event) {
             self.expiry.delete(wtxn, &created_key(exp, id))?;
         }
         if let Some(by_word) = self.by_word {

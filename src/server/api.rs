@@ -410,8 +410,8 @@ pub async fn api_kind_handler(
 /// and `until` bound the range (unix seconds); without them the whole period
 /// is covered, from the earliest stored event of that author and kind to
 /// now. Every month in the range is reported (zero-filled), oldest first,
-/// at most 1200 months. A month whose count hit the collection limit is
-/// flagged `"approximate": true` (NIP-45 semantics).
+/// at most [`MAX_MONTHS`] months. A month whose count hit the collection
+/// limit is flagged `"approximate": true` (NIP-45 semantics).
 pub async fn api_monthly_handler(
     State(relay): State<Arc<Relay>>,
     Path((identifier, kind)): Path<(String, u64)>,
@@ -424,7 +424,8 @@ pub async fn api_monthly_handler(
 
     // Bounded month range: without `since` the range spans the whole period
     // (from the earliest stored event of this author and kind); an explicit
-    // range must not exceed 1200 months (100 years) of count queries.
+    // range must not exceed MAX_MONTHS of count queries, so one request
+    // cannot pin the API reader thread behind a huge loop of scans.
     let now = unix_now();
     let until = params.until.unwrap_or(now);
     let since = match params.since {
@@ -454,10 +455,10 @@ pub async fn api_monthly_handler(
             "until must not be earlier than since",
         );
     }
-    if months.len() > 1200 {
+    if months.len() > MAX_MONTHS {
         return error_response(
             StatusCode::BAD_REQUEST,
-            "the requested range exceeds 1200 months",
+            &format!("the requested range exceeds {MAX_MONTHS} months"),
         );
     }
 
@@ -732,7 +733,7 @@ pub async fn api_daily_handler(
 pub async fn api_id_handler(
     State(relay): State<Arc<Relay>>,
     Path(hex_id): Path<String>,
-    Query(params): Query<ApiParams>,
+    Query(mut params): Query<ApiParams>,
 ) -> (StatusCode, Json<Value>) {
     if hex_id.len() != 64 || hex::decode(&hex_id).is_err() {
         return error_response(
@@ -740,6 +741,13 @@ pub async fn api_id_handler(
             "the id must be a 64-character hex string",
         );
     }
+    // Bound the query parameters like every other handler: the `limit` /
+    // `offset` caps protect against a scan over the whole budget.
+    let cfg = relay.config.read().await;
+    if let Err((status, msg)) = bound_params(&mut params, &cfg) {
+        return error_response(status, &msg);
+    }
+    drop(cfg);
     let filter = apply_params(
         Filter {
             ids: Some(vec![hex_id]),
@@ -982,12 +990,17 @@ pub async fn api_related_handler(
 pub async fn api_follows_handler(
     State(relay): State<Arc<Relay>>,
     Path(identifier): Path<String>,
-    Query(params): Query<ApiParams>,
+    Query(mut params): Query<ApiParams>,
 ) -> (StatusCode, Json<Value>) {
     let hex_pk = match parse_author_identifier(&identifier) {
         Ok(pk) => pk,
         Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
     };
+    let cfg = relay.config.read().await;
+    if let Err((status, msg)) = bound_params(&mut params, &cfg) {
+        return error_response(status, &msg);
+    }
+    drop(cfg);
     let no_tags = excluded_tags(&params);
     let filter = apply_params(
         Filter {
@@ -1091,12 +1104,17 @@ pub async fn api_top_authors_handler(
 pub async fn api_relays_handler(
     State(relay): State<Arc<Relay>>,
     Path(identifier): Path<String>,
-    Query(params): Query<ApiParams>,
+    Query(mut params): Query<ApiParams>,
 ) -> (StatusCode, Json<Value>) {
     let hex_pk = match parse_author_identifier(&identifier) {
         Ok(pk) => pk,
         Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
     };
+    let cfg = relay.config.read().await;
+    if let Err((status, msg)) = bound_params(&mut params, &cfg) {
+        return error_response(status, &msg);
+    }
+    drop(cfg);
     let no_tags = excluded_tags(&params);
     let filter = apply_params(
         Filter {
@@ -1138,6 +1156,12 @@ fn month_start_of_next(y: i64, m: u32) -> u64 {
 }
 
 /// The months covered by `[since, until]`, oldest first.
+/// Maximum number of months a single `/monthly` request may scan: each
+/// month is a database count query, so an unbounded range would let one
+/// request pin the API reader thread for a long time (120 months = 10
+/// years of history).
+const MAX_MONTHS: usize = 120;
+
 fn month_range(since: u64, until: u64) -> Vec<(i64, u32)> {
     if until < since {
         return Vec::new();

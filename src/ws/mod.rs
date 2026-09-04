@@ -188,8 +188,13 @@ impl Conn {
         // delivered for the replaced subscription.
         self.pending_reqs.retain(|p| p.sub_id != pending.sub_id);
         if self.pending_reqs.len() >= MAX_PENDING_REQS
-            && let Some(dropped) = self.pending_reqs.pop_front()
+            && let Some(mut dropped) = self.pending_reqs.pop_front()
         {
+            // The dropped response was cut off before its remaining
+            // events were sent: flag it so the EOSE carries the NIP-67
+            // "more" hint instead of claiming a complete result (the
+            // subscription itself stays open).
+            dropped.truncated_or_more = true;
             self.finish_pending_req(dropped);
         }
         self.pending_reqs.push_back(pending);
@@ -379,12 +384,11 @@ impl Conn {
         let text = match &frame {
             Message::Text(text) => text.as_str(),
             Message::Binary(data) => return self.handle_binary(data, max_msg_size).await,
-            // A WS-level ping must be answered with a pong (the keep-alive
-            // PING below relies on the peer doing the same).
-            Message::Ping(data) => {
-                self.send(Message::Pong(data.clone()));
-                return false;
-            }
+            // A Close inside the batch window must end the connection too
+            // (RFC 6455: answer the close and stop reading), not be
+            // swallowed until the next select iteration. (Pings are not
+            // handled here: tungstenite already queues the pong.)
+            Message::Close(_) => return true,
             _ => return false,
         };
         if text.len() > max_msg_size {
@@ -428,6 +432,8 @@ pub async fn handle_connection(
 
     let max_connections = relay.config.read().await.limits.max_connections;
     let max_per_ip = relay.config.read().await.limits.max_connections_per_ip;
+    // `active` is the post-increment count (this connection included), so
+    // `>` accepts exactly `max_connections` connections.
     if active > max_connections as u64 || !relay.try_register_connection(&peer_ip, max_per_ip) {
         relay
             .stats

@@ -83,6 +83,10 @@ impl super::Conn {
             self.send_neg_err(&sub_id, "error: too many ids or authors in the filter");
             return;
         }
+        if filter.invalid_tag_values() {
+            self.send_neg_err(&sub_id, "error: tag constraint values must be strings");
+            return;
+        }
         let Some(initial) = rest[2].as_str() else {
             self.send_neg_err(&sub_id, "error: NEG-OPEN message must be hex");
             return;

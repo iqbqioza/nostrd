@@ -105,6 +105,12 @@ enum Msg {
         pubkeys: Vec<[u8; 32]>,
         reply: oneshot::Sender<Vec<(bool, u64)>>,
     },
+    /// Read-only list of every vanished pubkey (startup rebuilds consult
+    /// it so a vanished author cannot be resurrected as a group member or
+    /// role holder by replaying pre-vanish events).
+    VanishPubkeys {
+        reply: oneshot::Sender<Vec<Vec<u8>>>,
+    },
     /// NIP-77: query returning only `(created_at, id)` records so that large
     /// negentropy ranges do not materialize every full event in memory.
     NegQuery {
@@ -718,6 +724,12 @@ impl DbClient {
             reply,
         })
         .await
+    }
+
+    /// Every vanished pubkey (raw 32-byte keys). Startup-only use.
+    pub async fn vanish_pubkeys(&self) -> Vec<Vec<u8>> {
+        self.request_read(|reply| Msg::VanishPubkeys { reply })
+            .await
     }
 
     pub async fn apply_vanish(&self, pubkey: [u8; 32]) -> usize {

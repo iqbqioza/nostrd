@@ -111,7 +111,14 @@ pub(crate) fn build_admins_event(
             .members
             .iter()
             .filter(|(_, roles)| !roles.is_empty())
-            .map(|(pk, roles)| (pk.clone(), roles.iter().cloned().collect()))
+            .map(|(pk, roles)| {
+                // Sorted so the relay-generated event is deterministic
+                // across restarts (a HashSet iteration order would change
+                // the event id).
+                let mut roles: Vec<String> = roles.iter().cloned().collect();
+                roles.sort();
+                (pk.clone(), roles)
+            })
             .collect();
         admins.sort();
         for (pk, roles) in admins {

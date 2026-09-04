@@ -56,9 +56,14 @@ pub(crate) fn relay_discovery_event(
         tags.push(vec!["R".into(), "!auth".into()]);
     }
     tags.push(vec!["R".into(), "!payment".into()]);
-    // NIP-66's `R` keys cover auth, writes, pow and payment: the relay
-    // never restricts writes, so the requirement is negated.
-    tags.push(vec!["R".into(), "!writes".into()]);
+    // NIP-66's `R` keys cover auth, writes, pow and payment: when
+    // `restrict_relay` narrows writes to the allowlist, the requirement
+    // is asserted; otherwise it is negated.
+    if access.restrict_relay {
+        tags.push(vec!["R".into(), "writes".into()]);
+    } else {
+        tags.push(vec!["R".into(), "!writes".into()]);
+    }
     if cfg.nip_enabled(13) && cfg.relay.require_pow > 0 {
         tags.push(vec!["R".into(), "pow".into()]);
     } else {

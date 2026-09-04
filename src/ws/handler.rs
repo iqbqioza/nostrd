@@ -331,6 +331,10 @@ impl super::Conn {
             self.send_closed(sub_id, "invalid: too many ids or authors in a filter");
             return;
         }
+        if filters.iter().any(|f| f.invalid_tag_values()) {
+            self.send_closed(sub_id, "invalid: tag constraint values must be strings");
+            return;
+        }
 
         let search_disabled = filters.iter().any(|f| f.has_search()) && !search_enabled;
 
@@ -579,6 +583,10 @@ impl super::Conn {
         }
         if filters.iter().any(|f| f.too_many_members()) {
             self.send_closed(sub_id, "invalid: too many ids or authors in a filter");
+            return;
+        }
+        if filters.iter().any(|f| f.invalid_tag_values()) {
+            self.send_closed(sub_id, "invalid: tag constraint values must be strings");
             return;
         }
         // Cap the filter count like REQ: without it each filter would get its

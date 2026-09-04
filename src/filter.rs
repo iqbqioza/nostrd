@@ -171,6 +171,20 @@ impl Filter {
     pub fn has_search(&self) -> bool {
         self.search.as_deref().is_some_and(|s| !s.trim().is_empty())
     }
+
+    /// Whether any `#`-prefixed tag constraint carries a value that is
+    /// neither a string nor an array of strings. NIP-01 only defines those
+    /// two forms; anything else would silently match nothing (the live
+    /// match and the scan both skip non-string values), so such a filter
+    /// is rejected at parse time instead.
+    pub(crate) fn invalid_tag_values(&self) -> bool {
+        self.tags.values().any(|v| {
+            !v.is_string()
+                && !v
+                    .as_array()
+                    .is_some_and(|a| a.iter().all(serde_json::Value::is_string))
+        })
+    }
 }
 
 /// The string values of a filter tag attribute (a single string or an

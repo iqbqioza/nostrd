@@ -59,6 +59,21 @@ pub(crate) const READER_THREADS: usize = 2;
 /// `true` when the thread must shut down.
 fn handle_read_msg(store: &Store, errors: &Arc<std::sync::atomic::AtomicU64>, msg: Msg) -> bool {
     match msg {
+        Msg::VanishPubkeys { reply } => {
+            let mut out: Vec<Vec<u8>> = Vec::new();
+            if let Ok(rtxn) = store.env.read_txn()
+                && let Ok(iter) = store.vanish.iter(&rtxn)
+            {
+                for item in iter {
+                    match item {
+                        Ok((k, _)) => out.push(k.to_vec()),
+                        Err(_) => break,
+                    }
+                }
+            }
+            let _ = reply.send(out);
+            false
+        }
         Msg::Query {
             filters,
             limit,
@@ -458,6 +473,12 @@ pub(crate) fn spawn(
                             // batch first so that ordering is preserved.
                             flush_everything(&store, &thread_errors, &mut batch);
                             match other {
+                                // A read-only list request can only arrive
+                                // on the reader channel; this arm keeps the
+                                // writer's match exhaustive.
+                                Msg::VanishPubkeys { reply } => {
+                                    let _ = reply.send(Vec::new());
+                                }
                                 Msg::BlossomMigrationDone { reply } => {
                                     let done = match store.blossom_migration_done() {
                                         Ok(done) => done,

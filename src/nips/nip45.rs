@@ -43,7 +43,7 @@ pub fn hll(filters: &[Filter], events: &[Event]) -> Option<String> {
         };
         let register = pubkey[offset] as usize;
         let zeros = nip13::leading_zero_bits(&pubkey[offset + 1..]);
-        let value = zeros + 1;
+        let value = (zeros + 1) as u8;
         if value > registers[register] {
             registers[register] = value;
         }

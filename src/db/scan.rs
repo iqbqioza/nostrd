@@ -10,7 +10,10 @@ use std::collections::HashSet;
 use heed::types::Bytes;
 use heed::{Database, RoTxn};
 
-use super::store::{ID_LEN, Store, TAG_VALUE_MAX, created_key, kind_key, pubkey_key, tag_range};
+use super::store::{
+    ID_LEN, Store, TAG_INDEX_VALUE_MAX, WORD_INDEX_MAX, created_key, kind_key, pubkey_key,
+    tag_range,
+};
 use crate::error::Result;
 use crate::event::Event;
 use crate::filter::{EventFields, Filter};
@@ -401,6 +404,9 @@ impl Store {
         terms
             .iter()
             .map(|term| {
+                if term.len() > WORD_INDEX_MAX {
+                    return 0;
+                }
                 let mut start = term.as_bytes().to_vec();
                 start.push(0x00);
                 let mut end = term.as_bytes().to_vec();
@@ -785,7 +791,7 @@ impl Store {
                     .collect();
                 let mut ranges: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(terms.len());
                 for (word, df) in terms.iter().zip(dfs.iter()) {
-                    if *df >= DF_SAMPLE {
+                    if *df >= DF_SAMPLE || word.len() > WORD_INDEX_MAX {
                         continue;
                     }
                     let start = {
@@ -854,7 +860,10 @@ impl Store {
                 let name_byte = tag_name.as_bytes()[0];
                 let mut ranges: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
                 for value in crate::filter::tag_values(values) {
-                    if value.len() > TAG_VALUE_MAX {
+                    // A value beyond the index-key limit was never indexed
+                    // (put skips it): a range boundary past LMDB's key
+                    // limit would error the whole query.
+                    if value.len() > TAG_INDEX_VALUE_MAX {
                         continue;
                     }
                     ranges.push(tag_range(name_byte, value.as_bytes(), since, until));

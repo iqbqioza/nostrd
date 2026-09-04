@@ -569,6 +569,19 @@ fn alias_int<T: TryFrom<i64> + Default>(v: &toml::Value) -> T {
         .unwrap_or_default()
 }
 
+/// A boolean legacy alias: a non-boolean value is warned about instead of
+/// being silently dropped to `false` (an auth flag silently disabled is
+/// worse than a loudly ignored value).
+fn alias_bool(v: &toml::Value, key: &str) -> bool {
+    match v.as_bool() {
+        Some(b) => b,
+        None => {
+            log::warn!("deprecated config key {key} expects a boolean; the value was ignored");
+            false
+        }
+    }
+}
+
 /// Applies the legacy aliases found in `raw` to `cfg` and warns about
 /// each one. The old keys are recognized (never flagged as unknown) and
 /// their values land in the new locations.
@@ -590,10 +603,12 @@ fn apply_legacy_aliases(raw: &str, cfg: &mut Config) {
             "config key [{old_section}].{old_key} is deprecated; use [{new_section}].{new_key} instead — the value is still applied"
         );
         match (*old_section, *old_key) {
-            ("relay", "enable_git") => cfg.relay.enabled_git = v.as_bool().unwrap_or(false),
-            ("server", "require_auth") => cfg.relay.require_auth = v.as_bool().unwrap_or(false),
+            ("relay", "enable_git") => cfg.relay.enabled_git = alias_bool(v, "relay.enable_git"),
+            ("server", "require_auth") => {
+                cfg.relay.require_auth = alias_bool(v, "server.require_auth")
+            }
             ("server", "send_auth_challenge") => {
-                cfg.relay.send_auth_challenge = v.as_bool().unwrap_or(false)
+                cfg.relay.send_auth_challenge = alias_bool(v, "server.send_auth_challenge")
             }
             ("server", "management_port") => cfg.rpc.management_port = alias_int::<u16>(v),
             ("server", "management_host") => {
@@ -990,6 +1005,14 @@ impl Config {
             );
         }
 
+        // `require_auth` only takes effect when NIP-42 is enabled (the
+        // AUTH message is the only way to authenticate); silently ignoring
+        // it would leave a supposedly auth-required relay wide open.
+        if self.relay.require_auth && !self.nip_enabled(42) {
+            return Err(Error::Config(
+                "relay.require_auth requires NIP-42 to be enabled (add 42 to relay.enabled_nips or remove 42 from relay.disabled_nips)".into(),
+            ));
+        }
         // Limits must be usable (zero would disable core functionality or
         // make the queue fail fast on the first request).
         let l = &self.limits;

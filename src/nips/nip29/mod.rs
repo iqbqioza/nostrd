@@ -176,6 +176,13 @@ impl Group {
 pub struct GroupStore {
     pub groups: HashMap<String, Group>,
     deleted: HashSet<String>,
+    /// Groups whose create event is gone (the creator vanished, or the
+    /// 9007 was deleted/expired) but whose other events survived the
+    /// rebuild: their state cannot be restored, so their content must be
+    /// withheld from everyone instead of becoming world-readable
+    /// (fail-closed). A fresh CREATE_GROUP later removes the id from this
+    /// set.
+    ghost: HashSet<String>,
     /// Cap on the store size (active groups + deleted markers): bounds the
     /// in-memory state even when an attacker churns group ids. 0 =
     /// unlimited.
@@ -250,6 +257,15 @@ impl GroupStore {
         }
 
         if event.kind == LEAVE {
+            // NIP-29: leaving must not remove the group's last admin
+            // (nobody could then manage the group).
+            let retains_admin = group
+                .members
+                .iter()
+                .any(|(pk, roles)| !roles.is_empty() && pk != &event.pubkey);
+            if !retains_admin {
+                return Err("restricted: the group must retain at least one admin".into());
+            }
             return Ok(());
         }
 
@@ -260,29 +276,43 @@ impl GroupStore {
             if event.kind == 9002 {
                 validate_edit_metadata(self, gid, group, event)?;
             }
+            // NIP-29: the group must retain at least one admin — a 9000
+            // without roles could silently demote the last admin, and a
+            // 9001/LEAVE could remove them, leaving the group unmanageable
+            // (nobody could then issue 9000/9001/9002 again).
+            let admin_removed: HashSet<String> = match event.kind {
+                9000 => event
+                    .tags
+                    .iter()
+                    // A `p` tag without roles (len == 2) or with an
+                    // all-empty role list (`["p", pk, ""]`) demotes the
+                    // subject: both must count as admin removal.
+                    .filter(|t| t.len() >= 2 && t[0] == P && t[2..].iter().all(|r| r.is_empty()))
+                    .map(|t| t[1].clone())
+                    .collect(),
+                9001 => tag_values(event, P).map(str::to_string).collect(),
+                _ => HashSet::new(),
+            };
             if event.kind == 9000 {
-                // NIP-29: the roles of each `p`-tag subject are replaced; a
-                // `p` tag without roles demotes the subject to a plain member.
-                // Refuse to leave the group with no admin at all (the creator
-                // or any admin could otherwise be silently demoted and the
-                // group left unmanageable).
-                let grants_roles = event.tags.iter().any(|t| t.len() > 2 && t[0] == P);
-                if !grants_roles {
-                    let demoted: HashSet<&str> = event
-                        .tags
-                        .iter()
-                        .filter(|t| t.len() == 2 && t[0] == P)
-                        .map(|t| t[1].as_str())
-                        .collect();
-                    // An admin keeps their roles unless named in a `p` tag.
-                    let retains_admin = group
-                        .members
-                        .iter()
-                        .any(|(pk, roles)| !roles.is_empty() && !demoted.contains(pk.as_str()));
-                    if !retains_admin {
-                        return Err("restricted: the group must retain at least one admin".into());
-                    }
+                // A `p` tag with roles only replaces roles (never removes
+                // the user); a `p` tag without roles demotes. An
+                // all-empty role list (`["p", pk, ""]`) is a demotion: the
+                // apply side drops empty roles, so it must not count as a
+                // role grant (which would bypass the last-admin guard).
+                let grants_roles = event
+                    .tags
+                    .iter()
+                    .any(|t| t.len() > 2 && t[0] == P && t[2..].iter().any(|r| !r.is_empty()));
+                if grants_roles {
+                    return Ok(());
                 }
+            }
+            let retains_admin = group
+                .members
+                .iter()
+                .any(|(pk, roles)| !roles.is_empty() && !admin_removed.contains(pk));
+            if !retains_admin {
+                return Err("restricted: the group must retain at least one admin".into());
             }
             return Ok(());
         }
@@ -360,7 +390,11 @@ impl GroupStore {
                     // without roles leaves the user a plain member.
                     for tag in event.tags.iter().filter(|t| t.len() >= 2 && t[0] == P) {
                         let pk = tag[1].clone();
-                        let roles: HashSet<String> = tag[2..].iter().cloned().collect();
+                        // An empty role element (`["p", pk, ""]`) is a
+                        // malformed demotion: it must not turn into an
+                        // admin grant (an empty-string role is non-empty).
+                        let roles: HashSet<String> =
+                            tag[2..].iter().filter(|r| !r.is_empty()).cloned().collect();
                         // An empty role list leaves the user a plain member
                         // (replacing any previous roles).
                         group.members.insert(pk, roles);
@@ -395,7 +429,7 @@ impl GroupStore {
                     }
                 };
                 if parent_before != parent_after {
-                    if let Some(old) = parent_before
+                    if let Some(old) = parent_before.clone()
                         && let Some(parent_group) = self.groups.get_mut(&old)
                     {
                         parent_group.children.retain(|c| c != gid);
@@ -407,7 +441,7 @@ impl GroupStore {
                         parent_group.children.push(gid.to_string());
                     }
                     if let Some(group) = self.groups.get_mut(gid) {
-                        group.parent = parent_after;
+                        group.parent = parent_after.clone();
                     }
                 }
                 if emit {
@@ -421,6 +455,19 @@ impl GroupStore {
                         out.push(build_meta_event(
                             &parent,
                             self.groups.get(&parent),
+                            relay_pubkey,
+                            now,
+                        ));
+                    }
+                    // The old parent's children list changed too: its
+                    // metadata must be republished or the stored event
+                    // keeps listing this group as a child.
+                    if parent_before != parent_after
+                        && let Some(old) = parent_before
+                    {
+                        out.push(build_meta_event(
+                            &old,
+                            self.groups.get(&old),
                             relay_pubkey,
                             now,
                         ));
@@ -445,6 +492,7 @@ impl GroupStore {
             }
             CREATE_GROUP => {
                 if !self.groups.contains_key(gid) && (ignore_capacity || !self.at_capacity()) {
+                    self.unghost(gid);
                     let mut group = Group::default();
                     group
                         .members
@@ -545,6 +593,12 @@ impl GroupStore {
         if self.deleted.contains(gid) {
             return false;
         }
+        // A group whose create event was lost (creator vanished, 9007
+        // deleted or expired) cannot be restored with its settings: treat
+        // it as gone so its surviving content is not served to everyone.
+        if self.ghost.contains(gid) {
+            return false;
+        }
         let Some(group) = self.groups.get(gid) else {
             return true;
         };
@@ -626,6 +680,14 @@ impl GroupStore {
         // metadata strictly monotonic, so the *stored* 39000-39005 always
         // reflect the latest state; only the in-memory member map could
         // diverge until the next edit.
+        // The rank ordering also inverts cross-kind arrival order within a
+        // second: a 9001 remove followed in the same second by a 9021 JOIN
+        // replays as [9001, JOIN] (correct) but a JOIN followed by a 9001
+        // replays as [9001, JOIN] too — the removed member resurrects until
+        // the next edit. Arrival order is not stored, so this cannot be
+        // fixed exactly; the relay-stamped put-user (9000) events, which
+        // arrive after the member operation, keep the stored 39002 list
+        // correct.
         events.sort_by(|a, b| {
             (a.created_at, group_rank(a.kind), a.kind, &a.id).cmp(&(
                 b.created_at,
@@ -634,9 +696,60 @@ impl GroupStore {
                 &b.id,
             ))
         });
-        for event in events {
+        // A vanished author must not be resurrected as a member by
+        // replaying pre-vanish events signed by others (the vanish
+        // deleted the author's own JOIN, but an admin's put-user or the
+        // relay's own JOIN-time put-user survive): skip the events that
+        // would add a vanished pubkey to a group.
+        let vanished: std::collections::HashSet<String> = db
+            .vanish_pubkeys()
+            .await
+            .into_iter()
+            .map(hex::encode)
+            .collect();
+        // Every group id referenced by the surviving events: any of them
+        // that did not make it into `groups` (its create event was
+        // deleted by a vanish / NIP-09 / expiry) becomes a ghost — its
+        // content is withheld instead of turning world-readable.
+        let mut seen_gids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for event in &events {
+            if let Some(gid) = crate::nips::nip29::group_id(event) {
+                seen_gids.insert(gid.to_string());
+            }
+        }
+        for mut event in events {
+            // A vanished author must not be resurrected as a member by
+            // replaying pre-vanish events signed by others (the vanish
+            // deleted the author's own JOIN, but an admin's put-user or
+            // the relay's own JOIN-time put-user survive): skip the
+            // events that would add a vanished pubkey to a group. For a
+            // 9000 put-user only the vanished pubkeys' `p` tags are
+            // dropped — the other assignments of the same event must
+            // still be applied.
+            if event.kind == JOIN && vanished.contains(&event.pubkey) {
+                continue;
+            }
+            if event.kind == 9000 {
+                event
+                    .tags
+                    .retain(|t| t.len() < 2 || t[0] != P || !vanished.contains(&t[1]));
+                if event.tags.is_empty() {
+                    continue;
+                }
+            }
             self.apply(&event, "", unix_now(), false, true);
         }
+        for gid in seen_gids {
+            if !self.groups.contains_key(&gid) && !self.deleted.contains(&gid) {
+                self.ghost.insert(gid);
+            }
+        }
+    }
+
+    /// Removes a group id from the ghost set once a fresh CREATE_GROUP
+    /// restores it.
+    pub(crate) fn unghost(&mut self, gid: &str) {
+        self.ghost.remove(gid);
     }
 }
 

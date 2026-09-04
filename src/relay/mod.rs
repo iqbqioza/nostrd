@@ -935,8 +935,12 @@ impl Relay {
         // Relay-generated events are stamped with the strictly monotonic
         // clock (not plain `now`): two events applied in the same second
         // must still be distinguishable, or the NIP-01 id tie-break could
-        // let a stale, later-committed version win.
-        let stamp = self.stamp_floor(now.max(event.created_at.saturating_add(1)));
+        // let a stale, later-committed version win. The floor is clamped
+        // to `now`: a group event may carry a future created_at (allowed
+        // up to max_created_at_future_secs), and stamping the metadata in
+        // the future would make it invisible to `until: now` scans and,
+        // after a restart, unreplaceable until the wall clock catches up.
+        let stamp = self.stamp_floor(now);
         let generated = self.groups.write().await.apply(
             event,
             &relay_pubkey,
