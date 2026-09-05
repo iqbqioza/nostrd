@@ -161,6 +161,7 @@ pub(crate) fn apply_put_batch(
                 }
             }
         }
+
         if poisoned {
             // The transaction is unusable: abort it and revoke every reply
             // queued for it, because the applied puts were rolled back with
@@ -249,6 +250,11 @@ pub(crate) struct Store {
     pub(crate) by_tag: Database<Bytes, Bytes>,
     pub(crate) by_word: Option<Database<Bytes, Bytes>>,
     pub(crate) event_meta: Option<Database<Bytes, Bytes>>,
+    /// Whether the per-event metadata header (kind/created/pubkey/expiry)
+    /// is written for the scan prefilter. Disabling it removes one random
+    /// index write per event (keeping the ingest cost flat as the database
+    /// grows) at the cost of the scan falling back to the full parse.
+    pub(crate) meta_index: bool,
     pub(crate) deleted: Database<Bytes, Bytes>,
     pub(crate) expiry: Database<Bytes, Bytes>,
     pub(crate) replaceable: Database<Bytes, Bytes>,
@@ -345,6 +351,7 @@ impl Store {
             by_tag,
             by_word,
             event_meta: Some(event_meta),
+            meta_index: cfg.meta_index,
             deleted,
             expiry,
             replaceable,
@@ -423,6 +430,7 @@ impl Store {
             by_tag: self.by_tag,
             by_word: self.by_word,
             event_meta: self.event_meta,
+            meta_index: self.meta_index,
             deleted: self.deleted,
             expiry: self.expiry,
             replaceable: self.replaceable,
@@ -994,7 +1002,9 @@ impl Store {
         }
         self.by_kind
             .put(wtxn, &kind_key(event.kind, created, id), b"")?;
-        if let Some(meta) = self.event_meta {
+        if self.meta_index
+            && let Some(meta) = self.event_meta
+        {
             let expiry = crate::nips::nip40::expiry(event).unwrap_or(0);
             meta.put(wtxn, id, &encode_meta(event.kind, created, pubkey, expiry))?;
         }

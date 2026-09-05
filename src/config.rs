@@ -316,6 +316,12 @@ pub struct DatabaseConfig {
     /// How many words of each event's content are added to the NIP-50
     /// search index.
     pub max_indexed_words: usize,
+    /// Write the per-event metadata header used by the scan prefilter
+    /// (kind/created_at/pubkey/expiry). Disabling it removes one random
+    /// index write per event — the ingest cost stays flat as the database
+    /// grows — and the scan falls back to the full parse for the prefilter
+    /// checks.
+    pub meta_index: bool,
     /// LMDB read/write buffer size (the `read_buffer_size` /
     /// `write_buffer_size` of the environment).
     pub db_buffer_size: usize,
@@ -449,6 +455,7 @@ impl Default for DatabaseConfig {
             reader_threads: 2,
             search_index: true,
             max_indexed_words: 32,
+            meta_index: true,
             db_buffer_size: 2_048,
             db_request_timeout_secs: 30,
             max_db_queue_msgs: 4_096,
@@ -1565,6 +1572,7 @@ fn known_config_keys() -> &'static [(&'static str, &'static [&'static str])] {
                 "max_groups",
                 "require_pow",
                 "max_indexed_words",
+                "meta_index",
                 "reader_threads",
                 "buffer_size",
                 "db_request_timeout_secs",
@@ -1587,6 +1595,7 @@ fn known_config_keys() -> &'static [(&'static str, &'static [&'static str])] {
                 "reader_threads",
                 "search_index",
                 "max_indexed_words",
+                "meta_index",
                 "db_buffer_size",
                 "db_request_timeout_secs",
                 "max_db_queue_msgs",

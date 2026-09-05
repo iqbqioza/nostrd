@@ -701,7 +701,7 @@ pub async fn handle_connection(
                     tokio::time::Instant::now() + tokio::time::Duration::from_millis(5),
                 );
                 tokio::pin!(window_deadline);
-                for _ in 0..EVENT_BATCH * 16 {
+                for _ in 0..EVENT_BATCH * 32 {
                     let frame = tokio::select! {
                         biased;
                         frame = receiver.next() => match frame {
