@@ -103,7 +103,19 @@ impl Cli {
             }
             Command::Stop => return self.stop(),
             Command::Stats => return self.stats(),
-            Command::Start { foreground: true } => return Ok(()),
+            // The foreground start also validates the config and rejects
+            // a second instance: two processes on the same LMDB env would
+            // fight over the lock.
+            Command::Start { foreground: true } => {
+                let cfg = self.load_config()?;
+                cfg.validate()?;
+                if let Some(pid) = running_pid(&cfg.daemon.pid_file) {
+                    return Err(Error::Config(format!(
+                        "already running (pid {pid}); use 'nostrd stop' or 'nostrd restart'"
+                    )));
+                }
+                return Ok(());
+            }
             Command::Blossom { action } => return self.blossom_allowlist(action),
             Command::Relay { action } => return self.relay_access(action),
             _ => {}

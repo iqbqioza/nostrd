@@ -219,6 +219,13 @@ pub struct LimitsConfig {
     pub max_connections_per_ip: usize,
     /// Maximum accepted WebSocket message size in bytes.
     pub max_ws_message_bytes: usize,
+    /// Per-connection kernel receive buffer (KiB, 0 = kernel default).
+    /// Larger buffers let the relay absorb a publishing burst while it
+    /// commits a batch, which keeps the batch size (and the number of
+    /// commits) high for a fast publisher. The buffer only consumes real
+    /// kernel memory while data is actually queued, so a large value does
+    /// not cost idle connections anything.
+    pub socket_recv_buffer_kb: u32,
     pub max_filters: usize,
     pub max_subscriptions: usize,
     pub max_limit: usize,
@@ -299,13 +306,24 @@ pub struct DatabaseConfig {
     /// actually written.
     pub max_map_size: usize,
     pub purge_interval_secs: u64,
+    /// How many threads serve the WebSocket reader queue (REQ/COUNT/NEG
+    /// scans and the small lookups). More threads parallelize query
+    /// serving across cores; the scans share LMDB read transactions, so
+    /// they never take the write lock.
+    pub reader_threads: usize,
     /// Enable the NIP-50 full-text word index.
     pub search_index: bool,
     /// How many words of each event's content are added to the NIP-50
     /// search index.
     pub max_indexed_words: usize,
-    /// LMDB read/write buffer size (the `read_buffer_size` /
-    /// `write_buffer_size` of the environment).
+    /// Write the per-event metadata header used by the scan prefilter
+    /// (kind/created_at/pubkey/expiry). Disabling it removes one random
+    /// index write per event — the ingest cost stays flat as the database
+    /// grows — and the scan falls back to the full parse for the prefilter
+    /// checks.
+    pub meta_index: bool,
+    /// Initial per-connection WebSocket read/write buffer size in bytes
+    /// (the buffers grow on demand; the name predates the current use).
     pub db_buffer_size: usize,
     /// Seconds a database request may wait before timing out (0 = wait
     /// forever). A timeout keeps the relay responsive even when the storage
@@ -394,6 +412,7 @@ impl Default for LimitsConfig {
             max_connections: 10_000,
             max_connections_per_ip: 64,
             max_ws_message_bytes: 1 << 20,
+            socket_recv_buffer_kb: 64,
             max_filters: 20,
             max_subscriptions: 20,
             max_limit: 500,
@@ -433,8 +452,10 @@ impl Default for DatabaseConfig {
             // only with the stored data (sparse file).
             max_map_size: 1024 * 1024 * 1024 * 1024,
             purge_interval_secs: 300,
+            reader_threads: 2,
             search_index: true,
-            max_indexed_words: 128,
+            max_indexed_words: 32,
+            meta_index: true,
             db_buffer_size: 2_048,
             db_request_timeout_secs: 30,
             max_db_queue_msgs: 4_096,
@@ -569,6 +590,19 @@ fn alias_int<T: TryFrom<i64> + Default>(v: &toml::Value) -> T {
         .unwrap_or_default()
 }
 
+/// A boolean legacy alias: a non-boolean value is warned about instead of
+/// being silently dropped to `false` (an auth flag silently disabled is
+/// worse than a loudly ignored value).
+fn alias_bool(v: &toml::Value, key: &str) -> bool {
+    match v.as_bool() {
+        Some(b) => b,
+        None => {
+            log::warn!("deprecated config key {key} expects a boolean; the value was ignored");
+            false
+        }
+    }
+}
+
 /// Applies the legacy aliases found in `raw` to `cfg` and warns about
 /// each one. The old keys are recognized (never flagged as unknown) and
 /// their values land in the new locations.
@@ -590,10 +624,12 @@ fn apply_legacy_aliases(raw: &str, cfg: &mut Config) {
             "config key [{old_section}].{old_key} is deprecated; use [{new_section}].{new_key} instead — the value is still applied"
         );
         match (*old_section, *old_key) {
-            ("relay", "enable_git") => cfg.relay.enabled_git = v.as_bool().unwrap_or(false),
-            ("server", "require_auth") => cfg.relay.require_auth = v.as_bool().unwrap_or(false),
+            ("relay", "enable_git") => cfg.relay.enabled_git = alias_bool(v, "relay.enable_git"),
+            ("server", "require_auth") => {
+                cfg.relay.require_auth = alias_bool(v, "server.require_auth")
+            }
             ("server", "send_auth_challenge") => {
-                cfg.relay.send_auth_challenge = v.as_bool().unwrap_or(false)
+                cfg.relay.send_auth_challenge = alias_bool(v, "server.send_auth_challenge")
             }
             ("server", "management_port") => cfg.rpc.management_port = alias_int::<u16>(v),
             ("server", "management_host") => {
@@ -990,6 +1026,14 @@ impl Config {
             );
         }
 
+        // `require_auth` only takes effect when NIP-42 is enabled (the
+        // AUTH message is the only way to authenticate); silently ignoring
+        // it would leave a supposedly auth-required relay wide open.
+        if self.relay.require_auth && !self.nip_enabled(42) {
+            return Err(Error::Config(
+                "relay.require_auth requires NIP-42 to be enabled (add 42 to relay.enabled_nips or remove 42 from relay.disabled_nips)".into(),
+            ));
+        }
         // Limits must be usable (zero would disable core functionality or
         // make the queue fail fast on the first request).
         let l = &self.limits;
@@ -1004,10 +1048,12 @@ impl Config {
             ("limits.max_sub_bytes", l.max_sub_bytes),
             ("limits.max_api_concurrent", l.max_api_concurrent),
             ("limits.live_buffer", l.live_buffer),
+            ("limits.live_batch_size", l.live_batch_size),
             ("limits.max_out_queue_bytes", l.max_out_queue_bytes),
         ];
         let db_nonzero = [
             ("database.db_buffer_size", self.database.db_buffer_size),
+            ("database.reader_threads", self.database.reader_threads),
             (
                 "database.max_indexed_words",
                 self.database.max_indexed_words,
@@ -1021,6 +1067,16 @@ impl Config {
                 self.database.max_db_queue_events,
             ),
         ];
+        if self.limits.socket_recv_buffer_kb > 4096 {
+            return Err(Error::Config(
+                "limits.socket_recv_buffer_kb must be at most 4096".into(),
+            ));
+        }
+        if !(1..=64).contains(&self.database.reader_threads) {
+            return Err(Error::Config(
+                "database.reader_threads must be between 1 and 64".into(),
+            ));
+        }
         for (name, value) in db_nonzero {
             if value == 0 {
                 return Err(Error::Config(format!("{name} must be at least 1 (got 0)")));
@@ -1484,6 +1540,7 @@ fn known_config_keys() -> &'static [(&'static str, &'static [&'static str])] {
                 "max_connections",
                 "max_connections_per_ip",
                 "max_ws_message_bytes",
+                "socket_recv_buffer_kb",
                 "max_filters",
                 "max_subscriptions",
                 "max_limit",
@@ -1538,8 +1595,10 @@ fn known_config_keys() -> &'static [(&'static str, &'static [&'static str])] {
                 "map_size",
                 "max_map_size",
                 "purge_interval_secs",
+                "reader_threads",
                 "search_index",
                 "max_indexed_words",
+                "meta_index",
                 "db_buffer_size",
                 "db_request_timeout_secs",
                 "max_db_queue_msgs",

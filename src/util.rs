@@ -30,3 +30,16 @@ pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     let outer = Sha256::digest([opad.as_slice(), inner.as_slice()].concat());
     outer.into()
 }
+
+/// Normalizes an IP address for blocking and per-IP accounting: a
+/// dual-stack listener reports IPv4 peers as `::ffff:a.b.c.d`, which
+/// would otherwise never equal a `blockip "a.b.c.d"` entry.
+pub fn normalize_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip {
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(std::net::IpAddr::V4)
+            .unwrap_or(std::net::IpAddr::V6(v6)),
+        other => other,
+    }
+}

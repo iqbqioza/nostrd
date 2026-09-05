@@ -25,6 +25,12 @@ pub(crate) struct NegState {
 /// before it is closed (generous for legitimate syncs).
 pub(crate) const MAX_NEG_MSG_ROUNDS: u32 = 128;
 
+/// The maximum number of NEG-OPENs one connection may issue: each open
+/// resets the round budget, so without this cap a client could renew the
+/// 128-round CPU budget forever (closing and re-opening must not bypass
+/// the cap, hence the connection-wide counter).
+pub(crate) const MAX_NEG_OPENS: u32 = 256;
+
 impl super::Conn {
     pub(crate) fn send_neg_err(&mut self, sub_id: &str, reason: &str) {
         self.send_json(json!(["NEG-ERR", sub_id, reason]));
@@ -64,6 +70,14 @@ impl super::Conn {
             Ok(mut filter) => {
                 // Negentropy needs every matching record, not a capped page.
                 filter.limit = None;
+                // NIP-50 disabled: strip the search like REQ/COUNT/API do,
+                // otherwise a NEG-OPEN would return a subset of what a REQ
+                // with the same filter returns, and the peer would treat
+                // the missing events as absent on this relay (and may
+                // delete them locally).
+                if !self.relay.config.read().await.nip_enabled(50) {
+                    filter.search = None;
+                }
                 filter
             }
             Err(_) => {
@@ -73,6 +87,10 @@ impl super::Conn {
         };
         if filter.too_many_members() {
             self.send_neg_err(&sub_id, "error: too many ids or authors in the filter");
+            return;
+        }
+        if filter.invalid_tag_values() {
+            self.send_neg_err(&sub_id, "error: tag constraint values must be strings");
             return;
         }
         let Some(initial) = rest[2].as_str() else {
@@ -123,7 +141,14 @@ impl super::Conn {
                     if item.protected && !self.is_authed() {
                         return false;
                     }
-                    if item.wrap_recipients.is_some()
+                    // NIP-59/NIP-17: gift wraps are only served to their
+                    // recipients when NIP-42 is enabled (the same gate as
+                    // the REQ path's `gift_wrap_visible`): with NIP-42
+                    // disabled the wraps are public, and withholding them
+                    // from NEG would make a syncing peer delete its local
+                    // copies.
+                    if self.giftwrap_restricted
+                        && item.wrap_recipients.is_some()
                         && !self.authed_pubkeys.iter().any(|pk| {
                             item.wrap_recipients
                                 .as_ref()
@@ -176,6 +201,44 @@ impl super::Conn {
             ]));
             return;
         }
+        // The initial message is validated *before* the old state is
+        // removed: a failing NEG-OPEN must not close the peer's existing
+        // subscription (the capacity check above already guards the "too
+        // many items" path the same way).
+        let response = match nip77::respond(&items, &initial) {
+            Ok(response) => response,
+            Err(reason) => {
+                self.send_neg_err(&sub_id, &format!("error: {reason}"));
+                return;
+            }
+        };
+        // Bound the initial response like the NEG-MSG replies: a mode-2
+        // answer returns every id of the range, and without the cap a
+        // large max_neg_items would let one NEG-OPEN bypass the REQ
+        // response budget entirely. The wire size is the hex encoding
+        // (2x) plus the JSON frame, so budget against that.
+        let budget = self.req_response_bytes;
+        if budget > 0 && response.len() as u64 * 2 > budget {
+            self.send_neg_err(
+                &sub_id,
+                "blocked: negentropy response too large (increase limits.max_req_response_bytes)",
+            );
+            return;
+        }
+        // Every open renews the round budget; the connection-wide count
+        // caps how often, so a client cannot renew the 128-round CPU
+        // budget forever by re-opening (or close+re-opening) the
+        // subscription.
+        if self.neg_opens_total >= MAX_NEG_OPENS {
+            // Like every other failed NEG-OPEN, the old subscription is
+            // left untouched.
+            self.send_neg_err(
+                &sub_id,
+                "blocked: too many negentropy opens (connection limit)",
+            );
+            return;
+        }
+        self.neg_opens_total += 1;
         if let Some(old) = self.neg.remove(&sub_id) {
             self.neg_total = self.neg_total.saturating_sub(old.items.len());
             // Release the subscription slot of the replaced negentropy
@@ -184,31 +247,27 @@ impl super::Conn {
                 .stats
                 .subscriptions_active
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            self.subscriptions_held
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
-
-        match nip77::respond(&items, &initial) {
-            Ok(response) => {
-                self.neg_total += items.len();
-                self.neg.insert(
-                    sub_id.clone(),
-                    NegState {
-                        items,
-                        rounds_left: MAX_NEG_MSG_ROUNDS,
-                    },
-                );
-                // NEG-OPEN subscriptions are active subscriptions: they hold
-                // filters and items until closed, so they count towards
-                // `subscriptions_active` like REQ subscriptions.
-                self.relay
-                    .stats
-                    .subscriptions_active
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                self.send_neg_msg(&sub_id, &response);
-            }
-            Err(reason) => {
-                self.send_neg_err(&sub_id, &format!("error: {reason}"));
-            }
-        }
+        self.neg_total += items.len();
+        self.neg.insert(
+            sub_id.clone(),
+            NegState {
+                items,
+                rounds_left: MAX_NEG_MSG_ROUNDS,
+            },
+        );
+        // NEG-OPEN subscriptions are active subscriptions: they hold
+        // filters and items until closed, so they count towards
+        // `subscriptions_active` like REQ subscriptions.
+        self.relay
+            .stats
+            .subscriptions_active
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.subscriptions_held
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.send_neg_msg(&sub_id, &response);
     }
 
     pub(crate) async fn handle_neg_msg(&mut self, rest: &[Value]) {
@@ -244,7 +303,31 @@ impl super::Conn {
         }
         state.rounds_left -= 1;
         match nip77::respond(&state.items, &message) {
-            Ok(response) => self.send_neg_msg(&sub_id, &response),
+            Ok(response) => {
+                // Bound the response like the REQ path's
+                // `max_req_response_bytes`: a mode-2 reply returns every
+                // id of the range (up to ~6 MiB of hex for 100k items),
+                // and 128 rounds would otherwise amplify one connection
+                // into hundreds of MiB of bandwidth.
+                let budget = self.req_response_bytes;
+                // The response is sent hex-encoded inside a JSON array
+                // (roughly 2.2x the binary size), so budget against the
+                // wire size, not the binary size.
+                let wire_size = response.len() as u64 * 2;
+                let over_budget = budget > 0 && wire_size > budget;
+                if over_budget {
+                    if let Some(state) = self.neg.remove(&sub_id) {
+                        self.neg_total = self.neg_total.saturating_sub(state.items.len());
+                        self.release_neg_stats_subscription();
+                    }
+                    self.send_neg_err(
+                        &sub_id,
+                        "blocked: negentropy response too large (increase limits.max_req_response_bytes)",
+                    );
+                    return;
+                }
+                self.send_neg_msg(&sub_id, &response)
+            }
             Err(reason) => {
                 if let Some(state) = self.neg.remove(&sub_id) {
                     self.neg_total = self.neg_total.saturating_sub(state.items.len());
@@ -261,6 +344,8 @@ impl super::Conn {
         self.relay
             .stats
             .subscriptions_active
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.subscriptions_held
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 

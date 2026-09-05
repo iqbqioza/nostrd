@@ -211,6 +211,7 @@ Every key is optional; a missing key uses the default shown below.
 | `max_connections_per_ip` | integer | `64` | Max connections per source IP (`0` = no per-IP cap) |
 | `max_ws_message_bytes` | integer | `1048576` | Max bytes per WebSocket message/frame |
 | `db_buffer_size` | integer | `2048` | Initial per-connection buffer size (bytes) |
+| `socket_recv_buffer_kb` | integer | `64` | Per-connection kernel receive buffer (KiB, `0` = kernel default; the kernel may double it). Larger values let a fast publisher's burst absorb into one batch while the relay commits; the buffer uses real memory only while data is queued |
 | `max_out_queue_bytes` | integer | `262144` | Per-connection outgoing queue cap (bytes) |
 | `ws_idle_timeout_secs` | integer | `300` | Close idle connections after this long (`0` = never) |
 | `http_read_timeout_secs` | integer | `30` | Seconds to deliver a complete HTTP request head before the connection is closed (`0` = disabled; slow-loris defense — applies to WebSocket upgrades too) |
@@ -239,7 +240,7 @@ Every key is optional; a missing key uses the default shown below.
 | `max_tag_value_bytes` | integer | `1024` | Max bytes per tag value |
 | `max_created_at_future_secs` | integer | `3600` | Tolerated future skew of `created_at` (seconds) |
 | `require_pow` | integer | `0` | Required proof-of-work difficulty in leading zero bits |
-| `max_indexed_words` | integer | `128` | Words of content indexed for NIP-50 search |
+| `max_indexed_words` | integer | `32` | Words of content indexed for NIP-50 search |
 
 ### Database queue and overload protection
 
@@ -352,6 +353,9 @@ Every key is optional; a missing key uses the default shown below.
 | `max_map_size` | integer | `1099511627776` (1 TB) | Memory-map ceiling (bytes) |
 | `purge_interval_secs` | integer | `300` | NIP-40 purge interval (seconds) |
 | `search_index` | boolean | `true` | Enable the NIP-50 word index |
+| `reader_threads` | integer | `2` | Dedicated scan threads (1-64) |
+| `max_indexed_words` | integer | `32` | Words of each event's content indexed for search |
+| `meta_index` | boolean | `true` | Write the per-event metadata header used by the scan prefilter. Disabling it drops one random index write per event (ingest stays flat as the database grows) at the cost of scans falling back to the full parse |
 
 ### Key details
 
@@ -606,7 +610,7 @@ max_tags = 2000
 max_tag_value_bytes = 1024
 max_created_at_future_secs = 3600
 require_pow = 0
-max_indexed_words = 128
+max_indexed_words = 32
 db_buffer_size = 2048
 max_neg_items = 100000
 db_request_timeout_secs = 30

@@ -10,6 +10,10 @@
 
 mod removal;
 mod scan;
+
+/// The cap on search terms per filter, shared by the scan path and the
+/// live delivery (`pub(crate)` re-export because `scan` is private).
+pub(crate) use scan::SEARCH_MAX_TERMS;
 pub(crate) mod store;
 #[cfg(test)]
 mod tests;
@@ -100,6 +104,12 @@ enum Msg {
     FirstSeenStatus {
         pubkeys: Vec<[u8; 32]>,
         reply: oneshot::Sender<Vec<(bool, u64)>>,
+    },
+    /// Read-only list of every vanished pubkey (startup rebuilds consult
+    /// it so a vanished author cannot be resurrected as a group member or
+    /// role holder by replaying pre-vanish events).
+    VanishPubkeys {
+        reply: oneshot::Sender<Vec<Vec<u8>>>,
     },
     /// NIP-77: query returning only `(created_at, id)` records so that large
     /// negentropy ranges do not materialize every full event in memory.
@@ -279,6 +289,9 @@ pub struct DbClient {
     max_pending_msgs: usize,
     max_pending_events: usize,
     max_api_pending: usize,
+    /// How many threads serve the WebSocket reader queue (from
+    /// `database.reader_threads`); used to fan the shutdown messages out.
+    reader_threads: usize,
 }
 
 impl DbClient {
@@ -298,6 +311,7 @@ impl DbClient {
         // blob — copy them over so existing bans/allowlists survive.
         store.migrate_access_pubkeys()?;
         log::info!("access control migration check complete");
+        let reader_threads = cfg.reader_threads.clamp(1, 64);
         let threads = threads::spawn(
             store,
             expiry,
@@ -305,6 +319,7 @@ impl DbClient {
             request_timeout_secs,
             max_pending_msgs,
             max_pending_events,
+            reader_threads,
         )?;
         Ok(DbClient {
             tx: threads.tx,
@@ -319,6 +334,7 @@ impl DbClient {
             max_pending_msgs: threads.max_pending_msgs,
             max_pending_events: threads.max_pending_events,
             max_api_pending: threads.max_api_pending,
+            reader_threads: threads.reader_threads,
         })
     }
 
@@ -331,9 +347,11 @@ impl DbClient {
         self.request_with(make, &self.tx).await
     }
 
-    /// Sends a read-only request to the dedicated reader thread.
+    /// Sends a read-only request to the dedicated reader thread. The
+    /// writer-queue counters are not part of the gate: the reader threads
+    /// exist so reads keep working while the writer is stalled.
     async fn request_read<R: Default>(&self, make: impl FnOnce(oneshot::Sender<R>) -> Msg) -> R {
-        self.request_with(make, &self.read_tx).await
+        self.request_with_checked(make, &self.read_tx, false).await
     }
 
     /// Startup-only read: neither fails fast on a momentarily full queue
@@ -413,12 +431,29 @@ impl DbClient {
         make: impl FnOnce(oneshot::Sender<R>) -> Msg,
         channel: &mpsc::UnboundedSender<Msg>,
     ) -> Option<oneshot::Receiver<R>> {
-        if self.pending_msgs.load(std::sync::atomic::Ordering::Relaxed) >= self.max_pending_msgs
-            || self
-                .pending_events
-                .load(std::sync::atomic::Ordering::Relaxed)
-                >= self.max_pending_events
-        {
+        self.send_request_checked(make, channel, true)
+    }
+
+    /// Like [`Self::send_request`], but with `check_writer` the fail-fast
+    /// gate also inspects the writer-queue counters (`pending_msgs` /
+    /// `pending_events`). Read-only requests on the dedicated reader
+    /// channel pass `false`: the whole point of the separate reader threads
+    /// is that reads keep working while the writer is stalled, so a
+    /// write-backlog must not fail-fast the reads.
+    fn send_request_checked<R>(
+        &self,
+        make: impl FnOnce(oneshot::Sender<R>) -> Msg,
+        channel: &mpsc::UnboundedSender<Msg>,
+        check_writer: bool,
+    ) -> Option<oneshot::Receiver<R>> {
+        let writer_stalled = check_writer
+            && (self.pending_msgs.load(std::sync::atomic::Ordering::Relaxed)
+                >= self.max_pending_msgs
+                || self
+                    .pending_events
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    >= self.max_pending_events);
+        if writer_stalled {
             // Surface the overload in the stats (db_errors).
             self.errors
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -456,7 +491,16 @@ impl DbClient {
         make: impl FnOnce(oneshot::Sender<R>) -> Msg,
         channel: &mpsc::UnboundedSender<Msg>,
     ) -> R {
-        let Some(rx) = self.send_request(make, channel) else {
+        self.request_with_checked(make, channel, true).await
+    }
+
+    async fn request_with_checked<R: Default>(
+        &self,
+        make: impl FnOnce(oneshot::Sender<R>) -> Msg,
+        channel: &mpsc::UnboundedSender<Msg>,
+        check_writer: bool,
+    ) -> R {
+        let Some(rx) = self.send_request_checked(make, channel, check_writer) else {
             return R::default();
         };
         if self.timeout_secs == 0 {
@@ -643,10 +687,24 @@ impl DbClient {
             .await
     }
 
-    /// Stores a batch of events in a single write transaction.
+    /// Stores a batch of events in a single write transaction. Used by the
+    /// tests; the relay itself goes through [`Self::put_batch_deferred`].
+    #[allow(dead_code)]
     pub async fn put_batch(&self, events: Vec<(Event, u64)>) -> Vec<PutOutcome> {
         self.request_write(|reply| Msg::PutBatch { events, reply })
             .await
+    }
+
+    /// Queues a batch for the writer and returns the reply receiver
+    /// without awaiting it: the connection can keep reading frames while
+    /// the writer commits, instead of stalling on the commit (and letting
+    /// the socket buffer decide the batch size). Returns `None` when the
+    /// queue is full (the batch was not queued).
+    pub fn put_batch_deferred(
+        &self,
+        events: Vec<(Event, u64)>,
+    ) -> Option<tokio::sync::oneshot::Receiver<Vec<PutOutcome>>> {
+        self.send_request(|reply| Msg::PutBatch { events, reply }, &self.tx)
     }
 
     /// NIP-77: returns only `(created_at, id)` records of the matching
@@ -714,6 +772,12 @@ impl DbClient {
             reply,
         })
         .await
+    }
+
+    /// Every vanished pubkey (raw 32-byte keys). Startup-only use.
+    pub async fn vanish_pubkeys(&self) -> Vec<Vec<u8>> {
+        self.request_read(|reply| Msg::VanishPubkeys { reply })
+            .await
     }
 
     pub async fn apply_vanish(&self, pubkey: [u8; 32]) -> usize {
@@ -919,7 +983,11 @@ impl DbClient {
 
     pub fn shutdown(&self) {
         let _ = self.tx.send(Msg::Shutdown);
-        let _ = self.read_tx.send(Msg::Shutdown);
+        // One per reader thread (the WebSocket reader pool is shared
+        // behind a mutex; each thread consumes one shutdown message).
+        for _ in 0..self.reader_threads {
+            let _ = self.read_tx.send(Msg::Shutdown);
+        }
         let _ = self.api_read_tx.send(Msg::Shutdown);
     }
 }

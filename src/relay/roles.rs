@@ -132,7 +132,17 @@ impl super::Relay {
             };
             let stored = self.publish_relay_event(event).await;
             if stored {
-                self.publish_membership(None).await;
+                // The membership republish must not be silently dropped:
+                // a failure would leave the old membership event stored,
+                // and the restart rebuild would resurrect assignments to
+                // the deleted role. The tombstone itself still guarantees
+                // the role stays deleted; the operator is told the
+                // membership refresh failed so it can be retried.
+                if !self.publish_membership(None).await {
+                    log::warn!(
+                        "delete_role {id}: the membership list could not be republished; assignments to the deleted role may resurface after a restart"
+                    );
+                }
             }
             stored
         } else {
@@ -171,9 +181,17 @@ impl super::Relay {
     pub(crate) async fn apply_leave_request(&self, event: &Event) {
         let removed = self.roles.write().await.remove_pubkey(&event.pubkey);
         if removed {
-            let _ = self
+            // A failed republish would let the rebuild resurrect the
+            // member after a restart: surface it in the log.
+            if !self
                 .publish_membership(Some((false, event.pubkey.clone())))
-                .await;
+                .await
+            {
+                log::warn!(
+                    "apply_leave_request: the membership list could not be republished; {} may resurface after a restart",
+                    event.pubkey
+                );
+            }
         }
     }
 }

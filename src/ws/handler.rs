@@ -5,15 +5,41 @@
 use axum::extract::ws::Message;
 use serde_json::{Value, json};
 
-use super::EVENT_BATCH;
-
 use crate::event::Event;
 use crate::filter::Filter;
 use crate::nips::{nip29, nip40, nip42, nip45, nip70};
 use crate::util::unix_now;
 
 impl super::Conn {
+    /// The verb of a JSON array message, extracted with a lightweight scan
+    /// (no full parse): `["EVENT", ...]` → `"EVENT"`. Returns `None` when
+    /// the text is not a string array.
+    pub(crate) fn first_token(text: &str) -> Option<&str> {
+        let rest = text.trim_start().strip_prefix('[')?.trim_start();
+        let rest = rest.strip_prefix('"')?;
+        let end = rest.find('"')?;
+        Some(&rest[..end])
+    }
+
     pub(crate) async fn handle_text(&mut self, text: &str) {
+        let Some(kind) = Self::first_token(text) else {
+            self.send_notice("error: expected an array message");
+            return;
+        };
+        // EVENT messages are queued and accepted in batches so the
+        // database commit cost is paid once per batch instead of once
+        // per event; the batch is flushed when it is full, when the
+        // socket is momentarily idle, or before any other message.
+        // Fast path: the message is parsed directly as a `(verb, event)`
+        // pair in a single JSON pass — the generic `Value` parse (and its
+        // per-message allocation) is skipped entirely for the hot path.
+        // The generic path is only taken for malformed messages (to emit
+        // the NOTICE).
+        if kind == "EVENT"
+            && let Ok((_, event)) = serde_json::from_str::<(String, Event)>(text)
+        {
+            return self.queue_event_value(event).await;
+        }
         let Ok(value) = serde_json::from_str::<Value>(text) else {
             self.send_notice("error: invalid json");
             return;
@@ -28,19 +54,10 @@ impl super::Conn {
         };
 
         match kind {
-            // EVENT messages are queued and accepted in batches so the
-            // database commit cost is paid once per batch instead of once
-            // per event; the batch is flushed when it is full, when the
-            // socket is momentarily idle, or before any other message.
+            // The EVENT arm is only reached for malformed EVENT messages
+            // (the valid ones returned above).
             "EVENT" => {
-                // Fast path: the message is parsed directly as a
-                // `(verb, event)` pair in a single JSON pass, avoiding the
-                // generic Value parse plus its clone. The generic path is
-                // only taken for malformed messages (to emit the NOTICE).
-                match serde_json::from_str::<(String, Event)>(text) {
-                    Ok((_, event)) => self.queue_event_value(event).await,
-                    Err(_) => self.queue_event(&msg[1..]).await,
-                }
+                self.queue_event(&msg[1..]).await;
             }
             "REQ" => {
                 self.flush_pending_events().await;
@@ -84,30 +101,37 @@ impl super::Conn {
 
     /// Queues an already-parsed event for batched acceptance.
     pub(crate) async fn queue_event_value(&mut self, event: Event) {
-        self.relay.stats.bump(&self.relay.stats.events_received, 1);
+        self.events_received_local += 1;
         // Path-specific write policy (nostrd): `/inbox` and `/outbox` are
         // restricted endpoints — see `write_policy_reason`.
         if let Some(reason) = self.write_policy_reason(&event).await {
+            self.relay.stats.bump(&self.relay.stats.events_rejected, 1);
             self.send_ok(&event.id, false, &reason);
             return;
         }
+        // The connection loop queues the batch at the end of its sliding
+        // window (and resolves it on a spawned task while reading keeps
+        // going); a mid-window synchronous flush here would serialize the
+        // connection on every commit.
         self.pending_events.push(event);
-        if self.pending_events.len() >= EVENT_BATCH {
-            self.flush_pending_events().await;
-        }
     }
 
     /// The write policy of the endpoint this connection is on:
     /// `/outbox` accepts only events authored by the NIP-42-authenticated
-    /// pubkey of this connection (`server.outbox_write_policy = "any"`) or
+    /// pubkey of this connection (`relay.outbox_write_policy = "any"`) or
     /// only events authored by the relay's own pubkey (`"relay"`); `/inbox`
     /// accepts only events carrying a `p` tag — any recipient
-    /// (`server.inbox_write_policy = "any"`) or the relay itself
+    /// (`relay.inbox_write_policy = "any"`) or the relay itself
     /// (`"relay"`). Every other path is unrestricted.
     pub(crate) async fn write_policy_reason(&self, event: &Event) -> Option<String> {
-        // Clone the connection data so the future does not hold `&self`
-        // across the config await (the connection task's future must be
+        // Fast path: the vast majority of connections are on the default
+        // path — a cheap string comparison rejects them before any clone
+        // (the clones below exist only so the future does not hold `&self`
+        // across the config await; the connection task's future must be
         // `Send`).
+        if self.path != "/outbox" && self.path != "/inbox" {
+            return None;
+        }
         let path = self.path.clone();
         let authed = self.authed_pubkeys.clone();
         let relay = self.relay.clone();
@@ -193,7 +217,6 @@ impl super::Conn {
 
     /// Queues an EVENT message for batched acceptance (generic path).
     pub(crate) async fn queue_event(&mut self, rest: &[Value]) {
-        self.relay.stats.bump(&self.relay.stats.events_received, 1);
         if rest.is_empty() {
             self.send_notice("error: EVENT requires an event object");
             return;
@@ -308,6 +331,10 @@ impl super::Conn {
             self.send_closed(sub_id, "invalid: too many ids or authors in a filter");
             return;
         }
+        if filters.iter().any(|f| f.invalid_tag_values()) {
+            self.send_closed(sub_id, "invalid: tag constraint values must be strings");
+            return;
+        }
 
         let search_disabled = filters.iter().any(|f| f.has_search()) && !search_enabled;
 
@@ -342,7 +369,7 @@ impl super::Conn {
                     .unwrap_or_default()
             })
             .sum();
-        let replacing = self.subs.get(sub_id).map(|(_, bytes)| *bytes);
+        let replacing = self.subs.get(sub_id).map(|(_, bytes, _)| *bytes);
         let next_total = self
             .sub_bytes
             .saturating_sub(replacing.unwrap_or(0))
@@ -352,15 +379,23 @@ impl super::Conn {
             return;
         }
         self.sub_bytes = next_total;
-        self.subs
-            .insert(sub_id.to_string(), (stored.clone(), sub_bytes));
-        // Subscribe to live events *before* running the query, so no event
-        // stored between the query and the subscription is missed (a
-        // duplicate delivery of an event that is both in the query result
-        // and live is harmless: clients deduplicate by id).
-        if self.live.is_none() {
-            self.live = Some(self.relay.live.subscribe());
-        }
+        self.subs.insert(
+            sub_id.to_string(),
+            (
+                stored.clone(),
+                sub_bytes,
+                // The serialized sub id: the live path wraps every
+                // matching event with it, so it is encoded once per
+                // subscription instead of once per event.
+                serde_json::to_string(sub_id).unwrap_or_default(),
+            ),
+        );
+        // Register the subscription in the live index *before* running
+        // the query, so no event stored between the query and the
+        // subscription is missed (a duplicate delivery of an event that
+        // is both in the query result and live is harmless: clients
+        // deduplicate by id).
+        self.sync_live_index();
         if replacing.is_none() {
             self.relay
                 .stats
@@ -368,6 +403,8 @@ impl super::Conn {
             self.relay
                 .stats
                 .bump(&self.relay.stats.subscriptions_active, 1);
+            self.subscriptions_held
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
         let now = unix_now();
@@ -412,31 +449,51 @@ impl super::Conn {
             self.send_notice("error: CLOSE requires a subscription id");
             return;
         };
+        // `remove_subscription` re-syncs the live index.
         self.remove_subscription(sub_id);
-        // Drop the live receiver with the last subscription so
-        // connection without active subscriptions are never woken.
-        if self.subs.is_empty() {
-            self.live = None;
-        }
+    }
+
+    /// Re-derives the connection's entries in the live subscription
+    /// index from its current subscriptions. Called after every REQ /
+    /// CLOSE / sub replacement: the index maps filter components to
+    /// connections, and the bus delivers only to the candidate set.
+    pub(crate) fn sync_live_index(&self) {
+        let components: Vec<crate::relay::FilterComponents> = self
+            .subs
+            .values()
+            .flat_map(|(filters, _, _)| filters.iter().map(crate::relay::FilterComponents::of))
+            .collect();
+        let mut index = self
+            .relay
+            .sub_index
+            .write()
+            .unwrap_or_else(|p| p.into_inner());
+        index.unregister(self.conn_id);
+        index.register(self.conn_id, &components);
     }
 
     /// Releases a subscription (and any negentropy state held under the
     /// same id): its filter bytes, its live slot and its negentropy items.
     pub(crate) fn remove_subscription(&mut self, sub_id: &str) {
-        if let Some((_, bytes)) = self.subs.remove(sub_id) {
+        if let Some((_, bytes, _)) = self.subs.remove(sub_id) {
             self.sub_bytes = self.sub_bytes.saturating_sub(bytes);
             self.relay
                 .stats
                 .subscriptions_active
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            // NIP-77: a CLOSE on a subscription id also ends any negentropy
-            // state held under the same id, releasing its items from the
-            // connection's memory accounting and its subscription slot.
-            if let Some(state) = self.neg.remove(sub_id) {
-                self.neg_total = self.neg_total.saturating_sub(state.items.len());
-                self.release_neg_stats_subscription();
-            }
+            self.subscriptions_held
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
+        // NIP-77: a CLOSE on a subscription id also ends any negentropy
+        // state held under the same id (even when no REQ subscription with
+        // that id exists — a NEG-OPEN-only id must still be closable),
+        // releasing its items from the connection's memory accounting and
+        // its subscription slot.
+        if let Some(state) = self.neg.remove(sub_id) {
+            self.neg_total = self.neg_total.saturating_sub(state.items.len());
+            self.release_neg_stats_subscription();
+        }
+        self.sync_live_index();
     }
 
     pub(crate) async fn handle_auth(&mut self, rest: &[Value]) {
@@ -525,8 +582,17 @@ impl super::Conn {
                 }
             }
         }
+        // NIP-45: COUNT requires at least one filter.
+        if filters.is_empty() {
+            self.send_closed(sub_id, "invalid: COUNT requires at least one filter");
+            return;
+        }
         if filters.iter().any(|f| f.too_many_members()) {
             self.send_closed(sub_id, "invalid: too many ids or authors in a filter");
+            return;
+        }
+        if filters.iter().any(|f| f.invalid_tag_values()) {
+            self.send_closed(sub_id, "invalid: tag constraint values must be strings");
             return;
         }
         // Cap the filter count like REQ: without it each filter would get its
@@ -623,7 +689,12 @@ impl super::Conn {
     /// caller skips the lock otherwise); `expiry_enabled` is a per-connection
     /// cache refreshed whenever a message arrives, so the hot live path does
     /// not acquire the shared config lock once per batch per connection.
-    pub(crate) fn deliver_live(&mut self, event: &Event, groups: Option<&nip29::GroupStore>) {
+    pub(crate) fn deliver_live(
+        &mut self,
+        event: &Event,
+        event_json: &str,
+        groups: Option<&nip29::GroupStore>,
+    ) {
         // Fast path: most connections have no subscriptions.
         if self.subs.is_empty() {
             return;
@@ -657,28 +728,24 @@ impl super::Conn {
         let matching: Vec<String> = self
             .subs
             .iter()
-            .filter(|(_, (filters, _))| filters.iter().any(|f| f.matches(event)))
+            .filter(|(_, (filters, _, _))| filters.iter().any(|f| f.matches(event)))
             .map(|(sub_id, _)| sub_id.clone())
             .collect();
         if matching.is_empty() {
             return;
         }
-        // Serialize the event once and wrap it per subscription: the JSON
-        // of a large event would otherwise be encoded once per matching
-        // subscription (a hot path on busy relays).
-        let Ok(event_json) = serde_json::to_string(event) else {
-            return;
-        };
-        let mut out = String::with_capacity(event_json.len() + 32);
+        // The event JSON is shared (encoded once by the live bus) and the
+        // sub id JSON is cached per subscription: the wrap below only
+        // concatenates strings.
         for sub_id in matching {
-            let Ok(sub_json) = serde_json::to_string(&sub_id) else {
+            let Some((_, _, sub_json)) = self.subs.get(&sub_id) else {
                 continue;
             };
-            out.clear();
+            let mut out = String::with_capacity(event_json.len() + sub_json.len() + 16);
             out.push_str("[\"EVENT\",");
-            out.push_str(&sub_json);
+            out.push_str(sub_json);
             out.push(',');
-            out.push_str(&event_json);
+            out.push_str(event_json);
             out.push(']');
             self.send(Message::Text(std::mem::take(&mut out).into()));
         }

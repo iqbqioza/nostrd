@@ -54,6 +54,11 @@ const SUPPORTED_METHODS: &[&str] = &[
     "listeventsneedingmoderation",
 ];
 
+/// Maximum length of a NIP-43 role id accepted through the NIP-86 RPC:
+/// the id lands in a stored relay event and the in-memory role map, so it
+/// must not be able to grow to the full RPC body size.
+const MAX_ROLE_ID_LEN: usize = 64;
+
 fn rpc_ok(result: Value) -> Response {
     (StatusCode::OK, Json(json!({ "result": result }))).into_response()
 }
@@ -86,14 +91,10 @@ pub async fn rpc_handler(
     // NIP-86 `blockip` also applies to this endpoint: a blocked peer must
     // not reach the management RPC (the WebSocket handler already refuses
     // its connections).
-    if relay
-        .access
-        .read()
-        .await
-        .blocked_ips
-        .iter()
-        .any(|(b, _)| b.parse::<std::net::IpAddr>().is_ok_and(|b| b == peer.ip()))
-    {
+    if relay.access.read().await.blocked_ips.iter().any(|(b, _)| {
+        b.parse::<std::net::IpAddr>()
+            .is_ok_and(|b| b == crate::util::normalize_ip(peer.ip()))
+    }) {
         return StatusCode::FORBIDDEN.into_response();
     }
     // The spec requires the JSON-RPC content type (parameters such as
@@ -292,6 +293,11 @@ pub async fn rpc_handler(
             let Some(id) = params.first().and_then(Value::as_str) else {
                 return rpc_err("invalid params");
             };
+            if id.len() > MAX_ROLE_ID_LEN {
+                return rpc_err(&format!(
+                    "role id exceeds the maximum of {MAX_ROLE_ID_LEN} characters"
+                ));
+            }
             let label = params.get(1).and_then(Value::as_str).unwrap_or("");
             let description = params.get(2).and_then(Value::as_str).unwrap_or("");
             let color = params.get(3).and_then(Value::as_str).unwrap_or("");
@@ -312,6 +318,11 @@ pub async fn rpc_handler(
             let Some(id) = params.first().and_then(Value::as_str) else {
                 return rpc_err("invalid params");
             };
+            if id.len() > MAX_ROLE_ID_LEN {
+                return rpc_err(&format!(
+                    "role id exceeds the maximum of {MAX_ROLE_ID_LEN} characters"
+                ));
+            }
             let label = params.get(1).and_then(Value::as_str).unwrap_or("");
             let description = params.get(2).and_then(Value::as_str).unwrap_or("");
             let color = params.get(3).and_then(Value::as_str).unwrap_or("");
@@ -364,6 +375,9 @@ pub async fn rpc_handler(
             ) else {
                 return rpc_err("invalid params");
             };
+            if !is_pubkey(pubkey) {
+                return rpc_err("invalid pubkey");
+            }
             relay.unassign_role(pubkey, role).await;
             audit!(&relay, &identity, "unassignrole", params);
             rpc_ok(json!(true))
@@ -471,7 +485,14 @@ pub async fn rpc_handler(
 fn audit_params(params: &[Value]) -> String {
     let mut text = serde_json::to_string(params).unwrap_or_default();
     if text.len() > 200 {
-        text.truncate(200);
+        // Truncate on a char boundary: `String::truncate` panics when the
+        // index lands inside a multi-byte UTF-8 sequence (e.g. a Japanese
+        // relay name or an emoji in the reason).
+        let mut end = 200;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
         text.push('…');
     }
     text
@@ -563,6 +584,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         let mut cfg = Config::default();
         cfg.database.path = path;
+        cfg.database.map_size = 16 * 1024 * 1024;
+        cfg.database.max_map_size = 256 * 1024 * 1024;
         cfg.rpc.management_token = "test-token".into();
         if let Some(key) = key {
             cfg.relay.enabled_nips = vec![43];

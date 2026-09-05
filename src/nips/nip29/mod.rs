@@ -95,6 +95,26 @@ pub fn group_id_any(event: &Event) -> Option<&str> {
     }
 }
 
+/// Trait-based variant of [`group_id_any`] for the negentropy light path
+/// (the candidate was deserialized without its content).
+pub fn group_id_any_light<E: crate::filter::EventFields>(event: &E) -> Option<&str> {
+    match event.kind() {
+        GROUP_META..=GROUP_PINS => tag_value_light(event, D),
+        _ => tag_value_light(event, H),
+    }
+}
+
+fn tag_value_light<'a, E: crate::filter::EventFields>(
+    event: &'a E,
+    name: &'a str,
+) -> Option<&'a str> {
+    event
+        .tags()
+        .iter()
+        .find(|t| t.len() >= 2 && t[0] == name)
+        .map(|t| t[1].as_str())
+}
+
 /// The `previous` tag values of an event (NIP-29 timeline references).
 pub fn previous_tags(event: &Event) -> Vec<String> {
     tag_values(event, "previous").map(str::to_string).collect()
@@ -156,6 +176,13 @@ impl Group {
 pub struct GroupStore {
     pub groups: HashMap<String, Group>,
     deleted: HashSet<String>,
+    /// Groups whose create event is gone (the creator vanished, or the
+    /// 9007 was deleted/expired) but whose other events survived the
+    /// rebuild: their state cannot be restored, so their content must be
+    /// withheld from everyone instead of becoming world-readable
+    /// (fail-closed). A fresh CREATE_GROUP later removes the id from this
+    /// set.
+    ghost: HashSet<String>,
     /// Cap on the store size (active groups + deleted markers): bounds the
     /// in-memory state even when an attacker churns group ids. 0 =
     /// unlimited.
@@ -230,6 +257,15 @@ impl GroupStore {
         }
 
         if event.kind == LEAVE {
+            // NIP-29: leaving must not remove the group's last admin
+            // (nobody could then manage the group).
+            let retains_admin = group
+                .members
+                .iter()
+                .any(|(pk, roles)| !roles.is_empty() && pk != &event.pubkey);
+            if !retains_admin {
+                return Err("restricted: the group must retain at least one admin".into());
+            }
             return Ok(());
         }
 
@@ -240,29 +276,55 @@ impl GroupStore {
             if event.kind == 9002 {
                 validate_edit_metadata(self, gid, group, event)?;
             }
+            // NIP-29: the group must retain at least one admin — a 9000
+            // without roles could silently demote the last admin, and a
+            // 9001/LEAVE could remove them, leaving the group unmanageable
+            // (nobody could then issue 9000/9001/9002 again).
+            let admin_removed: HashSet<String> = match event.kind {
+                9000 => event
+                    .tags
+                    .iter()
+                    // A `p` tag without roles (len == 2) or with an
+                    // all-empty role list (`["p", pk, ""]`) demotes the
+                    // subject: both must count as admin removal.
+                    .filter(|t| t.len() >= 2 && t[0] == P && t[2..].iter().all(|r| r.is_empty()))
+                    .map(|t| t[1].clone())
+                    .collect(),
+                9001 => tag_values(event, P).map(str::to_string).collect(),
+                _ => HashSet::new(),
+            };
             if event.kind == 9000 {
-                // NIP-29: the roles of each `p`-tag subject are replaced; a
-                // `p` tag without roles demotes the subject to a plain member.
-                // Refuse to leave the group with no admin at all (the creator
-                // or any admin could otherwise be silently demoted and the
-                // group left unmanageable).
-                let grants_roles = event.tags.iter().any(|t| t.len() > 2 && t[0] == P);
-                if !grants_roles {
-                    let demoted: HashSet<&str> = event
-                        .tags
-                        .iter()
-                        .filter(|t| t.len() == 2 && t[0] == P)
-                        .map(|t| t[1].as_str())
-                        .collect();
-                    // An admin keeps their roles unless named in a `p` tag.
-                    let retains_admin = group
-                        .members
-                        .iter()
-                        .any(|(pk, roles)| !roles.is_empty() && !demoted.contains(pk.as_str()));
-                    if !retains_admin {
-                        return Err("restricted: the group must retain at least one admin".into());
-                    }
+                // A `p` tag with roles only replaces roles (never removes
+                // the user); a `p` tag without roles demotes. An
+                // all-empty role list (`["p", pk, ""]`) is a demotion: the
+                // apply side drops empty roles, so it must not count as a
+                // role grant (which would bypass the last-admin guard).
+                // The apply side processes the p tags *in order*, each
+                // overwriting the member's roles, so the *final* state
+                // decides: simulate it (e.g. `["p", A, "mod"], ["p", A]`
+                // ends with A demoted even though a grant is present).
+                let mut final_roles: HashMap<&str, bool> = group
+                    .members
+                    .iter()
+                    .map(|(pk, roles)| (pk.as_str(), !roles.is_empty()))
+                    .collect();
+                for tag in event.tags.iter().filter(|t| t.len() >= 2 && t[0] == P) {
+                    let pk = tag[1].as_str();
+                    let has_roles = tag[2..].iter().any(|r| !r.is_empty());
+                    final_roles.insert(pk, has_roles);
                 }
+                let retains_admin = final_roles.values().any(|admin| *admin);
+                if !retains_admin {
+                    return Err("restricted: the group must retain at least one admin".into());
+                }
+                return Ok(());
+            }
+            let retains_admin = group
+                .members
+                .iter()
+                .any(|(pk, roles)| !roles.is_empty() && !admin_removed.contains(pk));
+            if !retains_admin {
+                return Err("restricted: the group must retain at least one admin".into());
             }
             return Ok(());
         }
@@ -280,8 +342,19 @@ impl GroupStore {
 
     /// Applies a stored event to the group state and returns the unsigned
     /// relay-generated events to publish (empty when `emit` is false, e.g.
-    /// during startup rebuild).
-    pub fn apply(&mut self, event: &Event, relay_pubkey: &str, now: u64, emit: bool) -> Vec<Event> {
+    /// during startup rebuild). `ignore_capacity` lets the startup rebuild
+    /// restore every group that was actually stored: a group dropped by the
+    /// capacity limit must not become "unknown" (its private content would
+    /// turn world-readable), and the limit still applies to new creations
+    /// at runtime.
+    pub fn apply(
+        &mut self,
+        event: &Event,
+        relay_pubkey: &str,
+        now: u64,
+        emit: bool,
+        ignore_capacity: bool,
+    ) -> Vec<Event> {
         let Some(gid) = group_id(event) else {
             return Vec::new();
         };
@@ -329,7 +402,11 @@ impl GroupStore {
                     // without roles leaves the user a plain member.
                     for tag in event.tags.iter().filter(|t| t.len() >= 2 && t[0] == P) {
                         let pk = tag[1].clone();
-                        let roles: HashSet<String> = tag[2..].iter().cloned().collect();
+                        // An empty role element (`["p", pk, ""]`) is a
+                        // malformed demotion: it must not turn into an
+                        // admin grant (an empty-string role is non-empty).
+                        let roles: HashSet<String> =
+                            tag[2..].iter().filter(|r| !r.is_empty()).cloned().collect();
                         // An empty role list leaves the user a plain member
                         // (replacing any previous roles).
                         group.members.insert(pk, roles);
@@ -350,21 +427,22 @@ impl GroupStore {
                 }
             }
             9002 => {
-                let (parent_before, parent_after) = {
+                let (parent_before, parent_after, children_before) = {
                     match self.groups.get_mut(gid) {
                         Some(group) => {
                             apply_settings(group, event);
+                            let children_before = group.children.clone();
                             group.children =
                                 tag_values(event, "child").map(str::to_string).collect();
                             let before = group.parent.clone();
                             let after = tag_value(event, "parent").map(str::to_string);
-                            (before, after)
+                            (before, after, children_before)
                         }
-                        None => (None, None),
+                        None => (None, None, Vec::new()),
                     }
                 };
                 if parent_before != parent_after {
-                    if let Some(old) = parent_before
+                    if let Some(old) = parent_before.clone()
                         && let Some(parent_group) = self.groups.get_mut(&old)
                     {
                         parent_group.children.retain(|c| c != gid);
@@ -376,7 +454,64 @@ impl GroupStore {
                         parent_group.children.push(gid.to_string());
                     }
                     if let Some(group) = self.groups.get_mut(gid) {
-                        group.parent = parent_after;
+                        group.parent = parent_after.clone();
+                    }
+                }
+                // The parent side of the link: a `child` tag on the
+                // parent's 9002 declares a child (the child's own `parent`
+                // tag is its side of the link). The declared list replaces
+                // the previous children; the parent back-pointer of the
+                // removed children is cleared, and the added children get
+                // their back-pointer set, keeping the two directions
+                // consistent.
+                let child_added: Vec<String> =
+                    tag_values(event, "child").map(str::to_string).collect();
+                let mut child_removed: Vec<String> = Vec::new();
+                for child in &children_before {
+                    if !child_added.iter().any(|c| c == child) {
+                        child_removed.push(child.clone());
+                    }
+                }
+                for child in &child_added {
+                    let old_parent = self.groups.get(child).and_then(|g| g.parent.clone());
+                    if old_parent.as_deref() == Some(gid) {
+                        continue;
+                    }
+                    // Only a child that does not already belong to another
+                    // parent gets its back-pointer assigned here: changing
+                    // an existing child's parent is the child's own 9002's
+                    // decision (the parent's admin must not re-parent a
+                    // group they do not administer).
+                    if old_parent.is_some() {
+                        continue;
+                    }
+                    if let Some(child_group) = self.groups.get_mut(child) {
+                        child_group.parent = Some(gid.to_string());
+                    }
+                    // The child's metadata changed (its parent tag):
+                    // republish it so peers see the new link.
+                    if emit {
+                        out.push(build_meta_event(
+                            child,
+                            self.groups.get(child),
+                            relay_pubkey,
+                            now,
+                        ));
+                    }
+                }
+                for child in &child_removed {
+                    if let Some(child_group) = self.groups.get_mut(child)
+                        && child_group.parent.as_deref() == Some(gid)
+                    {
+                        child_group.parent = None;
+                        if emit {
+                            out.push(build_meta_event(
+                                child,
+                                self.groups.get(child),
+                                relay_pubkey,
+                                now,
+                            ));
+                        }
                     }
                 }
                 if emit {
@@ -390,6 +525,19 @@ impl GroupStore {
                         out.push(build_meta_event(
                             &parent,
                             self.groups.get(&parent),
+                            relay_pubkey,
+                            now,
+                        ));
+                    }
+                    // The old parent's children list changed too: its
+                    // metadata must be republished or the stored event
+                    // keeps listing this group as a child.
+                    if parent_before != parent_after
+                        && let Some(old) = parent_before
+                    {
+                        out.push(build_meta_event(
+                            &old,
+                            self.groups.get(&old),
                             relay_pubkey,
                             now,
                         ));
@@ -413,7 +561,8 @@ impl GroupStore {
                 // The referenced events are deleted by the relay itself.
             }
             CREATE_GROUP => {
-                if !self.groups.contains_key(gid) && !self.at_capacity() {
+                if !self.groups.contains_key(gid) && (ignore_capacity || !self.at_capacity()) {
+                    self.unghost(gid);
                     let mut group = Group::default();
                     group
                         .members
@@ -490,6 +639,27 @@ impl GroupStore {
                     ));
                 }
             }
+            9011 => {
+                // NIP-29 remove-pin: the referenced pins are dropped (the
+                // add-pin event 9010 replaces the whole list).
+                if let Some(group) = self.groups.get_mut(gid) {
+                    for tag in event
+                        .tags
+                        .iter()
+                        .filter(|t| t.len() >= 2 && (t[0] == E || t[0] == A))
+                    {
+                        group.pins.retain(|(k, v)| k != &tag[0] || v != &tag[1]);
+                    }
+                }
+                if emit {
+                    out.push(build_pins_event(
+                        gid,
+                        self.groups.get(gid),
+                        relay_pubkey,
+                        now,
+                    ));
+                }
+            }
             _ => {}
         }
         out
@@ -512,6 +682,12 @@ impl GroupStore {
         // and its (possibly private) history must not become readable by
         // everyone.
         if self.deleted.contains(gid) {
+            return false;
+        }
+        // A group whose create event was lost (creator vanished, 9007
+        // deleted or expired) cannot be restored with its settings: treat
+        // it as gone so its surviving content is not served to everyone.
+        if self.ghost.contains(gid) {
             return false;
         }
         let Some(group) = self.groups.get(gid) else {
@@ -595,6 +771,14 @@ impl GroupStore {
         // metadata strictly monotonic, so the *stored* 39000-39005 always
         // reflect the latest state; only the in-memory member map could
         // diverge until the next edit.
+        // The rank ordering also inverts cross-kind arrival order within a
+        // second: a 9001 remove followed in the same second by a 9021 JOIN
+        // replays as [9001, JOIN] (correct) but a JOIN followed by a 9001
+        // replays as [9001, JOIN] too — the removed member resurrects until
+        // the next edit. Arrival order is not stored, so this cannot be
+        // fixed exactly; the relay-stamped put-user (9000) events, which
+        // arrive after the member operation, keep the stored 39002 list
+        // correct.
         events.sort_by(|a, b| {
             (a.created_at, group_rank(a.kind), a.kind, &a.id).cmp(&(
                 b.created_at,
@@ -603,9 +787,60 @@ impl GroupStore {
                 &b.id,
             ))
         });
-        for event in events {
-            self.apply(&event, "", unix_now(), false);
+        // A vanished author must not be resurrected as a member by
+        // replaying pre-vanish events signed by others (the vanish
+        // deleted the author's own JOIN, but an admin's put-user or the
+        // relay's own JOIN-time put-user survive): skip the events that
+        // would add a vanished pubkey to a group.
+        let vanished: std::collections::HashSet<String> = db
+            .vanish_pubkeys()
+            .await
+            .into_iter()
+            .map(hex::encode)
+            .collect();
+        // Every group id referenced by the surviving events: any of them
+        // that did not make it into `groups` (its create event was
+        // deleted by a vanish / NIP-09 / expiry) becomes a ghost — its
+        // content is withheld instead of turning world-readable.
+        let mut seen_gids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for event in &events {
+            if let Some(gid) = crate::nips::nip29::group_id(event) {
+                seen_gids.insert(gid.to_string());
+            }
         }
+        for mut event in events {
+            // A vanished author must not be resurrected as a member by
+            // replaying pre-vanish events signed by others (the vanish
+            // deleted the author's own JOIN, but an admin's put-user or
+            // the relay's own JOIN-time put-user survive): skip the
+            // events that would add a vanished pubkey to a group. For a
+            // 9000 put-user only the vanished pubkeys' `p` tags are
+            // dropped — the other assignments of the same event must
+            // still be applied.
+            if event.kind == JOIN && vanished.contains(&event.pubkey) {
+                continue;
+            }
+            if event.kind == 9000 {
+                event
+                    .tags
+                    .retain(|t| t.len() < 2 || t[0] != P || !vanished.contains(&t[1]));
+                if event.tags.is_empty() {
+                    continue;
+                }
+            }
+            self.apply(&event, "", unix_now(), false, true);
+        }
+        for gid in seen_gids {
+            if !self.groups.contains_key(&gid) && !self.deleted.contains(&gid) {
+                self.ghost.insert(gid);
+            }
+        }
+    }
+
+    /// Removes a group id from the ghost set once a fresh CREATE_GROUP
+    /// restores it.
+    pub(crate) fn unghost(&mut self, gid: &str) {
+        self.ghost.remove(gid);
     }
 }
 
@@ -628,7 +863,7 @@ fn event_code(event: &Event) -> Option<&str> {
 fn validate_edit_metadata(
     store: &GroupStore,
     gid: &str,
-    group: &Group,
+    _group: &Group,
     event: &Event,
 ) -> Result<(), String> {
     // NIP-29: "A kind:9002 MAY carry at most one parent tag". A second
@@ -637,27 +872,76 @@ fn validate_edit_metadata(
     if tag_values(event, "parent").count() > 1 {
         return Err("restricted: at most one parent tag is allowed".into());
     }
+    // A group cannot be its own child, and one 9002 must not make a
+    // group both the parent and the child of this one (that would create
+    // a two-way cycle the walks below cannot see: both directions would
+    // be applied and every later parent edit would loop forever).
+    let parent_value = tag_value(event, "parent").map(str::to_string);
+    if tag_values(event, "child").any(|c| c == gid) {
+        return Err("restricted: a group cannot be its own child".into());
+    }
+    if let Some(parent) = &parent_value
+        && tag_values(event, "child").any(|c| c == parent)
+    {
+        return Err("restricted: a group cannot be both parent and child".into());
+    }
+    // The declared children must not create a cycle either: walking down
+    // the children lists from the declared children must not reach this
+    // group (e.g. `parent: P` together with `child: P` on a P that has no
+    // parent would otherwise create a two-way cycle the upward walk
+    // misses).
+    for child in tag_values(event, "child") {
+        // Breadth-first walk down the children lists from the declared
+        // child; a visited set stops the walk on pre-existing cycles in
+        // the stored data instead of looping forever.
+        let mut queue: Vec<&str> = vec![child];
+        let mut visited: HashSet<&str> = HashSet::new();
+        while let Some(current) = queue.pop() {
+            if current == gid {
+                return Err("restricted: would create a cycle".into());
+            }
+            if !visited.insert(current) {
+                continue;
+            }
+            if let Some(group) = store.groups.get(current) {
+                queue.extend(group.children.iter().map(String::as_str));
+            }
+        }
+    }
     // A parent value must not create a cycle or self-reference, and the
     // parent must exist and the author must be its admin.
-    if let Some(parent) = tag_value(event, H).and_then(|_| tag_value(event, "parent")) {
-        let mut cursor = Some(parent);
+    if let Some(parent) = parent_value {
+        let mut cursor = Some(parent.as_str());
+        let mut visited: HashSet<&str> = HashSet::new();
         while let Some(current) = cursor {
             if current == gid {
                 return Err("restricted: would create a cycle".into());
+            }
+            if !visited.insert(current) {
+                // A pre-existing cycle in the stored data: stop the walk
+                // instead of looping forever.
+                break;
             }
             cursor = store.groups.get(current).and_then(|g| g.parent.as_deref());
         }
         let parent_group = store
             .groups
-            .get(parent)
+            .get(&parent)
             .ok_or_else(|| "restricted: parent group does not exist".to_string())?;
         if !parent_group.is_admin(event.pubkey.as_str()) {
             return Err("restricted: you are not an admin of the parent group".into());
         }
     }
-    // Metadata edits must carry the full child list.
+    // NIP-29: a metadata edit must carry every existing child as a child
+    // tag, or the edit is rejected — otherwise a partial edit (e.g. only a
+    // name change) would silently drop the children on the apply side,
+    // which replaces the list.
     let children: HashSet<&str> = tag_values(event, "child").collect();
-    if !group.children.iter().all(|c| children.contains(c.as_str())) {
+    if !_group
+        .children
+        .iter()
+        .all(|c| children.contains(c.as_str()))
+    {
         return Err("restricted: missing child tags in metadata edit".into());
     }
     Ok(())

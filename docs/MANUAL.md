@@ -166,6 +166,7 @@ To generate a secret key, use the `nostrd genkey` command (see [5. Command Refer
 | `max_connections` | Maximum concurrent connections | `10000` |
 | `max_connections_per_ip` | Max connections per source IP (0 = unlimited) | `64` |
 | `max_ws_message_bytes` | Max bytes per WebSocket message/frame | `1048576` (1 MB) |
+| `socket_recv_buffer_kb` | Per-connection kernel receive buffer (KiB, `0` = kernel default; the kernel may double the value). Larger values let a fast publisher's burst absorb into one batch while the relay commits it (higher ingest throughput); the buffer only uses real memory while data is queued, so idle connections cost nothing. The send buffer stays 16 KiB | `64` |
 | `max_filters` | Max filters per REQ | `20` |
 | `max_subscriptions` | Max subscriptions per connection | `20` |
 | `max_limit` | Ceiling for the REQ `limit` | `500` |
@@ -200,8 +201,9 @@ To generate a secret key, use the `nostrd genkey` command (see [5. Command Refer
 | `max_map_size` | Memory-map ceiling (bytes). **Raise this if you hit the "map is full" error** | 1 TB |
 | `purge_interval_secs` | Interval for purging NIP-40 expired events | `300` |
 | `search_index` | Enable the NIP-50 full-text index | `true` |
-| `max_indexed_words` | Words indexed per event for search | `128` |
-| `db_buffer_size` | LMDB read/write buffer size (bytes) | `2048` |
+| `reader_threads` | Threads serving WebSocket REQ/COUNT/NEG scans (parallelize query serving across cores; LMDB read transactions never take the write lock) | `2` |
+| `max_indexed_words` | Words indexed per event for search | `32` |
+| `db_buffer_size` | Initial per-connection WebSocket buffer (bytes, grows on demand) | `2048` |
 | `db_request_timeout_secs` | Database request timeout (0 = wait forever) | `30` |
 | `max_db_queue_msgs` / `max_db_queue_events` | Overload protection when the DB queue backs up | `4096` / `262144` |
 
@@ -748,7 +750,28 @@ Settings that require a **restart**: `private_key`, `api_host`, `metrics_enabled
 
 ---
 
-## 14. When You Are Stuck
+## 14. Large-Scale Deployments
+
+The relay is designed to scale to hundreds of thousands of connections
+on a single host (the live delivery wakes only the subscribers that can
+match an event, and the per-connection memory is kept small). Pushing
+into the millions requires host-level tuning:
+
+| Setting | Value | Why |
+| --- | --- | --- |
+| `ulimit -n` / systemd `LimitNOFILE` | ≥ 2× the target connections (+1000) | Every connection holds an fd |
+| `net.core.somaxconn` | ≥ 1024 | Pending accept queue for connection bursts |
+| `net.ipv4.tcp_mem` / `net.ipv4.tcp_rmem` / `tcp_wmem` | tuned to the host RAM | The relay sets 16 KiB per socket direction; the kernel defaults must still cover the aggregate |
+| `net.ipv4.tcp_fin_timeout` | low (e.g. 10) | Reclaims TIME_WAIT sockets faster |
+| `vm.overcommit_memory` | 1 or 2 | The LMDB map is a large sparse virtual reservation (see `database.max_map_size`) |
+
+Per-connection kernel memory is ~32 KiB (16 KiB per direction, set by
+the relay) and user space ~10 KiB (the task, the connection state, the
+WebSocket buffer), so a million connections need roughly 40 GiB of
+kernel + user memory on top of the database. The WebSocket reader pool
+has two threads; a single heavy REQ no longer stalls every query.
+
+## 15. When You Are Stuck
 
 See [Troubleshooting (TROUBLESHOOTING.md)](TROUBLESHOOTING.md) for common errors and their fixes.
 

@@ -156,7 +156,11 @@ impl RoleStore {
         let mut members: Vec<(String, Vec<String>)> = self
             .assignments
             .iter()
-            .map(|(pk, roles)| (pk.clone(), roles.clone()))
+            .map(|(pk, roles)| {
+                let mut roles = roles.clone();
+                roles.sort();
+                (pk.clone(), roles)
+            })
             .collect();
         members.sort();
         for (pubkey, roles) in members {
@@ -188,6 +192,14 @@ impl RoleStore {
             serde_json::from_value(json!({ "kinds": [ROLE_DEFINITION, MEMBERSHIP_LIST] }))
                 .expect("static filter");
         let (events, _) = db.query_full(vec![filter], 1_000_000, unix_now()).await;
+        // A vanished pubkey must not be resurrected as a role holder by a
+        // pre-vanish membership list.
+        let vanished: std::collections::HashSet<String> = db
+            .vanish_pubkeys()
+            .await
+            .into_iter()
+            .map(hex::encode)
+            .collect();
         for event in events {
             if event.pubkey != relay_pubkey {
                 continue;
@@ -224,7 +236,7 @@ impl RoleStore {
                 }
                 MEMBERSHIP_LIST => {
                     for tag in &event.tags {
-                        if tag.len() >= 2 && tag[0] == "member" {
+                        if tag.len() >= 2 && tag[0] == "member" && !vanished.contains(&tag[1]) {
                             self.assignments.insert(tag[1].clone(), tag[2..].to_vec());
                         }
                     }

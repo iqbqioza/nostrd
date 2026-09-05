@@ -383,7 +383,7 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
         shutdown_rx.clone(),
     )));
 
-    let (header_timeout, max_connections, per_sec_per_ip) = {
+    let (header_timeout, max_connections, per_sec_per_ip, recv_buf_kb) = {
         let cfg = relay.config.read().await;
         (
             // 0 = disabled (the documented convention): hyper treats
@@ -393,6 +393,7 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
                 .then(|| std::time::Duration::from_secs(cfg.limits.http_read_timeout_secs)),
             cfg.limits.max_connections,
             IpConnLimiter::new(cfg.limits.max_connections_per_sec_per_ip),
+            cfg.limits.socket_recv_buffer_kb,
         )
     };
     let _ = serve_limited(
@@ -401,6 +402,7 @@ pub async fn run_server(config_path: PathBuf, config: Config, db: DbClient) -> R
         max_connections,
         header_timeout,
         per_sec_per_ip,
+        recv_buf_kb,
         shutdown_rx,
     )
     .await;
@@ -577,7 +579,11 @@ async fn ws_handler(State(relay): State<Arc<Relay>>, request: Request) -> Respon
             .await
             .blocked_ips
             .iter()
-            .any(|(blocked, _)| blocked.parse::<std::net::IpAddr>().is_ok_and(|b| b == ip))
+            .any(|(blocked, _)| {
+                blocked
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|b| b == crate::util::normalize_ip(ip))
+            })
     {
         return StatusCode::FORBIDDEN.into_response();
     }
@@ -646,7 +652,9 @@ async fn ws_handler(State(relay): State<Arc<Relay>>, request: Request) -> Respon
                     handle_connection(
                         socket,
                         relay,
-                        peer_ip.unwrap_or_else(|| "0.0.0.0".parse().unwrap()),
+                        peer_ip
+                            .map(crate::util::normalize_ip)
+                            .unwrap_or_else(|| "0.0.0.0".parse().unwrap()),
                         path,
                     )
                 })
@@ -831,6 +839,7 @@ async fn serve_limited(
     max_connections: usize,
     header_timeout: Option<std::time::Duration>,
     per_sec_per_ip: Option<IpConnLimiter>,
+    recv_buf_kb: u32,
     mut shutdown: watch::Receiver<bool>,
 ) {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -855,8 +864,11 @@ async fn serve_limited(
                     continue;
                 };
                 // Per-IP connection rate limit (slow-loris / socket flood).
+                // The address is normalized like every other per-IP
+                // accounting: a dual-stack listener reports IPv4 peers as
+                // ::ffff:a.b.c.d, which must not dodge the per-second cap.
                 if let Some(limiter) = &per_sec_per_ip
-                    && !limiter.allow(peer.ip(), crate::util::unix_now())
+                    && !limiter.allow(crate::util::normalize_ip(peer.ip()), crate::util::unix_now())
                 {
                     continue;
                 }
@@ -870,10 +882,17 @@ async fn serve_limited(
                 // Keep per-connection kernel buffers small so that hundreds
                 // of thousands of idle connections do not pin gigabytes of
                 // kernel memory (see the same tuning in `ws_handler`).
+                // The receive buffer follows `limits.socket_recv_buffer_kb`
+                // (default 64 KiB; the kernel may double it) so a fast
+                // publisher's burst absorbs into one batch while the relay
+                // commits; the send buffer stays 16 KiB (the outgoing path
+                // flushes eagerly). The receive buffer only consumes real
+                // memory while data is actually queued, so idle
+                // connections cost nothing.
                 let _ = stream.set_nodelay(true);
                 unsafe {
-                    set_sock_opt(&stream, libc::SO_RCVBUF, 32 * 1024);
-                    set_sock_opt(&stream, libc::SO_SNDBUF, 32 * 1024);
+                    set_sock_opt(&stream, libc::SO_RCVBUF, (recv_buf_kb * 1024) as i32);
+                    set_sock_opt(&stream, libc::SO_SNDBUF, 16 * 1024);
                 }
 
                 let app = app.clone();
@@ -1055,12 +1074,36 @@ async fn reload_handler(
                             ("relay.enabled_nips", old.relay.enabled_nips != new_config.relay.enabled_nips),
                             ("relay.disabled_nips", old.relay.disabled_nips != new_config.relay.disabled_nips),
                             (
+                                "database.map_size",
+                                old.database.map_size != new_config.database.map_size,
+                            ),
+                            (
+                                "database.max_map_size",
+                                old.database.max_map_size != new_config.database.max_map_size,
+                            ),
+                            (
+                                "database.search_index",
+                                old.database.search_index != new_config.database.search_index,
+                            ),
+                            (
+                                "database.meta_index",
+                                old.database.meta_index != new_config.database.meta_index,
+                            ),
+                            (
+                                "database.reader_threads",
+                                old.database.reader_threads != new_config.database.reader_threads,
+                            ),
+                            (
                                 "blossom.host",
                                 old.blossom.host != new_config.blossom.host,
                             ),
                             (
                                 "blossom.storage",
                                 old.blossom.storage != new_config.blossom.storage,
+                            ),
+                            (
+                                "blossom.min_free_bytes",
+                                old.blossom.min_free_bytes != new_config.blossom.min_free_bytes,
                             ),
                             (
                                 "blossom.local_path",
@@ -1149,6 +1192,16 @@ async fn reload_handler(
                                 old.limits.max_connections_per_sec_per_ip
                                     != new_config.limits.max_connections_per_sec_per_ip,
                             ),
+                            (
+                                "limits.socket_recv_buffer_kb",
+                                old.limits.socket_recv_buffer_kb
+                                    != new_config.limits.socket_recv_buffer_kb,
+                            ),
+                            (
+                                "rpc.max_admin_body_bytes",
+                                old.rpc.max_admin_body_bytes
+                                    != new_config.rpc.max_admin_body_bytes,
+                            ),
                         ];
                         for (name, changed) in static_routes {
                             if changed {
@@ -1160,6 +1213,12 @@ async fn reload_handler(
                         }
                         drop(old);
                         *config.write().await = new_config;
+                        // Bump the config version: connections refresh
+                        // their cached NIP-40/NIP-42 flags on the next
+                        // live batch (see `Conn::config_version`).
+                        relay
+                            .config_version
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         info!("configuration reloaded from {}", config_path.display());
                     }
                     Err(e) => error!("config reload failed: {e}"),
@@ -1201,6 +1260,7 @@ mod tests {
             max_connections,
             header_timeout,
             per_sec,
+            16,
             rx,
         ));
         (addr, tx, handle)

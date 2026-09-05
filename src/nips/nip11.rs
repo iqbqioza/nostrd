@@ -45,7 +45,7 @@ pub fn relay_info(
             "min_pow_difficulty": if config.nip_enabled(13) { config.relay.require_pow } else { 0 },
             "auth_required": config.relay.require_auth,
             "payment_required": false,
-            "restricted_writes": false,
+            "restricted_writes": access.restrict_relay,
             "created_at_lower_limit": 0,
             // NIP-11: an absolute unix timestamp. The relay accepts events up
             // to `max_created_at_future` seconds into the future.

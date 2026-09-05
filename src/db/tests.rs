@@ -16,6 +16,9 @@ fn config() -> DatabaseConfig {
     let _ = std::fs::remove_dir_all(&path);
     DatabaseConfig {
         path,
+        // Small memory map for the parallel test run (see the ws tests).
+        map_size: 16 * 1024 * 1024,
+        max_map_size: 256 * 1024 * 1024,
         ..Default::default()
     }
 }
@@ -350,8 +353,11 @@ fn equal_timestamp_replaceable_keeps_lowest_id() {
         high.id = "ff".repeat(32);
         // compute_id would overwrite; emulate by using valid-length ids
         // (the db only checks length and hex).
-        assert_eq!(db.put(low.clone(), now).await, PutOutcome::Stored);
-        assert_eq!(db.put(high.clone(), now).await, PutOutcome::Duplicate);
+        // Put the high id first: the tie-break must replace it with the
+        // lower id (a "first one wins" implementation would wrongly keep
+        // the high id here).
+        assert_eq!(db.put(high.clone(), now).await, PutOutcome::Stored);
+        assert_eq!(db.put(low.clone(), now).await, PutOutcome::Replaced);
         let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [10000]})).unwrap();
         let (res, _) = db.query(vec![f], 500, now).await;
         assert_eq!(res.len(), 1);
@@ -1681,6 +1687,32 @@ fn replaceable_kinds_ignore_the_d_tag() {
 #[test]
 
 // ----- overload protection -----
+fn reader_requests_survive_a_writer_backlog() {
+    // The dedicated reader threads exist so reads keep working while the
+    // writer is stalled: a full writer queue must not fail-fast a query.
+    let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128, 4, 8).unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let now = unix_now();
+        db.put(event(1, "stored", now, vec![]), now).await;
+        // Simulate a deep writer queue.
+        db.pending_msgs
+            .store(4, std::sync::atomic::Ordering::Relaxed);
+        db.pending_events
+            .store(8, std::sync::atomic::Ordering::Relaxed);
+        let (res, _) = db
+            .query(
+                vec![serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap()],
+                10,
+                now,
+            )
+            .await;
+        assert_eq!(res.len(), 1, "reads must not fail-fast on a write backlog");
+        db.shutdown();
+    });
+}
+
+#[test]
 fn request_fails_fast_when_the_queue_is_full() {
     // Overload protection: with a full queue, new requests fail fast
     // instead of accumulating in memory, and the overload is surfaced
@@ -1755,6 +1787,43 @@ fn search_works_without_word_index() {
         .unwrap();
         let (res, _) = db.query(vec![f], 500, now).await;
         assert_eq!(res.len(), 1);
+    });
+}
+
+#[test]
+fn meta_index_disabled_skips_rebuild_and_keeps_scans_working() {
+    // database.meta_index = false must (a) not write the metadata header,
+    // (b) not trigger the startup rebuild, and (c) keep the scan working
+    // through the full-parse fallback.
+    let cfg = DatabaseConfig {
+        meta_index: false,
+        ..config()
+    };
+    let db = DbClient::open(
+        &cfg,
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let stored = event(1, "meta disabled", now, vec![]);
+        assert_eq!(db.put(stored.clone(), now).await, PutOutcome::Stored);
+
+        // The scan must find the event via the full-parse fallback.
+        let f: Filter = serde_json::from_value(serde_json::json!({
+            "kinds": [1], "since": now, "until": now + 1
+        }))
+        .unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].id, stored.id);
+        db.shutdown();
     });
 }
 
@@ -2333,5 +2402,77 @@ fn reload_loads_report_success() {
         let allow = db.try_load_blossom_allow().await.expect("loads");
         assert!(allow.is_empty());
         db.shutdown();
+    });
+}
+
+#[test]
+fn event_meta_roundtrips_and_prefilters() {
+    use crate::db::store::{META_LEN, decode_meta, encode_meta};
+    // Header roundtrip.
+    let pubkey = [0x42u8; 32];
+    let header = encode_meta(30001, 1_600_000_000, &pubkey, 0);
+    assert_eq!(header.len(), META_LEN);
+    let (kind, created, pk, exp) = decode_meta(&header).unwrap();
+    assert_eq!((kind, created, exp), (30001, 1_600_000_000, 0));
+    assert_eq!(pk, pubkey);
+    assert!(decode_meta(&header[..META_LEN - 1]).is_none());
+    // The scan stores the meta alongside the event and a query whose
+    // kinds do not match is answered without the event.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let e = event(30001, "meta test", now, vec![]);
+        assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
+        let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [30001]})).unwrap();
+        let (res, _) = db.query(vec![f], 10, now).await;
+        assert_eq!(res.len(), 1);
+        let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap();
+        let (res, _) = db.query(vec![f], 10, now).await;
+        assert!(res.is_empty(), "kind mismatch must reject via the header");
+        db.shutdown();
+    });
+}
+
+#[test]
+fn event_meta_rebuilds_from_stored_events() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let expiry = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let store = crate::db::store::Store::open(&config(), expiry, 128).unwrap();
+        let _db = store.clone_for_reader();
+        let now = unix_now();
+        let mut ev = event(1, "rebuild", now, vec![]);
+        let id = ev.id_bytes().unwrap();
+        // Seed the store directly (the writer thread is not running).
+        let mut wtxn = store.env.write_txn().unwrap();
+        let raw = serde_json::to_vec(&ev).unwrap();
+        store.events.put(&mut wtxn, &id, &raw).unwrap();
+        store
+            .by_created
+            .put(&mut wtxn, &crate::db::store::created_key(now, &id), b"")
+            .unwrap();
+        wtxn.commit().unwrap();
+        ev.id = hex::encode(id);
+        // The meta index is empty: a rebuild must fill it.
+        assert!(store.meta_needs_rebuild().unwrap());
+        let count = store.rebuild_event_meta().unwrap();
+        assert_eq!(count, 1);
+        assert!(!store.meta_needs_rebuild().unwrap());
+        let meta = store.event_meta.unwrap();
+        let rtxn = store.env.read_txn().unwrap();
+        let raw = meta.get(&rtxn, &id).unwrap().unwrap();
+        let (kind, created, _, _) = crate::db::store::decode_meta(raw).unwrap();
+        assert_eq!(kind, 1);
+        assert_eq!(created, now);
     });
 }

@@ -1,8 +1,11 @@
 //! The relay: event acceptance (single and batched), live
 //! broadcasting, NIP-29/NIP-43 group and role state, and the
+//! live-delivery subscription index.
 //! relay-generated event publishing. Event validation lives in
 //! [`validate`].
 
+mod index;
+pub(crate) use index::{FilterComponents, SubscriptionIndex};
 mod roles;
 mod validate;
 
@@ -12,7 +15,7 @@ use secp256k1::{Keypair, Secp256k1, XOnlyPublicKey};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicIsize, AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::RwLock;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 
 use crate::config::{AccessControl, Config};
 use crate::db::{DbClient, PutOutcome};
@@ -23,17 +26,34 @@ use crate::nips::nip43::{self, RoleStore};
 use crate::stats::Stats;
 use crate::util::unix_now;
 
+/// Per-connection live-delivery queue capacity (in batches): a
+/// connection that stops reading drops live batches instead of
+/// accumulating them (the old broadcast channel's lag semantics).
+pub(crate) const LIVE_QUEUE_CAPACITY: usize = 64;
+
 pub struct Relay {
     pub config: Arc<RwLock<Config>>,
     pub access: Arc<RwLock<AccessControl>>,
     pub db: DbClient,
     pub stats: Arc<Stats>,
-    /// Batched live events: the bus task accumulates events and broadcasts
-    /// `Arc<Vec<Event>>` batches so that idle connections wake up once per
-    /// batch instead of once per event.
-    pub live: broadcast::Sender<Arc<Vec<Event>>>,
-    live_tx: mpsc::Sender<Event>,
-    live_rx: Option<mpsc::Receiver<Event>>,
+    /// The live subscription index: filter components (kinds, authors,
+    /// tags) → connection ids. The bus task looks up the candidate
+    /// connections for each event batch and delivers only to them, so an
+    /// event wakes the connections that can match it instead of every
+    /// subscriber (the per-connection filter match remains the final
+    /// check).
+    pub sub_index: std::sync::Arc<std::sync::RwLock<crate::relay::SubscriptionIndex>>,
+    /// Per-connection live-delivery queues: the bus task sends each batch
+    /// to the candidate connections' bounded queues (dropped when full,
+    /// the same backpressure semantics as the old broadcast).
+    pub conn_queues: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<u64, mpsc::Sender<crate::ws::LiveBatch>>>,
+    >,
+    /// Connection id counter: the id identifies a connection in the
+    /// subscription index and the queue map.
+    pub next_conn_id: std::sync::atomic::AtomicU64,
+    live_tx: mpsc::Sender<(Event, Arc<String>)>,
+    live_rx: Option<mpsc::Receiver<(Event, Arc<String>)>>,
     live_batch_interval_ms: u64,
     live_batch_size: usize,
     pub groups: Arc<RwLock<GroupStore>>,
@@ -55,6 +75,10 @@ pub struct Relay {
     /// connect and re-check the list (and close) when it changed, so a
     /// newly blocked IP's existing connections are dropped too.
     pub ip_blocks_version: AtomicU64,
+    /// Bumped on every SIGHUP config reload: connections cache the NIP-40/
+    /// NIP-42 flags against this version and refresh them only when it
+    /// changes, so the hot live path never takes the shared config lock.
+    pub config_version: std::sync::atomic::AtomicU64,
     /// The relay's own keypair (from `relay.private_key`), used to sign
     /// NIP-29 and NIP-43 relay-generated events.
     key: Option<Keypair>,
@@ -194,7 +218,6 @@ impl Relay {
         private_key_hex: &str,
         live_bus: LiveBusConfig,
     ) -> Relay {
-        let (live, _) = broadcast::channel(4096);
         let (live_tx, live_rx) = mpsc::channel(live_bus.buffer.max(16));
         let live_batch_interval_ms = live_bus.batch_interval_ms.clamp(1, 1000);
         let live_batch_size = live_bus.batch_size.max(1);
@@ -235,7 +258,11 @@ impl Relay {
             access: Arc::new(RwLock::new(access)),
             db,
             stats,
-            live,
+            sub_index: std::sync::Arc::new(std::sync::RwLock::new(SubscriptionIndex::default())),
+            conn_queues: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
+            next_conn_id: std::sync::atomic::AtomicU64::new(1),
             live_tx,
             live_rx: Some(live_rx),
             live_batch_interval_ms,
@@ -248,6 +275,7 @@ impl Relay {
             per_ip_connections: std::sync::Mutex::new(HashMap::new()),
             publish_rate: std::sync::Mutex::new(HashMap::new()),
             ip_blocks_version: AtomicU64::new(0),
+            config_version: AtomicU64::new(0),
             key,
             secp,
             config_path: Arc::new(tokio::sync::RwLock::new(None)),
@@ -271,25 +299,59 @@ impl Relay {
         let Some(mut rx) = self.live_rx.take() else {
             return;
         };
-        let tx = self.live.clone();
+        let sub_index = std::sync::Arc::clone(&self.sub_index);
+        let conn_queues = std::sync::Arc::clone(&self.conn_queues);
         let interval_ms = self.live_batch_interval_ms;
         let batch_size = self.live_batch_size;
         tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(tokio::time::Duration::from_millis(interval_ms));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let mut batch: Vec<Event> = Vec::with_capacity(batch_size);
-            let flush = |batch: &mut Vec<Event>| {
+            let mut batch: Vec<(Event, Arc<String>)> = Vec::with_capacity(batch_size);
+            let flush = |batch: &mut Vec<(Event, Arc<String>)>| {
                 if batch.is_empty() {
                     return;
                 }
-                let _ = tx.send(Arc::new(std::mem::take(batch)));
+                let batch = Arc::new(std::mem::take(batch));
+                // Deliver to the candidate connections only: the
+                // subscription index maps each event's components to the
+                // connections that could match, so an event wakes the
+                // subscribers that can see it instead of all of them.
+                // The per-connection filter match remains the final
+                // check; the per-connection queues drop when full (the
+                // same backpressure as the old broadcast).
+                let conns = {
+                    let index = sub_index.read().unwrap_or_else(|p| p.into_inner());
+                    let mut conns = std::collections::HashSet::new();
+                    for (event, _) in batch.iter() {
+                        conns.extend(index.candidates(event));
+                    }
+                    conns
+                };
+                // Collect the candidate senders under the lock, then drop
+                // the lock before delivering: the sends never block
+                // (`try_send`), so holding the map lock during the
+                // fan-out would only delay connections joining/leaving.
+                let senders: Vec<mpsc::Sender<crate::ws::LiveBatch>> = {
+                    let queues = conn_queues.lock().unwrap_or_else(|p| p.into_inner());
+                    conns
+                        .iter()
+                        .filter_map(|conn| queues.get(conn).cloned())
+                        .collect()
+                };
+                for sender in senders {
+                    // `try_send` on the bounded queue: a slow connection
+                    // that stops reading drops the batch instead of
+                    // accumulating it in memory (the same lag semantics
+                    // as the old broadcast channel).
+                    let _ = sender.try_send(batch.clone());
+                }
             };
             loop {
                 tokio::select! {
                     event = rx.recv() => match event {
-                        Some(event) => {
-                            batch.push(event);
+                        Some((event, json)) => {
+                            batch.push((event, json));
                             if batch.len() >= batch_size {
                                 flush(&mut batch);
                             }
@@ -307,9 +369,11 @@ impl Relay {
 
     /// Queues an event for live delivery to subscribers. The event is
     /// dropped (never stored) when the live buffer is full, as it remains
-    /// available through subscriptions.
+    /// available through subscriptions. The JSON is encoded once here —
+    /// every subscriber shares the same serialization.
     pub fn broadcast(&self, event: Event) {
-        let _ = self.live_tx.try_send(event);
+        let json = Arc::new(serde_json::to_string(&event).unwrap_or_default());
+        let _ = self.live_tx.try_send((event, json));
     }
 
     /// Whether `pubkey` may publish another event under
@@ -499,6 +563,10 @@ impl Relay {
                 drop(cfg);
                 drop(access);
                 self.vanish_pubkey(pubkey).await;
+                // A vanish request is accepted like any other event (the
+                // OK:true is sent): count it so the accepted/rejected
+                // accounting stays consistent with the OKs.
+                self.stats.bump(&self.stats.events_accepted, 1);
                 return (PutOutcome::Stored, None);
             }
             crate::relay::validate::Precheck::Accept => {}
@@ -551,10 +619,8 @@ impl Relay {
         match outcome {
             PutOutcome::Stored | PutOutcome::Replaced | PutOutcome::Ephemeral => {
                 self.stats.bump(&self.stats.events_accepted, 1);
-                self.after_put(&event, now, nip9, nip43, nip29_enabled)
-                    .await;
-                let arc = Arc::new(event);
-                (outcome, Some(arc))
+                self.after_put(event, now, nip9, nip43, nip29_enabled).await;
+                (outcome, None)
             }
             PutOutcome::Duplicate => {
                 self.stats.bump(&self.stats.events_duplicate, 1);
@@ -576,6 +642,24 @@ impl Relay {
         events: Vec<Event>,
         authed: &[String],
     ) -> Vec<(String, PutOutcome)> {
+        let batch = self.accept_batch_begin(events, authed).await;
+        batch.finish(self).await
+    }
+
+    /// The in-flight part of a non-group batch: the per-event checks have
+    /// run and the write is queued on the writer thread, but the commit
+    /// has not been awaited yet. The connection can keep reading frames
+    /// while the writer commits.
+    /// Phase 1 of [`Self::accept_events_batch`]: the per-event checks and
+    /// the writer queueing. The write is *queued* (not awaited), so the
+    /// caller can keep reading frames while the writer commits; the
+    /// outcomes arrive through [`PendingBatch::finish`]. Batches containing
+    /// group-state events are fully resolved here (the sequential path).
+    pub(crate) async fn accept_batch_begin(
+        &self,
+        events: Vec<Event>,
+        authed: &[String],
+    ) -> PendingBatch {
         // Group moderation events mutate the in-memory group state; their
         // effects must be visible to later events of the same batch (e.g. a
         // put-user followed by the new member's post), so batches containing
@@ -631,7 +715,19 @@ impl Relay {
                 let (outcome, _) = self.accept_event(event, authed, Some(&known)).await;
                 out.push((id, outcome));
             }
-            return out;
+            return PendingBatch {
+                receiver: None,
+                resolved: Some(out),
+                results: Vec::new(),
+                put_slots: Vec::new(),
+                puts: Vec::new(),
+                new_pubkeys: Vec::new(),
+                vanishes: Vec::new(),
+                now: 0,
+                nip9: false,
+                nip43: false,
+                nip29: false,
+            };
         }
         let now = unix_now();
         let cfg = self.config.read().await;
@@ -726,77 +822,31 @@ impl Relay {
             }
         }
 
-        let mut outcomes = if puts.is_empty() {
-            Vec::new()
+        let receiver = if puts.is_empty() {
+            None
         } else {
             self.db
-                .put_batch(puts.iter().map(|e| (e.clone(), now)).collect())
-                .await
+                .put_batch_deferred(puts.iter().map(|e| (e.clone(), now)).collect())
         };
-        if outcomes.len() != puts.len() {
-            // The write was rejected before it was queued (overload
-            // fail-fast): nothing will commit, so every pending event is
-            // reported as failed instead of being replied with an empty id.
-            outcomes = vec![PutOutcome::Invalid("error: database overloaded".into()); puts.len()];
-        }
 
-        // Record the first-seen timestamp only for accounts whose first
-        // event actually stored: a failed first event must not pre-warm the
-        // account-age clock.
-        let is_new_vec = if new_pubkeys.is_empty() {
-            vec![false; puts.len()]
-        } else {
-            new_pubkeys
-        };
-        let mut persist_first_seen: Vec<[u8; 32]> = Vec::new();
-        for (((event, outcome), slot), is_new) in puts
-            .into_iter()
-            .zip(outcomes)
-            .zip(put_slots)
-            .zip(is_new_vec)
-        {
-            let id = event.id.clone();
-            match outcome {
-                PutOutcome::Stored | PutOutcome::Replaced | PutOutcome::Ephemeral => {
-                    self.stats.bump(&self.stats.events_accepted, 1);
-                    if is_new && let Some(pk) = event.pubkey_bytes() {
-                        persist_first_seen.push(pk);
-                    }
-                    self.after_put(&event, now, nip9_enabled, roles_enabled, groups_enabled)
-                        .await;
-                }
-                PutOutcome::Duplicate => {
-                    self.stats.bump(&self.stats.events_duplicate, 1);
-                }
-                _ => {
-                    self.stats.bump(&self.stats.events_rejected, 1);
-                }
-            }
-            results[slot] = (id, outcome);
+        PendingBatch {
+            receiver,
+            resolved: None,
+            results,
+            put_slots,
+            puts,
+            new_pubkeys,
+            vanishes,
+            now,
+            nip9: nip9_enabled,
+            nip43: roles_enabled,
+            nip29: groups_enabled,
         }
-        if !persist_first_seen.is_empty() {
-            self.db
-                .touch_first_seen_batch(
-                    persist_first_seen.into_iter().map(|pk| (pk, now)).collect(),
-                )
-                .await;
-        }
-
-        for (slot, id, event) in vanishes {
-            if let Some(pubkey) = event.pubkey_bytes() {
-                self.vanish_pubkey(pubkey).await;
-            }
-            results[slot] = (id, PutOutcome::Stored);
-        }
-
-        results
     }
 
-    /// Shared side effects of a stored event: NIP-09 deletion handling,
-    /// NIP-43 leave requests, NIP-29 group state and the live broadcast.
     async fn after_put(
         &self,
-        event: &Event,
+        event: Event,
         now: u64,
         nip9: bool,
         nip43: bool,
@@ -806,8 +856,8 @@ impl Relay {
             let removed = self
                 .db
                 .apply_deletion(
-                    nip09::deletion_targets(event),
-                    nip09::deletion_addresses(event),
+                    nip09::deletion_targets(&event),
+                    nip09::deletion_addresses(&event),
                     Some(event.pubkey.clone()),
                     event.created_at,
                 )
@@ -824,16 +874,16 @@ impl Relay {
         if nip43 && event.kind == nip43::LEAVE {
             // NIP-43: leave requests (ephemeral kinds) update the member
             // list without being stored.
-            self.apply_leave_request(event).await;
+            self.apply_leave_request(&event).await;
         }
         let is_group_event = nip29_enabled
             && ((nip29::MOD_MIN..=nip29::MOD_MAX).contains(&event.kind)
                 || event.kind == nip29::JOIN
                 || event.kind == nip29::LEAVE);
         if is_group_event {
-            self.apply_group_event(event, now).await;
+            self.apply_group_event(&event, now).await;
         }
-        self.broadcast(event.clone());
+        self.broadcast(event);
     }
 
     /// NIP-62: deletes every event by `pubkey` and removes the pubkey from
@@ -849,6 +899,12 @@ impl Relay {
                 group.members.remove(&pubkey_hex);
             }
         }
+        // NIP-43 role assignments hold pubkeys too: a vanished author
+        // must not keep its roles.
+        if self.config.read().await.nip_enabled(43) {
+            let mut roles = self.roles.write().await;
+            roles.assignments.remove(&pubkey_hex);
+        }
     }
 
     /// Applies a stored NIP-29 event to the group state and publishes the
@@ -858,13 +914,19 @@ impl Relay {
         // Relay-generated events are stamped with the strictly monotonic
         // clock (not plain `now`): two events applied in the same second
         // must still be distinguishable, or the NIP-01 id tie-break could
-        // let a stale, later-committed version win.
-        let stamp = self.stamp_floor(now.max(event.created_at.saturating_add(1)));
-        let generated =
-            self.groups
-                .write()
-                .await
-                .apply(event, &relay_pubkey, stamp, self.has_relay_key());
+        // let a stale, later-committed version win. The floor is clamped
+        // to `now`: a group event may carry a future created_at (allowed
+        // up to max_created_at_future_secs), and stamping the metadata in
+        // the future would make it invisible to `until: now` scans and,
+        // after a restart, unreplaceable until the wall clock catches up.
+        let stamp = self.stamp_floor(now);
+        let generated = self.groups.write().await.apply(
+            event,
+            &relay_pubkey,
+            stamp,
+            self.has_relay_key(),
+            false,
+        );
 
         if event.kind == 9005 {
             // Group moderation delete-event: admins may delete events, but
@@ -881,8 +943,130 @@ impl Relay {
         }
 
         for mut ev in generated {
-            self.store_relay_event(&mut ev).await;
+            if !self.store_relay_event(&mut ev).await {
+                // The in-memory group state moved on, but the stored
+                // metadata did not: without this the saved 39000-39005
+                // stay stale until the next edit (and the restart rebuild
+                // replays the older moderation events). Surface it.
+                log::warn!(
+                    "could not store the relay-generated group event for {}",
+                    ev.tags
+                        .iter()
+                        .find(|t| t.first().map(String::as_str) == Some("d"))
+                        .and_then(|t| t.get(1))
+                        .cloned()
+                        .unwrap_or_default()
+                );
+            }
         }
+    }
+}
+
+pub(crate) struct PendingBatch {
+    receiver: Option<tokio::sync::oneshot::Receiver<Vec<PutOutcome>>>,
+    resolved: Option<Vec<(String, PutOutcome)>>,
+    results: Vec<(String, PutOutcome)>,
+    put_slots: Vec<usize>,
+    puts: Vec<Event>,
+    new_pubkeys: Vec<bool>,
+    vanishes: Vec<(usize, String, Event)>,
+    now: u64,
+    nip9: bool,
+    nip43: bool,
+    nip29: bool,
+}
+
+impl PendingBatch {
+    /// Phase 2 of [`Self::accept_events_batch`]: awaits the commit
+    /// (for non-group batches) and applies the side effects
+    /// (first-seen persistence, vanish resolution, NIP-09/29/43 and
+    /// the live broadcast). Group batches were fully resolved in
+    /// `begin` and return their results here.
+    pub(crate) async fn finish(self, relay: &Relay) -> Vec<(String, PutOutcome)> {
+        if let Some(resolved) = self.resolved {
+            return resolved;
+        }
+        let mut results = self.results;
+        let puts = self.puts;
+        let put_slots = self.put_slots;
+        let new_pubkeys = self.new_pubkeys;
+        let vanishes = self.vanishes;
+        let now = self.now;
+        let nip9 = self.nip9;
+        let nip43 = self.nip43;
+        let nip29 = self.nip29;
+        let Some(receiver) = self.receiver else {
+            for (event, slot) in puts.into_iter().zip(put_slots) {
+                relay.stats.bump(&relay.stats.events_rejected, 1);
+                results[slot] = (
+                    event.id,
+                    PutOutcome::Invalid("error: database overloaded".into()),
+                );
+            }
+            return results;
+        };
+        let mut outcomes = receiver.await.unwrap_or_default();
+        if outcomes.len() != puts.len() {
+            // The write was rejected before it was queued (overload
+            // fail-fast): nothing will commit, so every pending event
+            // is reported as failed instead of being replied with an
+            // empty id.
+            outcomes = vec![PutOutcome::Invalid("error: database overloaded".into()); puts.len()];
+        }
+
+        // Record the first-seen timestamp only for accounts whose first
+        // event actually stored: a failed first event must not pre-warm
+        // the account-age clock.
+        let is_new_vec = if new_pubkeys.is_empty() {
+            vec![false; puts.len()]
+        } else {
+            new_pubkeys
+        };
+        let mut persist_first_seen: Vec<[u8; 32]> = Vec::new();
+        for (((event, outcome), slot), is_new) in puts
+            .into_iter()
+            .zip(outcomes)
+            .zip(put_slots)
+            .zip(is_new_vec)
+        {
+            let id = event.id.clone();
+            match outcome {
+                PutOutcome::Stored | PutOutcome::Replaced | PutOutcome::Ephemeral => {
+                    relay.stats.bump(&relay.stats.events_accepted, 1);
+                    if is_new && let Some(pk) = event.pubkey_bytes() {
+                        persist_first_seen.push(pk);
+                    }
+                    relay.after_put(event, now, nip9, nip43, nip29).await;
+                }
+                PutOutcome::Duplicate => {
+                    relay.stats.bump(&relay.stats.events_duplicate, 1);
+                }
+                _ => {
+                    relay.stats.bump(&relay.stats.events_rejected, 1);
+                }
+            }
+            results[slot] = (id, outcome);
+        }
+        if !persist_first_seen.is_empty() {
+            relay
+                .db
+                .touch_first_seen_batch(
+                    persist_first_seen.into_iter().map(|pk| (pk, now)).collect(),
+                )
+                .await;
+        }
+
+        for (slot, id, event) in vanishes {
+            if let Some(pubkey) = event.pubkey_bytes() {
+                relay.vanish_pubkey(pubkey).await;
+            }
+            // Same accounting as the single-event path: a vanish is
+            // accepted (its OK:true is sent) and counts as accepted.
+            relay.stats.bump(&relay.stats.events_accepted, 1);
+            results[slot] = (id, PutOutcome::Stored);
+        }
+
+        results
     }
 }
 
@@ -902,6 +1086,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         let mut cfg = crate::config::Config::default();
         cfg.database.path = path;
+        cfg.database.map_size = 16 * 1024 * 1024;
+        cfg.database.max_map_size = 256 * 1024 * 1024;
         let db = crate::db::DbClient::open(
             &cfg.database,
             true,

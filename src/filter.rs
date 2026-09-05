@@ -15,6 +15,40 @@ use crate::event::Event;
 /// authors in a single filter.
 pub const MAX_FILTER_MEMBERS: usize = 512;
 
+/// The event fields the in-memory filter matching reads. `Event`
+/// implements it directly; the negentropy path uses a lightweight
+/// deserialization that skips the content (the dominant field) and the
+/// signature.
+pub(crate) trait EventFields {
+    fn id(&self) -> &str;
+    fn pubkey(&self) -> &str;
+    fn kind(&self) -> u64;
+    fn created_at(&self) -> u64;
+    fn tags(&self) -> &[Vec<String>];
+    fn content(&self) -> &str;
+}
+
+impl EventFields for Event {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn pubkey(&self) -> &str {
+        &self.pubkey
+    }
+    fn kind(&self) -> u64 {
+        self.kind
+    }
+    fn created_at(&self) -> u64 {
+        self.created_at
+    }
+    fn tags(&self) -> &[Vec<String>] {
+        &self.tags
+    }
+    fn content(&self) -> &str {
+        &self.content
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Filter {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -33,6 +67,12 @@ pub struct Filter {
     pub search: Option<String>,
     #[serde(flatten)]
     pub tags: BTreeMap<String, Value>,
+    /// Cached tokenized search terms (the `search` string is immutable
+    /// after parsing, so the terms are computed once per filter and shared
+    /// across the filter's clones; the live delivery path matches every
+    /// event against them).
+    #[serde(skip)]
+    pub search_terms: std::sync::Arc<std::sync::OnceLock<Vec<String>>>,
 }
 
 impl Filter {
@@ -49,16 +89,17 @@ impl Filter {
     }
 
     /// Performs an in-memory match (used for live events and final checks).
-    pub fn matches(&self, ev: &Event) -> bool {
+    pub fn matches<E: EventFields>(&self, ev: &E) -> bool {
         if let Some(ids) = &self.ids {
             // NIP-01: `ids` entries may be full ids or prefixes. Only
             // even-length, non-empty prefixes are matched, mirroring the
             // historical scan (which decodes hex) so live and stored results
             // agree; an empty or odd-length entry matches nothing.
+            let id_str = ev.id();
             let matches = ids.iter().any(|id| {
                 !id.is_empty()
                     && id.len() % 2 == 0
-                    && (id == &ev.id || (id.len() < ev.id.len() && ev.id.starts_with(id)))
+                    && (id == id_str || (id.len() < id_str.len() && id_str.starts_with(id)))
             });
             if !matches {
                 return false;
@@ -67,26 +108,26 @@ impl Filter {
         // NIP-26: events published under a delegation tag match filters on
         // the delegator's pubkey as well as on the event's own author.
         if let Some(authors) = &self.authors
-            && !authors.iter().any(|a| a == &ev.pubkey)
+            && !authors.iter().any(|a| a == ev.pubkey())
             && !ev
-                .tags
+                .tags()
                 .iter()
                 .any(|t| t.len() >= 2 && t[0] == "delegation" && authors.iter().any(|a| a == &t[1]))
         {
             return false;
         }
         if let Some(kinds) = &self.kinds
-            && !kinds.contains(&ev.kind)
+            && !kinds.contains(&ev.kind())
         {
             return false;
         }
         if let Some(since) = self.since
-            && ev.created_at < since
+            && ev.created_at() < since
         {
             return false;
         }
         if let Some(until) = self.until
-            && ev.created_at > until
+            && ev.created_at() > until
         {
             return false;
         }
@@ -95,9 +136,21 @@ impl Filter {
         // first and the word index and the non-indexed fallback agree.
         if let Some(search) = self.search.as_deref()
             && !search.trim().is_empty()
-            && !crate::nips::nip50::matches_terms(&ev.content, &crate::nips::nip50::terms(search))
         {
-            return false;
+            let terms = self.search_terms.get_or_init(|| {
+                // Cap the terms like the scan path does: the live
+                // delivery applies them to every event, so an
+                // uncapped search string would force O(terms × event
+                // words) comparisons per event (a CPU-DoS vector
+                // against every live event on the relay).
+                crate::nips::nip50::terms(search)
+                    .into_iter()
+                    .take(crate::db::SEARCH_MAX_TERMS)
+                    .collect()
+            });
+            if !crate::nips::nip50::matches_terms(ev.content(), terms) {
+                return false;
+            }
         }
         self.tags.iter().all(|(name, value)| {
             // NIP-01: tag constraints are `#`-prefixed; any other key is an
@@ -107,11 +160,10 @@ impl Filter {
                 return true;
             }
             let tag_name = name.strip_prefix('#').unwrap_or(name);
-            let values = tag_string_values(value);
-            values.iter().any(|v| {
-                ev.tags
+            tag_values(value).any(|v| {
+                ev.tags()
                     .iter()
-                    .any(|t| t.len() >= 2 && t[0] == tag_name && &t[1] == v)
+                    .any(|t| t.len() >= 2 && t[0] == tag_name && t[1] == v)
             })
         })
     }
@@ -119,19 +171,38 @@ impl Filter {
     pub fn has_search(&self) -> bool {
         self.search.as_deref().is_some_and(|s| !s.trim().is_empty())
     }
+
+    /// Whether any `#`-prefixed tag constraint carries a value that is
+    /// neither a string nor an array of strings. NIP-01 only defines those
+    /// two forms; anything else would silently match nothing (the live
+    /// match and the scan both skip non-string values), so such a filter
+    /// is rejected at parse time instead.
+    pub(crate) fn invalid_tag_values(&self) -> bool {
+        // Only `#`-prefixed keys are tag constraints (NIP-01); any other
+        // key is an unknown filter field and is ignored, so its value type
+        // must not reject the filter.
+        self.tags.iter().any(|(name, v)| {
+            name.starts_with('#')
+                && !v.is_string()
+                && !v
+                    .as_array()
+                    .is_some_and(|a| a.iter().all(serde_json::Value::is_string))
+        })
+    }
 }
 
-/// The string values of a filter tag attribute (a single
-/// string or an array of strings); other value kinds yield nothing.
-pub(crate) fn tag_string_values(value: &Value) -> Vec<String> {
-    match value {
-        Value::String(s) => vec![s.clone()],
-        Value::Array(items) => items
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect(),
-        _ => Vec::new(),
-    }
+/// The string values of a filter tag attribute (a single string or an
+/// array of strings), borrowed — no per-event allocation: the live
+/// delivery path iterates these for every event × tag constraint, so
+/// cloning the values into `Vec<String>` was a hot-path allocation.
+pub(crate) fn tag_values(value: &Value) -> impl Iterator<Item = &str> {
+    value.as_str().into_iter().chain(
+        value
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str),
+    )
 }
 
 /// nostrd extension: the `inbox` and `outbox` filter keys expand into the
@@ -193,6 +264,44 @@ pub(crate) fn rewrite_inbox_outbox(value: &mut Value) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tag_values_borrows_without_allocating() {
+        let single = serde_json::json!("abc");
+        let values: Vec<&str> = tag_values(&single).collect();
+        assert_eq!(values, vec!["abc"]);
+        let array = serde_json::json!(["a", "b", 3]);
+        let values: Vec<&str> = tag_values(&array).collect();
+        assert_eq!(values, vec!["a", "b"]);
+        let other = serde_json::json!(7);
+        assert_eq!(tag_values(&other).count(), 0);
+        let empty: serde_json::Value = serde_json::json!([]);
+        assert_eq!(tag_values(&empty).count(), 0);
+    }
+
+    #[test]
+    fn search_terms_are_cached_and_shared() {
+        let filter: Filter =
+            serde_json::from_value(serde_json::json!({"search": "rust nostr"})).unwrap();
+        assert!(
+            filter.search_terms.get().is_none(),
+            "not computed before first use"
+        );
+        let mut ev = ev(1, vec![]);
+        ev.content = "I like rust".into();
+        assert!(filter.matches(&ev));
+        assert!(
+            filter.search_terms.get().is_some(),
+            "the terms must be computed once and cached"
+        );
+        // The cached terms are shared with clones (the hot live path
+        // clones filters into subscriptions).
+        let clone = filter.clone();
+        assert!(clone.search_terms.get().is_some());
+        let mut other = super::tests::ev(1, vec![]);
+        other.content = "nothing relevant".into();
+        assert!(!clone.matches(&other));
+    }
 
     fn ev(kind: u64, tags: Vec<Vec<String>>) -> Event {
         Event {

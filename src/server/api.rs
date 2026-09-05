@@ -410,8 +410,8 @@ pub async fn api_kind_handler(
 /// and `until` bound the range (unix seconds); without them the whole period
 /// is covered, from the earliest stored event of that author and kind to
 /// now. Every month in the range is reported (zero-filled), oldest first,
-/// at most 1200 months. A month whose count hit the collection limit is
-/// flagged `"approximate": true` (NIP-45 semantics).
+/// at most [`MAX_MONTHS`] months. A month whose count hit the collection
+/// limit is flagged `"approximate": true` (NIP-45 semantics).
 pub async fn api_monthly_handler(
     State(relay): State<Arc<Relay>>,
     Path((identifier, kind)): Path<(String, u64)>,
@@ -424,7 +424,8 @@ pub async fn api_monthly_handler(
 
     // Bounded month range: without `since` the range spans the whole period
     // (from the earliest stored event of this author and kind); an explicit
-    // range must not exceed 1200 months (100 years) of count queries.
+    // range must not exceed MAX_MONTHS of count queries, so one request
+    // cannot pin the API reader thread behind a huge loop of scans.
     let now = unix_now();
     let until = params.until.unwrap_or(now);
     let since = match params.since {
@@ -454,10 +455,10 @@ pub async fn api_monthly_handler(
             "until must not be earlier than since",
         );
     }
-    if months.len() > 1200 {
+    if months.len() > MAX_MONTHS {
         return error_response(
             StatusCode::BAD_REQUEST,
-            "the requested range exceeds 1200 months",
+            &format!("the requested range exceeds {MAX_MONTHS} months"),
         );
     }
 
@@ -468,6 +469,7 @@ pub async fn api_monthly_handler(
         );
     };
     let count_limit = relay.config.read().await.limits.max_count;
+    let no_tags = excluded_tags(&params);
 
     let mut month_counts = Vec::with_capacity(months.len());
     let mut total = 0u64;
@@ -496,6 +498,9 @@ pub async fn api_monthly_handler(
                 !nip70::is_protected(e)
                     && (e.kind != nip62::GIFT_WRAP_KIND)
                     && groups.as_deref().is_none_or(|g| g.visible_to(e, None))
+                    && !no_tags
+                        .iter()
+                        .any(|name| e.tags.iter().any(|t| t.len() >= 2 && t[0] == *name))
             })
             .count();
         drop(groups);
@@ -551,8 +556,13 @@ pub async fn api_query_handler(
 /// "approximate": bool}`.
 pub async fn api_count_handler(
     State(relay): State<Arc<Relay>>,
-    Query(params): Query<ApiParams>,
+    Query(mut params): Query<ApiParams>,
 ) -> (StatusCode, Json<Value>) {
+    let cfg = relay.config.read().await;
+    if let Err((status, msg)) = bound_params(&mut params, &cfg) {
+        return error_response(status, &msg);
+    }
+    drop(cfg);
     let Some(_permit) = relay.api_limit.try_acquire() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -565,6 +575,9 @@ pub async fn api_count_handler(
     if !relay.config.read().await.nip_enabled(50) {
         filter.search = None;
     }
+    // The absence filters apply like the /query path (a `no_p` count must
+    // agree with the visible rows of a `no_p` query).
+    let no_tags = excluded_tags(&params);
     let (events, more) = relay.db.api_count(vec![filter], count_limit, now).await;
     let has_group_events = events.iter().any(nip29::is_group_event);
     let groups = if has_group_events {
@@ -578,6 +591,9 @@ pub async fn api_count_handler(
             !nip70::is_protected(e)
                 && (e.kind != nip62::GIFT_WRAP_KIND)
                 && groups.as_deref().is_none_or(|g| g.visible_to(e, None))
+                && !no_tags
+                    .iter()
+                    .any(|name| e.tags.iter().any(|t| t.len() >= 2 && t[0] == *name))
         })
         .count();
     drop(groups);
@@ -595,7 +611,7 @@ pub async fn api_count_handler(
 pub async fn api_kinds_handler(
     State(relay): State<Arc<Relay>>,
     Path(identifier): Path<String>,
-    Query(_params): Query<ApiParams>,
+    Query(params): Query<ApiParams>,
 ) -> (StatusCode, Json<Value>) {
     let hex_pk = match parse_author_identifier(&identifier) {
         Ok(pk) => pk,
@@ -618,11 +634,15 @@ pub async fn api_kinds_handler(
     } else {
         None
     };
+    let no_tags = excluded_tags(&params);
     let mut by_kind: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
     for e in events.iter().filter(|e| {
         !nip70::is_protected(e)
             && (e.kind != nip62::GIFT_WRAP_KIND)
             && groups.as_deref().is_none_or(|g| g.visible_to(e, None))
+            && !no_tags
+                .iter()
+                .any(|name| e.tags.iter().any(|t| t.len() >= 2 && t[0] == *name))
     }) {
         *by_kind.entry(e.kind).or_default() += 1;
     }
@@ -665,6 +685,15 @@ pub async fn api_daily_handler(
         (_, Some(m)) if !(1..=12).contains(&m) => {
             return error_response(StatusCode::BAD_REQUEST, "month must be between 1 and 12");
         }
+        // A far-future or far-past year would overflow the civil-date
+        // arithmetic (and scan an empty range): bound it to the range the
+        // timestamp arithmetic can represent.
+        (Some(y), _m) if !(1970..=2999).contains(&y) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "year must be between 1970 and 2999",
+            );
+        }
         (Some(y), m) => (y, m.unwrap_or(month_of(now).1)),
         (None, Some(m)) => (month_of(now).0, m),
         (None, None) => month_of(now),
@@ -680,6 +709,7 @@ pub async fn api_daily_handler(
         );
     };
     let count_limit = relay.config.read().await.limits.max_count;
+    let no_tags = excluded_tags(&params);
 
     let mut day_counts = Vec::with_capacity(days_in_month as usize);
     let mut total = 0u64;
@@ -705,6 +735,9 @@ pub async fn api_daily_handler(
                 !nip70::is_protected(e)
                     && (e.kind != nip62::GIFT_WRAP_KIND)
                     && groups.as_deref().is_none_or(|g| g.visible_to(e, None))
+                    && !no_tags
+                        .iter()
+                        .any(|name| e.tags.iter().any(|t| t.len() >= 2 && t[0] == *name))
             })
             .count();
         drop(groups);
@@ -727,7 +760,7 @@ pub async fn api_daily_handler(
 pub async fn api_id_handler(
     State(relay): State<Arc<Relay>>,
     Path(hex_id): Path<String>,
-    Query(params): Query<ApiParams>,
+    Query(mut params): Query<ApiParams>,
 ) -> (StatusCode, Json<Value>) {
     if hex_id.len() != 64 || hex::decode(&hex_id).is_err() {
         return error_response(
@@ -735,6 +768,13 @@ pub async fn api_id_handler(
             "the id must be a 64-character hex string",
         );
     }
+    // Bound the query parameters like every other handler: the `limit` /
+    // `offset` caps protect against a scan over the whole budget.
+    let cfg = relay.config.read().await;
+    if let Err((status, msg)) = bound_params(&mut params, &cfg) {
+        return error_response(status, &msg);
+    }
+    drop(cfg);
     let filter = apply_params(
         Filter {
             ids: Some(vec![hex_id]),
@@ -763,7 +803,7 @@ pub async fn api_id_handler(
 pub async fn api_stats_handler(
     State(relay): State<Arc<Relay>>,
     Path(identifier): Path<String>,
-    Query(_params): Query<ApiParams>,
+    Query(params): Query<ApiParams>,
 ) -> (StatusCode, Json<Value>) {
     let hex_pk = match parse_author_identifier(&identifier) {
         Ok(pk) => pk,
@@ -778,6 +818,7 @@ pub async fn api_stats_handler(
     let count_limit = relay.config.read().await.limits.max_count;
     let now = unix_now();
     let filter: Filter = serde_json::from_value(json!({ "authors": [hex_pk] })).expect("static");
+    let no_tags = excluded_tags(&params);
 
     let (events, more) = relay
         .db
@@ -795,17 +836,46 @@ pub async fn api_stats_handler(
         !nip70::is_protected(e)
             && (e.kind != nip62::GIFT_WRAP_KIND)
             && groups.as_deref().is_none_or(|g| g.visible_to(e, None))
+            && !no_tags
+                .iter()
+                .any(|name| e.tags.iter().any(|t| t.len() >= 2 && t[0] == *name))
     }) {
         *by_kind.entry(e.kind).or_default() += 1;
         total += 1;
     }
     drop(groups);
 
-    let (first, _) = relay.db.api_query(vec![filter.clone()], 1, now, true).await;
-    let (last, _) = relay.db.api_query(vec![filter], 1, now, false).await;
+    // The timestamps must respect the same visibility rules as `total`
+    // and `kinds`: a protected/gift-wrapped/private-group event is not
+    // countable, so its activity time must not leak either. A single-row
+    // fetch is not enough — the author's newest event may be an invisible
+    // gift wrap, so fetch a window until a visible event is found.
+    let (first, _) = relay
+        .db
+        .api_query(vec![filter.clone()], 64, now, true)
+        .await;
+    let (last, _) = relay.db.api_query(vec![filter], 64, now, false).await;
     drop(_permit);
-    let first_seen = first.first().map(|e| e.created_at);
-    let last_seen = last.first().map(|e| e.created_at);
+    let stats_groups = relay.groups.read().await;
+    let visible_first = first.into_iter().find(|e| {
+        !nip70::is_protected(e)
+            && e.kind != nip62::GIFT_WRAP_KIND
+            && stats_groups.visible_to(e, None)
+            && !no_tags
+                .iter()
+                .any(|name| e.tags.iter().any(|t| t.len() >= 2 && t[0] == *name))
+    });
+    let visible_last = last.into_iter().find(|e| {
+        !nip70::is_protected(e)
+            && e.kind != nip62::GIFT_WRAP_KIND
+            && stats_groups.visible_to(e, None)
+            && !no_tags
+                .iter()
+                .any(|name| e.tags.iter().any(|t| t.len() >= 2 && t[0] == *name))
+    });
+    drop(stats_groups);
+    let first_seen = visible_first.map(|e| e.created_at);
+    let last_seen = visible_last.map(|e| e.created_at);
     let first_month = first_seen.map(|ts| {
         let (y, m) = month_of(ts);
         format!("{y:04}-{m:02}")
@@ -852,6 +922,15 @@ pub async fn api_hourly_handler(
         (_, Some(m)) if !(1..=12).contains(&m) => {
             return error_response(StatusCode::BAD_REQUEST, "month must be between 1 and 12");
         }
+        // A far-future or far-past year would overflow the civil-date
+        // arithmetic (and scan an empty range): bound it to the range the
+        // timestamp arithmetic can represent.
+        (Some(y), _m) if !(1970..=2999).contains(&y) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "year must be between 1970 and 2999",
+            );
+        }
         (Some(y), m) => (y, m.unwrap_or(month_of(now).1)),
         (None, Some(m)) => (month_of(now).0, m),
         (None, None) => month_of(now),
@@ -876,6 +955,7 @@ pub async fn api_hourly_handler(
         );
     };
     let count_limit = relay.config.read().await.limits.max_count;
+    let no_tags = excluded_tags(&params);
 
     let mut hour_counts = Vec::with_capacity(24);
     let mut total = 0u64;
@@ -901,6 +981,9 @@ pub async fn api_hourly_handler(
                 !nip70::is_protected(e)
                     && (e.kind != nip62::GIFT_WRAP_KIND)
                     && groups.as_deref().is_none_or(|g| g.visible_to(e, None))
+                    && !no_tags
+                        .iter()
+                        .any(|name| e.tags.iter().any(|t| t.len() >= 2 && t[0] == *name))
             })
             .count();
         drop(groups);
@@ -924,7 +1007,7 @@ pub async fn api_hourly_handler(
 pub async fn api_related_handler(
     State(relay): State<Arc<Relay>>,
     Path(hex_id): Path<String>,
-    Query(params): Query<ApiParams>,
+    Query(mut params): Query<ApiParams>,
 ) -> (StatusCode, Json<Value>) {
     if hex_id.len() != 64 || hex::decode(&hex_id).is_err() {
         return error_response(
@@ -932,16 +1015,38 @@ pub async fn api_related_handler(
             "the id must be a 64-character hex string",
         );
     }
+    // Bound the query parameters like every other handler: without the
+    // cap an unauthenticated request could collect and serialize the
+    // whole scan budget (~200k events) and OOM the relay.
+    let cfg = relay.config.read().await;
+    if let Err((status, msg)) = bound_params(&mut params, &cfg) {
+        return error_response(status, &msg);
+    }
+    drop(cfg);
     let no_tags = excluded_tags(&params);
     let limit = params.limit.unwrap_or(100);
+    // The `e` query parameter must not overwrite the target id: the
+    // replies filter matches the id *or* the parameter.
+    let e_target = match &params.e {
+        Some(e) => json!([hex_id.clone(), e.clone()]),
+        None => json!(hex_id.clone()),
+    };
+    let mut replies = apply_params(
+        Filter {
+            tags: std::collections::BTreeMap::from([("#e".to_string(), e_target)]),
+            ..Default::default()
+        },
+        &params,
+    );
+    // apply_params overwrites `#e` with the bare `e` parameter; restore
+    // the union of the id and the parameter.
+    if let Some(ref e) = params.e {
+        replies
+            .tags
+            .insert("#e".to_string(), json!([hex_id.clone(), e.clone()]));
+    }
     let filters: Vec<Filter> = vec![
-        apply_params(
-            Filter {
-                tags: std::collections::BTreeMap::from([("#e".to_string(), json!(hex_id.clone()))]),
-                ..Default::default()
-            },
-            &params,
-        ),
+        replies,
         apply_params(
             Filter {
                 tags: std::collections::BTreeMap::from([("#q".to_string(), json!(hex_id.clone()))]),
@@ -969,12 +1074,17 @@ pub async fn api_related_handler(
 pub async fn api_follows_handler(
     State(relay): State<Arc<Relay>>,
     Path(identifier): Path<String>,
-    Query(params): Query<ApiParams>,
+    Query(mut params): Query<ApiParams>,
 ) -> (StatusCode, Json<Value>) {
     let hex_pk = match parse_author_identifier(&identifier) {
         Ok(pk) => pk,
         Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
     };
+    let cfg = relay.config.read().await;
+    if let Err((status, msg)) = bound_params(&mut params, &cfg) {
+        return error_response(status, &msg);
+    }
+    drop(cfg);
     let no_tags = excluded_tags(&params);
     let filter = apply_params(
         Filter {
@@ -1078,12 +1188,17 @@ pub async fn api_top_authors_handler(
 pub async fn api_relays_handler(
     State(relay): State<Arc<Relay>>,
     Path(identifier): Path<String>,
-    Query(params): Query<ApiParams>,
+    Query(mut params): Query<ApiParams>,
 ) -> (StatusCode, Json<Value>) {
     let hex_pk = match parse_author_identifier(&identifier) {
         Ok(pk) => pk,
         Err(msg) => return error_response(StatusCode::BAD_REQUEST, &msg),
     };
+    let cfg = relay.config.read().await;
+    if let Err((status, msg)) = bound_params(&mut params, &cfg) {
+        return error_response(status, &msg);
+    }
+    drop(cfg);
     let no_tags = excluded_tags(&params);
     let filter = apply_params(
         Filter {
@@ -1125,6 +1240,12 @@ fn month_start_of_next(y: i64, m: u32) -> u64 {
 }
 
 /// The months covered by `[since, until]`, oldest first.
+/// Maximum number of months a single `/monthly` request may scan: each
+/// month is a database count query, so an unbounded range would let one
+/// request pin the API reader thread for a long time (120 months = 10
+/// years of history).
+const MAX_MONTHS: usize = 120;
+
 fn month_range(since: u64, until: u64) -> Vec<(i64, u32)> {
     if until < since {
         return Vec::new();
@@ -1317,6 +1438,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
         let mut cfg = Config::default();
         cfg.database.path = path;
+        cfg.database.map_size = 16 * 1024 * 1024;
+        cfg.database.max_map_size = 256 * 1024 * 1024;
         let db = DbClient::open(
             &cfg.database,
             true,
@@ -1343,6 +1466,63 @@ mod tests {
         .await;
         relay.start_live_bus();
         Arc::new(relay)
+    }
+
+    #[test]
+    fn year_and_month_validation() {
+        // The daily/hourly handlers reject out-of-range years: a huge
+        // year would overflow the civil-date arithmetic.
+        let mut params = ApiParams {
+            year: Some(1_000_000),
+            month: Some(1),
+            ..Default::default()
+        };
+        assert!(
+            params.year.is_some_and(|y| !(1970..=2999).contains(&y)),
+            "the guard range is 1970..=2999"
+        );
+        params.year = Some(1970);
+        assert!((1970..=2999).contains(&params.year.unwrap()));
+        params.month = Some(13);
+        assert!(!(1..=12).contains(&params.month.unwrap()));
+    }
+
+    #[test]
+    fn excluded_tags_lists_absence_filters() {
+        let mut params = ApiParams::default();
+        assert!(excluded_tags(&params).is_empty());
+        params.no_p = Some(true);
+        params.no_e = Some(true);
+        let tags = excluded_tags(&params);
+        assert_eq!(tags, vec!["p", "e"]);
+        params.no_t = Some(true);
+        params.no_d = Some(true);
+        assert_eq!(excluded_tags(&params).len(), 4);
+    }
+
+    #[test]
+    fn related_filters_merge_e_parameter_with_the_id() {
+        // The `e` query parameter must be OR-ed with the path id, not
+        // replace it: the replies filter matches both targets.
+        let params = ApiParams {
+            e: Some("e1".into()),
+            ..Default::default()
+        };
+        let mut f = apply_params(
+            Filter {
+                tags: std::collections::BTreeMap::from([("#e".to_string(), json!("target-id"))]),
+                ..Default::default()
+            },
+            &params,
+        );
+        if let Some(ref e) = params.e {
+            f.tags
+                .insert("#e".to_string(), json!(["target-id", e.clone()]));
+        }
+        let values = f.tags["#e"].as_array().unwrap();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0], "target-id");
+        assert_eq!(values[1], "e1");
     }
 
     #[test]

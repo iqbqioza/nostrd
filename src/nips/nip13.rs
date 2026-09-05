@@ -9,9 +9,11 @@
 
 use crate::event::Event;
 
-/// Count of leading zero bits in a 256-bit digest.
-pub fn leading_zero_bits(digest: &[u8]) -> u8 {
-    let mut count = 0u8;
+/// Count of leading zero bits in a 256-bit digest. A `u16` (not `u8`):
+/// a fully zero digest counts 256 leading zero bits, which would overflow
+/// an 8-bit counter (and panic in debug builds).
+pub fn leading_zero_bits(digest: &[u8]) -> u16 {
+    let mut count = 0u16;
     'outer: for byte in digest {
         for bit in (0..8).rev() {
             if byte & (1 << bit) == 0 {
@@ -31,7 +33,7 @@ pub fn verify(event: &Event, required: u8) -> bool {
     let Some(id) = event.id_bytes() else {
         return false;
     };
-    leading_zero_bits(&id) >= required
+    leading_zero_bits(&id) >= required as u16
 }
 
 #[cfg(test)]

@@ -34,6 +34,36 @@ use crate::event::Event;
 use crate::nips::{nip33, nip40, nip50};
 
 pub(crate) const EVENTS: &str = "events";
+/// The lightweight per-event metadata index: id → fixed-length header
+/// (kind, created_at, pubkey, expiration). The scan checks these fields
+/// before deserializing the full JSON, so candidates failing the
+/// kind/since/until/author checks are rejected without the parse.
+pub(crate) const EVENT_META: &str = "event_meta";
+/// Length of an [`EVENT_META`] header: kind (8) + created_at (8) +
+/// pubkey (32) + expiration (8, 0 = none).
+pub(crate) const META_LEN: usize = 56;
+
+pub(crate) fn encode_meta(kind: u64, created: u64, pubkey: &[u8], expiry: u64) -> Vec<u8> {
+    let mut v = Vec::with_capacity(META_LEN);
+    v.extend_from_slice(&kind.to_be_bytes());
+    v.extend_from_slice(&created.to_be_bytes());
+    v.extend_from_slice(&pubkey[..32]);
+    v.extend_from_slice(&expiry.to_be_bytes());
+    v
+}
+
+/// Decodes a meta header into `(kind, created_at, pubkey, expiry)`.
+pub(crate) fn decode_meta(raw: &[u8]) -> Option<(u64, u64, [u8; 32], u64)> {
+    if raw.len() < META_LEN {
+        return None;
+    }
+    let kind = u64::from_be_bytes(raw[0..8].try_into().ok()?);
+    let created = u64::from_be_bytes(raw[8..16].try_into().ok()?);
+    let pubkey = raw[16..48].try_into().ok()?;
+    let expiry = u64::from_be_bytes(raw[48..56].try_into().ok()?);
+    Some((kind, created, pubkey, expiry))
+}
+
 pub(crate) const BY_CREATED: &str = "by_created";
 pub(crate) const BY_PUBKEY: &str = "by_pubkey";
 pub(crate) const BY_KIND: &str = "by_kind";
@@ -52,6 +82,12 @@ pub(crate) const BLOSSOM: &str = "blossom";
 pub(crate) const CREATED_LEN: usize = 8;
 pub(crate) const ID_LEN: usize = 32;
 pub(crate) const TAG_VALUE_MAX: usize = 1024;
+/// Longest tag value that fits an index key under LMDB's key-size limit:
+/// `name(1) + sep(1) + len(4) + value + created(8) + id(32)`.
+pub(crate) const TAG_INDEX_VALUE_MAX: usize = MAX_INDEX_KEY - 1 - 1 - 4 - CREATED_LEN - ID_LEN;
+/// Longest search term that fits a word-index key under the same limit:
+/// `word + sep(1) + created(8) + id(32)`.
+pub(crate) const WORD_INDEX_MAX: usize = MAX_INDEX_KEY - 1 - CREATED_LEN - ID_LEN;
 /// LMDB's maximum key size (`MDB_MAXKEYSIZE`). Index keys longer than this
 /// are rejected with `MDB_BAD_VALSIZE`, which would abort the *entire* write
 /// batch and reject every connection's events in the drain window. Over-long
@@ -125,6 +161,7 @@ pub(crate) fn apply_put_batch(
                 }
             }
         }
+
         if poisoned {
             // The transaction is unusable: abort it and revoke every reply
             // queued for it, because the applied puts were rolled back with
@@ -212,6 +249,12 @@ pub(crate) struct Store {
     pub(crate) by_kind: Database<Bytes, Bytes>,
     pub(crate) by_tag: Database<Bytes, Bytes>,
     pub(crate) by_word: Option<Database<Bytes, Bytes>>,
+    pub(crate) event_meta: Option<Database<Bytes, Bytes>>,
+    /// Whether the per-event metadata header (kind/created/pubkey/expiry)
+    /// is written for the scan prefilter. Disabling it removes one random
+    /// index write per event (keeping the ingest cost flat as the database
+    /// grows) at the cost of the scan falling back to the full parse.
+    pub(crate) meta_index: bool,
     pub(crate) deleted: Database<Bytes, Bytes>,
     pub(crate) expiry: Database<Bytes, Bytes>,
     pub(crate) replaceable: Database<Bytes, Bytes>,
@@ -282,6 +325,7 @@ impl Store {
         } else {
             None
         };
+        let event_meta = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(EVENT_META))?;
         let deleted = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(DELETED))?;
         let expiry = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(EXPIRY))?;
         let replaceable = env.create_database::<Bytes, Bytes>(&mut wtxn, Some(REPLACEABLE))?;
@@ -306,6 +350,8 @@ impl Store {
             by_kind,
             by_tag,
             by_word,
+            event_meta: Some(event_meta),
+            meta_index: cfg.meta_index,
             deleted,
             expiry,
             replaceable,
@@ -336,6 +382,18 @@ impl Store {
 
     /// Free bytes on the filesystem hosting the data directory, when
     /// statvfs succeeds.
+    /// Returns an error when the disk is too full to safely write to the
+    /// memory map (writing to a full disk raises SIGBUS and kills the
+    /// process): every writing path must refuse to commit below the margin.
+    pub(crate) fn disk_full_error(&self) -> Result<()> {
+        if let Some(free) = self.free_space()
+            && free < DISK_FREE_MARGIN
+        {
+            return Err(crate::error::Error::StorageFull);
+        }
+        Ok(())
+    }
+
     pub(crate) fn free_space(&self) -> Option<u64> {
         let path = self.env.path();
         let dir = if path.is_file() {
@@ -371,6 +429,8 @@ impl Store {
             by_kind: self.by_kind,
             by_tag: self.by_tag,
             by_word: self.by_word,
+            event_meta: self.event_meta,
+            meta_index: self.meta_index,
             deleted: self.deleted,
             expiry: self.expiry,
             replaceable: self.replaceable,
@@ -389,6 +449,7 @@ impl Store {
     /// whole `AccessControl` is serialized as JSON so NIP-86 mutations
     /// survive restarts.
     pub(crate) fn save_access(&self, access: &crate::config::AccessControl) -> Result<()> {
+        self.disk_full_error()?;
         let data = serde_json::to_vec(access)?;
         let mut wtxn = self.env.write_txn()?;
         self.access.put(&mut wtxn, b"access", &data)?;
@@ -771,6 +832,19 @@ impl Store {
                 "blocked: this pubkey has requested to vanish".into(),
             ));
         }
+        // A vanished delegator must not be re-published through a
+        // delegation: the delegatee's event is indexed under the
+        // delegator's pubkey too (NIP-26), which would revive the
+        // vanished identity's feed.
+        if let Some(delegator) = crate::nips::nip26::delegation(event)
+            && let Ok(delegator_bytes) = hex::decode(delegator[0])
+            && delegator_bytes.len() == ID_LEN
+            && self.vanish.get(wtxn, &delegator_bytes)?.is_some()
+        {
+            return Ok(PutOutcome::Invalid(
+                "blocked: the delegator has requested to vanish".into(),
+            ));
+        }
         if self.banned.get(wtxn, &id)?.is_some() {
             return Ok(PutOutcome::Invalid("blocked: event has been banned".into()));
         }
@@ -847,6 +921,83 @@ impl Store {
         Ok(outcome)
     }
 
+    /// Whether the meta index must be rebuilt: an old database written by
+    /// a relay before the meta index existed has events but no meta
+    /// entries (the derived index is filled in the background at startup;
+    /// scans fall back to the full JSON parse until then).
+    pub(crate) fn meta_needs_rebuild(&self) -> Result<bool> {
+        // Disabled index: nothing to rebuild (the scan falls back to the
+        // full parse). Without this check every start would re-derive the
+        // whole meta index that the operator explicitly turned off.
+        if !self.meta_index {
+            return Ok(false);
+        }
+        let rtxn = self.env.read_txn()?;
+        let has_events = !self.by_created.is_empty(&rtxn)?;
+        let meta_empty = self
+            .event_meta
+            .is_none_or(|db| db.is_empty(&rtxn).unwrap_or(true));
+        Ok(has_events && meta_empty)
+    }
+
+    /// Rebuilds the [`EVENT_META`] index from the stored events (read and
+    /// write chunks, so a huge database never holds a giant transaction;
+    /// called once at startup when the index is stale).
+    pub(crate) fn rebuild_event_meta(&self) -> Result<usize> {
+        let Some(meta) = self.event_meta else {
+            return Ok(0);
+        };
+        let mut count = 0usize;
+        let mut last: Option<Vec<u8>> = None;
+        loop {
+            // Read a chunk with a read txn (parsing the headers), then
+            // write it with a fresh write txn: the heed iterator borrows
+            // the transaction, so the writes cannot share it.
+            let chunk = {
+                let rtxn = self.env.read_txn()?;
+                let range = (
+                    last.as_deref()
+                        .map(std::ops::Bound::Excluded)
+                        .unwrap_or(std::ops::Bound::Unbounded),
+                    std::ops::Bound::Unbounded,
+                );
+                let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(10_000);
+                for item in self.events.range(&rtxn, &range)? {
+                    let (id, raw) = item?;
+                    let Ok(event) = serde_json::from_slice::<Event>(raw) else {
+                        continue;
+                    };
+                    let Ok(pubkey) = hex::decode(&event.pubkey) else {
+                        continue;
+                    };
+                    let expiry = crate::nips::nip40::expiry(&event).unwrap_or(0);
+                    out.push((
+                        id.to_vec(),
+                        encode_meta(event.kind, event.created_at, &pubkey, expiry),
+                    ));
+                    if out.len() >= 10_000 {
+                        break;
+                    }
+                }
+                out
+            };
+            if chunk.is_empty() {
+                break;
+            }
+            let mut wtxn = self.env.write_txn()?;
+            for (id, header) in &chunk {
+                meta.put(&mut wtxn, id, header)?;
+            }
+            wtxn.commit()?;
+            count += chunk.len();
+            last = chunk.last().map(|(id, _)| id.clone());
+            if chunk.len() < 10_000 {
+                break;
+            }
+        }
+        Ok(count)
+    }
+
     fn put_indexes(
         &self,
         wtxn: &mut heed::RwTxn,
@@ -870,6 +1021,12 @@ impl Store {
         }
         self.by_kind
             .put(wtxn, &kind_key(event.kind, created, id), b"")?;
+        if self.meta_index
+            && let Some(meta) = self.event_meta
+        {
+            let expiry = crate::nips::nip40::expiry(event).unwrap_or(0);
+            meta.put(wtxn, id, &encode_meta(event.kind, created, pubkey, expiry))?;
+        }
         for tag in &event.tags {
             if indexable_tag(tag) {
                 let key = tag_key(tag[0].as_bytes()[0], tag[1].as_bytes(), created, id);
@@ -944,6 +1101,9 @@ impl Store {
         }
         self.by_kind
             .delete(wtxn, &kind_key(event.kind, event.created_at, id))?;
+        if let Some(meta) = self.event_meta {
+            meta.delete(wtxn, id)?;
+        }
         for tag in &event.tags {
             if indexable_tag(tag) {
                 self.by_tag.delete(
@@ -957,11 +1117,11 @@ impl Store {
                 )?;
             }
         }
-        if self
-            .expiry_enabled
-            .load(std::sync::atomic::Ordering::Relaxed)
-            && let Some(exp) = nip40::expiry(&event)
-        {
+        // The expiry entry is deleted regardless of the NIP-40 toggle: a
+        // stale key would otherwise survive a removal performed while the
+        // feature was disabled and keep purging a re-published event with
+        // the same id forever.
+        if let Some(exp) = nip40::expiry(&event) {
             self.expiry.delete(wtxn, &created_key(exp, id))?;
         }
         if let Some(by_word) = self.by_word {
