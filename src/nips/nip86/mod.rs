@@ -485,7 +485,14 @@ pub async fn rpc_handler(
 fn audit_params(params: &[Value]) -> String {
     let mut text = serde_json::to_string(params).unwrap_or_default();
     if text.len() > 200 {
-        text.truncate(200);
+        // Truncate on a char boundary: `String::truncate` panics when the
+        // index lands inside a multi-byte UTF-8 sequence (e.g. a Japanese
+        // relay name or an emoji in the reason).
+        let mut end = 200;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
         text.push('…');
     }
     text

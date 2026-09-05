@@ -943,7 +943,21 @@ impl Relay {
         }
 
         for mut ev in generated {
-            self.store_relay_event(&mut ev).await;
+            if !self.store_relay_event(&mut ev).await {
+                // The in-memory group state moved on, but the stored
+                // metadata did not: without this the saved 39000-39005
+                // stay stale until the next edit (and the restart rebuild
+                // replays the older moderation events). Surface it.
+                log::warn!(
+                    "could not store the relay-generated group event for {}",
+                    ev.tags
+                        .iter()
+                        .find(|t| t.first().map(String::as_str) == Some("d"))
+                        .and_then(|t| t.get(1))
+                        .cloned()
+                        .unwrap_or_default()
+                );
+            }
         }
     }
 }

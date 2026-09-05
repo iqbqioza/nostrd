@@ -71,13 +71,13 @@ pub(crate) fn build_meta_event(
         }
     }
     if s.private {
-        event.tags.push(vec!["private".into()]);
+        event.tags.push(vec!["private".to_string()]);
     }
     if s.restricted {
         event.tags.push(vec!["restricted".into()]);
     }
     if s.closed {
-        event.tags.push(vec!["closed".into()]);
+        event.tags.push(vec!["closed".to_string()]);
     }
     if s.hidden {
         event.tags.push(vec!["hidden".into()]);
@@ -182,4 +182,153 @@ pub(crate) fn build_remove_user(gid: &str, member: &str, relay_pubkey: &str, now
     event.tags[0] = vec![H.to_string(), gid.to_string()];
     event.tags.push(vec![P.to_string(), member.to_string()]);
     event
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn group_with_members() -> Group {
+        let mut group = Group::default();
+        group
+            .members
+            .entry("admin1".into())
+            .or_default()
+            .insert("admin".into());
+        group
+            .members
+            .entry("mod1".into())
+            .or_default()
+            .insert("mod".into());
+        group.members.insert("member1".into(), Default::default());
+        group.settings.name = "Test Group".into();
+        group.settings.private = true;
+        group.settings.closed = true;
+        group.settings.supported_kinds = Some(vec![1, 7]);
+        group.parent = Some("parent-g".into());
+        group.children.push("child-g".into());
+        group.pins.push(("e".into(), "a".repeat(64)));
+        group
+    }
+
+    #[test]
+    fn builders_produce_spec_shaped_events() {
+        let group = group_with_members();
+        let now = 1_700_000_000;
+
+        let meta = build_meta_event("g1", Some(&group), "relay", now);
+        assert_eq!(meta.kind, GROUP_META);
+        assert_eq!(meta.pubkey, "relay");
+        assert_eq!(meta.created_at, now);
+        assert!(
+            meta.tags
+                .iter()
+                .any(|t| t == &vec!["d".to_string(), "g1".to_string()])
+        );
+        assert!(
+            meta.tags
+                .iter()
+                .any(|t| t == &vec!["name".to_string(), "Test Group".to_string()])
+        );
+        assert!(meta.tags.iter().any(|t| t == &vec!["private".to_string()]));
+        assert!(meta.tags.iter().any(|t| t == &vec!["closed".to_string()]));
+        assert!(meta.tags.iter().any(|t| t
+            == &vec![
+                "supported_kinds".to_string(),
+                "1".to_string(),
+                "7".to_string()
+            ]));
+        assert!(
+            meta.tags
+                .iter()
+                .any(|t| t == &vec!["parent".to_string(), "parent-g".to_string()])
+        );
+        assert!(
+            meta.tags
+                .iter()
+                .any(|t| t == &vec!["child".to_string(), "child-g".to_string()])
+        );
+
+        // Admins: only members with roles, sorted deterministically.
+        let admins = build_admins_event("g1", Some(&group), "relay", now);
+        assert_eq!(admins.kind, GROUP_ADMINS);
+        let admin_tags: Vec<&Vec<String>> = admins.tags.iter().filter(|t| t[0] == P).collect();
+        assert_eq!(admin_tags.len(), 2, "admins and mods");
+        assert_eq!(admin_tags[0][1], "admin1");
+        assert_eq!(admin_tags[1][1], "mod1");
+        assert_eq!(admin_tags[1][2], "mod");
+
+        // Members: everyone, plain p tags, sorted.
+        let members = build_members_event("g1", Some(&group), "relay", now);
+        assert_eq!(members.kind, GROUP_MEMBERS);
+        let member_tags: Vec<&String> = members
+            .tags
+            .iter()
+            .filter(|t| t[0] == P)
+            .map(|t| &t[1])
+            .collect();
+        assert_eq!(member_tags, vec!["admin1", "member1", "mod1"]);
+
+        // Pins.
+        let pins = build_pins_event("g1", Some(&group), "relay", now);
+        assert_eq!(pins.kind, GROUP_PINS);
+        assert!(
+            pins.tags
+                .iter()
+                .any(|t| t == &vec!["e".to_string(), "a".repeat(64)])
+        );
+
+        // Put/remove user carry the h tag instead of d.
+        let put = build_put_user("g1", "member1", &["mod"], "relay", now);
+        assert_eq!(put.kind, 9000);
+        assert!(
+            put.tags
+                .iter()
+                .any(|t| t == &vec![H.to_string(), "g1".into()])
+        );
+        assert!(
+            put.tags
+                .iter()
+                .any(|t| t == &vec![P.to_string(), "member1".into(), "mod".into()])
+        );
+        let remove = build_remove_user("g1", "member1", "relay", now);
+        assert_eq!(remove.kind, 9001);
+        assert!(
+            remove
+                .tags
+                .iter()
+                .any(|t| t == &vec![P.to_string(), "member1".into()])
+        );
+
+        // A missing group produces the bare metadata event.
+        let bare = build_meta_event("g2", None, "relay", now);
+        assert_eq!(bare.kind, GROUP_META);
+        assert_eq!(bare.tags.len(), 1);
+        let bare_admins = build_admins_event("g2", None, "relay", now);
+        assert_eq!(bare_admins.tags.len(), 1);
+    }
+
+    #[test]
+    fn apply_settings_replaces_entire_settings() {
+        let mut group = Group::default();
+        group.settings.name = "old".into();
+        let mut edit = base_event(9002, "g1", "relay", 1);
+        edit.tags[0] = vec![H.to_string(), "g1".into()];
+        edit.tags
+            .push(vec!["name".to_string(), "new name".to_string()]);
+        edit.tags.push(vec!["private".to_string()]);
+        edit.tags
+            .push(vec!["supported_kinds".to_string(), "30023".to_string()]);
+        edit.tags.push(vec![
+            "bad_value".to_string(),
+            "x".to_string(),
+            "y".to_string(),
+        ]);
+        apply_settings(&mut group, &edit);
+        assert_eq!(group.settings.name, "new name");
+        assert!(group.settings.private);
+        // The old settings are gone (replacement semantics).
+        assert!(!group.settings.closed);
+        assert_eq!(group.settings.supported_kinds, Some(vec![30023]));
+    }
 }

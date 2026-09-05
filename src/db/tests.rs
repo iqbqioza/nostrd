@@ -1762,6 +1762,43 @@ fn search_works_without_word_index() {
 }
 
 #[test]
+fn meta_index_disabled_skips_rebuild_and_keeps_scans_working() {
+    // database.meta_index = false must (a) not write the metadata header,
+    // (b) not trigger the startup rebuild, and (c) keep the scan working
+    // through the full-parse fallback.
+    let cfg = DatabaseConfig {
+        meta_index: false,
+        ..config()
+    };
+    let db = DbClient::open(
+        &cfg,
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let stored = event(1, "meta disabled", now, vec![]);
+        assert_eq!(db.put(stored.clone(), now).await, PutOutcome::Stored);
+
+        // The scan must find the event via the full-parse fallback.
+        let f: Filter = serde_json::from_value(serde_json::json!({
+            "kinds": [1], "since": now, "until": now + 1
+        }))
+        .unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].id, stored.id);
+        db.shutdown();
+    });
+}
+
+#[test]
 fn query_directed_ascending() {
     let db = DbClient::open(
         &config(),

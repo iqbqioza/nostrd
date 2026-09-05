@@ -322,8 +322,8 @@ pub struct DatabaseConfig {
     /// grows — and the scan falls back to the full parse for the prefilter
     /// checks.
     pub meta_index: bool,
-    /// LMDB read/write buffer size (the `read_buffer_size` /
-    /// `write_buffer_size` of the environment).
+    /// Initial per-connection WebSocket read/write buffer size in bytes
+    /// (the buffers grow on demand; the name predates the current use).
     pub db_buffer_size: usize,
     /// Seconds a database request may wait before timing out (0 = wait
     /// forever). A timeout keeps the relay responsive even when the storage
@@ -1067,6 +1067,11 @@ impl Config {
                 self.database.max_db_queue_events,
             ),
         ];
+        if self.limits.socket_recv_buffer_kb > 4096 {
+            return Err(Error::Config(
+                "limits.socket_recv_buffer_kb must be at most 4096".into(),
+            ));
+        }
         if !(1..=64).contains(&self.database.reader_threads) {
             return Err(Error::Config(
                 "database.reader_threads must be between 1 and 64".into(),

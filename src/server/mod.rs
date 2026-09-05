@@ -882,11 +882,13 @@ async fn serve_limited(
                 // Keep per-connection kernel buffers small so that hundreds
                 // of thousands of idle connections do not pin gigabytes of
                 // kernel memory (see the same tuning in `ws_handler`).
-                // 16 KiB per direction: the incoming buffer only needs a
-                // few frames (the batch window reads 1 ms at a time) and
-                // the outgoing path flushes eagerly, so the smaller kernel
-                // buffers roughly halve the per-connection kernel memory
-                // (64 KiB → 32 KiB) at a million connections.
+                // The receive buffer follows `limits.socket_recv_buffer_kb`
+                // (default 64 KiB; the kernel may double it) so a fast
+                // publisher's burst absorbs into one batch while the relay
+                // commits; the send buffer stays 16 KiB (the outgoing path
+                // flushes eagerly). The receive buffer only consumes real
+                // memory while data is actually queued, so idle
+                // connections cost nothing.
                 let _ = stream.set_nodelay(true);
                 unsafe {
                     set_sock_opt(&stream, libc::SO_RCVBUF, (recv_buf_kb * 1024) as i32);
@@ -1080,6 +1082,14 @@ async fn reload_handler(
                                 old.database.max_map_size != new_config.database.max_map_size,
                             ),
                             (
+                                "database.search_index",
+                                old.database.search_index != new_config.database.search_index,
+                            ),
+                            (
+                                "database.meta_index",
+                                old.database.meta_index != new_config.database.meta_index,
+                            ),
+                            (
                                 "blossom.host",
                                 old.blossom.host != new_config.blossom.host,
                             ),
@@ -1177,6 +1187,16 @@ async fn reload_handler(
                                 "limits.max_connections_per_sec_per_ip",
                                 old.limits.max_connections_per_sec_per_ip
                                     != new_config.limits.max_connections_per_sec_per_ip,
+                            ),
+                            (
+                                "limits.socket_recv_buffer_kb",
+                                old.limits.socket_recv_buffer_kb
+                                    != new_config.limits.socket_recv_buffer_kb,
+                            ),
+                            (
+                                "rpc.max_admin_body_bytes",
+                                old.rpc.max_admin_body_bytes
+                                    != new_config.rpc.max_admin_body_bytes,
                             ),
                         ];
                         for (name, changed) in static_routes {

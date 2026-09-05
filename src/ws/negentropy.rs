@@ -195,6 +195,29 @@ impl super::Conn {
             ]));
             return;
         }
+        // The initial message is validated *before* the old state is
+        // removed: a failing NEG-OPEN must not close the peer's existing
+        // subscription (the capacity check above already guards the "too
+        // many items" path the same way).
+        let response = match nip77::respond(&items, &initial) {
+            Ok(response) => response,
+            Err(reason) => {
+                self.send_neg_err(&sub_id, &format!("error: {reason}"));
+                return;
+            }
+        };
+        // Bound the initial response like the NEG-MSG replies: a mode-2
+        // answer returns every id of the range, and without the cap a
+        // large max_neg_items would let one NEG-OPEN bypass the REQ
+        // response budget entirely.
+        let budget = self.req_response_bytes;
+        if budget > 0 && response.len() as u64 > budget {
+            self.send_neg_err(
+                &sub_id,
+                "blocked: negentropy response too large (increase limits.max_req_response_bytes)",
+            );
+            return;
+        }
         if let Some(old) = self.neg.remove(&sub_id) {
             self.neg_total = self.neg_total.saturating_sub(old.items.len());
             // Release the subscription slot of the replaced negentropy
@@ -203,31 +226,27 @@ impl super::Conn {
                 .stats
                 .subscriptions_active
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            self.subscriptions_held
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
-
-        match nip77::respond(&items, &initial) {
-            Ok(response) => {
-                self.neg_total += items.len();
-                self.neg.insert(
-                    sub_id.clone(),
-                    NegState {
-                        items,
-                        rounds_left: MAX_NEG_MSG_ROUNDS,
-                    },
-                );
-                // NEG-OPEN subscriptions are active subscriptions: they hold
-                // filters and items until closed, so they count towards
-                // `subscriptions_active` like REQ subscriptions.
-                self.relay
-                    .stats
-                    .subscriptions_active
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                self.send_neg_msg(&sub_id, &response);
-            }
-            Err(reason) => {
-                self.send_neg_err(&sub_id, &format!("error: {reason}"));
-            }
-        }
+        self.neg_total += items.len();
+        self.neg.insert(
+            sub_id.clone(),
+            NegState {
+                items,
+                rounds_left: MAX_NEG_MSG_ROUNDS,
+            },
+        );
+        // NEG-OPEN subscriptions are active subscriptions: they hold
+        // filters and items until closed, so they count towards
+        // `subscriptions_active` like REQ subscriptions.
+        self.relay
+            .stats
+            .subscriptions_active
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.subscriptions_held
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.send_neg_msg(&sub_id, &response);
     }
 
     pub(crate) async fn handle_neg_msg(&mut self, rest: &[Value]) {
@@ -300,6 +319,8 @@ impl super::Conn {
         self.relay
             .stats
             .subscriptions_active
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.subscriptions_held
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 

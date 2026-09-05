@@ -26,6 +26,10 @@ pub fn tokenize(text: &str) -> Vec<String> {
         } else if !current.is_empty() {
             if current.len() >= 2 && !numeric {
                 words.push(std::mem::take(&mut current));
+                // The next token starts fresh: a leading letter must not
+                // inherit the "numeric" flag of the previous token, or the
+                // indexing would depend on the token's position in the text.
+                numeric = true;
             } else {
                 current.clear();
                 numeric = true;
@@ -33,6 +37,32 @@ pub fn tokenize(text: &str) -> Vec<String> {
         }
     }
     if current.len() >= 2 && !numeric {
+        words.push(current);
+    }
+    words
+}
+
+/// Tokenizes for a *query*: unlike the index tokenizer, numeric-only words
+/// stay in the term list. They are not in the word index, so the index walk
+/// finds nothing for them (such searches return no results instead of
+/// matching everything). A mixed query like "nostr 2023" constrains the
+/// walk to "nostr"; the per-event match only requires one term (NIP-50:
+/// any of the terms), so "2023" does not act as an additional constraint.
+fn query_tokenize(text: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    for ch in text.chars() {
+        if ch.is_alphanumeric() {
+            current.extend(ch.to_lowercase());
+        } else if !current.is_empty() {
+            if current.len() >= 2 {
+                words.push(std::mem::take(&mut current));
+            } else {
+                current.clear();
+            }
+        }
+    }
+    if current.len() >= 2 {
         words.push(current);
     }
     words
@@ -51,7 +81,7 @@ pub fn terms(search: &str) -> Vec<String> {
         .filter(|token| !token.contains(':'))
         .collect::<Vec<&str>>()
         .join(" ");
-    tokenize(&without_extensions)
+    query_tokenize(&without_extensions)
 }
 
 /// Whether any of `terms` appears in `content` as a whole word.
@@ -76,10 +106,30 @@ mod tests {
 
     #[test]
     fn tokenizer() {
-        assert_eq!(tokenize("Hello, World! 123"), vec!["hello", "world", "123"]);
+        // Numeric-only words are not indexed (they dominate the word
+        // index of machine-generated content and bloat the random
+        // inserts); mixed words are.
+        assert_eq!(tokenize("Hello, World! 123"), vec!["hello", "world"]);
         assert_eq!(tokenize("a bc"), vec!["bc"]);
+        assert_eq!(tokenize("2023 nostr"), vec!["nostr"]);
+        assert_eq!(tokenize("nostr 2023"), vec!["nostr"]);
+        assert_eq!(tokenize("abc123 def"), vec!["abc123", "def"]);
+        assert_eq!(tokenize("12ab 34"), vec!["12ab"]);
+        assert_eq!(tokenize("I have 123 apples"), vec!["have", "apples"]);
         assert!(tokenize("").is_empty());
         assert!(tokenize("  !!!  ").is_empty());
+    }
+
+    #[test]
+    fn query_terms_keep_numeric_words() {
+        // The query side keeps numeric words: a search for "nostr 2023"
+        // walks the index on "nostr" and rejects events lacking "2023" in
+        // the per-event match. A numeric-only query yields terms (which
+        // the index walk cannot satisfy — no results — instead of the
+        // "no search" fallback that would match everything).
+        assert_eq!(terms("nostr 2023"), vec!["nostr", "2023"]);
+        assert_eq!(terms("123"), vec!["123"]);
+        assert_eq!(terms("include:spam 2023"), vec!["2023"]);
     }
 
     #[test]

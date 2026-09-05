@@ -791,6 +791,14 @@ impl Store {
                     .collect();
                 let mut ranges: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(terms.len());
                 for (word, df) in terms.iter().zip(dfs.iter()) {
+                    // A common term (df reaching the sampling cap) is
+                    // dropped from the walk. A term absent from the index
+                    // (df == 0, e.g. numeric-only words) has an empty
+                    // range, which walk_merged skips harmlessly — it must
+                    // stay in the list, because `df == 0` also results
+                    // from the query-wide term cap for multi-filter REQs,
+                    // where the term *is* indexed and must still be
+                    // walked.
                     if *df >= DF_SAMPLE || word.len() > WORD_INDEX_MAX {
                         continue;
                     }

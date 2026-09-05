@@ -913,6 +913,12 @@ impl Store {
     /// entries (the derived index is filled in the background at startup;
     /// scans fall back to the full JSON parse until then).
     pub(crate) fn meta_needs_rebuild(&self) -> Result<bool> {
+        // Disabled index: nothing to rebuild (the scan falls back to the
+        // full parse). Without this check every start would re-derive the
+        // whole meta index that the operator explicitly turned off.
+        if !self.meta_index {
+            return Ok(false);
+        }
         let rtxn = self.env.read_txn()?;
         let has_events = !self.by_created.is_empty(&rtxn)?;
         let meta_empty = self

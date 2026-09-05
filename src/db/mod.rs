@@ -347,9 +347,11 @@ impl DbClient {
         self.request_with(make, &self.tx).await
     }
 
-    /// Sends a read-only request to the dedicated reader thread.
+    /// Sends a read-only request to the dedicated reader thread. The
+    /// writer-queue counters are not part of the gate: the reader threads
+    /// exist so reads keep working while the writer is stalled.
     async fn request_read<R: Default>(&self, make: impl FnOnce(oneshot::Sender<R>) -> Msg) -> R {
-        self.request_with(make, &self.read_tx).await
+        self.request_with_checked(make, &self.read_tx, false).await
     }
 
     /// Startup-only read: neither fails fast on a momentarily full queue
@@ -429,12 +431,29 @@ impl DbClient {
         make: impl FnOnce(oneshot::Sender<R>) -> Msg,
         channel: &mpsc::UnboundedSender<Msg>,
     ) -> Option<oneshot::Receiver<R>> {
-        if self.pending_msgs.load(std::sync::atomic::Ordering::Relaxed) >= self.max_pending_msgs
-            || self
-                .pending_events
-                .load(std::sync::atomic::Ordering::Relaxed)
-                >= self.max_pending_events
-        {
+        self.send_request_checked(make, channel, true)
+    }
+
+    /// Like [`Self::send_request`], but with `check_writer` the fail-fast
+    /// gate also inspects the writer-queue counters (`pending_msgs` /
+    /// `pending_events`). Read-only requests on the dedicated reader
+    /// channel pass `false`: the whole point of the separate reader threads
+    /// is that reads keep working while the writer is stalled, so a
+    /// write-backlog must not fail-fast the reads.
+    fn send_request_checked<R>(
+        &self,
+        make: impl FnOnce(oneshot::Sender<R>) -> Msg,
+        channel: &mpsc::UnboundedSender<Msg>,
+        check_writer: bool,
+    ) -> Option<oneshot::Receiver<R>> {
+        let writer_stalled = check_writer
+            && (self.pending_msgs.load(std::sync::atomic::Ordering::Relaxed)
+                >= self.max_pending_msgs
+                || self
+                    .pending_events
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    >= self.max_pending_events);
+        if writer_stalled {
             // Surface the overload in the stats (db_errors).
             self.errors
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -472,7 +491,16 @@ impl DbClient {
         make: impl FnOnce(oneshot::Sender<R>) -> Msg,
         channel: &mpsc::UnboundedSender<Msg>,
     ) -> R {
-        let Some(rx) = self.send_request(make, channel) else {
+        self.request_with_checked(make, channel, true).await
+    }
+
+    async fn request_with_checked<R: Default>(
+        &self,
+        make: impl FnOnce(oneshot::Sender<R>) -> Msg,
+        channel: &mpsc::UnboundedSender<Msg>,
+        check_writer: bool,
+    ) -> R {
+        let Some(rx) = self.send_request_checked(make, channel, check_writer) else {
             return R::default();
         };
         if self.timeout_secs == 0 {

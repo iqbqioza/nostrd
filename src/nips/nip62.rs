@@ -66,11 +66,34 @@ pub fn tag_matches(tag: &str, identity: &RelayIdentity<'_>) -> bool {
     // hostname variants (localhost vs 127.0.0.1 are intentionally not
     // normalized further). The scheme and the hostname are both
     // case-insensitive (RFC 3986 / DNS).
+    let tag_scheme = tag.split_once("://").map(|(s, _)| s.to_ascii_lowercase());
     let authority = scheme_authority(tag);
     let (tag_host, tag_port) = split_host_port(authority);
     let authority = authority_of(identity);
     let (our_host, our_port) = split_host_port(&authority);
-    tag_host.eq_ignore_ascii_case(our_host) && (tag_port == our_port || tag_port.is_none())
+    if !tag_host.eq_ignore_ascii_case(our_host) {
+        return false;
+    }
+    match (tag_port, our_port) {
+        (Some(tp), Some(op)) => tp == op,
+        // An omitted port means the default port of the scheme: a
+        // `wss://host` tag must not match a relay on a non-standard port.
+        // A bare host (no scheme) has no default port: keep the lenient
+        // any-port behavior.
+        (None, Some(op)) => scheme_default_port(tag_scheme.as_deref()).is_none_or(|dp| dp == op),
+        (None, None) => true,
+        (Some(_), None) => false,
+    }
+}
+
+pub(crate) fn scheme_default_port(scheme: Option<&str>) -> Option<u16> {
+    match scheme {
+        Some(s) if s == "wss" || s == "https" => Some(443),
+        Some(s) if s == "ws" || s == "http" => Some(80),
+        // Unknown or absent scheme: no default to compare against, which
+        // keeps the old lenient behavior for bare-host tags.
+        _ => None,
+    }
 }
 
 /// The authority part of a URL behind a known scheme (case-insensitive),
@@ -183,6 +206,31 @@ mod tests {
         // public_url overrides the configured host/port.
         let public = RelayIdentity::new("127.0.0.1", 8080, "wss://public.example.net");
         assert!(targets_us(&event("wss://public.example.net"), &public));
+    }
+
+    #[test]
+    fn omitted_port_means_the_scheme_default() {
+        // `wss://host` (no port) matches a relay on 443, not on a
+        // non-standard port; `ws://host` matches 80.
+        let on_443 = RelayIdentity::new("relay.example.com", 443, "");
+        assert!(tag_matches("wss://relay.example.com", &on_443));
+        assert!(tag_matches("https://relay.example.com", &on_443));
+        assert!(!tag_matches("ws://relay.example.com", &on_443));
+
+        let on_80 = RelayIdentity::new("relay.example.com", 80, "");
+        assert!(tag_matches("ws://relay.example.com", &on_80));
+        assert!(tag_matches("http://relay.example.com", &on_80));
+        assert!(!tag_matches("wss://relay.example.com", &on_80));
+
+        let on_8080 = RelayIdentity::new("relay.example.com", 8080, "");
+        assert!(
+            !tag_matches("wss://relay.example.com", &on_8080),
+            "a scheme-default port must not match a non-standard port"
+        );
+        assert!(tag_matches("wss://relay.example.com:8080", &on_8080));
+
+        // A bare host (no scheme) keeps the lenient any-port behavior.
+        assert!(tag_matches("relay.example.com", &on_8080));
     }
 
     #[test]

@@ -178,8 +178,12 @@ impl Filter {
     /// match and the scan both skip non-string values), so such a filter
     /// is rejected at parse time instead.
     pub(crate) fn invalid_tag_values(&self) -> bool {
-        self.tags.values().any(|v| {
-            !v.is_string()
+        // Only `#`-prefixed keys are tag constraints (NIP-01); any other
+        // key is an unknown filter field and is ignored, so its value type
+        // must not reject the filter.
+        self.tags.iter().any(|(name, v)| {
+            name.starts_with('#')
+                && !v.is_string()
                 && !v
                     .as_array()
                     .is_some_and(|a| a.iter().all(serde_json::Value::is_string))

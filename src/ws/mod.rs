@@ -95,6 +95,10 @@ pub struct Conn {
     /// The connection's id in the relay's live subscription index and
     /// delivery-queue map.
     pub(crate) conn_id: u64,
+    /// This connection's open subscription count (REQ + negentropy),
+    /// tracked so the connection guard can release `subscriptions_active`
+    /// on panic as well as on the normal exit path.
+    pub(crate) subscriptions_held: Arc<std::sync::atomic::AtomicUsize>,
     /// Whether this connection delivers NIP-40 expired events live. Cached
     /// from the config on connect and refreshed only after a SIGHUP
     /// reload (see `config_version`), so the per-batch live path avoids
@@ -350,6 +354,10 @@ struct ConnectionGuard {
     /// the connection handling cannot leave a dead entry (the bus would
     /// keep trying to deliver to a gone connection forever).
     conn_id: u64,
+    /// The connection's open subscription count, released on drop so a
+    /// panic cannot leak `subscriptions_active` (the normal exit path
+    /// swaps it to zero first, so the drop only subtracts the rest).
+    subscriptions_held: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl Drop for ConnectionGuard {
@@ -368,6 +376,12 @@ impl Drop for ConnectionGuard {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .remove(&self.conn_id);
+        let held = self
+            .subscriptions_held
+            .swap(0, std::sync::atomic::Ordering::Relaxed);
+        self.stats
+            .subscriptions_active
+            .fetch_sub(held as u64, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -445,11 +459,13 @@ pub async fn handle_connection(
     let conn_id = relay
         .next_conn_id
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let subscriptions_held = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let _guard = ConnectionGuard {
         relay: relay.clone(),
         stats: relay.stats.clone(),
         peer_ip,
         conn_id,
+        subscriptions_held: Arc::clone(&subscriptions_held),
     };
 
     let (mut sender, mut receiver) = socket.split();
@@ -524,6 +540,7 @@ pub async fn handle_connection(
     let mut conn = Conn {
         relay,
         conn_id,
+        subscriptions_held,
         live: Some(live_rx),
         path,
         outgoing: std::collections::VecDeque::new(),
@@ -554,6 +571,8 @@ pub async fn handle_connection(
     // processed in the same loop, and outgoing messages are flushed to the
     // socket after every iteration. This halves the task count (no separate
     // writer task) and the per-connection channel.
+    #[allow(unused_assignments)] // the initial value is overwritten before the first read
+    let mut drain_stalled = !conn.outgoing.is_empty();
     loop {
         // Drain pending outgoing messages. A slow reader stalls only its
         // own connection (outgoing is bounded, so new messages are dropped).
@@ -574,6 +593,12 @@ pub async fn handle_connection(
         // Pump the queued REQ responses through the capped outgoing queue
         // in bounded chunks (see `pump_pending_reqs`).
         conn.pump_pending_reqs();
+        // Remember whether anything is still queued *after* the pump
+        // refilled the outgoing queue: the flush_wake branch retries
+        // promptly only when there is more to send. (A tungstenite feed
+        // never leaves a message queued on WouldBlock, so the queue's
+        // emptiness is what decides whether the socket is the bottleneck.)
+        drain_stalled = !conn.outgoing.is_empty();
         let live_fut = async {
             match conn.live.as_mut() {
                 Some(rx) => rx.recv().await,
@@ -588,16 +613,18 @@ pub async fn handle_connection(
             }
         };
         // Wakes the top-of-loop drain (which flushes the outgoing queue)
-        // shortly after anything was queued: a client that is blocked
-        // sending EVENTs cannot receive the OKs that unblock it unless the
-        // relay actually sends them, and without this branch the loop
-        // would wait for the next inbound frame (which never comes while
-        // the peer is blocked).
+        // when the previous drain could not empty it: a client that is
+        // blocked sending EVENTs cannot receive the OKs that unblock it
+        // unless the relay actually sends them, and without this branch
+        // the loop would wait for the next inbound frame (which never
+        // comes while the peer is blocked). When the last drain emptied
+        // the queue there is nothing to throttle, so the branch sleeps
+        // only when the socket itself is the bottleneck.
         let flush_wake = async {
-            if conn.outgoing.is_empty() {
-                std::future::pending().await
-            } else {
+            if drain_stalled {
                 tokio::time::sleep(tokio::time::Duration::from_millis(1)).await
+            } else {
+                std::future::pending().await
             }
         };
         let incoming_fut = async {
@@ -690,15 +717,15 @@ pub async fn handle_connection(
                 // per-frame `timeout(1ms)` of the old loop created and
                 // destroyed a timer-wheel entry for every frame (and taxed
                 // every single-frame REQ/EVENT with a full millisecond).
-                // The deadline is *sliding*: each frame resets it, so a
-                // continuous burst coalesces into one window (and one
-                // database commit), while an idle client still gets its
-                // OK within a few ms. The frame cap bounds the window when
-                // a client floods faster than the relay can drain; it is
-                // sized to the receive buffer so a full socket becomes one
-                // batch (one commit).
+                // The deadline is *sliding*: each frame resets it (1 ms
+                // after the frame), so a continuous burst coalesces into
+                // one window (and one database commit), while an idle
+                // client still gets its OK within ~1 ms. The frame cap
+                // bounds the window when a client floods faster than the
+                // relay can drain; it is sized well above the receive
+                // buffer so a full socket becomes one batch.
                 let window_deadline = tokio::time::sleep_until(
-                    tokio::time::Instant::now() + tokio::time::Duration::from_millis(5),
+                    tokio::time::Instant::now() + tokio::time::Duration::from_millis(1),
                 );
                 tokio::pin!(window_deadline);
                 for _ in 0..EVENT_BATCH * 32 {
@@ -847,11 +874,15 @@ pub async fn handle_connection(
 
     // Release the connection's accounting: any subscriptions still open at
     // disconnect were never CLOSE'd, so decrement them here (REQ
-    // subscriptions and negentropy subscriptions both hold a slot).
-    conn.relay.stats.subscriptions_active.fetch_sub(
-        (conn.subs.len() + conn.neg.len()) as u64,
-        std::sync::atomic::Ordering::Relaxed,
-    );
+    // subscriptions and negentropy subscriptions both hold a slot). The
+    // guard drops the remainder if a panic ever skips this path.
+    let held = conn
+        .subscriptions_held
+        .swap(0, std::sync::atomic::Ordering::Relaxed);
+    conn.relay
+        .stats
+        .subscriptions_active
+        .fetch_sub(held as u64, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[cfg(test)]
@@ -1000,6 +1031,7 @@ mod tests {
         Conn {
             relay,
             conn_id,
+            subscriptions_held: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             path: "/".into(),
             outgoing: std::collections::VecDeque::new(),
             out_bytes: 0,
@@ -1743,6 +1775,52 @@ mod tests {
             assert_eq!(
                 after_close, before,
                 "closing the NEG subscription must release the slot"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn neg_open_replacement_keeps_old_state_on_failed_replace() {
+        // A failed NEG-OPEN replacement (invalid initial message) must not
+        // close the peer's existing subscription: the response is computed
+        // before the old state is removed.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let stats = conn.relay.stats.clone();
+            let before = stats
+                .subscriptions_active
+                .load(std::sync::atomic::Ordering::Relaxed);
+            conn.handle_neg_open(&[json!("s"), json!({"kinds": [1]}), json!("61000000")])
+                .await;
+            assert_eq!(
+                stats
+                    .subscriptions_active
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                before + 1,
+                "the first open holds a slot"
+            );
+            // A syntactically valid hex message that fails to parse:
+            // version byte followed by an out-of-order bound.
+            let bad = hex::encode([0x61u8, 0x02, 0x00, 0x01]);
+            conn.handle_neg_open(&[json!("s"), json!({"kinds": [1]}), json!(bad)])
+                .await;
+            assert_eq!(
+                stats
+                    .subscriptions_active
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                before + 1,
+                "a failed replacement must not release the old subscription"
+            );
+            // The old subscription still works.
+            conn.handle_neg_close(&[json!("s")]);
+            assert_eq!(
+                stats
+                    .subscriptions_active
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                before,
+                "closing releases the slot"
             );
             conn.relay.db.shutdown();
         });

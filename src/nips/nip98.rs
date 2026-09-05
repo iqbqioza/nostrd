@@ -85,6 +85,13 @@ pub fn matches_request_url(
     request_path: &str,
     request_query: Option<&str>,
 ) -> bool {
+    // `nostr+https`/`nostr+http` sign with the same TLS semantics as
+    // `https`/`http` (the `nostr+` prefix is a relay-information marker),
+    // so their default port follows the underlying scheme.
+    let scheme = tag
+        .split_once("://")
+        .map(|(s, _)| s.to_ascii_lowercase())
+        .map(|s| s.strip_prefix("nostr+").unwrap_or(&s).to_string());
     let Some(rest) = tag
         .strip_prefix("wss://")
         .or_else(|| tag.strip_prefix("https://"))
@@ -107,10 +114,14 @@ pub fn matches_request_url(
     if tag_path != request_path || tag_query.unwrap_or("") != request_query.unwrap_or("") {
         return false;
     }
-    authority_matches(authority, identity)
+    authority_matches(authority, scheme.as_deref(), identity)
 }
 
-fn authority_matches(authority: &str, identity: &crate::nips::nip62::RelayIdentity<'_>) -> bool {
+fn authority_matches(
+    authority: &str,
+    scheme: Option<&str>,
+    identity: &crate::nips::nip62::RelayIdentity<'_>,
+) -> bool {
     let our_authority = crate::nips::nip62::authority_of(identity);
     let (our_host, our_port) = crate::nips::nip62::split_host_port(&our_authority);
     let (tag_host, tag_port) = crate::nips::nip62::split_host_port(authority);
@@ -119,8 +130,11 @@ fn authority_matches(authority: &str, identity: &crate::nips::nip62::RelayIdenti
     }
     match (tag_port, our_port) {
         (Some(tp), Some(op)) => tp == op,
-        // An omitted port means the default port of the scheme.
-        (None, Some(op)) => op == 80 || op == 443,
+        // An omitted port means the default port of the scheme (the same
+        // rule as the NIP-62/NIP-42 relay-tag matching).
+        (None, Some(op)) => {
+            crate::nips::nip62::scheme_default_port(scheme).is_none_or(|dp| dp == op)
+        }
         (None, None) => true,
         (Some(_), None) => false,
     }

@@ -105,6 +105,7 @@ impl super::Conn {
         // Path-specific write policy (nostrd): `/inbox` and `/outbox` are
         // restricted endpoints — see `write_policy_reason`.
         if let Some(reason) = self.write_policy_reason(&event).await {
+            self.relay.stats.bump(&self.relay.stats.events_rejected, 1);
             self.send_ok(&event.id, false, &reason);
             return;
         }
@@ -402,6 +403,8 @@ impl super::Conn {
             self.relay
                 .stats
                 .bump(&self.relay.stats.subscriptions_active, 1);
+            self.subscriptions_held
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
 
         let now = unix_now();
@@ -478,15 +481,19 @@ impl super::Conn {
                 .stats
                 .subscriptions_active
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-            // NIP-77: a CLOSE on a subscription id also ends any negentropy
-            // state held under the same id, releasing its items from the
-            // connection's memory accounting and its subscription slot.
-            if let Some(state) = self.neg.remove(sub_id) {
-                self.neg_total = self.neg_total.saturating_sub(state.items.len());
-                self.release_neg_stats_subscription();
-            }
-            self.sync_live_index();
+            self.subscriptions_held
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         }
+        // NIP-77: a CLOSE on a subscription id also ends any negentropy
+        // state held under the same id (even when no REQ subscription with
+        // that id exists — a NEG-OPEN-only id must still be closable),
+        // releasing its items from the connection's memory accounting and
+        // its subscription slot.
+        if let Some(state) = self.neg.remove(sub_id) {
+            self.neg_total = self.neg_total.saturating_sub(state.items.len());
+            self.release_neg_stats_subscription();
+        }
+        self.sync_live_index();
     }
 
     pub(crate) async fn handle_auth(&mut self, rest: &[Value]) {
