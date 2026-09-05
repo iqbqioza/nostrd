@@ -512,7 +512,10 @@ pub async fn handle_connection(
     let idle_sleep: Option<tokio::time::Sleep> =
         idle.map(|d| tokio::time::sleep_until(tokio::time::Instant::now() + d + idle_jitter));
     let mut idle_sleep = idle_sleep.map(Box::pin);
-    let (live_tx, live_rx) = tokio::sync::mpsc::channel(crate::relay::LIVE_QUEUE_CAPACITY);
+    let (live_tx, live_rx): (
+        tokio::sync::mpsc::Sender<crate::ws::LiveBatch>,
+        tokio::sync::mpsc::Receiver<crate::ws::LiveBatch>,
+    ) = tokio::sync::mpsc::channel(crate::relay::LIVE_QUEUE_CAPACITY);
     relay
         .conn_queues
         .lock()
@@ -690,14 +693,15 @@ pub async fn handle_connection(
                 // The deadline is *sliding*: each frame resets it, so a
                 // continuous burst coalesces into one window (and one
                 // database commit), while an idle client still gets its
-                // OK within ~1 ms. The frame cap (EVENT_BATCH * 4) bounds
-                // the window when a client floods faster than the relay
-                // can drain.
+                // OK within a few ms. The frame cap bounds the window when
+                // a client floods faster than the relay can drain; it is
+                // sized to the receive buffer so a full socket becomes one
+                // batch (one commit).
                 let window_deadline = tokio::time::sleep_until(
                     tokio::time::Instant::now() + tokio::time::Duration::from_millis(5),
                 );
                 tokio::pin!(window_deadline);
-                for _ in 0..EVENT_BATCH * 4 {
+                for _ in 0..EVENT_BATCH * 16 {
                     let frame = tokio::select! {
                         biased;
                         frame = receiver.next() => match frame {

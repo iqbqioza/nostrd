@@ -18,18 +18,21 @@
 pub fn tokenize(text: &str) -> Vec<String> {
     let mut words = Vec::new();
     let mut current = String::new();
+    let mut numeric = true;
     for ch in text.chars() {
         if ch.is_alphanumeric() {
+            numeric &= ch.is_ascii_digit();
             current.extend(ch.to_lowercase());
         } else if !current.is_empty() {
-            if current.len() >= 2 {
+            if current.len() >= 2 && !numeric {
                 words.push(std::mem::take(&mut current));
             } else {
                 current.clear();
+                numeric = true;
             }
         }
     }
-    if current.len() >= 2 {
+    if current.len() >= 2 && !numeric {
         words.push(current);
     }
     words

@@ -417,6 +417,7 @@ pub(crate) fn spawn(
                         Err(_) => break,
                     }
                 }
+
                 let drained_msgs: usize = msgs
                     .iter()
                     // `Msg::Shutdown` is sent directly (never through

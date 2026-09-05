@@ -104,26 +104,25 @@ async fn ingest(url: &str, n: usize) {
         (received, ok_true, first_reason)
     });
     let t0 = Instant::now();
-    const BURST: usize = 50;
+    const BURST: usize = 200;
     let mut sent = 0;
     while sent < n {
         for _ in 0..BURST.min(n - sent) {
             // A unique content per event: identical contents and
             // timestamps would produce identical ids, and the relay would
             // deduplicate the whole burst into one stored event.
-            let ev = sign_event(&secp, &keypair, 1, &format!("bench {sent}"), now);
-            let t0 = std::time::Instant::now();
+            // Spread created_at like real deployments (identical
+            // timestamps force every index into the worst-case random
+            // insert pattern and exaggerate the DB-size cost).
+            let created = now - (sent % 1000) as u64;
+            let ev = sign_event(&secp, &keypair, 1, &format!("bench {sent}"), created);
             sink.send(frame(&format!(r#"["EVENT",{ev}]"#)))
                 .await
                 .expect("send");
-            if t0.elapsed() > std::time::Duration::from_secs(2) {
-                eprintln!("SLOW send #{sent}: {:.0}ms", t0.elapsed().as_millis());
-            }
             sent += 1;
         }
-        // No sleep: a continuous stream lets the relay's batch window
-        // coalesce the whole burst (and the whole test) into as few
-        // commits as possible.
+        // Yield occasionally so the drain task (which reads the OKs that
+        // unblock the relay's sends) gets scheduled between sends.
         tokio::task::yield_now().await;
     }
     let dt = t0.elapsed();
@@ -325,6 +324,69 @@ async fn search(url: &str, term: &str) {
     println!("search: {events} events in {:.3}s", dt.as_secs_f64());
 }
 
+/// `parallel-ingest <conns> <n>`: `conns` concurrent connections each
+/// publish `n` events (unique per connection), measuring the combined
+/// throughput. Real deployments have many publishers, and the single
+/// writer thread merges their batches, so the aggregate can exceed one
+/// connection's ceiling.
+async fn parallel_ingest(url: &str, conns: usize, n: usize) {
+    let secp = Secp256k1::new();
+    let keypair = Keypair::from_seckey_slice(&secp, &[7u8; 32]).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let secp = Arc::new(secp);
+    let mut handles = Vec::with_capacity(conns);
+    for c in 0..conns {
+        let url = url.to_string();
+        let secp = Arc::clone(&secp);
+        handles.push(tokio::spawn(async move {
+            let ws = connect(&url).await;
+            let (mut sink, mut stream) = ws.split();
+            let drain = tokio::spawn(async move {
+                let mut ok = 0usize;
+                while ok < n {
+                    match stream.next().await {
+                        Some(Ok(msg)) if msg.is_text() => {
+                            if !msg.to_text().unwrap().starts_with("[\"AUTH\"") {
+                                ok += 1;
+                            }
+                        }
+                        _ => break,
+                    }
+                }
+            });
+            const BURST: usize = 100;
+            let mut sent = 0;
+            while sent < n {
+                for _ in 0..BURST.min(n - sent) {
+                    let ev = sign_event(&secp, &keypair, 1, &format!("p{c} {sent}"), now);
+                    sink.send(frame(&format!(r#"["EVENT",{ev}]"#)))
+                        .await
+                        .expect("send");
+                    sent += 1;
+                }
+                tokio::task::yield_now().await;
+            }
+            let _ = tokio::time::timeout(Duration::from_secs(120), drain).await;
+        }));
+    }
+    let t0 = Instant::now();
+    for h in handles {
+        h.await.unwrap();
+    }
+    let dt = t0.elapsed();
+    println!(
+        "parallel-ingest: {} conns x {} = {} events in {:.2}s = {:.0} ev/s",
+        conns,
+        n,
+        conns * n,
+        dt.as_secs_f64(),
+        (conns * n) as f64 / dt.as_secs_f64()
+    );
+}
+
 /// `parallel-req <conns> <term>`: issue the same search REQ from `conns`
 /// concurrent connections and measure until every EOSE arrived. A single
 /// heavy scan runs on one reader thread, so more reader threads
@@ -377,7 +439,7 @@ async fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 3 {
         eprintln!(
-            "usage: bench <ws://host:port> <ingest N | fanout S P | req N | search TERM | parallel-req C TERM>"
+            "usage: bench <ws://host:port> <ingest N | parallel-ingest C N | fanout S P | req N | search TERM | parallel-req C TERM>"
         );
         std::process::exit(1);
     }
@@ -395,6 +457,14 @@ async fn main() {
         "req" => req(url, args[3].parse().expect("N")).await,
         "search" => search(url, &args[3]).await,
         "parallel-req" => parallel_req(url, args[3].parse().expect("C"), &args[4]).await,
+        "parallel-ingest" => {
+            parallel_ingest(
+                url,
+                args[3].parse().expect("C"),
+                args[4].parse().expect("N"),
+            )
+            .await
+        }
         other => {
             eprintln!("unknown scenario {other}");
             std::process::exit(1);
