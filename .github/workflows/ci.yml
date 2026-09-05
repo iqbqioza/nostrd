@@ -9,29 +9,74 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
-    name: Format, lint and test
+  fmt:
+    name: Format check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
-
-      - uses: Swatinem/rust-cache@v2
+          components: rustfmt
 
       - name: Format check
         run: cargo fmt --all -- --check
 
-      - name: Clippy (all targets, warnings denied)
+  clippy:
+    name: Clippy (all targets, warnings denied)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
 
       - name: Tests
         run: cargo test --all-targets
 
+  freebsd:
+    name: Build and test on FreeBSD
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          # Pin a stable release: the action's default tracks FreeBSD
+          # -CURRENT, which breaks CI with unrelated upstream churn. The
+          # 14.x builder image predates the current pkg repository index
+          # (the pkg OS-version check fails), so use the newest stable.
+          release: "15.1"
+          # IGNORE_OSVERSION: the builder image may lag the current pkg
+          # repository index by a patch level (FreeBSD:14:amd64 mismatch);
+          # binary compatibility makes ignoring the check safe.
+          prepare: |
+            env IGNORE_OSVERSION=yes pkg update -f
+            env IGNORE_OSVERSION=yes pkg install -y rust
+          run: |
+            cargo test --all-targets
+
   build:
-    name: Release build
+    # Plain "Build": this is the CI compile check, not the tag-triggered
+    # release workflow (release.yml), so "Release build" was misleading.
+    name: Build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

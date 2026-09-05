@@ -83,7 +83,7 @@ The detailed guides live in the [`docs/`](docs/) directory:
 
 ## Install (pre-built binary)
 
-The GitHub Actions release workflow builds `nostrd` for **x86_64** and **aarch64** and attaches both binaries (plus checksums) to every release. The `install.sh` script downloads the right one, verifies its sha256 checksum and installs it into a directory on `PATH`.
+The GitHub Actions release workflow builds `nostrd` for **Linux (x86_64 + aarch64)** and **FreeBSD (x86_64)** and attaches the binaries (plus checksums) to every release. The `install.sh` script detects the OS and architecture, downloads the right binary, verifies its sha256 checksum and installs it into a directory on `PATH`.
 
 The fastest way — **one-liner, no clone needed**:
 
