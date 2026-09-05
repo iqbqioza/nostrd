@@ -36,7 +36,18 @@ impl fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Io(e) => Some(e),
+            Error::Json(e) => Some(e),
+            Error::Heed(e) => Some(e),
+            Error::Secp(e) => Some(e),
+            Error::Hex(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 impl From<std::io::Error> for Error {
     fn from(e: std::io::Error) -> Self {
@@ -65,5 +76,57 @@ impl From<secp256k1::Error> for Error {
 impl From<hex::FromHexError> for Error {
     fn from(e: hex::FromHexError) -> Self {
         Error::Hex(e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_covers_every_variant() {
+        let io = Error::Io(std::io::Error::other("io"));
+        let json = Error::Json(serde_json::from_str::<()>("x").unwrap_err());
+        let heed = Error::Heed(heed::Error::Mdb(heed::MdbError::NotFound));
+        let secp = Error::Secp(secp256k1::Error::InvalidSignature);
+        let hex = Error::Hex(hex::FromHexError::InvalidHexCharacter { c: 'z', index: 0 });
+        for e in [
+            &io,
+            &json,
+            &heed,
+            &secp,
+            &hex,
+            &Error::Config("cfg".into()),
+            &Error::Protocol("proto".into()),
+            &Error::StorageFull,
+            &Error::Other("other".into()),
+        ] {
+            let text = e.to_string();
+            assert!(!text.is_empty(), "every variant must display something");
+        }
+    }
+
+    #[test]
+    fn source_reports_inner_errors() {
+        let io = Error::Io(std::io::Error::other("io"));
+        assert!(std::error::Error::source(&io).is_some());
+        let hex = Error::Hex(hex::FromHexError::OddLength);
+        assert!(std::error::Error::source(&hex).is_some());
+        let config = Error::Config("x".into());
+        assert!(
+            std::error::Error::source(&config).is_none(),
+            "String variants have no source"
+        );
+        assert!(std::error::Error::source(&Error::StorageFull).is_none());
+    }
+
+    #[test]
+    fn conversions_build_the_right_variant() {
+        let io: Error = std::io::Error::other("io").into();
+        assert!(matches!(io, Error::Io(_)));
+        let hex: Error = hex::FromHexError::OddLength.into();
+        assert!(matches!(hex, Error::Hex(_)));
+        let json: Error = serde_json::from_str::<()>("x").unwrap_err().into();
+        assert!(matches!(json, Error::Json(_)));
     }
 }

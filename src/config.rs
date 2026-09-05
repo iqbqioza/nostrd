@@ -1577,8 +1577,6 @@ fn known_config_keys() -> &'static [(&'static str, &'static [&'static str])] {
                 "max_groups",
                 "require_pow",
                 "max_indexed_words",
-                "meta_index",
-                "reader_threads",
                 "buffer_size",
                 "db_request_timeout_secs",
                 "new_pubkey_min_age_secs",

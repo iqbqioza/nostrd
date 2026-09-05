@@ -872,9 +872,18 @@ fn validate_edit_metadata(
     if tag_values(event, "parent").count() > 1 {
         return Err("restricted: at most one parent tag is allowed".into());
     }
-    // A group cannot be its own child.
+    // A group cannot be its own child, and one 9002 must not make a
+    // group both the parent and the child of this one (that would create
+    // a two-way cycle the walks below cannot see: both directions would
+    // be applied and every later parent edit would loop forever).
+    let parent_value = tag_value(event, "parent").map(str::to_string);
     if tag_values(event, "child").any(|c| c == gid) {
         return Err("restricted: a group cannot be its own child".into());
+    }
+    if let Some(parent) = &parent_value
+        && tag_values(event, "child").any(|c| c == parent)
+    {
+        return Err("restricted: a group cannot be both parent and child".into());
     }
     // The declared children must not create a cycle either: walking down
     // the children lists from the declared children must not reach this
@@ -882,32 +891,42 @@ fn validate_edit_metadata(
     // parent would otherwise create a two-way cycle the upward walk
     // misses).
     for child in tag_values(event, "child") {
-        let mut cursor = Some(child);
-        while let Some(current) = cursor {
+        // Breadth-first walk down the children lists from the declared
+        // child; a visited set stops the walk on pre-existing cycles in
+        // the stored data instead of looping forever.
+        let mut queue: Vec<&str> = vec![child];
+        let mut visited: HashSet<&str> = HashSet::new();
+        while let Some(current) = queue.pop() {
             if current == gid {
                 return Err("restricted: would create a cycle".into());
             }
-            cursor = store.groups.get(current).and_then(|g| {
-                g.children
-                    .iter()
-                    .find(|c| c.as_str() == child)
-                    .map(|c| c.as_str())
-            });
+            if !visited.insert(current) {
+                continue;
+            }
+            if let Some(group) = store.groups.get(current) {
+                queue.extend(group.children.iter().map(String::as_str));
+            }
         }
     }
     // A parent value must not create a cycle or self-reference, and the
     // parent must exist and the author must be its admin.
-    if let Some(parent) = tag_value(event, H).and_then(|_| tag_value(event, "parent")) {
-        let mut cursor = Some(parent);
+    if let Some(parent) = parent_value {
+        let mut cursor = Some(parent.as_str());
+        let mut visited: HashSet<&str> = HashSet::new();
         while let Some(current) = cursor {
             if current == gid {
                 return Err("restricted: would create a cycle".into());
+            }
+            if !visited.insert(current) {
+                // A pre-existing cycle in the stored data: stop the walk
+                // instead of looping forever.
+                break;
             }
             cursor = store.groups.get(current).and_then(|g| g.parent.as_deref());
         }
         let parent_group = store
             .groups
-            .get(parent)
+            .get(&parent)
             .ok_or_else(|| "restricted: parent group does not exist".to_string())?;
         if !parent_group.is_admin(event.pubkey.as_str()) {
             return Err("restricted: you are not an admin of the parent group".into());

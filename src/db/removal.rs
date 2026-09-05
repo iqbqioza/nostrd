@@ -246,13 +246,16 @@ impl Store {
             std::ops::Bound::Included(start.as_slice()),
             std::ops::Bound::Excluded(end.as_slice()),
         );
-        let ids: Vec<Vec<u8>> = self
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = self
             .by_pubkey
             .range(&wtxn, &range)?
-            .filter_map(|item| item.ok().map(|(k, _)| k[k.len() - ID_LEN..].to_vec()))
+            .filter_map(|item| {
+                item.ok()
+                    .map(|(k, _)| (k.to_vec(), k[k.len() - ID_LEN..].to_vec()))
+            })
             .collect();
         let pubkey_hex = hex::encode(pubkey);
-        for id in ids {
+        for (key, id) in entries {
             let Some(raw) = self.events.get(&wtxn, &id)? else {
                 continue;
             };
@@ -262,8 +265,13 @@ impl Store {
             // NIP-62: only events *authored* by the vanished pubkey are
             // removed. NIP-26 delegatee events are indexed under the
             // delegator's pubkey too, but they belong to the delegatee and
-            // must survive a delegator's request to vanish.
+            // must survive a delegator's request to vanish. Their
+            // delegator-side index entry is dropped nevertheless, so the
+            // vanished identity's feed is not revived by the delegation.
             if event.pubkey != pubkey_hex {
+                if crate::nips::nip26::delegation(&event).is_some() {
+                    self.by_pubkey.delete(&mut wtxn, &key)?;
+                }
                 continue;
             }
             self.remove_event(&mut wtxn, &id)?;

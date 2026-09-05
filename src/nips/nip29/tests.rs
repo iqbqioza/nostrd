@@ -266,6 +266,38 @@ fn last_admin_cannot_be_demoted() {
         store.validate_write(&transfer).is_ok(),
         "a new admin may be granted"
     );
+    // The final state decides: a grant and a demotion of the *same*
+    // pubkey in one event (tags applied in order) must not bypass the
+    // guard — `["p", A, "mod"]` followed by `["p", A]` ends with A
+    // demoted, leaving no admin.
+    let same_key_demote = event(
+        9000,
+        ADMIN,
+        Some("g1"),
+        vec![
+            vec![P.into(), ADMIN.into(), "admin".into()],
+            vec![P.into(), ADMIN.into()],
+        ],
+    );
+    assert!(
+        store.validate_write(&same_key_demote).is_err(),
+        "a grant overwritten by a demotion of the same key is still a demotion"
+    );
+    // The reverse order keeps the grant and is accepted.
+    let same_key_grant = event(
+        9000,
+        ADMIN,
+        Some("g1"),
+        vec![
+            vec![P.into(), ADMIN.into()],
+            vec![P.into(), ADMIN.into(), "admin".into()],
+        ],
+    );
+    assert!(
+        store.validate_write(&same_key_grant).is_ok(),
+        "a demotion overwritten by a grant of the same key keeps an admin"
+    );
+
     // Demoting a non-last admin is still allowed.
     let mut store2 = seeded();
     store2.apply(
@@ -339,6 +371,43 @@ fn subgroups() {
         vec![vec!["parent".into(), "ghost".into()]],
     );
     assert!(store.validate_write(&ghost).is_err());
+
+    // Declaring a child that would close a cycle is rejected: g1 is a
+    // child of g2, so a child-tag declaration of g2 on g1 must fail (the
+    // downward walk reaches g1 from g2).
+    let downward_cycle = event(
+        9002,
+        ADMIN,
+        Some("g1"),
+        vec![vec!["child".into(), "g2".into()]],
+    );
+    assert!(
+        store.validate_write(&downward_cycle).is_err(),
+        "a child declaration that would create a cycle must be rejected"
+    );
+
+    // A group cannot declare itself as its own child.
+    let self_child = event(
+        9002,
+        ADMIN,
+        Some("g1"),
+        vec![vec!["child".into(), "g1".into()]],
+    );
+    assert!(store.validate_write(&self_child).is_err());
+
+    // A metadata edit must carry every existing child (NIP-29).
+    let partial_edit = event(9002, ADMIN, Some("g2"), vec![]);
+    assert!(
+        store.validate_write(&partial_edit).is_err(),
+        "a partial edit omitting the child list must be rejected"
+    );
+    let full_edit = event(
+        9002,
+        ADMIN,
+        Some("g2"),
+        vec![vec!["child".into(), "g1".into()]],
+    );
+    assert!(store.validate_write(&full_edit).is_ok());
 
     // Deleting a child removes it from the parent's child list.
     let delete_child = event(DELETE_GROUP, ADMIN, Some("g1"), vec![]);

@@ -469,6 +469,7 @@ pub async fn api_monthly_handler(
         );
     };
     let count_limit = relay.config.read().await.limits.max_count;
+    let no_tags = excluded_tags(&params);
 
     let mut month_counts = Vec::with_capacity(months.len());
     let mut total = 0u64;
@@ -497,6 +498,9 @@ pub async fn api_monthly_handler(
                 !nip70::is_protected(e)
                     && (e.kind != nip62::GIFT_WRAP_KIND)
                     && groups.as_deref().is_none_or(|g| g.visible_to(e, None))
+                    && !no_tags
+                        .iter()
+                        .any(|name| e.tags.iter().any(|t| t.len() >= 2 && t[0] == *name))
             })
             .count();
         drop(groups);
@@ -607,7 +611,7 @@ pub async fn api_count_handler(
 pub async fn api_kinds_handler(
     State(relay): State<Arc<Relay>>,
     Path(identifier): Path<String>,
-    Query(_params): Query<ApiParams>,
+    Query(params): Query<ApiParams>,
 ) -> (StatusCode, Json<Value>) {
     let hex_pk = match parse_author_identifier(&identifier) {
         Ok(pk) => pk,
@@ -630,11 +634,15 @@ pub async fn api_kinds_handler(
     } else {
         None
     };
+    let no_tags = excluded_tags(&params);
     let mut by_kind: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
     for e in events.iter().filter(|e| {
         !nip70::is_protected(e)
             && (e.kind != nip62::GIFT_WRAP_KIND)
             && groups.as_deref().is_none_or(|g| g.visible_to(e, None))
+            && !no_tags
+                .iter()
+                .any(|name| e.tags.iter().any(|t| t.len() >= 2 && t[0] == *name))
     }) {
         *by_kind.entry(e.kind).or_default() += 1;
     }
@@ -701,6 +709,7 @@ pub async fn api_daily_handler(
         );
     };
     let count_limit = relay.config.read().await.limits.max_count;
+    let no_tags = excluded_tags(&params);
 
     let mut day_counts = Vec::with_capacity(days_in_month as usize);
     let mut total = 0u64;
@@ -726,6 +735,9 @@ pub async fn api_daily_handler(
                 !nip70::is_protected(e)
                     && (e.kind != nip62::GIFT_WRAP_KIND)
                     && groups.as_deref().is_none_or(|g| g.visible_to(e, None))
+                    && !no_tags
+                        .iter()
+                        .any(|name| e.tags.iter().any(|t| t.len() >= 2 && t[0] == *name))
             })
             .count();
         drop(groups);
@@ -791,7 +803,7 @@ pub async fn api_id_handler(
 pub async fn api_stats_handler(
     State(relay): State<Arc<Relay>>,
     Path(identifier): Path<String>,
-    Query(_params): Query<ApiParams>,
+    Query(params): Query<ApiParams>,
 ) -> (StatusCode, Json<Value>) {
     let hex_pk = match parse_author_identifier(&identifier) {
         Ok(pk) => pk,
@@ -806,6 +818,7 @@ pub async fn api_stats_handler(
     let count_limit = relay.config.read().await.limits.max_count;
     let now = unix_now();
     let filter: Filter = serde_json::from_value(json!({ "authors": [hex_pk] })).expect("static");
+    let no_tags = excluded_tags(&params);
 
     let (events, more) = relay
         .db
@@ -823,6 +836,9 @@ pub async fn api_stats_handler(
         !nip70::is_protected(e)
             && (e.kind != nip62::GIFT_WRAP_KIND)
             && groups.as_deref().is_none_or(|g| g.visible_to(e, None))
+            && !no_tags
+                .iter()
+                .any(|name| e.tags.iter().any(|t| t.len() >= 2 && t[0] == *name))
     }) {
         *by_kind.entry(e.kind).or_default() += 1;
         total += 1;
@@ -845,11 +861,17 @@ pub async fn api_stats_handler(
         !nip70::is_protected(e)
             && e.kind != nip62::GIFT_WRAP_KIND
             && stats_groups.visible_to(e, None)
+            && !no_tags
+                .iter()
+                .any(|name| e.tags.iter().any(|t| t.len() >= 2 && t[0] == *name))
     });
     let visible_last = last.into_iter().find(|e| {
         !nip70::is_protected(e)
             && e.kind != nip62::GIFT_WRAP_KIND
             && stats_groups.visible_to(e, None)
+            && !no_tags
+                .iter()
+                .any(|name| e.tags.iter().any(|t| t.len() >= 2 && t[0] == *name))
     });
     drop(stats_groups);
     let first_seen = visible_first.map(|e| e.created_at);
@@ -933,6 +955,7 @@ pub async fn api_hourly_handler(
         );
     };
     let count_limit = relay.config.read().await.limits.max_count;
+    let no_tags = excluded_tags(&params);
 
     let mut hour_counts = Vec::with_capacity(24);
     let mut total = 0u64;
@@ -958,6 +981,9 @@ pub async fn api_hourly_handler(
                 !nip70::is_protected(e)
                     && (e.kind != nip62::GIFT_WRAP_KIND)
                     && groups.as_deref().is_none_or(|g| g.visible_to(e, None))
+                    && !no_tags
+                        .iter()
+                        .any(|name| e.tags.iter().any(|t| t.len() >= 2 && t[0] == *name))
             })
             .count();
         drop(groups);
@@ -1440,6 +1466,63 @@ mod tests {
         .await;
         relay.start_live_bus();
         Arc::new(relay)
+    }
+
+    #[test]
+    fn year_and_month_validation() {
+        // The daily/hourly handlers reject out-of-range years: a huge
+        // year would overflow the civil-date arithmetic.
+        let mut params = ApiParams {
+            year: Some(1_000_000),
+            month: Some(1),
+            ..Default::default()
+        };
+        assert!(
+            params.year.is_some_and(|y| !(1970..=2999).contains(&y)),
+            "the guard range is 1970..=2999"
+        );
+        params.year = Some(1970);
+        assert!((1970..=2999).contains(&params.year.unwrap()));
+        params.month = Some(13);
+        assert!(!(1..=12).contains(&params.month.unwrap()));
+    }
+
+    #[test]
+    fn excluded_tags_lists_absence_filters() {
+        let mut params = ApiParams::default();
+        assert!(excluded_tags(&params).is_empty());
+        params.no_p = Some(true);
+        params.no_e = Some(true);
+        let tags = excluded_tags(&params);
+        assert_eq!(tags, vec!["p", "e"]);
+        params.no_t = Some(true);
+        params.no_d = Some(true);
+        assert_eq!(excluded_tags(&params).len(), 4);
+    }
+
+    #[test]
+    fn related_filters_merge_e_parameter_with_the_id() {
+        // The `e` query parameter must be OR-ed with the path id, not
+        // replace it: the replies filter matches both targets.
+        let params = ApiParams {
+            e: Some("e1".into()),
+            ..Default::default()
+        };
+        let mut f = apply_params(
+            Filter {
+                tags: std::collections::BTreeMap::from([("#e".to_string(), json!("target-id"))]),
+                ..Default::default()
+            },
+            &params,
+        );
+        if let Some(ref e) = params.e {
+            f.tags
+                .insert("#e".to_string(), json!(["target-id", e.clone()]));
+        }
+        let values = f.tags["#e"].as_array().unwrap();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0], "target-id");
+        assert_eq!(values[1], "e1");
     }
 
     #[test]

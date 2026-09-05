@@ -25,6 +25,12 @@ pub(crate) struct NegState {
 /// before it is closed (generous for legitimate syncs).
 pub(crate) const MAX_NEG_MSG_ROUNDS: u32 = 128;
 
+/// The maximum number of NEG-OPENs one connection may issue: each open
+/// resets the round budget, so without this cap a client could renew the
+/// 128-round CPU budget forever (closing and re-opening must not bypass
+/// the cap, hence the connection-wide counter).
+pub(crate) const MAX_NEG_OPENS: u32 = 256;
+
 impl super::Conn {
     pub(crate) fn send_neg_err(&mut self, sub_id: &str, reason: &str) {
         self.send_json(json!(["NEG-ERR", sub_id, reason]));
@@ -209,15 +215,30 @@ impl super::Conn {
         // Bound the initial response like the NEG-MSG replies: a mode-2
         // answer returns every id of the range, and without the cap a
         // large max_neg_items would let one NEG-OPEN bypass the REQ
-        // response budget entirely.
+        // response budget entirely. The wire size is the hex encoding
+        // (2x) plus the JSON frame, so budget against that.
         let budget = self.req_response_bytes;
-        if budget > 0 && response.len() as u64 > budget {
+        if budget > 0 && response.len() as u64 * 2 > budget {
             self.send_neg_err(
                 &sub_id,
                 "blocked: negentropy response too large (increase limits.max_req_response_bytes)",
             );
             return;
         }
+        // Every open renews the round budget; the connection-wide count
+        // caps how often, so a client cannot renew the 128-round CPU
+        // budget forever by re-opening (or close+re-opening) the
+        // subscription.
+        if self.neg_opens_total >= MAX_NEG_OPENS {
+            // Like every other failed NEG-OPEN, the old subscription is
+            // left untouched.
+            self.send_neg_err(
+                &sub_id,
+                "blocked: too many negentropy opens (connection limit)",
+            );
+            return;
+        }
+        self.neg_opens_total += 1;
         if let Some(old) = self.neg.remove(&sub_id) {
             self.neg_total = self.neg_total.saturating_sub(old.items.len());
             // Release the subscription slot of the replaced negentropy
@@ -289,7 +310,11 @@ impl super::Conn {
                 // and 128 rounds would otherwise amplify one connection
                 // into hundreds of MiB of bandwidth.
                 let budget = self.req_response_bytes;
-                let over_budget = budget > 0 && response.len() as u64 > budget;
+                // The response is sent hex-encoded inside a JSON array
+                // (roughly 2.2x the binary size), so budget against the
+                // wire size, not the binary size.
+                let wire_size = response.len() as u64 * 2;
+                let over_budget = budget > 0 && wire_size > budget;
                 if over_budget {
                     if let Some(state) = self.neg.remove(&sub_id) {
                         self.neg_total = self.neg_total.saturating_sub(state.items.len());

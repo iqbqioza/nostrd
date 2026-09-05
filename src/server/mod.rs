@@ -1090,6 +1090,10 @@ async fn reload_handler(
                                 old.database.meta_index != new_config.database.meta_index,
                             ),
                             (
+                                "database.reader_threads",
+                                old.database.reader_threads != new_config.database.reader_threads,
+                            ),
+                            (
                                 "blossom.host",
                                 old.blossom.host != new_config.blossom.host,
                             ),

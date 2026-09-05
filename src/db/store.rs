@@ -832,6 +832,19 @@ impl Store {
                 "blocked: this pubkey has requested to vanish".into(),
             ));
         }
+        // A vanished delegator must not be re-published through a
+        // delegation: the delegatee's event is indexed under the
+        // delegator's pubkey too (NIP-26), which would revive the
+        // vanished identity's feed.
+        if let Some(delegator) = crate::nips::nip26::delegation(event)
+            && let Ok(delegator_bytes) = hex::decode(delegator[0])
+            && delegator_bytes.len() == ID_LEN
+            && self.vanish.get(wtxn, &delegator_bytes)?.is_some()
+        {
+            return Ok(PutOutcome::Invalid(
+                "blocked: the delegator has requested to vanish".into(),
+            ));
+        }
         if self.banned.get(wtxn, &id)?.is_some() {
             return Ok(PutOutcome::Invalid("blocked: event has been banned".into()));
         }

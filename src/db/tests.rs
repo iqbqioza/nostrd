@@ -353,8 +353,11 @@ fn equal_timestamp_replaceable_keeps_lowest_id() {
         high.id = "ff".repeat(32);
         // compute_id would overwrite; emulate by using valid-length ids
         // (the db only checks length and hex).
-        assert_eq!(db.put(low.clone(), now).await, PutOutcome::Stored);
-        assert_eq!(db.put(high.clone(), now).await, PutOutcome::Duplicate);
+        // Put the high id first: the tie-break must replace it with the
+        // lower id (a "first one wins" implementation would wrongly keep
+        // the high id here).
+        assert_eq!(db.put(high.clone(), now).await, PutOutcome::Stored);
+        assert_eq!(db.put(low.clone(), now).await, PutOutcome::Replaced);
         let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [10000]})).unwrap();
         let (res, _) = db.query(vec![f], 500, now).await;
         assert_eq!(res.len(), 1);
@@ -1684,6 +1687,32 @@ fn replaceable_kinds_ignore_the_d_tag() {
 #[test]
 
 // ----- overload protection -----
+fn reader_requests_survive_a_writer_backlog() {
+    // The dedicated reader threads exist so reads keep working while the
+    // writer is stalled: a full writer queue must not fail-fast a query.
+    let db = DbClient::open(&config(), true, Arc::new(Default::default()), 0, 128, 4, 8).unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let now = unix_now();
+        db.put(event(1, "stored", now, vec![]), now).await;
+        // Simulate a deep writer queue.
+        db.pending_msgs
+            .store(4, std::sync::atomic::Ordering::Relaxed);
+        db.pending_events
+            .store(8, std::sync::atomic::Ordering::Relaxed);
+        let (res, _) = db
+            .query(
+                vec![serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap()],
+                10,
+                now,
+            )
+            .await;
+        assert_eq!(res.len(), 1, "reads must not fail-fast on a write backlog");
+        db.shutdown();
+    });
+}
+
+#[test]
 fn request_fails_fast_when_the_queue_is_full() {
     // Overload protection: with a full queue, new requests fail fast
     // instead of accumulating in memory, and the overload is surfaced

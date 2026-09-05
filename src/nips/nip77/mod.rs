@@ -21,6 +21,12 @@ use std::cmp::Ordering;
 use sha2::{Digest, Sha256};
 
 pub const PROTOCOL_VERSION: u8 = 0x61;
+
+/// The maximum number of ranges one NEG-MSG may carry: the per-range
+/// fingerprint/bisection work grows with the item set, so the input side
+/// is budgeted to keep a single frame's CPU cost bounded (the round
+/// budget then caps the total).
+pub(crate) const MAX_NEG_RANGES_PER_MSG: usize = 1024;
 /// Ranges with at most this many items are answered with an id list instead
 /// of being bisected.
 pub const ID_LIST_THRESHOLD: usize = 100;
@@ -110,6 +116,13 @@ pub fn respond(items: &[Item], client_message: &[u8]) -> Result<Vec<u8>, String>
         return Ok(vec![PROTOCOL_VERSION]);
     }
     let ranges = parse_message(client_message)?;
+    // A single message must not scan unbounded fingerprint/bisection
+    // work: thousands of ranges over a 100k-item set would burn seconds
+    // of CPU per frame (the client controls the number of ranges it
+    // sends, so this is the input-side budget of the protocol).
+    if ranges.len() > MAX_NEG_RANGES_PER_MSG {
+        return Err("too many ranges in one negentropy message".into());
+    }
     let mut out: Vec<u8> = Vec::new();
     out.push(PROTOCOL_VERSION);
     let mut prev_ts = 0u64;

@@ -814,15 +814,17 @@ impl Store {
                     };
                     ranges.push((start, end));
                 }
-                // Every term was common: the query matches nothing worth
-                // scanning (the empty range set would match nothing).
-                if ranges.is_empty() {
+                // Every term was common: the index walk has no range to
+                // scan. Falling through to the time-range scan below
+                // (which checks the terms per event) keeps the query
+                // correct — a relay big enough for "nostr" to reach the
+                // sampling cap must still find notes containing it.
+                if !ranges.is_empty() {
+                    if !self.walk_merged(rtxn, by_word, &ranges, ascending, &mut consider, more)? {
+                        return Ok(false);
+                    }
                     return Ok(out.full());
                 }
-                if !self.walk_merged(rtxn, by_word, &ranges, ascending, &mut consider, more)? {
-                    return Ok(false);
-                }
-                return Ok(out.full());
             }
         }
 

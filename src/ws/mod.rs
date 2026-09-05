@@ -78,6 +78,10 @@ pub struct Conn {
     /// subscriptions, so that a connection cannot pin more than twice the
     /// configured per-query maximum in memory.
     pub(crate) neg_total: usize,
+    /// Total NEG-OPENs this connection has issued (including re-opens of
+    /// closed subscriptions): caps how often the 128-round CPU budget can
+    /// be renewed, independently of the per-subscription state.
+    pub(crate) neg_opens_total: u32,
     pub(crate) challenge: String,
     /// Every pubkey authenticated on this connection (NIP-42: all of them
     /// are treated as authenticated).
@@ -551,6 +555,7 @@ pub async fn handle_connection(
         sub_bytes: 0,
         neg: HashMap::new(),
         neg_total: 0,
+        neg_opens_total: 0,
         challenge,
         authed_pubkeys: Vec::new(),
         pending_events: Vec::new(),
@@ -976,6 +981,57 @@ mod tests {
         build_conn_with("").await
     }
 
+    /// Builds a connection on a pre-built relay (for tests that need
+    /// several connections sharing one relay + subscription index).
+    async fn build_conn_on(relay: Arc<Relay>) -> Conn {
+        let (out_queue_bytes, expiry_enabled, giftwrap_restricted) = {
+            let cfg = relay.config.read().await;
+            (
+                cfg.limits.max_out_queue_bytes,
+                cfg.nip_enabled(40),
+                cfg.nip_enabled(42),
+            )
+        };
+        let conn_id = relay
+            .next_conn_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let (live_tx, live_rx) = tokio::sync::mpsc::channel(crate::relay::LIVE_QUEUE_CAPACITY);
+        relay
+            .conn_queues
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(conn_id, live_tx);
+        Conn {
+            relay,
+            conn_id,
+            subscriptions_held: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            live: Some(live_rx),
+            path: "/".into(),
+            outgoing: std::collections::VecDeque::new(),
+            out_bytes: 0,
+            out_queue_bytes,
+            req_response_bytes: 0,
+            pending_reqs: std::collections::VecDeque::new(),
+            subs: HashMap::new(),
+            sub_bytes: 0,
+            neg: HashMap::new(),
+            neg_total: 0,
+            neg_opens_total: 0,
+            challenge: "test-challenge".into(),
+            authed_pubkeys: Vec::new(),
+            pending_events: Vec::new(),
+            expiry_enabled,
+            giftwrap_restricted,
+            config_version: 0,
+            dropped: 0,
+            in_msgs: 0,
+            in_bytes: 0,
+            out_msgs: 0,
+            out_bytes_total: 0,
+            events_received_local: 0,
+        }
+    }
+
     async fn build_conn_with(private_key: &str) -> Conn {
         let mut cfg = Config::default();
         cfg.database.path = temp_db_path();
@@ -1042,6 +1098,7 @@ mod tests {
             sub_bytes: 0,
             neg: HashMap::new(),
             neg_total: 0,
+            neg_opens_total: 0,
             challenge: "test-challenge".into(),
             authed_pubkeys: Vec::new(),
             pending_events: Vec::new(),
@@ -1645,8 +1702,40 @@ mod tests {
     fn live_index_delivers_only_to_candidate_connections() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let mut conn_a = build_conn().await;
-            let mut conn_b = build_conn().await;
+            // Two connections on the *same* relay: the candidate
+            // narrowing is a property of the shared subscription index,
+            // so building separate relays would prove nothing.
+            let mut shared = Relay::new(
+                Arc::new(RwLock::new(Config::default())),
+                crate::db::DbClient::open(
+                    &{
+                        let mut cfg = Config::default();
+                        cfg.database.path = temp_db_path();
+                        cfg.database.map_size = 16 * 1024 * 1024;
+                        cfg.database.max_map_size = 256 * 1024 * 1024;
+                        cfg.database
+                    },
+                    true,
+                    Arc::new(Default::default()),
+                    0,
+                    128,
+                    4096,
+                    262144,
+                )
+                .unwrap(),
+                Stats::new(),
+                "",
+                crate::relay::LiveBusConfig {
+                    buffer: 1024,
+                    batch_interval_ms: 10,
+                    batch_size: 64,
+                },
+            )
+            .await;
+            shared.start_live_bus();
+            let shared = Arc::new(shared);
+            let mut conn_a = build_conn_on(Arc::clone(&shared)).await;
+            let mut conn_b = build_conn_on(Arc::clone(&shared)).await;
             let now = unix_now();
             conn_a
                 .handle_req(&[json!("a"), json!({"kinds": [30001]})])
@@ -1821,6 +1910,88 @@ mod tests {
                     .load(std::sync::atomic::Ordering::Relaxed),
                 before,
                 "closing releases the slot"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn neg_open_byte_cap_rejects_oversized_initial_response() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            // A small response budget: any mode-2 answer over it is
+            // rejected with NEG-ERR while the (empty) old subscription is
+            // kept.
+            // Any initial answer is at least the version byte plus a
+            // bound, so a 1-byte budget rejects everything.
+            conn.req_response_bytes = 1;
+            conn.handle_neg_open(&[json!("s"), json!({"kinds": [1]}), json!("61000000")])
+                .await;
+            assert!(
+                conn.outgoing
+                    .iter()
+                    .any(|m| m.to_text().is_ok_and(|t| t.contains("NEG-ERR"))),
+                "the oversized response must produce a NEG-ERR"
+            );
+            assert!(
+                conn.neg.is_empty(),
+                "the failed open must not leave a subscription"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn neg_open_replacement_success_is_net_zero() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            let stats = conn.relay.stats.clone();
+            let before = stats
+                .subscriptions_active
+                .load(std::sync::atomic::Ordering::Relaxed);
+            conn.handle_neg_open(&[json!("s"), json!({"kinds": [1]}), json!("61000000")])
+                .await;
+            conn.handle_neg_open(&[json!("s"), json!({"kinds": [1]}), json!("61000000")])
+                .await;
+            assert_eq!(
+                stats
+                    .subscriptions_active
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                before + 1,
+                "a successful replacement keeps exactly one slot"
+            );
+            conn.handle_neg_close(&[json!("s")]);
+            assert_eq!(
+                stats
+                    .subscriptions_active
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                before,
+                "closing releases the slot"
+            );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn neg_open_item_cap_keeps_old_subscription() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            conn.relay.config.write().await.limits.max_neg_items = 2;
+            conn.handle_neg_open(&[json!("s"), json!({"kinds": [1]}), json!("61000000")])
+                .await;
+            assert_eq!(conn.neg.len(), 1, "the first open succeeds");
+            // A replacement with more items than the cap is rejected and
+            // the old subscription survives.
+            let too_many = hex::encode([0x61u8, 0x02, 0x00, 0x00, 0x03, 0x00]);
+            conn.handle_neg_open(&[json!("s"), json!({"kinds": [1]}), json!(too_many)])
+                .await;
+            assert_eq!(
+                conn.neg.len(),
+                1,
+                "the over-cap open must not remove the old subscription"
             );
             conn.relay.db.shutdown();
         });
