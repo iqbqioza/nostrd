@@ -57,8 +57,12 @@ jobs:
       - uses: vmactions/freebsd-vm@v1
         with:
           usesh: true
+          # Pin a stable release: the action's default tracks FreeBSD
+          # -CURRENT, which breaks CI with unrelated upstream churn.
+          release: "14.2"
           prepare: |
-            pkg install -y rust clang
+            pkg update -f
+            pkg install -y rust
           run: |
             cargo build --release
             mkdir -p dist

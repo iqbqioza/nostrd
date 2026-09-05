@@ -87,7 +87,7 @@ nostrd builds and runs on FreeBSD (13.x and 14.x, amd64). Install Rust
 and build with:
 
 ```sh
-pkg install -y rust clang
+pkg install -y rust   # clang ships with the FreeBSD base system
 cargo build --release
 ```
 
