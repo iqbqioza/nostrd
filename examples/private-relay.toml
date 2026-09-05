@@ -1,0 +1,55 @@
+# nostrd.toml — private (invite-only / authenticated) relay
+#
+# For a closed community: only authenticated clients (NIP-42) may
+# publish, only allow-listed pubkeys are served, and the relay is
+# locked down to a fixed audience. Combine `require_auth` (any
+# authenticated user may publish) with the allow list (only these
+# pubkeys are served at all) for a truly private relay.
+
+[relay]
+name = "nostrd private"
+description = "Private relay for a closed group of friends"
+pubkey = ""
+private_key = ""            # `nostrd genkey`
+public_url = "wss://private.example.com"
+# Only authenticated clients (NIP-42 AUTH before EVENT) may publish.
+require_auth = true
+send_auth_challenge = true
+# Keep it small: no search, no groups, no negentropy, no NIP-50.
+enabled_nips = [1, 9, 11, 40, 42, 45, 46, 59, 65, 70, 84]
+disabled_nips = [29, 43, 50, 77, 86, 98]
+
+[access]
+# Allow list: only these pubkeys may read (REQ) and write. Leave empty
+# to skip the allow list (require_auth alone then governs writes).
+allowed_pubkeys = [
+    # "npub1..." or 64-hex pubkey of each member, e.g.:
+    # "npub1yourfriend1",
+]
+# Deny list: never serve these pubkeys even when they authenticate.
+blocked_pubkeys = []
+# Optional: only accept these kinds (empty = all kinds allowed).
+allowed_kinds = [1, 4, 6, 7, 14, 42, 9735]
+blocked_kinds = []
+
+[limits]
+# A private relay is small: tighten everything.
+max_connections = 500
+max_connections_per_ip = 8
+max_events_per_min_per_pubkey = 30
+
+[rpc]
+# Management API (NIP-86) on its own port (must differ from
+# server.port) with a strong token; 0 disables the API entirely.
+management_port = 8081
+management_token = "change-me-to-a-long-random-string"
+
+[server]
+host = "0.0.0.0"
+port = 8080
+metrics_enabled = false
+
+[database]
+path = "./data"
+search_index = false
+meta_index = true

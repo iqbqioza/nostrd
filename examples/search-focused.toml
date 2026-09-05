@@ -1,0 +1,44 @@
+# nostrd.toml — search-focused relay
+#
+# Tuned for NIP-50 full-text search: the word index is fully enabled,
+# more words per event are indexed, and the metadata prefilter keeps
+# the scans fast on large databases. Good for a public relay that
+# serves as a searchable archive (e.g. a "nostr search" instance).
+
+[relay]
+name = "nostrd search"
+description = "Searchable Nostr relay (NIP-50)"
+pubkey = ""
+private_key = ""
+public_url = "wss://search.example.com"
+# The word index and the scan prefilter are what this relay is about.
+enabled_nips = [1, 9, 11, 40, 45, 46, 50, 57, 59, 65, 70, 77, 84, 94]
+
+[database]
+path = "./data"
+search_index = true
+# Index more words per event for longer content (default is 32).
+max_indexed_words = 64
+# The per-event metadata header (kind/created/pubkey/expiry) powers the
+# scan prefilter — keep it on for fast searches.
+meta_index = true
+# Two dedicated scan threads so REQ searches and the REST API never
+# block the ingest path.
+reader_threads = 4
+
+[limits]
+# Searches run until the response budget; generous limits for querying.
+max_limit = 2000
+max_count = 5000
+max_api_limit = 10000
+max_api_search_bytes = 8192
+max_req_response_bytes = 67108864
+# Search clients are bursty readers: allow many short connections.
+max_connections = 20000
+max_connections_per_ip = 128
+socket_recv_buffer_kb = 128
+
+[server]
+host = "0.0.0.0"
+port = 8080
+metrics_enabled = true

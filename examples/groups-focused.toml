@@ -1,0 +1,44 @@
+# nostrd.toml — groups-focused relay (NIP-29 / NIP-43)
+#
+# A relay optimized for NIP-29 group-chat communities: more groups,
+# fast live delivery of group messages, and the NIP-43 role system on
+# top of the built-in admin roles (admin/mod) of NIP-29.
+#
+# Group metadata (kinds 39000-39005) is relay-generated and signed with
+# relay.private_key — generate one with `nostrd genkey` or group
+# membership edits will be rejected with "relay key not set".
+
+[relay]
+name = "nostrd groups"
+description = "Nostr groups relay (NIP-29 + NIP-43)"
+pubkey = ""
+private_key = ""            # REQUIRED: `nostrd genkey` — signs group metadata
+public_url = "wss://groups.example.com"
+enabled_nips = [1, 9, 11, 29, 40, 42, 43, 45, 46, 50, 57, 59, 65, 70, 77, 86, 94]
+# NIP-29 group events can be a significant share of the write load:
+max_groups = 5000           # more groups than the default 1000
+
+[limits]
+# Group chats are long-lived connections: keep them alive longer and
+# push live batches faster.
+ws_idle_timeout_secs = 900
+live_batch_interval_ms = 10
+live_batch_size = 64
+# Chat content is short but frequent; a larger send buffer absorbs
+# bursts without dropping the live queue.
+max_out_queue_bytes = 524288
+# Group membership edits reference the group's events; late publishing
+# window for moderation events arriving out of order.
+group_late_publish_secs = 3600
+# Room for many simultaneous group readers/writers per IP.
+max_connections_per_ip = 128
+
+[database]
+path = "./data"
+search_index = true         # message search inside groups (NIP-50)
+max_indexed_words = 16      # group messages are short — 16 words is plenty
+meta_index = true
+
+[server]
+host = "0.0.0.0"
+port = 8080
