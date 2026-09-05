@@ -182,6 +182,22 @@ nostrd stats
 
 Point your Nostr client at `ws://<host>:8080` (or `wss://<domain>` behind a TLS proxy).
 
+### Ready-made configurations
+
+The `examples/` directory contains validated `nostrd.toml` templates for
+specialized deployments — copy one, adjust it and `nostrd check` it:
+
+| Template | Purpose |
+| --- | --- |
+| `relay-basic.toml` | Minimal general-purpose relay |
+| `blossom-only.toml` | Blossom media server on its own hostname (local or S3) |
+| `groups-focused.toml` | NIP-29 groups + NIP-43 roles relay |
+| `chat-focused.toml` | Low-latency real-time chat relay |
+| `dm-focused.toml` | Private DM relay (NIP-17/59, search off) |
+| `private-relay.toml` | Invite-only / authenticated relay (NIP-42 + allow list) |
+| `search-focused.toml` | NIP-50 full-text search archive relay |
+| `tiny-vps.toml` | Smallest footprint for a 512 MB VPS |
+
 ## REST API
 
 nostrd exposes a **read-only HTTP API** on the same port under `/api/v1`, served by a dedicated database reader thread with its own concurrency limiter, so heavy REST traffic can never stall WebSocket subscribers.

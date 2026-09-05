@@ -1,0 +1,44 @@
+# nostrd.toml — basic relay (minimal setup)
+#
+# A plain general-purpose relay: every NIP is enabled with the built-in
+# defaults, suitable for a personal or small community relay on a regular
+# VPS. Copy this file to nostrd.toml, adjust the values, then:
+#
+#   nostrd check          # validate the configuration
+#   nostrd start          # run it (daemonizes; use --foreground to test)
+#
+# See docs/MANUAL.md for the full reference.
+
+[relay]
+name = "nostrd"
+description = "A minimal and stable Nostr relay"
+pubkey = ""                 # your public key (npub or hex), shown in NIP-11
+contact = ""                # admin contact, shown in NIP-11
+icon = ""                   # relay icon URL, shown in NIP-11
+post_policy = ""            # a NIP-01 filter to accept only matching events
+private_key = ""            # run `nostrd genkey` to generate one
+public_url = ""             # e.g. "wss://relay.example.com" behind a proxy
+enabled_nips = []           # empty = all supported NIPs are enabled
+disabled_nips = []          # disable specific NIPs, e.g. [50]
+reject_ephemeral = false    # true = drop NIP-01 ephemeral events (20000-29999)
+require_pow = 0             # required NIP-13 difficulty (0 = off)
+require_auth = false        # true = only authenticated (NIP-42) clients may publish
+
+[server]
+host = "0.0.0.0"            # listen on all interfaces
+port = 8080
+metrics_enabled = true
+
+[database]
+path = "./data"
+map_size = 1073741824       # initial LMDB map, grows up to max_map_size
+max_map_size = 1099511627776
+search_index = true         # NIP-50 word index (search works without it too)
+reader_threads = 2
+
+[daemon]
+pid_file = "./nostrd.pid"
+log_file = "./nostrd.log"
+
+[blossom]
+host = ""                   # empty = the Blossom file server is disabled

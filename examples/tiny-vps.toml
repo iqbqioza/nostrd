@@ -1,0 +1,51 @@
+# nostrd.toml — tiny VPS (512 MB RAM, minimal footprint)
+#
+# A smallest-footprint relay for a 512 MB VPS: no search index, a small
+# LMDB map, tight connection limits, and the Blossom file server
+# disabled. See docs/MANUAL.md "Memory" for the numbers behind this.
+
+[relay]
+name = "nostrd tiny"
+description = "Small personal relay"
+pubkey = ""
+private_key = ""
+public_url = "wss://tiny.example.com"
+# No search, no groups, no negentropy — the heavy NIPs are off.
+disabled_nips = [29, 43, 50, 77]
+
+[server]
+host = "0.0.0.0"
+port = 8080
+metrics_enabled = false
+
+[limits]
+max_connections = 2000
+max_connections_per_ip = 16
+max_subscriptions = 10
+max_limit = 200
+max_count = 1000
+max_ws_message_bytes = 524288
+max_out_queue_bytes = 131072
+# Keep the per-connection kernel buffers small (the kernel may double
+# the receive side): a tiny VPS cannot afford gigabytes of sockets.
+socket_recv_buffer_kb = 16
+
+[database]
+path = "./data"
+# Small LMDB map: 256 MiB is enough for a personal relay's history and
+# keeps the sparse reservation small.
+map_size = 268435456
+max_map_size = 268435456
+search_index = false
+meta_index = true
+reader_threads = 1
+max_db_queue_msgs = 1024
+max_db_queue_events = 32768
+
+[daemon]
+log_file = "./nostrd.log"
+max_log_size_bytes = 10485760
+max_log_files = 2
+
+[blossom]
+host = ""                   # Blossom disabled: no media storage on a tiny box
