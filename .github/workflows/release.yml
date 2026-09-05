@@ -48,9 +48,34 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  freebsd:
+    name: Build (nostrd-freebsd-x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          prepare: |
+            pkg install -y rust clang
+          run: |
+            cargo build --release
+            mkdir -p dist
+            cp target/release/nostrd "dist/nostrd-freebsd-x86_64"
+            chmod +x "dist/nostrd-freebsd-x86_64"
+            (cd dist && tar -czf "nostrd-freebsd-x86_64.tar.gz" "nostrd-freebsd-x86_64")
+            (cd dist && sha256 -r "nostrd-freebsd-x86_64" > "nostrd-freebsd-x86_64.sha256")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nostrd-freebsd-x86_64
+          path: dist/*
+          if-no-files-found: error
+
   release:
     name: Publish GitHub release
-    needs: build
+    needs: [build, freebsd]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -69,6 +94,9 @@ jobs:
             dist/nostrd-linux-aarch64 \
             dist/nostrd-linux-aarch64.tar.gz \
             dist/nostrd-linux-aarch64.sha256 \
+            dist/nostrd-freebsd-x86_64 \
+            dist/nostrd-freebsd-x86_64.tar.gz \
+            dist/nostrd-freebsd-x86_64.sha256 \
             --repo "$GITHUB_REPOSITORY" \
             --title "$GITHUB_REF_NAME" \
             --notes "See the commit history for changes in this release." \

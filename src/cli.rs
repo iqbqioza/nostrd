@@ -710,11 +710,10 @@ fn is_pubkey_or_npub(value: &str) -> bool {
     crate::config::is_pubkey_or_npub(value)
 }
 
-/// Checks whether a process is alive with `kill(pid, 0)`. On Linux the
-/// process name is cross-checked against `/proc/<pid>/comm` so that a stale
-/// pid file whose pid was reused by an unrelated process is not mistaken for
-/// a running relay (which would make `start` refuse and `stop` signal an
-/// innocent process).
+/// Checks whether a process is alive with `kill(pid, 0)`. The process name
+/// is cross-checked so that a stale pid file whose pid was reused by an
+/// unrelated process is not mistaken for a running relay (which would make
+/// `start` refuse and `stop` signal an innocent process).
 fn process_alive(pid: u32) -> bool {
     // SAFETY: signal 0 only probes for the existence of the process.
     let alive = {
@@ -724,12 +723,55 @@ fn process_alive(pid: u32) -> bool {
     if !alive {
         return false;
     }
-    // Best-effort name check (Linux only): a reused pid running a different
-    // program is not our daemon.
-    if let Ok(comm) = std::fs::read_to_string(format!("/proc/{pid}/comm")) {
-        return comm.trim() == "nostrd";
+    // Best-effort name check: a reused pid running a different program is
+    // not our daemon.
+    match process_name(pid) {
+        Some(name) => name == "nostrd",
+        None => true,
     }
-    true
+}
+
+/// The process name of `pid`: `/proc/<pid>/comm` on Linux, the
+/// `kern.proc.pid.<pid>.comm` sysctl on FreeBSD (both are best-effort; a
+/// platform without either returns `None` and the pid is trusted).
+#[cfg(target_os = "linux")]
+fn process_name(pid: u32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
+/// FreeBSD: the `sysctl` MIB `kern.proc.pid.<pid>.comm` returns the
+/// process name.
+#[cfg(target_os = "freebsd")]
+fn process_name(pid: u32) -> Option<String> {
+    use std::ffi::CString;
+    let mib = CString::new(format!("kern.proc.pid.{pid}.comm")).ok()?;
+    let mut buf = [0u8; 64];
+    let mut len = buf.len();
+    // SAFETY: sysctlbyname writes into the provided buffer, which stays
+    // alive for the call; the value is read back as bytes afterwards.
+    let ret = unsafe {
+        libc::sysctlbyname(
+            mib.as_ptr(),
+            buf.as_mut_ptr().cast::<libc::c_void>(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if ret != 0 {
+        return None;
+    }
+    std::str::from_utf8(&buf[..len])
+        .ok()
+        .map(|s| s.trim().to_string())
+}
+
+/// Any other platform: no name check, the pid is trusted.
+#[cfg(not(any(target_os = "linux", target_os = "freebsd")))]
+fn process_name(_pid: u32) -> Option<String> {
+    None
 }
 
 /// Waits up to 10 seconds for the daemon to exit (the pid file to disappear).

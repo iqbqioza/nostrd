@@ -57,11 +57,26 @@ else
   exit 1
 fi
 
-# --- architecture -----------------------------------------------------------
+# --- OS and architecture ---------------------------------------------------
+
+case "$(uname -s)" in
+  Linux)   OS="linux" ;;
+  FreeBSD) OS="freebsd" ;;
+  *)
+    echo "error: unsupported OS: $(uname -s)" >&2
+    echo "supported: Linux, FreeBSD" >&2
+    exit 1
+    ;;
+esac
 
 case "$(uname -m)" in
-  x86_64 | amd64)  ASSET="nostrd-linux-x86_64" ;;
-  aarch64 | arm64) ASSET="nostrd-linux-aarch64" ;;
+  x86_64 | amd64)
+    if [ "$OS" = "linux" ]; then ASSET="nostrd-linux-x86_64"; else ASSET="nostrd-freebsd-x86_64"; fi
+    ;;
+  aarch64 | arm64)
+    [ "$OS" = "linux" ] || { echo "error: FreeBSD is only packaged for x86_64" >&2; exit 1; }
+    ASSET="nostrd-linux-aarch64"
+    ;;
   *)
     echo "error: unsupported architecture: $(uname -m)" >&2
     exit 1
@@ -132,6 +147,14 @@ if command -v sha256sum >/dev/null 2>&1; then
   (cd "$tmpdir" && sha256sum -c "$ASSET.sha256" >/dev/null)
 elif command -v shasum >/dev/null 2>&1; then
   (cd "$tmpdir" && shasum -a 256 -c "$ASSET.sha256" >/dev/null)
+elif command -v sha256 >/dev/null 2>&1; then
+  # FreeBSD's sha256(1) has no -c mode: compare the digest manually.
+  actual="$(sha256 -q "$tmpdir/$ASSET")"
+  expected="$(awk '{print $1}' "$tmpdir/$ASSET.sha256")"
+  if [ -z "$expected" ] || [ "$actual" != "$expected" ]; then
+    echo "error: checksum mismatch for $ASSET" >&2
+    exit 1
+  fi
 else
   echo "warning: no sha256 verification tool found; skipping checksum check" >&2
 fi

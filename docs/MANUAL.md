@@ -70,6 +70,39 @@ cargo build --release
 
 When the build finishes, the binary is at `target/release/nostrd`.
 
+### Installing a pre-built binary
+
+The release workflow attaches pre-built binaries for **Linux x86_64**,
+**Linux aarch64** and **FreeBSD x86_64**. The same `install.sh` works on
+both OSes — it detects the platform, downloads the matching binary and
+verifies its checksum:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/iqbqioza/nostrd/main/install.sh | sh
+```
+
+#### FreeBSD
+
+nostrd builds and runs on FreeBSD (13.x and 14.x, amd64). Install Rust
+and build with:
+
+```sh
+pkg install -y rust clang
+cargo build --release
+```
+
+Platform notes:
+
+- The process-alive check used by `start`/`stop`/`restart` reads the
+  process name via the `kern.proc.pid.<pid>.comm` sysctl on FreeBSD (it
+  uses `/proc/<pid>/comm` on Linux), so a stale pid file whose pid was
+  reused by another program is detected on both platforms.
+- `daemon.mode` forks like on Linux; the standard double-fork daemon
+  works with the default `rc` integration (`service nostrd start`).
+- Blossom's `min_free_bytes` check uses `statvfs`, which both systems
+  provide; no other platform-specific code is used (the relay itself is
+  plain async Rust on top of tokio).
+
 ```bash
 ./target/release/nostrd --version
 ```
@@ -764,6 +797,13 @@ into the millions requires host-level tuning:
 | `net.ipv4.tcp_mem` / `net.ipv4.tcp_rmem` / `tcp_wmem` | tuned to the host RAM | The relay sets 16 KiB per socket direction; the kernel defaults must still cover the aggregate |
 | `net.ipv4.tcp_fin_timeout` | low (e.g. 10) | Reclaims TIME_WAIT sockets faster |
 | `vm.overcommit_memory` | 1 or 2 | The LMDB map is a large sparse virtual reservation (see `database.max_map_size`) |
+
+On FreeBSD the same knob is `sysctl kern.maxfiles` / `kern.maxfilesperproc`
+plus `ulimit -n` (the default 1024 per-process limit must be raised for
+any serious connection count), and `kern.ipc.somaxconn` replaces
+`net.core.somaxconn`. The `socket_recv_buffer_kb` setting applies like on
+Linux; note that FreeBSD does not double the requested `SO_RCVBUF`
+value, so the actual receive buffer equals the configured size.
 
 Per-connection kernel memory is ~32 KiB (16 KiB per direction, set by
 the relay) and user space ~10 KiB (the task, the connection state, the
