@@ -9,23 +9,43 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
-    name: Format, lint and test
+  fmt:
+    name: Format check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
-
-      - uses: Swatinem/rust-cache@v2
+          components: rustfmt
 
       - name: Format check
         run: cargo fmt --all -- --check
 
-      - name: Clippy (all targets, warnings denied)
+  clippy:
+    name: Clippy (all targets, warnings denied)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
+
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
 
       - name: Tests
         run: cargo test --all-targets
@@ -54,7 +74,9 @@ jobs:
             cargo test --all-targets
 
   build:
-    name: Release build
+    # Plain "Build": this is the CI compile check, not the tag-triggered
+    # release workflow (release.yml), so "Release build" was misleading.
+    name: Build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
