@@ -58,11 +58,16 @@ jobs:
         with:
           usesh: true
           # Pin a stable release: the action's default tracks FreeBSD
-          # -CURRENT, which breaks CI with unrelated upstream churn.
-          release: "14.2"
+          # -CURRENT, which breaks CI with unrelated upstream churn. The
+          # 14.x builder image predates the current pkg repository index
+          # (the pkg OS-version check fails), so use the newest stable.
+          release: "15.1"
+          # IGNORE_OSVERSION: the builder image may lag the current pkg
+          # repository index by a patch level (FreeBSD:14:amd64 mismatch);
+          # binary compatibility makes ignoring the check safe.
           prepare: |
-            pkg update -f
-            pkg install -y rust
+            env IGNORE_OSVERSION=yes pkg update -f
+            env IGNORE_OSVERSION=yes pkg install -y rust
           run: |
             cargo build --release
             mkdir -p dist
