@@ -683,7 +683,7 @@ impl Cli {
                 )));
             }
         }
-        crate::config::write_text_atomic(&self.config, &merged).map_err(|e| {
+        crate::config::write_text_atomic(&self.config, &merged, false).map_err(|e| {
             config_err(format!(
                 "cannot write {}: {e}; settings not merged",
                 self.config.display()
@@ -1506,6 +1506,11 @@ impl Cli {
     /// since `original` was snapshotted (same discipline as the config
     /// merge) instead of silently dropping the other edit.
     fn write_private_key(&self, original: &str, key: &str) -> Result<()> {
+        // The rewritten config carries the relay secret, so the write must
+        // keep the file `0600` from the moment it is published (see
+        // `write_text_atomic`): a `genkey` on a `0644` config used to leave
+        // the key world-readable between the temp file's `chmod` and the
+        // `rename` that followed it.
         let current = std::fs::read_to_string(&self.config)?;
         if current != original {
             return Err(config_err(format!(
@@ -1519,7 +1524,11 @@ impl Cli {
             "private_key",
             &format!("\"{}\"", crate::config::toml_escape(key)),
         )?;
-        crate::config::write_text_atomic(&self.config, &updated)?;
+        crate::config::write_text_atomic(&self.config, &updated, true)?;
+        // `secret = true` already publishes the file as 0600 (the temp keeps
+        // its mode across the rename), so this only covers a target that was
+        // somehow more permissive — and it must never be the step that makes
+        // the secret safe, which is why the flag above is what matters.
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&self.config, std::fs::Permissions::from_mode(0o600))?;
         Ok(())
