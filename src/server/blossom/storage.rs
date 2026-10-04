@@ -935,7 +935,11 @@ fn free_space_of(path: &std::path::Path) -> Option<u64> {
     // NUL-terminated string.
     if unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) } == 0 {
         let stat = unsafe { stat.assume_init() };
-        Some(stat.f_bavail.saturating_mul(stat.f_frsize))
+        // `statvfs` field widths differ by platform (`fsblkcnt_t` is u32 on
+        // macOS, u64 on Linux/FreeBSD; `f_frsize` is u64 on macOS): widen
+        // both losslessly so the product is computed in u64 everywhere.
+        #[allow(clippy::useless_conversion)]
+        Some(u64::from(stat.f_bavail).saturating_mul(u64::from(stat.f_frsize)))
     } else {
         None
     }
@@ -972,10 +976,16 @@ impl LocalStore {
                 .open(&canonical_root)?
         };
         let fd = std::os::fd::AsRawFd::as_raw_fd(&root_dir);
+        // The descriptor path must work as a directory *prefix*, not just
+        // exist: macOS (and FreeBSD with the default devfs) exposes
+        // `/dev/fd/N` itself, but a path below it (`/dev/fd/N/<npub>/...`)
+        // does not resolve (ENOENT), which would break every blob path.
+        // Probe `<fd path>/.` and fall back to the canonical root when it
+        // does not resolve.
         let fd_root = ["/proc/self/fd", "/dev/fd"]
             .into_iter()
             .map(|base| PathBuf::from(base).join(fd.to_string()))
-            .find(|path| path.exists());
+            .find(|path| path.join(".").exists());
         Ok(LocalStore {
             root: root.to_path_buf(),
             _root_dir: root_dir,
