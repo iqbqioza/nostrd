@@ -1755,6 +1755,112 @@ fn parent_side_adopt_requires_child_admin() {
 }
 
 #[test]
+fn one_edit_cannot_close_a_subgroup_cycle_through_its_own_new_edges() {
+    // NIP-29: "Relays MUST reject a kind:9002 whose parent value would
+    // create a cycle, including self-reference." One 9002 creates two edges
+    // in the same commit — `parent: P` links this group under P, `child: C`
+    // links C under this group — so checking the *stored* graph twice misses
+    // a cycle that only closes through those pending edges.
+    //
+    // Layout: gA is the root, gB is a child of gC, and gC is a child of gA
+    // (so gA -> gC -> gB is the stored chain). A new group gE carries
+    // `parent: gC` and `child: gA` in one event: gE.parent = gC and
+    // gA.parent = gE, which closes gA -> gC -> gE -> gA. Before the fix this
+    // was accepted and the relay published the cycle in its own 39000
+    // metadata, so every client walking the tree to a root looped forever.
+    let mut store = seeded();
+    for gid in ["g3", "g4"] {
+        let create = event(CREATE_GROUP, ADMIN, Some(gid), vec![]);
+        store.apply(&create, "", 1, false, false);
+    }
+    // gC becomes a child of gA.
+    let nest_c = event(
+        9002,
+        ADMIN,
+        Some("g3"),
+        vec![
+            vec!["parent".into(), "g1".into()],
+            vec!["child".into(), "g4".into()],
+        ],
+    );
+    assert!(store.validate_write(&nest_c).is_ok());
+    store.apply(&nest_c, "", 1, false, false);
+    // gE: parent=gC and child=gA in the same edit.
+    let create_e = event(CREATE_GROUP, ADMIN, Some("gE"), vec![]);
+    store.apply(&create_e, "", 1, false, false);
+    let cycle = event(
+        9002,
+        ADMIN,
+        Some("gE"),
+        vec![
+            vec!["parent".into(), "g3".into()],
+            vec!["child".into(), "g1".into()],
+        ],
+    );
+    assert!(
+        store.validate_write(&cycle).is_err(),
+        "an edit closing a cycle through its own new edges must be rejected"
+    );
+    // The stored graph stays a tree, and the walk terminates from any node.
+    let parent_of = |id: &str| store.group(id).and_then(|g| g.parent.clone());
+    for start in ["g1", "g3", "gE"] {
+        let mut cursor = parent_of(start);
+        let mut seen = std::collections::HashSet::new();
+        while let Some(node) = cursor {
+            assert!(
+                seen.insert(node.clone()),
+                "the parent chain from {start} must reach a root, not loop"
+            );
+            cursor = parent_of(&node);
+        }
+    }
+}
+
+#[test]
+fn a_legitimate_reparent_with_a_new_child_is_still_accepted() {
+    // The cycle check must not reject the ordinary combination: adopting an
+    // unrelated group as a child while reparenting this group elsewhere.
+    let mut store = seeded();
+    // g1 is seeded (with OTHER as a member); g2 and g3 are fresh roots.
+    for gid in ["g2", "g3"] {
+        let create = event(CREATE_GROUP, ADMIN, Some(gid), vec![]);
+        store.apply(&create, "", 1, false, false);
+    }
+    let nest_g3 = event(
+        9002,
+        ADMIN,
+        Some("g3"),
+        vec![vec!["parent".into(), "g1".into()]],
+    );
+    assert!(store.validate_write(&nest_g3).is_ok());
+    store.apply(&nest_g3, "", 1, false, false);
+    // Move g3 under g2. g3 keeps its own children and g2 gains one; no cycle.
+    let move_g3 = event(
+        9002,
+        ADMIN,
+        Some("g3"),
+        vec![vec!["parent".into(), "g2".into()]],
+    );
+    assert!(
+        store.validate_write(&move_g3).is_ok(),
+        "an acyclic reparent must be accepted: {:?}",
+        store.validate_write(&move_g3)
+    );
+    store.apply(&move_g3, "", 1, false, false);
+    assert_eq!(
+        store.group("g3").and_then(|g| g.parent.clone()).as_deref(),
+        Some("g2")
+    );
+    assert!(
+        store
+            .group("g2")
+            .unwrap()
+            .children
+            .contains(&"g3".to_string())
+    );
+}
+
+#[test]
 fn deleted_group_id_can_be_recreated() {
     // A fresh 9007 resurrects a deleted id (the tombstone blocks every
     // other write but not re-creation).

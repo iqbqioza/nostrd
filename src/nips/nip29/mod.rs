@@ -1890,15 +1890,69 @@ fn validate_edit_metadata(
     {
         bail!("restricted: a group cannot be both parent and child");
     }
-    // The declared children must not create a cycle either: walking down
-    // the children lists from the declared children must not reach this
-    // group (e.g. `parent: P` together with `child: P` on a P that has no
-    // parent would otherwise create a two-way cycle the upward walk
-    // misses).
+    // Both new edges must be checked together, against the graph as this edit
+    // will leave it. The apply arm creates, in one commit:
+    //
+    //   `parent: P`  ->  gid.parent = P          (an upward edge from gid)
+    //                    P.children += gid       (a downward edge from P)
+    //   `child: C`   ->  C.parent  = gid         (an upward edge from C)
+    //                    gid.children = [C…]    (a downward edge from gid)
+    //
+    // Two separate walks over the *stored* state cannot see a cycle that
+    // closes through one of those new edges, because the edge does not exist
+    // yet when the walk runs. Concretely, with `C.parent = G` already stored
+    // and this group unparented, an edit carrying `parent: C` and `child: G`
+    // passed both walks and published the cycle `G -> C -> G` in the
+    // relay-signed 39000 metadata, so every client walking the tree up to a
+    // root looped forever.
+    //
+    // The parent relation is functional (every group has at most one parent),
+    // so every cycle contains a node whose upward walk revisits a node. This
+    // edit only creates edges incident to `gid`, the new parent and the
+    // declared children, so walking *up* from each of those — through the
+    // pending edges rather than the stored ones — is exhaustive.
+    let declared_children: HashSet<&str> = tag_values(event, "child").collect();
+    let upcoming_parent = |node: &str| -> Option<&str> {
+        // The pending edges of this edit replace the stored ones; every other
+        // node keeps the parent the store holds.
+        if node == gid {
+            return parent_value.as_deref();
+        }
+        if declared_children.contains(node) {
+            return Some(gid);
+        }
+        store.groups.get(node).and_then(|g| g.parent.as_deref())
+    };
+    // Walk *up* from every node this edit touches. The parent relation is
+    // functional, so any cycle the edit creates contains one of them, and the
+    // walk follows the pending edges rather than the stored ones — which is
+    // what catches a cycle closing through an edge this very event adds.
+    let mut starts: Vec<&str> = vec![gid];
+    if let Some(parent) = &parent_value {
+        starts.push(parent.as_str());
+    }
+    starts.extend(tag_values(event, "child"));
+    for start in starts {
+        let mut cursor = Some(start);
+        let mut visited: HashSet<&str> = HashSet::new();
+        while let Some(current) = cursor {
+            // Revisiting a node means the parent relation loops. That is the
+            // cycle this edit would create; a pre-existing one in the stored
+            // data is reported the same way instead of being walked forever.
+            if !visited.insert(current) {
+                bail!("restricted: would create a cycle");
+            }
+            cursor = upcoming_parent(current);
+        }
+    }
+    // The declared children must not create a cycle seen from below either:
+    // walking down the children lists from a declared child must not reach
+    // this group. This is kept alongside the upward walk because it rejects
+    // declaring an *ancestor* as a child, which the upward walk cannot see
+    // when the edit carries no `parent` tag (the group is detached from its
+    // stored parent, so no upward walk from it loops). A visited set stops the
+    // walk on pre-existing cycles in the stored data instead of looping.
     for child in tag_values(event, "child") {
-        // Breadth-first walk down the children lists from the declared
-        // child; a visited set stops the walk on pre-existing cycles in
-        // the stored data instead of looping forever.
         let mut queue: Vec<&str> = vec![child];
         let mut visited: HashSet<&str> = HashSet::new();
         while let Some(current) = queue.pop() {
@@ -1908,27 +1962,18 @@ fn validate_edit_metadata(
             if !visited.insert(current) {
                 continue;
             }
-            if let Some(group) = store.groups.get(current) {
-                queue.extend(group.children.iter().map(String::as_str));
-            }
+            queue.extend(
+                store
+                    .groups
+                    .get(current)
+                    .into_iter()
+                    .flat_map(|g| g.children.iter().map(String::as_str)),
+            );
         }
     }
-    // A parent value must not create a cycle or self-reference, and the
-    // parent must exist and the author must be its admin.
+    // A parent value must name an existing group, and the author must be its
+    // admin.
     if let Some(parent) = parent_value {
-        let mut cursor = Some(parent.as_str());
-        let mut visited: HashSet<&str> = HashSet::new();
-        while let Some(current) = cursor {
-            if current == gid {
-                bail!("restricted: would create a cycle");
-            }
-            if !visited.insert(current) {
-                // A pre-existing cycle in the stored data: stop the walk
-                // instead of looping forever.
-                break;
-            }
-            cursor = store.groups.get(current).and_then(|g| g.parent.as_deref());
-        }
         let parent_group = store
             .groups
             .get(&parent)
