@@ -1861,6 +1861,65 @@ fn a_legitimate_reparent_with_a_new_child_is_still_accepted() {
 }
 
 #[test]
+fn member_tags_must_be_lowercase_hex_pubkeys() {
+    // The membership map is keyed by the `p` tag value verbatim and looked up
+    // with the event's own `pubkey`, which NIP-01 defines as lowercase hex
+    // (intake rejects anything else). A `p` value that is not lowercase
+    // 32-byte hex can therefore never match a real member: the account is
+    // locked out of its own group and the junk entry is republished in the
+    // relay-signed `39002`. Only `9000`/`9001` name members, so only those are
+    // checked.
+    assert!(is_pubkey_hex(ADMIN), "a lowercase 64-hex key is accepted");
+    assert!(
+        !is_pubkey_hex(&ADMIN.to_uppercase()),
+        "uppercase hex is not a NIP-01 pubkey"
+    );
+
+    // A `p` value that is not a pubkey must be reported for the two
+    // membership kinds.
+    for kind in [PUT_USER, REMOVE_USER] {
+        for bad in [
+            String::new(),
+            "not-a-pubkey".to_string(),
+            ADMIN[..63].to_string(), // one hex digit short
+            format!("{ADMIN}0"),     // one hex digit long
+            ADMIN.to_uppercase(),    // uppercase hex
+            "z".repeat(64),          // non-hex characters
+        ] {
+            let event = event(kind, ADMIN, Some("g1"), vec![vec![P.into(), bad.clone()]]);
+            assert_eq!(
+                malformed_member_tags(&event).collect::<Vec<_>>(),
+                vec![bad.as_str()],
+                "kind {kind} must reject the malformed member tag {bad:?}"
+            );
+        }
+    }
+
+    // A valid key is not reported.
+    let ok = event(
+        PUT_USER,
+        ADMIN,
+        Some("g1"),
+        vec![vec![P.into(), USER.into()]],
+    );
+    assert!(malformed_member_tags(&ok).next().is_none());
+
+    // Other kinds carry `p` tags for mentions, which must stay unconstrained.
+    for kind in [1, 9, 9021, CREATE_GROUP] {
+        let mention = event(
+            kind,
+            ADMIN,
+            None,
+            vec![vec![P.into(), "not-a-pubkey".into()]],
+        );
+        assert!(
+            malformed_member_tags(&mention).next().is_none(),
+            "kind {kind} does not name a group member; its p tags must not be constrained"
+        );
+    }
+}
+
+#[test]
 fn deleted_group_id_can_be_recreated() {
     // A fresh 9007 resurrects a deleted id (the tombstone blocks every
     // other write but not re-creation).

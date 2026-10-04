@@ -28,6 +28,7 @@ const NSEC_PREFIX: &[u8; 5] = b"nsec1";
 const NSEC_BODY_LEN: usize = 58;
 
 /// Outcome of the shared pre-acceptance checks.
+#[derive(Debug)]
 pub(crate) enum Precheck {
     Accept,
     Reject(String),
@@ -252,6 +253,22 @@ impl super::Relay {
             && nip29::group_id(event).is_none_or(|gid| gid.is_empty())
         {
             return Precheck::Reject("invalid: group events must carry an h tag".into());
+        }
+        // NIP-29: the `p` tags of a `9000`/`9001` name group members, and the
+        // membership map is keyed by that value verbatim. Intake rejects a
+        // non-lowercase `event.pubkey` (NIP-01), so a `p` value that is not
+        // lowercase 32-byte hex can never match a real member: the account is
+        // locked out of its own group (`restricted: only group members can
+        // post`) and the junk entry is republished in `39002`. Reject the
+        // event instead — the admin can re-send it with a valid key. Only the
+        // two kinds that mutate membership are checked; a `p` tag on an
+        // ordinary chat event is a mention.
+        if cfg.nip_enabled(29)
+            && let Some(malformed) = nip29::malformed_member_tags(event).next()
+        {
+            return Precheck::Reject(format!(
+                "invalid: member tag must be a lowercase 32-byte hex pubkey (got {malformed:?})"
+            ));
         }
         if cfg.nip_enabled(29) {
             // Group metadata events MUST be signed by the relay's own key.
@@ -1728,6 +1745,93 @@ mod tests {
         )
         .await;
         Arc::new(relay)
+    }
+
+    #[test]
+    fn a_malformed_group_member_tag_is_rejected_at_intake() {
+        // A `9000`/`9001` whose `p` tag is not a lowercase 32-byte hex pubkey
+        // must be refused at intake: the membership map is keyed by that value
+        // verbatim while `is_member` compares against the event's own
+        // (always lowercase) `pubkey`, so storing it would lock the named
+        // account out of its own group and publish the junk entry in `39002`.
+        //
+        // The helper `signed` re-signs after the tags are set, so each event
+        // here is correctly signed and reaches the group checks.
+        let good = "aa".repeat(32);
+        let put_user = |value: &str| {
+            signed(
+                9000,
+                vec![
+                    vec!["h".into(), "g1".into()],
+                    vec!["p".into(), value.into(), "member".into()],
+                ],
+            )
+        };
+
+        // A well-formed key is not reported.
+        assert!(
+            crate::nips::nip29::malformed_member_tags(&put_user(&good))
+                .next()
+                .is_none(),
+            "a lowercase 32-byte hex member tag must pass"
+        );
+        // Uppercase hex would be stored verbatim and could never match the
+        // member's own (lowercase) `pubkey`.
+        let uppercase = put_user(&good.to_uppercase());
+        assert!(
+            crate::nips::nip29::malformed_member_tags(&uppercase)
+                .next()
+                .is_some(),
+            "uppercase hex must be reported as malformed"
+        );
+        // A junk value would become a member nobody can ever hold.
+        let junk = put_user("not-a-pubkey");
+        assert!(
+            crate::nips::nip29::malformed_member_tags(&junk)
+                .next()
+                .is_some(),
+            "a junk member tag must be reported as malformed"
+        );
+
+        // End-to-end through `precheck`: the rejection carries the spec's
+        // `invalid:` prefix and is not confused with another failure.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_validate_relay("nostrfy-validate-member-tag-test").await;
+            let cfg = relay.config.read().await;
+            let access = AccessControl::default();
+            let now = unix_now();
+            let out = relay
+                .precheck(&cfg, &access, &uppercase, now, &[], None, None)
+                .await;
+            assert!(
+                matches!(&out, super::Precheck::Reject(m)
+                    if m.starts_with("invalid:") && m.contains("32-byte hex pubkey")),
+                "an uppercase member tag must be rejected at intake: {out:?}"
+            );
+            let out = relay
+                .precheck(&cfg, &access, &junk, now, &[], None, None)
+                .await;
+            assert!(
+                matches!(&out, super::Precheck::Reject(m)
+                    if m.starts_with("invalid:") && m.contains("32-byte hex pubkey")),
+                "a junk member tag must be rejected at intake: {out:?}"
+            );
+
+            // An ordinary event's `p` tag is a mention, not a member key, and
+            // must keep passing.
+            let mention = signed(1, vec![vec!["p".into(), "not-a-pubkey".into()]]);
+            let out = relay
+                .precheck(&cfg, &access, &mention, now, &[], None, None)
+                .await;
+            assert!(
+                !matches!(&out, super::Precheck::Reject(m) if m.contains("32-byte hex pubkey")),
+                "a mention must not be constrained: {out:?}"
+            );
+
+            drop(cfg);
+            relay.db.shutdown();
+        });
     }
 
     #[test]
