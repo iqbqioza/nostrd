@@ -405,8 +405,20 @@ impl super::Relay {
     /// with an add-user event (NIP-43 SHOULD + MAY). Returns false only
     /// when NIP-43 is disabled or the relay key is missing (the caller
     /// reports a retryable error instead of a false welcome).
-    pub(crate) async fn admit_member(&self, pubkey: &str) -> bool {
-        if !self.config.read().await.nip_enabled(43) || self.key.is_none() {
+    ///
+    /// `nip43_enabled` is passed in instead of read from `self.config`
+    /// here. The batched accept path held a `config` read guard across this
+    /// call, and `tokio::sync::RwLock` is write-preferring: a nested
+    /// `config.read()` queued behind a pending config writer (the SIGHUP
+    /// reload task, the NIP-86 config methods) while that writer waited for
+    /// the guard the same task already held — a permanent deadlock that
+    /// wedged every later config reader, i.e. the whole relay (NIP-11, the
+    /// WebSocket upgrade, NIP-86 and any further reload all hung; only
+    /// `kill -9` recovered). Taking the flag from the caller's snapshot
+    /// removes the re-entrancy entirely and keeps the decision consistent
+    /// with the `precheck` that produced it.
+    pub(crate) async fn admit_member(&self, pubkey: &str, nip43_enabled: bool) -> bool {
+        if !nip43_enabled || self.key.is_none() {
             return false;
         }
         let added = self
