@@ -483,6 +483,151 @@ fn deletion_by_address_and_author() {
 }
 
 #[test]
+fn the_replaceable_range_end_bounds_one_address() {
+    // `replaceable_key` is `kind(8) || pubkey(32) || dlen(4) || d` and LMDB
+    // compares keys bytewise. An upper bound built from `kind + 1` therefore
+    // leaves every slot of the same kind written by a *higher* pubkey inside
+    // `[start, end)`: the first 8 bytes equal `start`, and the rest sorts
+    // below `(kind + 1)`. The NIP-09 address walk used that bound, so one
+    // `a`-tag deletion scanned the whole kind — a write transaction plus
+    // fsync per 4096 entries on the single writer thread — for an address
+    // that owned nothing.
+    use crate::db::store::{replaceable_key, replaceable_key_range_end};
+    let low = [0x11u8; 32];
+    let high = [0xffu8; 32];
+    let start = replaceable_key(30023, &low, "");
+    let end = replaceable_key_range_end(30023, &low);
+
+    // Every `d` tag of the same (kind, pubkey) is inside the range.
+    for d in ["", "a", "a-longer-identifier", "with/slashes"] {
+        let key = replaceable_key(30023, &low, d);
+        assert!(
+            key >= start && key < end,
+            "the address's own d tag {d:?} must be inside the range"
+        );
+    }
+    // A higher pubkey of the same kind is outside — this is what the old
+    // bound let through.
+    for d in ["", "a", "a-longer-identifier"] {
+        let key = replaceable_key(30023, &high, d);
+        assert!(
+            key >= end,
+            "a higher pubkey of the same kind must be outside the range (d={d:?})"
+        );
+    }
+    // Another kind is outside too.
+    assert!(replaceable_key(30024, &low, "") >= end);
+    assert!(replaceable_key(30022, &low, "") < start);
+}
+
+#[test]
+fn an_address_deletion_does_not_walk_other_authors_of_that_kind() {
+    // End-to-end: a deletion for an address nobody wrote must not touch the
+    // slots other authors hold under the same kind, and must still remove the
+    // owner's own versions.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        // `ff..` sorts above the `00..` author whose address is deleted, so
+        // the old `kind + 1` bound swept it up.
+        let mut other = event(30023, "other", now, vec![vec!["d".into(), "post-1".into()]]);
+        other.pubkey = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".into();
+        other.id = nip01::compute_id(&other);
+        let owner = event(30023, "mine", now, vec![vec!["d".into(), "post-1".into()]]);
+        let author =
+            String::from("0000000000000000000000000000000000000000000000000000000000000000");
+        let mut owned = owner.clone();
+        owned.pubkey = author.clone();
+        owned.id = nip01::compute_id(&owned);
+
+        assert_eq!(db.put(other.clone(), now).await, PutOutcome::Stored);
+        assert_eq!(db.put(owned.clone(), now).await, PutOutcome::Stored);
+
+        let address = crate::nips::nip09::Address {
+            kind: 30023,
+            pubkey: author.clone(),
+            d: "post-1".into(),
+        };
+        assert_eq!(
+            db.apply_deletion(vec![], vec![address], Some(author), u64::MAX)
+                .await,
+            1,
+            "the owner's own version must be removed"
+        );
+
+        let f: Filter = serde_json::from_value(serde_json::json!({"kinds": [30023]})).unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 1, "only the owner's version is deleted");
+        assert_eq!(
+            res[0].id, other.id,
+            "the other author's event of the same kind must survive"
+        );
+    });
+}
+
+#[test]
+fn an_address_deletion_scans_only_its_own_slots() {
+    // The defect is cost, not correctness: the walk skipped foreign slots with
+    // a key guard, so a deletion still returned the right answer while
+    // iterating (and fsyncing a chunk for) every slot of that kind written by
+    // a higher pubkey. `removal_scanned` counts what the walk actually
+    // touched, which is the only observable difference.
+    let (db, faults) = open_with_faults(&config());
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let author =
+            String::from("1111111111111111111111111111111111111111111111111111111111111111");
+        // 200 versions of one address would need 200 chunks; a handful of
+        // foreign slots is enough to show the range is not bounded.
+        let mut foreign = Vec::new();
+        for i in 0..8u8 {
+            let mut e = event(30023, "x", now, vec![vec!["d".into(), "post-1".into()]]);
+            // `ff..` sorts above the author under test.
+            e.pubkey = format!("ff{i:02x}").to_string().repeat(32)[..64].to_string();
+            e.id = nip01::compute_id(&e);
+            foreign.push(e);
+        }
+        let mut mine = event(30023, "mine", now, vec![vec!["d".into(), "post-1".into()]]);
+        mine.pubkey = author.clone();
+        mine.id = nip01::compute_id(&mine);
+        for e in foreign.iter().chain(std::iter::once(&mine)) {
+            db.put(e.clone(), now).await;
+        }
+
+        let scanned = Arc::clone(&faults.removal_scanned);
+        scanned.store(0, std::sync::atomic::Ordering::SeqCst);
+        let address = crate::nips::nip09::Address {
+            kind: 30023,
+            pubkey: author.clone(),
+            d: "post-1".into(),
+        };
+        assert_eq!(
+            db.apply_deletion(vec![], vec![address], Some(author), u64::MAX)
+                .await,
+            1,
+            "the owner's own version must be removed"
+        );
+        let touched = scanned.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            touched <= 2,
+            "the walk must stay inside the deleted address's own slots, but it iterated \
+             {touched} slots of the whole kind (8 belong to other authors)"
+        );
+    });
+}
+
+#[test]
 fn deleted_address_rejects_older_republication() {
     // NIP-09: an `a`-tag deletion must stop the relay from publishing older
     // versions of the address afterwards ("stop publishing any referenced
@@ -7319,6 +7464,9 @@ struct Faults {
     /// Shared removal-chunk countdown (`1` fails before the first chunk,
     /// `2` after the first committed one).
     chunk_after: Arc<std::sync::atomic::AtomicUsize>,
+    /// Slots the removal walks iterated, so a test can assert that a walk
+    /// stayed inside the range it was supposed to cover.
+    removal_scanned: Arc<std::sync::atomic::AtomicU64>,
 }
 
 /// Opens a store and a client over it, returning the fault handles: the
@@ -7332,6 +7480,7 @@ fn open_with_faults(cfg: &DatabaseConfig) -> (DbClient, Faults) {
         commit: Arc::clone(&store.fail_next_commit),
         disk_full: Arc::clone(&store.disk_full_override),
         chunk_after: Arc::clone(&store.fail_chunk_after),
+        removal_scanned: Arc::clone(&store.removal_scanned),
     };
     let db = DbClient::open_with_store(
         cfg,
