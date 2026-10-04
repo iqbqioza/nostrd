@@ -2176,7 +2176,7 @@ impl Relay {
                         return false;
                     }
                 };
-                if let Err(e) = crate::config::write_text_atomic(&path, &updated) {
+                if let Err(e) = crate::config::write_text_atomic(&path, &updated, false) {
                     log::warn!(
                         "cannot persist relay.{field} to {}: {e}; the change applies \
                          until the next config reload",
