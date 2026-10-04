@@ -97,6 +97,35 @@ pub struct Stats {
     pub db_table_delete_pending: AtomicU64,
 }
 
+/// Keys [`Stats::as_public_json`] withholds from `/relay/stats`: the host's
+/// storage capacity, the failure-mode counters that say when the relay starts
+/// refusing work, and the per-reason connection-refusal breakdown (which
+/// reveals which anti-abuse limits are active). They stay in the
+/// `stats_file` snapshot — what `nostrfy stats` prints — and in `/metrics`.
+///
+/// `db_size_bytes` deliberately stays public: the relay's own data volume is
+/// not a capacity oracle once `db_free_bytes` is gone, and
+/// `TROUBLESHOOTING.md` documents `curl /relay/stats` as the way to read it.
+/// `db_free_bytes` and `db_disk_full` are the pair that matters — how much
+/// room the host has left, and exactly when writes start being refused.
+///
+/// This narrows one of the two surfaces, not all of them: `/metrics` is also
+/// unauthenticated and carries a wildcard `Access-Control-Allow-Origin`, so it
+/// still publishes `db_free_bytes` and `db_disk_full` as
+/// `nostrfy_db_free_bytes` / `nostrfy_db_disk_full`. An operator who needs the
+/// capacity oracle actually hidden must isolate `/metrics` — `api_host` puts
+/// it on its own hostname, or the reverse proxy in front of it must not
+/// expose the path. This const is deliberately not the only place the keys
+/// are dropped, so nothing here should be read as "the oracle is private".
+const PRIVATE_STATS_KEYS: &[&str] = &[
+    "db_free_bytes",
+    "db_disk_full",
+    "db_errors",
+    "accept_errors",
+    "rebuild_failures",
+    "log_errors",
+    "connection_refusals",
+];
 impl Stats {
     pub fn new() -> Arc<Stats> {
         let stats = Stats::default();
@@ -114,6 +143,34 @@ impl Stats {
         } else {
             counter.fetch_add(delta, Ordering::Relaxed);
         }
+    }
+
+    /// The snapshot served on `/relay/stats`: [`Self::as_json`] without the
+    /// keys in [`PRIVATE_STATS_KEYS`].
+    ///
+    /// The relay serves a decoy page on `/` so a plain probe (browser, curl,
+    /// scanner) learns nothing, and `/relay/stats` — same origin, no token,
+    /// wildcard `Access-Control-Allow-Origin` so any page can read it
+    /// cross-origin — answered every such probe with the full snapshot,
+    /// including the host's exact free disk space. With `db_disk_full` that
+    /// says both how much room is left and exactly when writes start being
+    /// refused, and the failure counters say when the relay is already
+    /// degrading. The counters that remain are throughput and gauges an
+    /// operator's dashboard needs and that grant no leverage.
+    ///
+    /// The withheld keys stay in the `stats_file` snapshot and therefore in
+    /// `nostrfy stats`, so nothing is lost to the operator, and they remain in
+    /// `/metrics` for the Prometheus scraper — which is itself unauthenticated,
+    /// so this narrows the exposure without closing it (see
+    /// [`PRIVATE_STATS_KEYS`]).
+    pub fn as_public_json(&self) -> Value {
+        let mut value = self.as_json();
+        if let Some(object) = value.as_object_mut() {
+            for key in PRIVATE_STATS_KEYS {
+                object.remove(*key);
+            }
+        }
+        value
     }
 
     pub fn as_json(&self) -> Value {
@@ -523,6 +580,88 @@ mod tests {
         assert!(
             written_at >= before && written_at <= unix_now(),
             "written_at must be the snapshot time (got {written_at})"
+        );
+    }
+
+    #[test]
+    fn the_public_snapshot_withholds_the_storage_and_failure_oracles() {
+        // `/relay/stats` is unauthenticated, sits on the same origin as the
+        // decoy site and carries a wildcard CORS policy, so every page on the
+        // web could read it. `db_free_bytes` is the host's exact free disk
+        // space and the failure counters say when writes start being refused
+        // — a storage-capacity and timing oracle with real leverage, served to
+        // anonymous probes on a relay whose whole point is that a plain probe
+        // learns nothing. (`/metrics` still serves these unauthenticated; this
+        // pins the narrower endpoint only.)
+        let stats = Stats::new();
+        stats.db_free_bytes.store(4242, Ordering::Relaxed);
+        stats.db_size_bytes.store(1024, Ordering::Relaxed);
+        stats.db_disk_full.store(1, Ordering::Relaxed);
+        stats.db_errors.store(2, Ordering::Relaxed);
+        stats.accept_errors.store(3, Ordering::Relaxed);
+        stats.rebuild_failures.store(4, Ordering::Relaxed);
+        stats.conn_refused_blocked.store(6, Ordering::Relaxed);
+
+        let public = stats.as_public_json();
+        // The list is spelled out here rather than read from the const, so
+        // emptying or shrinking the const fails the test instead of making it
+        // vacuous.
+        for key in [
+            "db_free_bytes",
+            "db_disk_full",
+            "db_errors",
+            "accept_errors",
+            "rebuild_failures",
+            "log_errors",
+            "connection_refusals",
+        ] {
+            assert!(
+                public.get(key).is_none(),
+                "{key} must not be served on the unauthenticated /relay/stats"
+            );
+        }
+        // Every withheld name must exist in the snapshot, so a typo in the
+        // const cannot make the removal a silent no-op.
+        let full = stats.as_json();
+        for key in PRIVATE_STATS_KEYS {
+            assert!(
+                full.get(*key).is_some(),
+                "{key} is withheld but not in the snapshot, so the const has a typo"
+            );
+        }
+        // The operator's view is unchanged: the stats file snapshot (what
+        // `nostrfy stats` prints) and `/metrics` still carry them.
+        for key in PRIVATE_STATS_KEYS {
+            assert!(
+                full.get(*key).is_some(),
+                "{key} must stay in the stats file snapshot and /metrics"
+            );
+        }
+        assert_eq!(
+            full.get("db_free_bytes").and_then(Value::as_u64),
+            Some(4242),
+            "the withheld value must survive verbatim for the operator"
+        );
+        // Throughput and gauges an operator dashboard needs are still public.
+        stats.bump(&stats.events_accepted, 9);
+        let public = stats.as_public_json();
+        assert_eq!(
+            public.get("events").and_then(|e| e.get("accepted")),
+            Some(&json!(9)),
+            "the accepted-event counter must stay public"
+        );
+        assert_eq!(
+            public.get("uptime_secs").and_then(Value::as_u64),
+            Some(0),
+            "the uptime gauge must stay public"
+        );
+        // `db_size_bytes` is the relay's own volume, not a capacity oracle
+        // once `db_free_bytes` is gone, and TROUBLESHOOTING.md documents
+        // `curl /relay/stats` as the way to read it.
+        assert_eq!(
+            public.get("db_size_bytes").and_then(Value::as_u64),
+            Some(1024),
+            "the database size must stay public for the documented workflow"
         );
     }
 

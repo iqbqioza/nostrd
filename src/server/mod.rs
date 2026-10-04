@@ -3837,6 +3837,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_stats_endpoint_withholds_the_storage_oracle() {
+        // `/relay/stats` needs no token and the router adds a wildcard
+        // `Access-Control-Allow-Origin`, so any web page can read it
+        // cross-origin. It must answer the public subset, not the snapshot
+        // the stats file gets: publishing the host's free disk space and the
+        // disk-full flag next to the decoy site hands an anonymous prober a
+        // storage-capacity oracle. Pinned on the handler so the route cannot
+        // quietly go back to the full snapshot.
+        let relay = blossom_relay().await;
+        use std::sync::atomic::Ordering;
+        relay
+            .stats
+            .db_free_bytes
+            .store(987_654_321, Ordering::Relaxed);
+        relay.stats.db_size_bytes.store(4096, Ordering::Relaxed);
+        relay.stats.db_disk_full.store(1, Ordering::Relaxed);
+        let body = stats_handler(State(relay.clone())).await.0;
+        for key in ["db_free_bytes", "db_disk_full"] {
+            assert!(
+                body.get(key).is_none(),
+                "{key} must not be served on the unauthenticated /relay/stats"
+            );
+        }
+        assert!(
+            body.get("events").and_then(|e| e.get("accepted")).is_some(),
+            "the ordinary counters must still be served"
+        );
+        // The operator's snapshot keeps them.
+        let full = relay.stats.as_json();
+        assert_eq!(
+            full.get("db_free_bytes")
+                .and_then(serde_json::Value::as_u64),
+            Some(987_654_321),
+            "the stats file snapshot must keep the storage oracle"
+        );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn termination_wait_pends_without_registered_signals() {
         // A failed signal registration must leave the handler waiting for
         // the shutdown watch instead of returning (which the supervisor

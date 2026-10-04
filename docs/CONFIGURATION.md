@@ -448,7 +448,11 @@ Set this whenever a reverse proxy (nginx, Caddy, a cloud load balancer, Cloudfla
 
 **`log_file`** — Where the daemon writes its log. Rotated when it grows past `max_log_size_bytes`.
 
-**`stats_file`** — Where live statistics are written (atomically, via temp-file + rename) every `stats_interval_secs` seconds. Read by `nostrfy stats`; the same data is served at `/relay/stats`. Every snapshot carries a `written_at` Unix timestamp: `nostrfy stats` refuses to print a snapshot older than 3× `stats_interval_secs` (or whose daemon is no longer running) and exits nonzero instead of presenting stale counters as live.
+**`stats_file`** — Where live statistics are written (atomically, via temp-file + rename) every `stats_interval_secs` seconds. Read by `nostrfy stats`; a public subset of the same data is served at `/relay/stats`. Every snapshot carries a `written_at` Unix timestamp: `nostrfy stats` refuses to print a snapshot older than 3× `stats_interval_secs` (or whose daemon is no longer running) and exits nonzero instead of presenting stale counters as live.
+
+`/relay/stats` needs no token and the server answers with a wildcard `Access-Control-Allow-Origin`, so any web page can read it cross-origin; it therefore withholds the host's free disk space (`db_free_bytes`, `db_disk_full`), the failure counters (`db_errors`, `accept_errors`, `rebuild_failures`, `log_errors`) and the per-reason connection-refusal breakdown (`connection_refusals`), which together are a storage-capacity and timing oracle for an anonymous prober. Those keys are in the stats file (so `nostrfy stats` prints them) and in `/metrics`.
+
+> **`/metrics` is unauthenticated too** and answers with the same wildcard CORS header, so it still publishes `nostrfy_db_free_bytes` / `nostrfy_db_disk_full` to anyone who can reach it. Narrowing `/relay/stats` does not hide the oracle on its own. If it must stay private, isolate `/metrics`: set `api_host` so it is served on its own hostname, or have the reverse proxy in front of the relay not expose the path.
 
 **`stats_interval_secs`** — How often the statistics file is refreshed (must be ≥ 1; `0` is rejected at startup, not silently clamped). `nostrfy stats` uses three times this value as its staleness threshold.
 
