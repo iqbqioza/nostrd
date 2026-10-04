@@ -58,7 +58,10 @@ fn subtract_counter(counter: &std::sync::atomic::AtomicUsize, value: usize) {
     if value == 0 {
         return;
     }
-    let _ = counter.fetch_update(
+    // `try_update` is the current name of this CAS helper; `fetch_update` was
+    // deprecated in favour of it (rustc 1.98), so the old spelling no longer
+    // compiles under the CI toolchain's `-D warnings`.
+    let _ = counter.try_update(
         std::sync::atomic::Ordering::Relaxed,
         std::sync::atomic::Ordering::Relaxed,
         |current| Some(current.saturating_sub(value)),

@@ -2240,9 +2240,14 @@ impl Relay {
                 // the admission itself: the code is the authorization).
                 // The event pubkey was signature-verified before the
                 // precheck, so it names the joiner.
+                //
+                // The NIP-43 flag is taken from the snapshot *before* the
+                // guards are dropped: `admit_member` must not re-acquire the
+                // config lock (see the comment on `admit_member`).
+                let nip43_enabled = cfg.nip_enabled(43);
                 drop(cfg);
                 drop(access);
-                if !self.admit_member(&event.pubkey).await {
+                if !self.admit_member(&event.pubkey, nip43_enabled).await {
                     // NIP-43 is disabled or the relay key is missing: the
                     // membership was not recorded, so a welcome would lie.
                     self.stats.bump(&self.stats.events_rejected, 1);
@@ -2343,13 +2348,24 @@ impl Relay {
         // One allocation shared by the database write and the live
         // broadcast: the event content is never deep-copied on this path.
         let event = Arc::new(event);
+        // The last reads of both guards, taken *before* the write so they
+        // can be released before it: `after_put` receives these flags
+        // instead of re-reading the config, and nothing below needs `access`.
+        // The call below commits (and fsyncs) inside it, so holding a
+        // `config`/`access` read guard across it kept every queued writer —
+        // the SIGHUP reload task, a NIP-86 access command — waiting for one
+        // disk flush per event. The batched fast path already released its
+        // guards before `PendingBatch::finish` awaited the commit; doing the
+        // same here keeps the singleton path (which every state-mutating
+        // kind now takes) from paying that cost once per event.
+        let (nip9, nip43, nip29_enabled) =
+            (cfg.nip_enabled(9), cfg.nip_enabled(43), cfg.nip_enabled(29));
+        drop(cfg);
+        drop(access);
         let outcome = self
             .db
             .put_with_first_seen(Arc::clone(&event), now, first_seen)
             .await;
-        let (nip9, nip43, nip29_enabled) =
-            (cfg.nip_enabled(9), cfg.nip_enabled(43), cfg.nip_enabled(29));
-        drop(access);
 
         let accepted = matches!(
             outcome,
@@ -2358,7 +2374,6 @@ impl Relay {
         if !accepted {
             self.publish_rate_rollback(&event.pubkey, now);
         }
-        drop(cfg);
         match outcome {
             PutOutcome::Stored | PutOutcome::Replaced | PutOutcome::Ephemeral => {
                 match self.after_put(event, now, nip9, nip43, nip29_enabled).await {
@@ -2520,6 +2535,17 @@ impl Relay {
             || event.kind == nip29::JOIN
             || event.kind == nip29::LEAVE
             || event.kind == nip43::LEAVE
+            // A NIP-43 join admitted by invite code mutates the membership
+            // (`admit_member`), exactly like the leave above — so it must be
+            // split out of the batched fast path like every other
+            // state-mutating event. Leaving it in `accept_batch_non_group`
+            // ran the admission inline while that function held the `config`
+            // read guard across `.await`, and `admit_member` read the same
+            // lock again: a permanent deadlock against a queued config
+            // writer. `accept_event_verified` is the safe route — it drops
+            // its guards before admitting, exactly like the vanish branch
+            // below.
+            || event.kind == nip43::JOIN
             || nip62::is_vanish(event)
             || (event.kind == 1 && self.relay_pubkey.as_deref() == Some(event.pubkey.as_str()))
     }
@@ -2704,7 +2730,21 @@ impl Relay {
                     // single-event path above) and acknowledge without
                     // storing the ephemeral request (welcome text rides
                     // the duplicate-style ack).
-                    if !self.admit_member(&event.pubkey).await {
+                    //
+                    // Unreachable today: `Precheck::Admit` is only produced
+                    // for `nip43::JOIN`, and `has_state_effects` lists that
+                    // kind, so a batch carrying a join is split and handled
+                    // by `accept_event_verified` above. Kept as a defensive
+                    // fallback so that dropping the kind from
+                    // `has_state_effects` later cannot silently reintroduce
+                    // the deadlock this path caused — the flag comes from
+                    // the held snapshot precisely because `cfg` and `access`
+                    // are held across the call and `admit_member` must not
+                    // re-acquire the config lock (see `admit_member`).
+                    // Should it ever be reached, the cost is a stall, not a
+                    // deadlock: the admission's two database commits would
+                    // run under both read guards.
+                    if !self.admit_member(&event.pubkey, cfg.nip_enabled(43)).await {
                         self.stats.bump(&self.stats.events_rejected, 1);
                         results.push((
                             id,
@@ -3845,6 +3885,16 @@ mod tests {
     }
 
     async fn build_relay_cfg(disable_fsync: bool) -> std::sync::Arc<Relay> {
+        build_relay_with_key(disable_fsync, "").await
+    }
+
+    /// Same as [`build_relay_cfg`] but with `relay.private_key` set, for the
+    /// paths that need the relay to sign its own snapshots (NIP-29 metadata,
+    /// the NIP-43 membership list).
+    async fn build_relay_with_key(
+        disable_fsync: bool,
+        private_key_hex: &str,
+    ) -> std::sync::Arc<Relay> {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = std::env::temp_dir()
@@ -3856,6 +3906,7 @@ mod tests {
         cfg.database.map_size = 16 * 1024 * 1024;
         cfg.database.max_map_size = 64 * 1024 * 1024;
         cfg.database.disabled_fsync = disable_fsync;
+        cfg.relay.private_key = private_key_hex.to_string();
         let db = crate::db::DbClient::open(
             &cfg.database,
             true,
@@ -3872,7 +3923,7 @@ mod tests {
             config,
             db,
             stats,
-            "",
+            private_key_hex,
             crate::relay::LiveBusConfig {
                 buffer: 1024,
                 batch_interval_ms: 10,
@@ -6825,6 +6876,142 @@ mod tests {
             assert!(
                 relay.has_state_effects(&leave),
                 "a NIP-43 LEAVE mutates role state and must order in batches"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn has_state_effects_includes_nip43_join() {
+        // Regression: a NIP-43 join admitted by invite code mutates the
+        // membership, so it must be ordered in batches like the leave. When
+        // it was missing, a batch carrying a join took the batched fast path
+        // and deadlocked the relay (see
+        // `a_join_batched_with_a_config_reload_completes`).
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay().await;
+            let join = crate::event::Event {
+                id: String::new(),
+                pubkey: "aa".repeat(32),
+                created_at: crate::util::unix_now(),
+                kind: crate::nips::nip43::JOIN,
+                tags: Vec::new(),
+                content: String::new(),
+                sig: String::new(),
+            };
+            assert!(
+                relay.has_state_effects(&join),
+                "a NIP-43 JOIN mutates role state and must order in batches"
+            );
+            // A plain note still takes the batched fast path, or the split
+            // above would cost every ordinary event its batched commit.
+            let note = crate::event::Event {
+                kind: 1,
+                ..join.clone()
+            };
+            assert!(
+                !relay.has_state_effects(&note),
+                "an ordinary note must keep the batched fast path"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn a_join_batched_with_a_config_reload_completes() {
+        // Regression: `accept_batch_non_group` held the config read guard
+        // across the admission, and the admission re-read the same lock. With
+        // a config writer queued (a SIGHUP reload) tokio's write-preferring
+        // RwLock deadlocked: every later config reader queued behind the stuck
+        // writer, so NIP-11, the WebSocket upgrade, NIP-86 and further reloads
+        // all hung and only `kill -9` recovered. The timeout turns a
+        // regression into a failure instead of a hung test.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            use crate::db::PutOutcome;
+            use std::sync::atomic::Ordering;
+
+            let relay = build_relay_with_key(false, &hex::encode([21u8; 32])).await;
+            // The relay signs the membership snapshot, so the join can only
+            // be admitted with a relay key configured.
+            let secret = secp256k1::SecretKey::from_slice(&[21u8; 32]).unwrap();
+            let keypair = secp256k1::Keypair::from_seckey_slice(relay.secp(), &secret.secret_bytes())
+                .unwrap();
+            let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
+                .0
+                .to_string();
+            relay.roles.write().await.add_claim("JOINCODE");
+            let now = crate::util::unix_now();
+            // Plain signed events: a NIP-43 join carries no `h` tag, and an
+            // `h`-tagged note would be rejected as an unknown group.
+            let signed = |kind: u64, tags: Vec<Vec<String>>| {
+                let mut e = crate::event::Event {
+                    id: String::new(),
+                    pubkey: pubkey.clone(),
+                    created_at: now,
+                    kind,
+                    tags,
+                    content: String::new(),
+                    sig: String::new(),
+                };
+                e.id = crate::nips::nip01::compute_id(&e);
+                let id = e.id_bytes().unwrap();
+                e.sig = relay
+                    .secp()
+                    .sign_schnorr_no_aux_rand(&id, &keypair)
+                    .to_string();
+                e
+            };
+            let join = signed(
+                crate::nips::nip43::JOIN,
+                vec![vec!["claim".into(), "JOINCODE".into()]],
+            );
+            let filler = signed(1, vec![vec!["d".into(), "filler".into()]]);
+
+            // A config writer hammering the same lock, like the SIGHUP reload.
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stop_writer = stop.clone();
+            let writer_relay = relay.clone();
+            let writer = tokio::spawn(async move {
+                while !stop_writer.load(Ordering::Relaxed) {
+                    {
+                        let _cfg = writer_relay.config.write().await;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            });
+
+            let outcomes = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                relay.accept_events_batch(vec![join.clone(), filler], &[]),
+            )
+            .await
+            .expect("a join batched with other events must not deadlock against a config writer");
+            stop.store(true, Ordering::Relaxed);
+            let _ = writer.await;
+
+            // Replies stay in receive order: the join's own slot, then the note.
+            assert_eq!(outcomes.len(), 2, "one outcome per event: {outcomes:?}");
+            assert_eq!(outcomes[0].0, join.id, "the join keeps its own slot");
+            assert!(
+                matches!(&outcomes[0].1, PutOutcome::Duplicate(msg) if msg == "info: welcome to this relay!"),
+                "the join must be admitted by its invite code: {:?}",
+                outcomes[0].1
+            );
+            assert!(
+                matches!(outcomes[1].1, PutOutcome::Stored),
+                "the note in the same batch must still store: {:?}",
+                outcomes[1].1
+            );
+            assert!(
+                relay.roles.read().await.is_member_of(&pubkey),
+                "the batched join must record the membership"
+            );
+            assert_eq!(
+                relay.stats.events_duplicate.load(Ordering::Relaxed),
+                1,
+                "the admitted join counts exactly like the single-event path"
             );
             relay.db.shutdown();
         });
