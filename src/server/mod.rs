@@ -4,6 +4,7 @@
 
 mod api;
 pub(crate) mod blossom;
+mod landing;
 mod livekit;
 
 use std::path::{Path, PathBuf};
@@ -326,6 +327,22 @@ async fn build_router(
     let cfg = relay.config.read().await;
     if cfg.server.metrics_enabled {
         app = app.route("/metrics", get(metrics_handler));
+    }
+    // Static files for the operator landing page. The directory is fixed at
+    // startup (the route exists only when it is configured); the files in
+    // it are read per request so they can be regenerated in place.
+    if !cfg.server.assets_dir.trim().is_empty() {
+        let dir = PathBuf::from(cfg.server.assets_dir.trim());
+        app = app.route(
+            "/assets/{name}",
+            get(
+                move |axum::extract::Path(name): axum::extract::Path<String>| {
+                    let dir = dir.clone();
+                    async move { landing::asset_response(&dir, &name).await }
+                },
+            )
+            .layer(axum::middleware::from_fn(reject_ws_upgrade)),
+        );
     }
     if cfg.nip_enabled(29)
         && !cfg.relay.livekit_url.trim().is_empty()
@@ -1164,6 +1181,19 @@ async fn blossom_root_info(
 /// when the client asked for it.
 async fn nip11_doc(relay: Arc<Relay>, wants_nostr_json: bool) -> Response {
     if !wants_nostr_json {
+        // An operator-supplied landing page replaces the decoy when one is
+        // configured and servable; any failure to serve it falls back to
+        // the decoy (never to the relay document), so a broken path does
+        // not reveal more than the default.
+        let landing = relay.config.read().await.server.landing_page_file.clone();
+        if !landing.trim().is_empty() {
+            let path = std::path::PathBuf::from(landing.trim());
+            if let Ok(Some(body)) =
+                tokio::task::spawn_blocking(move || landing::landing_page(&path)).await
+            {
+                return landing::landing_response(body);
+            }
+        }
         // No Nostr media type requested: answer with the built-in decoy
         // page instead of the relay document, so a plain probe (browser,
         // curl, scanner) sees an ordinary placeholder site and learns
@@ -2228,6 +2258,10 @@ async fn apply_reloaded_config(
             "server.api_host",
             old.server.api_host != new_config.server.api_host,
         ),
+        (
+            "server.assets_dir",
+            old.server.assets_dir != new_config.server.assets_dir,
+        ),
         ("server.host", old.server.host != new_config.server.host),
         ("server.port", old.server.port != new_config.server.port),
         (
@@ -2464,6 +2498,7 @@ async fn apply_reloaded_config(
     new_config.server.host = old.server.host.clone();
     new_config.server.port = old.server.port;
     new_config.server.ws_paths = old.server.ws_paths.clone();
+    new_config.server.assets_dir = old.server.assets_dir.clone();
     new_config.server.trusted_proxies = old.server.trusted_proxies.clone();
     new_config.server.metrics_enabled = old.server.metrics_enabled;
     new_config.rpc.max_admin_body_bytes = old.rpc.max_admin_body_bytes;
@@ -3576,6 +3611,159 @@ mod tests {
             .unwrap();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert!(json["supported_nips"].is_array());
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn landing_page_file_replaces_decoy_but_not_nip11() {
+        // With `server.landing_page_file` set, a plain browser GET gets the
+        // operator's page instead of the decoy; the Nostr media type still
+        // gets the relay document, and a rewrite of the file is picked up
+        // without a restart.
+        let relay = blossom_relay().await;
+        let dir = relay.config.read().await.database.path.join("landing");
+        std::fs::create_dir_all(&dir).unwrap();
+        let page = dir.join("index.html");
+        std::fs::write(&page, "<html>relay stats v1</html>").unwrap();
+        relay.config.write().await.server.landing_page_file = page.to_string_lossy().into_owned();
+        let get = |accept: &'static str| {
+            let mut b = Request::builder()
+                .method(Method::GET)
+                .uri("/")
+                .header(axum::http::header::HOST, "relay.example.com");
+            if !accept.is_empty() {
+                b = b.header(axum::http::header::ACCEPT, accept);
+            }
+            b.body(Body::empty()).unwrap()
+        };
+        let body_of = |response: Response| async move {
+            let b = axum::body::to_bytes(response.into_body(), 1 << 20)
+                .await
+                .unwrap();
+            String::from_utf8(b.to_vec()).unwrap()
+        };
+        let response = ws_handler(State(relay.clone()), get("text/html")).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_TYPE],
+            "text/html; charset=utf-8"
+        );
+        assert_eq!(body_of(response).await, "<html>relay stats v1</html>");
+        // Rewritten in place (different size): served without a restart.
+        std::fs::write(&page, "<html>relay stats v2 (updated)</html>").unwrap();
+        let response = ws_handler(State(relay.clone()), get("")).await;
+        assert_eq!(
+            body_of(response).await,
+            "<html>relay stats v2 (updated)</html>"
+        );
+        // NIP-11 is unaffected.
+        let response = ws_handler(State(relay.clone()), get("application/nostr+json")).await;
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_TYPE],
+            "application/nostr+json"
+        );
+        // A missing file falls back to the decoy, never to the relay
+        // document.
+        std::fs::remove_file(&page).unwrap();
+        let response = ws_handler(State(relay.clone()), get("text/html")).await;
+        assert!(body_of(response).await.contains("How to Open a Door"));
+        // A directory (not a regular file) falls back to the decoy too.
+        relay.config.write().await.server.landing_page_file = dir.to_string_lossy().into_owned();
+        let response = ws_handler(State(relay.clone()), get("text/html")).await;
+        assert!(body_of(response).await.contains("How to Open a Door"));
+        relay.db.shutdown();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn landing_page_symlink_is_not_followed() {
+        let relay = blossom_relay().await;
+        let dir = relay.config.read().await.database.path.join("landing-link");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("secret.txt");
+        std::fs::write(&target, "not for the web").unwrap();
+        let link = dir.join("index.html");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        relay.config.write().await.server.landing_page_file = link.to_string_lossy().into_owned();
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/")
+            .header(axum::http::header::HOST, "relay.example.com")
+            .body(Body::empty())
+            .unwrap();
+        let response = ws_handler(State(relay.clone()), request).await;
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!body.contains("not for the web"));
+        assert!(body.contains("How to Open a Door"));
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn assets_dir_serves_flat_regular_files_only() {
+        let relay = blossom_relay().await;
+        let root = relay.config.read().await.database.path.join("assets-test");
+        let dir = root.join("assets");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("og.png"), b"\x89PNG fake").unwrap();
+        std::fs::write(dir.join("sub").join("x.css"), "a{}").unwrap();
+        std::fs::write(dir.join(".hidden"), "h").unwrap();
+        std::fs::write(root.join("outside.txt"), "outside").unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(root.join("outside.txt"), dir.join("link.txt")).unwrap();
+        relay.config.write().await.server.assets_dir = dir.to_string_lossy().into_owned();
+        let app = build_router(&relay, None).await;
+        let get = |uri: &str| {
+            Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .header(axum::http::header::HOST, "relay.example.com")
+                .body(Body::empty())
+                .unwrap()
+        };
+        let response = app.clone().oneshot(get("/assets/og.png")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[axum::http::header::CONTENT_TYPE],
+            "image/png"
+        );
+        assert_eq!(
+            response.headers()[axum::http::header::X_CONTENT_TYPE_OPTIONS],
+            "nosniff"
+        );
+        for uri in [
+            "/assets/missing.png",
+            "/assets/.hidden",
+            "/assets/sub",
+            "/assets/sub/x.css",
+            "/assets/..%2Foutside.txt",
+            "/assets/%2E%2E",
+            "/assets/link.txt",
+        ] {
+            let response = app.clone().oneshot(get(uri)).await.unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{uri} must be 404"
+            );
+        }
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn assets_route_absent_by_default() {
+        let relay = blossom_relay().await;
+        let app = build_router(&relay, None).await;
+        let request = Request::builder()
+            .method(Method::GET)
+            .uri("/assets/og.png")
+            .header(axum::http::header::HOST, "relay.example.com")
+            .body(Body::empty())
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
         relay.db.shutdown();
     }
 

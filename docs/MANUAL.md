@@ -191,6 +191,8 @@ To generate a secret key, use the `nostrfy genkey` command (see [5. Command Refe
 | `outbox_write_policy` | Write policy for `/outbox`: `any` (the event must be authored by the connection's NIP-42-authenticated pubkey) or `relay` (only the relay's own events) | `any` |
 | `trusted_proxies` | Reverse-proxy addresses/CIDRs whose `X-Forwarded-For` is trusted, e.g. `["127.0.0.1/32", "::1/128"]`. When the peer matches, the per-IP caps, connect rate limit, `blockip` and logs use the right-most untrusted forwarded address (IPv6 aggregated by `/64`). List only addresses clients cannot reach directly. Fixed at startup | `[]` |
 | `metrics_enabled` | Serve `/metrics` (Prometheus format) | `true` |
+| `landing_page_file` | HTML file shown to a browser opening the relay URL, instead of the built-in decoy page. Re-read when the file changes (no restart needed). NIP-11 and WebSocket are unaffected | empty |
+| `assets_dir` | Directory served under `/assets/<name>` (images/CSS/JS for the landing page). Fixed at startup | empty |
 
 > **Note**: `require_auth = true` combined with `send_auth_challenge = false` locks everyone out — nobody can authenticate. Avoid this combination.
 
@@ -342,6 +344,8 @@ curl -H "Accept: application/nostr+json" http://127.0.0.1:8080/
 ```
 
 Returns the relay name, supported NIPs, limits, and more as JSON. The `supported_nips` list is dynamic — see [Section 8](#8-supported-nips) for what controls it.
+
+Without that `Accept` header (e.g. a browser) the root URL answers a built-in decoy page that says nothing about the relay. To show your own page instead, set `server.landing_page_file` (and `server.assets_dir` for its images/CSS) — see [CONFIGURATION](CONFIGURATION.md#5-server--server-settings).
 
 ### Reload the config without replacing the process
 

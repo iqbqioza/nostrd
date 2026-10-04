@@ -190,6 +190,19 @@ outbox_write_policy = "any"
 # changing it requires a restart.
 trusted_proxies = []
 
+# HTML page shown to a browser opening the relay URL (a GET without
+# `Accept: application/nostr+json` and without a WebSocket upgrade).
+# Empty = the built-in decoy page, which reveals nothing about the relay.
+# Read on demand and re-read when the file changes, so a cron job can
+# regenerate it (e.g. relay statistics) without a restart. Must be a
+# regular file (symlinks are not followed), at most 8 MiB.
+landing_page_file = ""
+
+# Directory served under /assets/<name> (images, CSS, JS for the landing
+# page). Flat ASCII file names only; no subdirectories, hidden files or
+# symlinks. Empty = no /assets/ route. Fixed at startup: requires a restart.
+assets_dir = ""
+
 # -----------------------------------------------------------------------------
 # Management API (NIP-86)
 # -----------------------------------------------------------------------------
