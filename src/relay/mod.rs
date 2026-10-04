@@ -152,7 +152,11 @@ pub struct Relay {
     /// `key`). The access-control checks exempt it, so the operator can
     /// always publish command events and read on restricted relays.
     pub(crate) relay_pubkey: Option<String>,
-    secp: Secp256k1<secp256k1::All>,
+    /// Shared signature-verification context. It is an `Arc` because the
+    /// accept path hands it to `spawn_blocking` verification tasks; the
+    /// precomputed tables are far too large to rebuild per batch, and
+    /// cloning them per task would defeat the point.
+    secp: Arc<Secp256k1<secp256k1::All>>,
     /// Path of the config file, set at startup so NIP-86 runtime changes
     /// (relay name/description/icon) can be persisted to disk; without
     /// persistence a SIGHUP config reload would silently revert them.
@@ -1512,7 +1516,7 @@ impl Relay {
         let (live_tx, live_rx) = mpsc::channel(live_bus.buffer.max(16));
         let live_batch_interval_ms = live_bus.batch_interval_ms.clamp(1, 1000);
         let live_batch_size = live_bus.batch_size.max(1);
-        let secp = Secp256k1::new();
+        let secp = Arc::new(Secp256k1::new());
         let key = if private_key_hex.is_empty() {
             None
         } else {
@@ -1924,7 +1928,13 @@ impl Relay {
     }
 
     pub fn secp(&self) -> &Secp256k1<secp256k1::All> {
-        &self.secp
+        self.secp.as_ref()
+    }
+
+    /// Shared handle to the verification context for the `spawn_blocking`
+    /// signature checks on the accept path (see [`Self::secp`]).
+    pub(crate) fn secp_shared(&self) -> Arc<Secp256k1<secp256k1::All>> {
+        Arc::clone(&self.secp)
     }
 
     /// Persists the current access control lists to the database so NIP-86
@@ -2561,8 +2571,16 @@ impl Relay {
         // earlier sibling, but never a rejected one.
         let (mut known_set, previous_capped) = self.batch_known_prefixes(&events).await;
         // One parallel pass for the whole batch: the sequential singletons
-        // below must not re-verify each signature inline.
-        let verified = crate::relay::validate::verify_signatures_parallel(&events, self.secp());
+        // below must not re-verify each signature inline. The batch is shared
+        // so the verification can run off the runtime worker, then reclaimed
+        // unchanged for the loop below.
+        let batch: Arc<Box<[Event]>> = Arc::new(events.into_boxed_slice());
+        let verified = crate::relay::validate::verify_signatures_parallel(
+            Arc::clone(&batch),
+            self.secp_shared(),
+        )
+        .await;
+        let events = crate::relay::validate::reclaim_events(batch);
         let mut out: Vec<(String, PutOutcome)> = Vec::with_capacity(events.len());
         let mut run: Vec<Event> = Vec::new();
         let mut run_verdicts: Vec<bool> = Vec::new();
@@ -2680,6 +2698,9 @@ impl Relay {
         let mut known_set: std::collections::HashSet<Vec<u8>> = known_prefixes
             .map(|known| known.known.clone())
             .unwrap_or_default();
+        // Shared for the off-runtime signature verification below, then
+        // reclaimed unchanged: the loop consumes the events by value.
+        let batch: Arc<Box<[Event]>> = Arc::new(events.into_boxed_slice());
 
         // The Schnorr signature check dominates the per-event accept cost
         // (tens of microseconds), so a large batch verifies every signature
@@ -2691,11 +2712,15 @@ impl Relay {
         let verified: &[bool] = match verified {
             Some(verdicts) => verdicts,
             None => {
-                computed = crate::relay::validate::verify_signatures_parallel(&events, self.secp());
+                computed = crate::relay::validate::verify_signatures_parallel(
+                    Arc::clone(&batch),
+                    self.secp_shared(),
+                )
+                .await;
                 &computed
             }
         };
-        for event in events {
+        for event in crate::relay::validate::reclaim_events(batch) {
             let id = event.id.clone();
             let verified = verified.get(results.len()).copied();
             let known = (!per_reference_lookup).then_some(crate::relay::validate::KnownPrevious {
@@ -3877,6 +3902,7 @@ mod tests {
     use super::signal_live_resync;
     use super::validate::contains_secret_key;
     use crate::nips::nip43::RoleStore;
+    use std::sync::Arc;
     use std::sync::atomic::Ordering;
 
     /// Builds a relay with an empty database.
@@ -6253,7 +6279,11 @@ mod tests {
                 (0..N).map(|i| bench_signed(secp, i, now)).collect();
             let t0 = std::time::Instant::now();
             for batch in big.chunks(1000) {
-                let v = crate::relay::validate::verify_signatures_parallel(batch, secp);
+                let v = crate::relay::validate::verify_signatures_parallel(
+                    Arc::new(batch.to_vec().into_boxed_slice()),
+                    relay.secp_shared(),
+                )
+                .await;
                 assert!(v.iter().all(|b| *b));
             }
             let par = t0.elapsed().as_secs_f64();

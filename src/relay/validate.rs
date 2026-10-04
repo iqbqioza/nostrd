@@ -2,11 +2,25 @@
 //! NIP-13/26/42/43/70 and access control), the shared [`Precheck`] used by
 //! both accept paths, and the nsec-leak detector.
 
+use std::sync::Arc;
+
 use anyhow::{anyhow, bail};
 
 use crate::config::{AccessControl, Config};
 use crate::event::Event;
 use crate::nips::{nip01, nip09, nip13, nip26, nip29, nip40, nip43, nip62, nip70};
+
+/// Wraps a batch for [`verify_signatures_parallel`] and recovers it
+/// afterwards. The blocking verification tasks need shared ownership
+/// (`'static`), so the batch is handed over as an `Arc<Box<[Event]>>` and
+/// taken back once every task has been awaited — no event is cloned, and the
+/// fallback only pays that cost if a reference is unexpectedly still held.
+pub(crate) fn reclaim_events(batch: Arc<Box<[Event]>>) -> Vec<Event> {
+    match Arc::try_unwrap(batch) {
+        Ok(events) => events.into_vec(),
+        Err(batch) => batch.iter().cloned().collect(),
+    }
+}
 
 /// A bech32-encoded nsec secret key is `nsec1` followed by 58 characters
 /// (52 data characters plus a 6-character checksum), 63 characters in total.
@@ -59,10 +73,45 @@ const MAX_PARALLEL_VERIFY_THREADS: usize = 8;
 ///
 /// `Secp256k1<All>` is `Send + Sync` (the precomputed context is immutable),
 /// so the shared context can verify on several threads at once.
-pub(crate) fn verify_signatures_parallel(
-    events: &[Event],
-    secp: &secp256k1::Secp256k1<secp256k1::All>,
+///
+/// **Off the reactor, on a reused pool.** This is pure CPU work, so it runs on
+/// `spawn_blocking` and never on a runtime worker: the workers drive every
+/// WebSocket connection, and a worker parked in a signature check cannot read
+/// a frame, answer a query or flush an outgoing batch. Handing the chunks to
+/// `spawn_blocking` also means the threads come from tokio's reused blocking
+/// pool instead of being created per batch — the fan-out is sized by the
+/// batch, and with many concurrent publishers a per-batch `thread::scope`
+/// grew the process thread count with the connection count (measured: +37
+/// threads at 32 concurrent publishers) while also blocking a worker for the
+/// whole verification. `events` is therefore shared (`Arc<[Event]>`) instead
+/// of borrowed, which is what makes it `'static` for the blocking tasks; the
+/// caller recovers the `Vec` with [`Self::reclaim_events`] once every task has
+/// been awaited, so no event is cloned.
+pub(crate) async fn verify_signatures_parallel(
+    events: Arc<Box<[Event]>>,
+    secp: Arc<secp256k1::Secp256k1<secp256k1::All>>,
 ) -> Vec<bool> {
+    let total = events.len();
+    // ONE blocking task per batch, not one per chunk. The intra-batch fan-out
+    // stays where it belongs — on the scoped threads inside the blocking
+    // task — because handing each chunk to `spawn_blocking` separately would
+    // queue `min(cores, 8)` blocking tasks per batch, and with many
+    // concurrent publishers that is what grows tokio's blocking pool (one
+    // thread per concurrent task, up to its 512-thread ceiling) instead of
+    // reusing a couple of threads per in-flight batch.
+    tokio::task::spawn_blocking(move || verify_chunks(&events, &secp))
+        .await
+        .unwrap_or_else(|e| {
+            // The task never ran (runtime shutting down): fail closed rather
+            // than let an unverified batch through.
+            log::error!("signature verification task did not run ({e}); rejecting its events");
+            vec![false; total]
+        })
+}
+
+/// Verifies every signature, fanning out over the machine's cores for a large
+/// batch and staying sequential for a small one. Runs on a blocking thread.
+fn verify_chunks(events: &[Event], secp: &secp256k1::Secp256k1<secp256k1::All>) -> Vec<bool> {
     let cpus = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
@@ -76,21 +125,20 @@ pub(crate) fn verify_signatures_parallel(
     let per = events.len().div_ceil(threads);
     let chunk_lens: Vec<usize> = events.chunks(per).map(<[Event]>::len).collect();
     std::thread::scope(|s| {
-        let mut handles = Vec::with_capacity(chunk_lens.len());
-        for chunk in events.chunks(per) {
-            handles.push(s.spawn(move || {
-                chunk
-                    .iter()
-                    .map(|e| nip01::verify(e, secp).is_ok())
-                    .collect::<Vec<bool>>()
-            }));
-        }
-        let verdicts = join_verdicts(handles, &chunk_lens);
-        // `div_ceil(per)` chunks never run empty, so the flattened length
-        // is exactly `events.len()` even when a chunk panicked.
-        debug_assert_eq!(verdicts.len(), events.len());
-        verdicts
+        let handles: Vec<_> = events
+            .chunks(per)
+            .map(|chunk| s.spawn(move || verify_chunk(chunk, secp)))
+            .collect();
+        join_verdicts(handles, &chunk_lens)
     })
+}
+
+/// Verifies one chunk, returning one verdict per event.
+fn verify_chunk(events: &[Event], secp: &secp256k1::Secp256k1<secp256k1::All>) -> Vec<bool> {
+    events
+        .iter()
+        .map(|e| nip01::verify(e, secp).is_ok())
+        .collect()
 }
 
 /// Joins the per-chunk verification threads, preserving the
@@ -625,7 +673,7 @@ mod tests {
 
     #[test]
     fn panicking_verification_chunk_stays_aligned() {
-        // A panicking verifier chunk must not shift the later chunks'
+        // A panicking verifier thread must not shift the later chunks'
         // verdicts: every event of the panicked chunk is failed closed.
         std::thread::scope(|s| {
             let handles = vec![
@@ -640,6 +688,112 @@ mod tests {
                 "the panicked chunk must contribute three `false` verdicts"
             );
         });
+    }
+
+    #[test]
+    fn signature_verification_runs_off_the_runtime_worker() {
+        // Regression: the verification used to run `std::thread::scope` and
+        // `join` inline on a runtime worker, so the worker was parked for the
+        // whole batch — it could not read a frame, answer a query or flush an
+        // outgoing batch while the CPU was busy. It also created a fresh set
+        // of threads per batch (measured: +37 threads at 32 concurrent
+        // publishers). Now the batch is verified on one blocking task, so the
+        // worker yields at the `.await` and the threads are reused.
+        //
+        // The assertion is about ordering, not wall-clock time, so it cannot
+        // flake on a slow machine: a second task is queued behind the
+        // verification and must get to run *before* the verification reports
+        // back. If the worker were parked in `join()`, that task could not run
+        // until after the verification returned, and the flag would still be
+        // unset when the assert runs.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            use std::sync::atomic::{AtomicBool, Ordering};
+
+            let secp = Arc::new(Secp256k1::new());
+            let keypair = Keypair::from_seckey_slice(&secp, &[9u8; 32]).unwrap();
+            let pubkey = XOnlyPublicKey::from_keypair(&keypair).0.to_string();
+            // Enough events to take the fan-out branch (over
+            // MIN_PARALLEL_VERIFY); the exact count only has to be non-zero,
+            // since a single scheduling point is what the ordering hinges on.
+            let count = super::MIN_PARALLEL_VERIFY * 2;
+            let mut events = Vec::with_capacity(count);
+            for i in 0..count {
+                let mut e = Event {
+                    id: String::new(),
+                    pubkey: pubkey.clone(),
+                    created_at: 1,
+                    kind: 1,
+                    tags: vec![vec!["d".into(), i.to_string()]],
+                    content: String::new(),
+                    sig: String::new(),
+                };
+                e.id = crate::nips::nip01::compute_id(&e);
+                let id = e.id_bytes().unwrap();
+                e.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+                events.push(e);
+            }
+
+            // Queued first, so it is the next task the worker picks up.
+            let progressed = Arc::new(AtomicBool::new(false));
+            let flag = Arc::clone(&progressed);
+            tokio::spawn(async move {
+                tokio::task::yield_now().await;
+                flag.store(true, Ordering::SeqCst);
+            });
+
+            let verdicts =
+                super::verify_signatures_parallel(Arc::new(events.into_boxed_slice()), secp).await;
+
+            assert!(
+                progressed.load(Ordering::SeqCst),
+                "another task must run while the signatures are verified: the verification is \
+                 holding the runtime worker instead of yielding"
+            );
+            assert_eq!(verdicts.len(), count, "one verdict per event, in order");
+            assert!(
+                verdicts.iter().all(|v| *v),
+                "every correctly signed event must verify: {verdicts:?}"
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn the_batch_is_reclaimed_without_cloning_when_unshared() {
+        // The accept paths hand the batch to the verification tasks as an
+        // `Arc` and take it back with `reclaim_events`; after every task has
+        // been awaited this must give the events back without a copy.
+        let events = vec![signed(1, vec![]), signed(7, vec![])];
+        let ids = events.iter().map(|e| e.id.clone()).collect::<Vec<_>>();
+        let batch: Arc<Box<[Event]>> = Arc::new(events.into_boxed_slice());
+        let _guard = Arc::clone(&batch);
+        let reclaimed = super::reclaim_events(batch);
+        assert_eq!(
+            reclaimed.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
+            ids,
+            "the reclaimed batch must carry the original events, in order"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_batch_is_copied_only_while_a_task_still_holds_it() {
+        // `reclaim_events` is called after the verification tasks are
+        // awaited, so the fast path is a move. This pins the fallback: a
+        // lingering reference must still yield a correct copy, never an
+        // empty batch (which would silently drop the whole batch).
+        let batch: Arc<Box<[Event]>> =
+            Arc::new(vec![signed(1, vec![]), signed(7, vec![])].into_boxed_slice());
+        let ids = batch.iter().map(|e| e.id.clone()).collect::<Vec<_>>();
+        let _still_held = Arc::clone(&batch);
+        let reclaimed = super::reclaim_events(batch);
+        assert_eq!(
+            reclaimed.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
+            ids,
+            "a lingering reference must fall back to a copy, never to nothing"
+        );
     }
 
     fn signed(kind: u64, tags: Vec<Vec<String>>) -> Event {
@@ -1918,13 +2072,20 @@ mod tests {
             for seed in 1..=20u8 {
                 events.push(signed_with_seed(seed, 1, vec![]));
             }
-            let verdicts =
-                crate::relay::validate::verify_signatures_parallel(&events, relay.secp());
+            let verdicts = crate::relay::validate::verify_signatures_parallel(
+                Arc::new(events.clone().into_boxed_slice()),
+                relay.secp_shared(),
+            )
+            .await;
             assert_eq!(verdicts.len(), 20);
             assert!(verdicts.iter().all(|v| *v));
             let mut bad = events.clone();
             bad[3].sig = "00".repeat(64);
-            let verdicts = crate::relay::validate::verify_signatures_parallel(&bad, relay.secp());
+            let verdicts = crate::relay::validate::verify_signatures_parallel(
+                Arc::new(bad.into_boxed_slice()),
+                relay.secp_shared(),
+            )
+            .await;
             assert!(!verdicts[3]);
             assert!(verdicts[0]);
 
