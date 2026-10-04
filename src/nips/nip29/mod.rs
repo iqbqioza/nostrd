@@ -38,6 +38,8 @@ pub const GROUP_PARTICIPANTS: u64 = 39004;
 pub const GROUP_PINS: u64 = 39005;
 pub const MOD_MIN: u64 = 9000;
 pub const MOD_MAX: u64 = 9020;
+pub const PUT_USER: u64 = 9000;
+pub const REMOVE_USER: u64 = 9001;
 pub const CREATE_GROUP: u64 = 9007;
 pub const DELETE_GROUP: u64 = 9008;
 pub const JOIN: u64 = 9021;
@@ -102,6 +104,38 @@ fn tag_values<'a>(event: &'a Event, name: &'static str) -> impl Iterator<Item = 
 /// Group id of a user or moderation event (from the `h` tag).
 pub fn group_id(event: &Event) -> Option<&str> {
     tag_value(event, H)
+}
+
+/// Whether `value` is a NIP-01 lowercase hex pubkey: exactly 64 hex digits.
+///
+/// The membership map is keyed by the `p` tag value verbatim
+/// ([`GroupStore::apply`]) and looked up with the event's own `pubkey`, which
+/// NIP-01 defines as lowercase hex and intake rejects otherwise
+/// (`validate_base`). A `p` value that is not a lowercase 32-byte hex key can
+/// therefore never match a real member, so accepting one silently locks the
+/// named account out of the group and publishes a junk entry in the
+/// relay-signed `39002` member list.
+pub fn is_pubkey_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Every `p` tag value of a group moderation event that is not a NIP-01
+/// pubkey. Kinds `9000` (put-user) and `9001` (remove-user) name members with
+/// `p` tags, so they are the only ones that can put a malformed key into the
+/// membership map. The relay's own snapshots (`39000`-`39005`) are signed and
+/// stored, never re-validated, and ordinary chat events carry `p` tags for
+/// mentions, which must not be constrained here.
+pub fn malformed_member_tags(event: &Event) -> impl Iterator<Item = &str> {
+    let names_members = matches!(event.kind, PUT_USER | REMOVE_USER);
+    event
+        .tags
+        .iter()
+        .filter(move |t| names_members && t.len() >= 2 && t[0] == P)
+        .map(|t| t[1].as_str())
+        .filter(|value| !is_pubkey_hex(value))
 }
 
 /// Whether the event is a group *action*: moderation events (9000-9020),
