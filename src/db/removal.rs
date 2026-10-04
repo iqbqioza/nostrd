@@ -11,7 +11,7 @@ use super::store::{
     decode_pending_purge, decode_purged_group_marker, delegated_by, deleted_address_key,
     dtag_key_safe, encode_pending_deletion, encode_pending_purge, encode_purged_group_marker,
     is_group_state_kind, pending_deletion_key, pubkey_key, purged_group_key, replaceable_key,
-    tag_key,
+    replaceable_key_range_end, tag_key,
 };
 use crate::error::Result;
 use crate::event::Event;
@@ -473,8 +473,14 @@ impl Store {
             if author_owns {
                 self.merge_address_tombstone(&akey, request_created)?;
             }
+            // Bound the walk on the `dlen` field, not on `kind`: `replaceable_key` is
+            // `kind(8) || pubkey(32) || dlen(4) || d`, so an upper bound built
+            // from `kind + 1` would leave every slot of the same kind written
+            // by a higher pubkey inside the range (LMDB compares keys
+            // bytewise) and turn one deletion into a full scan of that kind on
+            // the single writer thread.
             let start = replaceable_key(address.kind, &pubkey, "");
-            let end = replaceable_key(address.kind.saturating_add(1), &pubkey, "");
+            let end = replaceable_key_range_end(address.kind, &pubkey);
             let mut last_key: Option<Vec<u8>> = None;
             loop {
                 if self.cancelled() {
@@ -514,6 +520,9 @@ impl Store {
                 if entries.is_empty() {
                     break;
                 }
+                #[cfg(test)]
+                self.removal_scanned
+                    .fetch_add(entries.len() as u64, std::sync::atomic::Ordering::SeqCst);
                 last_key = Some(entries.last().unwrap().0.clone());
                 let mut chunk_state_removed = false;
                 for (key, value) in entries {

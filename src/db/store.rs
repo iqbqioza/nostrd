@@ -662,6 +662,12 @@ pub(crate) struct Store {
     /// Shared via `Arc` so a test can arm it after startup.
     #[cfg(test)]
     pub(crate) fail_chunk_after: Arc<std::sync::atomic::AtomicUsize>,
+    /// Test-only count of the slots a removal walk *iterated*, so a test can
+    /// pin that a walk stays inside the range it is supposed to cover (the
+    /// NIP-09 address walk must not sweep the slots other authors hold under
+    /// the same kind — see [`replaceable_key_range_end`]).
+    #[cfg(test)]
+    pub(crate) removal_scanned: Arc<std::sync::atomic::AtomicU64>,
     /// Test-only scan fault injection: the next scan returns a store error,
     /// so the reported read variants must answer `None` instead of an
     /// empty successful result. Shared with the reader clones so arming the
@@ -870,6 +876,8 @@ impl Store {
             #[cfg(test)]
             fail_chunk_after: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             #[cfg(test)]
+            removal_scanned: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
             fail_next_scan: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             #[cfg(test)]
             disk_full_override: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1000,6 +1008,8 @@ impl Store {
             fail_next_delete_chunk: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             fail_chunk_after: Arc::clone(&self.fail_chunk_after),
+            #[cfg(test)]
+            removal_scanned: Arc::clone(&self.removal_scanned),
             // Shared like `panic_next_read`: a test arms the store before
             // the reader threads start and exactly one reader consumes it.
             #[cfg(test)]
@@ -1833,6 +1843,28 @@ pub(crate) fn replaceable_key(kind: u64, pubkey: &[u8], dtag: &str) -> Vec<u8> {
     key.extend_from_slice(pubkey);
     key.extend_from_slice(&(dtag.len() as u32).to_be_bytes());
     key.extend_from_slice(dtag.as_bytes());
+    key
+}
+
+/// Exclusive upper bound of the [`replaceable_key`] range for one
+/// `(kind, pubkey)` pair: every `d` tag of that address, and nothing else.
+///
+/// The bound must sit on the `dlen` field, not on `kind`. `replaceable_key`
+/// is `kind(8) || pubkey(32) || dlen(4) || d`, so a bound built from
+/// `kind + 1` (as the NIP-09 address walk used to do) leaves the whole
+/// `(kind, any-pubkey)` space inside `[start, end)`: the first 8 bytes
+/// compare equal to `start`, and the remaining 40+ bytes compare below
+/// `(kind + 1)`. LMDB compares keys bytewise, so every slot of that kind
+/// written by a *higher* pubkey was iterated — one write transaction and
+/// fsync per 4096 entries on the single writer thread, for an address that
+/// owns nothing. `0xff` on the `dlen` field sorts above every real `d`
+/// length (`dtag_key_safe` caps it well below `u32::MAX`), so this bound
+/// closes the range exactly at `(kind, pubkey)`.
+pub(crate) fn replaceable_key_range_end(kind: u64, pubkey: &[u8]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(CREATED_LEN + ID_LEN + 4);
+    key.extend_from_slice(&kind.to_be_bytes());
+    key.extend_from_slice(pubkey);
+    key.extend_from_slice(&u32::MAX.to_be_bytes());
     key
 }
 
