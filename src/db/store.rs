@@ -298,7 +298,11 @@ pub(crate) fn path_free_space(path: &std::path::Path) -> Option<u64> {
     // NUL-terminated string.
     if unsafe { libc::statvfs(c_path.as_ptr(), stat.as_mut_ptr()) } == 0 {
         let stat = unsafe { stat.assume_init() };
-        Some(stat.f_bavail.saturating_mul(stat.f_frsize))
+        // `statvfs` field widths differ by platform (`fsblkcnt_t` is u32 on
+        // macOS, u64 on Linux/FreeBSD; `f_frsize` is u64 on macOS): widen
+        // both losslessly so the product is computed in u64 everywhere.
+        #[allow(clippy::useless_conversion)]
+        Some(u64::from(stat.f_bavail).saturating_mul(u64::from(stat.f_frsize)))
     } else {
         None
     }

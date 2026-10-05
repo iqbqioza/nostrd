@@ -3469,9 +3469,18 @@ name = \"nostrfy\"\n",
         // the FreeBSD CI runner). Ports in the 8765-8795 range are never
         // handed out by `bind(..:0)` on Linux or FreeBSD, so nothing but
         // this test can occupy one.
+        //
+        // A successful bind alone does not prove the port is closed: on
+        // macOS a `127.0.0.1:<port>` bind succeeds while another process
+        // listens on the wildcard `*:<port>`, and the probe would connect to
+        // that listener. Also require that nothing accepts a connection.
         let mut picked = None;
         for port in 8765..=8795u16 {
-            if let Ok(listener) = std::net::TcpListener::bind(("127.0.0.1", port)) {
+            let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+            if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(100)).is_ok() {
+                continue;
+            }
+            if let Ok(listener) = std::net::TcpListener::bind(addr) {
                 picked = Some((listener, port));
                 break;
             }
