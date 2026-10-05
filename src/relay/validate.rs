@@ -2448,4 +2448,89 @@ mod tests {
             relay.db.shutdown();
         });
     }
+
+    /// NIP-70 keys off the tag *name*. The write path used to require the
+    /// exact one-element `["-"]`, so `["-", "reason"]` read as unprotected:
+    /// an unauthenticated client could publish it, and the delivery path
+    /// (`ws/handler`) then served it to every subscriber — the author's
+    /// protection intent published to the world. The canonical form is
+    /// unchanged; only the malformed-but-plausible variants now gate too.
+    #[test]
+    fn a_multi_value_dash_tag_needs_authentication() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut cfg = Config::default();
+            cfg.database.map_size = 16 * 1024 * 1024;
+            cfg.database.max_map_size = 64 * 1024 * 1024;
+            cfg.database.path = std::env::temp_dir().join("nostrfy-nip70-multivalue-validate");
+            let _ = std::fs::remove_dir_all(&cfg.database.path);
+            let db = crate::db::DbClient::open(
+                &cfg.database,
+                true,
+                Arc::new(Default::default()),
+                0,
+                128,
+                4096,
+                262144,
+            )
+            .unwrap();
+            let relay = Arc::new(
+                Relay::new(
+                    Arc::new(RwLock::new(cfg)),
+                    db,
+                    crate::stats::Stats::new(),
+                    "",
+                    crate::relay::LiveBusConfig {
+                        buffer: 1024,
+                        batch_interval_ms: 10,
+                        batch_size: 64,
+                    },
+                )
+                .await,
+            );
+            let cfg = relay.config.read().await;
+            let now = unix_now();
+
+            let signed = |tags: Vec<Vec<String>>| signed_with_seed(5u8, 1, tags);
+
+            // The canonical marker: already refused unauthenticated.
+            let canonical = signed(vec![vec!["-".into()]]);
+            assert!(
+                relay
+                    .validate_base(&cfg, &canonical, now, &[], None)
+                    .is_err()
+            );
+
+            // The leak: a `-` tag with a value used to pass this gate.
+            let leaky = signed(vec![vec!["-".into(), "reason".into()]]);
+            let err = relay
+                .validate_base(&cfg, &leaky, now, &[], None)
+                .expect_err("`[-, reason]` must not be publishable unauthenticated");
+            assert!(
+                err.to_string().starts_with("auth-required"),
+                "the refusal must be the NIP-70 auth requirement, got: {err}"
+            );
+
+            // A longer one too, and `-` must be the whole name.
+            let longer = signed(vec![vec!["-".into(), "a".into(), "b".into()]]);
+            assert!(relay.validate_base(&cfg, &longer, now, &[], None).is_err());
+            for impostor in [vec!["--".to_string()], vec!["-x".to_string()]] {
+                let event = signed(vec![impostor]);
+                assert!(
+                    relay.validate_base(&cfg, &event, now, &[], None).is_ok(),
+                    "a tag merely starting with `-` is not a NIP-70 marker"
+                );
+            }
+
+            // The author publishing their own protected event still works:
+            // the gate is authentication, not a blanket refusal.
+            let author = leaky.pubkey.clone();
+            relay
+                .validate_base(&cfg, &leaky, now, std::slice::from_ref(&author), None)
+                .expect("the author must be able to publish their own protected event");
+
+            drop(cfg);
+            relay.db.shutdown();
+        });
+    }
 }
