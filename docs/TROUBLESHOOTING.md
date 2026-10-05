@@ -404,7 +404,7 @@ The NIP-98 spec says the `u` tag must be *exactly* the same as the absolute requ
 
 ### 5-2. `disk is full: refusing to commit N events`
 
-**Cause**: The database filesystem (or the LMDB map) is full. Writes stop to protect the data; reads and live delivery continue. `GET /health` answers `503` with a `database is refusing writes` reason while this lasts, and `nostrfy_db_disk_full` / `nostrfy_db_free_bytes` (JSON: `db_disk_full`, `db_free_bytes`) expose the state to monitoring.
+**Cause**: The database filesystem (or the LMDB map) is full. Writes stop to protect the data; reads and live delivery continue. `GET /health` answers `503` with a `database is refusing writes` reason while this lasts, and `nostrfy_db_disk_full` / `nostrfy_db_free_bytes` (JSON: `db_disk_full`, `db_free_bytes`) expose the state to monitoring. Read them from `/metrics` or from the `nostrfy stats` file snapshot, not from `/relay/stats` — that endpoint is unauthenticated and cross-origin readable, so it leaves the capacity figures out. (`/metrics` is unauthenticated too: if the host's free space must stay private, isolate it with `api_host` or at the reverse proxy.)
 
 **Fix**: Free up disk space (or raise `database.max_map_size` for a map-full error). Writes resume and `/health` returns `200` automatically once space is available — no restart is needed.
 

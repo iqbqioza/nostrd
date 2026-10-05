@@ -91,8 +91,15 @@ pub fn relay_info(
     info
 }
 
+/// The `/relay/stats` endpoint. It answers
+/// [`Relay::stats::as_public_json`], not the full snapshot: it sits on the
+/// same origin as the decoy site with no token and a wildcard CORS policy, so
+/// serving the host's free disk space and the failure counters here would
+/// publish a storage-capacity oracle to every plain probe. The stats file
+/// (and `nostrfy stats`) keep the full set for the operator. `/metrics` is
+/// unauthenticated too and still serves them — see `PRIVATE_STATS_KEYS`.
 pub async fn stats_handler(State(relay): State<Arc<Relay>>) -> Json<Value> {
-    Json(relay.stats.as_json())
+    Json(relay.stats.as_public_json())
 }
 
 /// The cached static part of the NIP-11 document. The volatile `stats`

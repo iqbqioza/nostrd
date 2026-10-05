@@ -804,7 +804,7 @@ Or over HTTP:
 curl http://127.0.0.1:8080/relay/stats
 ```
 
-Shows connections, events received/accepted/rejected, DB size, and more.
+Shows connections, events received/accepted/rejected, DB size, and more. The endpoint needs no token and is readable cross-origin, so it publishes a narrower view: the host's free disk space, the disk-full flag, the failure counters and the per-reason connection-refusal breakdown are left out, because together they tell a plain prober how much room is left and when the relay starts refusing writes. They are still in the `nostrfy stats` file snapshot above — and still in `/metrics`, which is unauthenticated as well, so isolate that endpoint (`api_host`, or the reverse proxy) if the capacity figures must stay private.
 
 `nostrfy stats` only prints current data: every snapshot carries a `written_at` timestamp, and if the daemon's pid file process is gone or the snapshot is older than three `stats_interval_secs` intervals, the command reports that the daemon is not running / the statistics are stale and exits nonzero instead of printing old counters as live. The HTTP `/relay/stats` endpoint always reports the in-process counters and is unaffected.
 
