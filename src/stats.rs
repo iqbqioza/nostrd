@@ -148,15 +148,18 @@ impl Stats {
     /// The snapshot served on `/relay/stats`: [`Self::as_json`] without the
     /// keys in [`PRIVATE_STATS_KEYS`].
     ///
-    /// The relay serves a decoy page on `/` so a plain probe (browser, curl,
-    /// scanner) learns nothing, and `/relay/stats` — same origin, no token,
-    /// wildcard `Access-Control-Allow-Origin` so any page can read it
-    /// cross-origin — answered every such probe with the full snapshot,
-    /// including the host's exact free disk space. With `db_disk_full` that
-    /// says both how much room is left and exactly when writes start being
-    /// refused, and the failure counters say when the relay is already
-    /// degrading. The counters that remain are throughput and gauges an
-    /// operator's dashboard needs and that grant no leverage.
+    /// `/relay/stats` needs no token and the router adds a wildcard
+    /// `Access-Control-Allow-Origin`, so any page on the web can read it
+    /// cross-origin. It sits on the same origin as whatever answers `/`: the
+    /// built-in decoy by default, or the operator's public page once
+    /// `server.landing_page_file` is set (which may itself advertise
+    /// statistics). Either way a plain probe — browser, curl, scanner — is
+    /// meant to learn nothing about the host, and the full snapshot answered
+    /// every one of them with the host's exact free disk space. With
+    /// `db_disk_full` that says both how much room is left and exactly when
+    /// writes start being refused, and the failure counters say when the relay
+    /// is already degrading. The counters that remain are throughput and gauges
+    /// an operator's dashboard needs and that grant no leverage.
     ///
     /// The withheld keys stay in the `stats_file` snapshot and therefore in
     /// `nostrfy stats`, so nothing is lost to the operator, and they remain in
@@ -585,14 +588,15 @@ mod tests {
 
     #[test]
     fn the_public_snapshot_withholds_the_storage_and_failure_oracles() {
-        // `/relay/stats` is unauthenticated, sits on the same origin as the
-        // decoy site and carries a wildcard CORS policy, so every page on the
-        // web could read it. `db_free_bytes` is the host's exact free disk
-        // space and the failure counters say when writes start being refused
-        // — a storage-capacity and timing oracle with real leverage, served to
-        // anonymous probes on a relay whose whole point is that a plain probe
-        // learns nothing. (`/metrics` still serves these unauthenticated; this
-        // pins the narrower endpoint only.)
+        // `/relay/stats` is unauthenticated and carries a wildcard CORS
+        // policy, so every page on the web could read it, on the same origin
+        // that serves the public page (decoy by default, or
+        // `server.landing_page_file`). `db_free_bytes` is the host's exact
+        // free disk space and the failure counters say when writes start being
+        // refused — a storage-capacity and timing oracle with real leverage,
+        // served to anonymous probes on a relay whose whole point is that a
+        // plain probe learns nothing. (`/metrics` still serves these
+        // unauthenticated; this pins the narrower endpoint only.)
         let stats = Stats::new();
         stats.db_free_bytes.store(4242, Ordering::Relaxed);
         stats.db_size_bytes.store(1024, Ordering::Relaxed);
