@@ -937,6 +937,226 @@ fn private_groups_hide_messages_but_not_metadata() {
     );
 }
 
+/// The same-second tie-break the rebuild replay applies when the true
+/// arrival order is unknowable, pinned event pair by event pair.
+///
+/// The replay sorts by `(created_at, group_rank(kind), kind, id)` and the
+/// rank exists only to make the *establishing* events land where a grant or a
+/// join needs them. Within one second the arrival order is unrecoverable —
+/// `id` is a hash — so that key is the tie-break, and every pair below is a
+/// deliberate decision rather than an accident. Each assertion is the order
+/// the replay produces today; a change that moves one of them is a semantic
+/// change to what a restart derives and must come with a reason.
+#[test]
+fn the_same_second_tie_break_is_pinned_per_pair() {
+    // The replay key with the id tiebreak neutralized, so a pair is compared
+    // on the two fields that actually decide it.
+    let key = |kind: u64| (group_rank(kind), kind);
+    // Group lifecycle first, so a grant or a join aimed at a group created
+    // in the same second is not dropped for "no such group" (the same
+    // constraint as `rebuild_order_applies_create_before_member_ops`).
+    assert!(key(CREATE_GROUP) < key(PUT_USER), "create before grant");
+    assert!(key(CREATE_GROUP) < key(JOIN), "create before join");
+    assert!(key(DELETE_GROUP) < key(PUT_USER), "delete before grant");
+    assert!(key(DELETE_GROUP) < key(JOIN), "delete before join");
+    // A create before its own delete: same rank, so the `kind` tiebreak
+    // decides, and the delete still wins the second.
+    assert!(
+        key(CREATE_GROUP) < key(DELETE_GROUP),
+        "create before delete"
+    );
+    // A grant before a removal: revocation dominates grant, otherwise a
+    // re-grant in the same second would undo the removal.
+    assert!(key(PUT_USER) < key(REMOVE_USER), "grant before removal");
+    // A leave after a join, so leaving dominates joining.
+    assert!(key(JOIN) < key(LEAVE), "join before leave");
+    // NOT pinned by rank: a removal before a same-second join. The removal is
+    // applied first and the join would re-add the member, so the join is
+    // guarded instead (`a_same_second_removal_beats_a_join`). Moving the
+    // removal past the join here would also drag it past the same-second
+    // moderation events, changing which of those the migration replay
+    // considers authorized.
+    assert!(
+        key(REMOVE_USER) < key(JOIN),
+        "the removal is applied before the join, which is why the join needs the guard"
+    );
+}
+
+/// #6: a removal and a join in the same second must not resurrect the member.
+///
+/// `REMOVE_USER` outranks nothing but is outranked by nothing that undoes it
+/// except the join, and the join is applied *after* it — so the removed
+/// member was re-added by the rebuild. The live path had removed them (or,
+/// if the join really did come second, the removal is the restrictive
+/// reading either way). This is the one pair where the tie-break is decided
+/// by [`Self::apply_join`] seeing the same-second removal instead of by
+/// moving `REMOVE_USER` past `JOIN`, which would also drag it past the
+/// same-second moderation events and change which of those the migration
+/// replay considers authorized.
+#[test]
+fn a_same_second_removal_beats_a_join() {
+    let now = 1_700_000_000;
+    let mut events = vec![
+        event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        event(
+            PUT_USER,
+            ADMIN,
+            Some("g1"),
+            vec![vec![P.into(), OTHER.into()]],
+        ),
+        event(
+            REMOVE_USER,
+            ADMIN,
+            Some("g1"),
+            vec![vec![P.into(), OTHER.into()]],
+        ),
+        event(JOIN, OTHER, Some("g1"), vec![]),
+    ];
+    for e in &mut events {
+        e.created_at = now;
+    }
+    // The production order: `group_rank` first, then kind, then id.
+    events.sort_by(|a, b| {
+        (a.created_at, group_rank(a.kind), a.kind, &a.id).cmp(&(
+            b.created_at,
+            group_rank(b.kind),
+            b.kind,
+            &b.id,
+        ))
+    });
+    let removals = SameSecondRemovals::collect(&events);
+
+    let mut store = GroupStore::default();
+    for e in &events {
+        if e.kind == JOIN && removals.removes(&e.pubkey, e.created_at) {
+            continue;
+        }
+        store.apply(e, "relay", now, false, true);
+    }
+
+    assert!(
+        !store
+            .group("g1")
+            .expect("the group must exist")
+            .is_member(OTHER),
+        "a member removed in the same second must not come back through a join"
+    );
+}
+
+/// The guard is scoped to the shared second: a join in a *later* second is the
+/// member genuinely re-joining and must take effect.
+#[test]
+fn a_later_join_after_a_removal_still_readmits() {
+    let now = 1_700_000_000;
+    let mut events = vec![
+        event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        event(
+            PUT_USER,
+            ADMIN,
+            Some("g1"),
+            vec![vec![P.into(), OTHER.into()]],
+        ),
+        event(
+            REMOVE_USER,
+            ADMIN,
+            Some("g1"),
+            vec![vec![P.into(), OTHER.into()]],
+        ),
+        event(JOIN, OTHER, Some("g1"), vec![]),
+    ];
+    events[3].created_at = now + 1;
+    events.sort_by(|a, b| {
+        (a.created_at, group_rank(a.kind), a.kind, &a.id).cmp(&(
+            b.created_at,
+            group_rank(b.kind),
+            b.kind,
+            &b.id,
+        ))
+    });
+    let removals = SameSecondRemovals::collect(&events);
+
+    let mut store = GroupStore::default();
+    for e in &events {
+        if e.kind == JOIN && removals.removes(&e.pubkey, e.created_at) {
+            continue;
+        }
+        store.apply(e, "relay", now, false, true);
+    }
+
+    assert!(
+        store
+            .group("g1")
+            .expect("the group must exist")
+            .is_member(OTHER),
+        "a join one second later is a real re-join and must be honoured"
+    );
+}
+
+/// End-to-end through [`GroupStore::rebuild`]: the guard has to be wired into
+/// the production replay, not only into the hand-rolled loop the pair tests
+/// use. Removing the `SameSecondRemovals` lookup from `rebuild_inner` makes
+/// this fail.
+#[test]
+fn rebuild_does_not_resurrect_a_member_removed_in_the_same_second() {
+    use std::sync::Arc;
+    let cfg = crate::config::DatabaseConfig {
+        path: std::env::temp_dir().join(format!(
+            "nostrfy-nip29-samesec-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        )),
+        map_size: 16 * 1024 * 1024,
+        max_map_size: 32 * 1024 * 1024,
+        ..Default::default()
+    };
+    let db = DbClient::open(
+        &cfg,
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let now = 1_700_000_000;
+        let mut stored = vec![
+            event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+            event(
+                PUT_USER,
+                ADMIN,
+                Some("g1"),
+                vec![vec![P.into(), OTHER.into()]],
+            ),
+            event(
+                REMOVE_USER,
+                ADMIN,
+                Some("g1"),
+                vec![vec![P.into(), OTHER.into()]],
+            ),
+            event(JOIN, OTHER, Some("g1"), vec![]),
+        ];
+        // Same second for all four: the arrival order is unrecoverable, so the
+        // removal has to win.
+        for e in &mut stored {
+            e.created_at = now;
+            e.id = crate::nips::nip01::compute_id(e);
+            assert_eq!(db.put(e.clone(), now).await, crate::db::PutOutcome::Stored);
+        }
+
+        let mut store = GroupStore::default();
+        assert!(store.rebuild(&db, None).await, "the rebuild must complete");
+        let group = store.group("g1").expect("the group must exist");
+        assert!(
+            !group.is_member(OTHER),
+            "the rebuild must not hand a same-second removed member their \
+             membership back"
+        );
+    });
+}
+
 #[test]
 fn rebuild_order_applies_create_before_member_ops() {
     // Within the same second the create (9007) must be applied before member

@@ -1717,8 +1717,19 @@ impl GroupStore {
                 ))
             });
             let max_created = page.last().map(|event| event.created_at);
+            // The removals issued in each second of this page. `group_rank`
+            // applies a `9001` before a same-second `9021`, so without this
+            // the join re-adds the member the removal just removed and a
+            // removed member comes back on the next restart. Every other
+            // pair keeps the order `group_rank` gives it.
+            let same_second_removals = SameSecondRemovals::collect(&page);
             for mut event in page {
                 if event.kind == JOIN && vanished.contains(&event.pubkey) {
+                    continue;
+                }
+                if event.kind == JOIN
+                    && same_second_removals.removes(&event.pubkey, event.created_at)
+                {
                     continue;
                 }
                 if event.kind == 9000 {
@@ -1886,6 +1897,55 @@ pub(crate) fn group_rank(kind: u64) -> u8 {
         9007 | 9008 => 0,
         9021 | 9022 => 2,
         _ => 1,
+    }
+}
+
+/// The pubkeys a `kind:9001` removed, indexed by the second that removed
+/// them.
+///
+/// The rebuild replays stored history in `(created_at, group_rank, kind, id)`
+/// order, which cannot recover the live arrival order inside a single second —
+/// `id` is a hash. One pair therefore needs an explicit decision: a removal
+/// and a re-join in the same second. `group_rank` applies the `9001` first and
+/// the `9021` second, so the join re-adds the member the removal just removed
+/// and a removed member is resurrected by the next restart. Re-ranking the
+/// removal after the join would fix that, but it would also drag the removal
+/// past the same-second moderation events, and the migration replay
+/// authorizes those against the membership state at their own position
+/// (`is_admin`), so it would change which of them a completed migration
+/// accepted.
+///
+/// Skipping the join leaves every other pair's order bit-for-bit identical and
+/// is the restrictive reading of an unknowable order: when a removal and a
+/// re-join share a second, the member ends up removed. A join in any later
+/// second is unaffected and is honoured.
+#[derive(Default)]
+pub(crate) struct SameSecondRemovals {
+    by_second: HashMap<u64, HashSet<String>>,
+}
+
+impl SameSecondRemovals {
+    /// Indexes the `p` tags of every `kind:9001` in `events` by second. The
+    /// caller must pass a page whose seconds are complete, which both replays
+    /// already guarantee: each refuses to persist a page cut mid-second
+    /// (`boundary_second_complete`), so no removal can be hiding in the next
+    /// page while its join is applied in this one.
+    pub(crate) fn collect(events: &[Event]) -> Self {
+        let mut by_second: HashMap<u64, HashSet<String>> = HashMap::new();
+        for event in events.iter().filter(|e| e.kind == REMOVE_USER) {
+            by_second
+                .entry(event.created_at)
+                .or_default()
+                .extend(tag_values(event, P).map(str::to_string));
+        }
+        Self { by_second }
+    }
+
+    /// Whether a `kind:9001` in the second `at` removed `pubkey`.
+    pub(crate) fn removes(&self, pubkey: &str, at: u64) -> bool {
+        self.by_second
+            .get(&at)
+            .is_some_and(|removed| removed.contains(pubkey))
     }
 }
 
