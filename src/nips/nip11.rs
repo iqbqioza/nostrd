@@ -92,11 +92,12 @@ pub fn relay_info(
 }
 
 /// The `/relay/stats` endpoint. It answers
-/// [`Relay::stats::as_public_json`], not the full snapshot: it sits on the
-/// same origin as the decoy site with no token and a wildcard CORS policy, so
-/// serving the host's free disk space and the failure counters here would
-/// publish a storage-capacity oracle to every plain probe. The stats file
-/// (and `nostrfy stats`) keep the full set for the operator. `/metrics` is
+/// [`Relay::stats::as_public_json`], not the full snapshot: it needs no token
+/// and the router adds a wildcard CORS policy, so serving the host's free disk
+/// space and the failure counters here would publish a storage-capacity oracle
+/// to every plain probe of the public page this origin also serves (the decoy
+/// by default, or `server.landing_page_file`). The stats file (and
+/// `nostrfy stats`) keep the full set for the operator. `/metrics` is
 /// unauthenticated too and still serves them — see `PRIVATE_STATS_KEYS`.
 pub async fn stats_handler(State(relay): State<Arc<Relay>>) -> Json<Value> {
     Json(relay.stats.as_public_json())
