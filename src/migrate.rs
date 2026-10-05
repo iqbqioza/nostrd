@@ -970,8 +970,22 @@ async fn replay_stored_moderation(
             .iter()
             .filter(|event| Some(event.created_at) == max_created)
             .count();
+        // Consistency with the startup rebuild, not an authorization change:
+        // this replay's only gate is `is_admin` (`replay_moderation`), and a
+        // join grants no roles, so skipping a join that shares its second
+        // with the removal of the same member cannot flip a 9005/9008 verdict.
+        // It is kept so the two replays derive the same group state from the
+        // same stored events — they share `group_rank` for exactly that
+        // reason — and so the `total_members` budget is not inflated by a
+        // member the restart will not have.
+        let same_second_removals = crate::nips::nip29::SameSecondRemovals::collect(&page);
         for mut event in page {
             if event.kind == crate::nips::nip29::JOIN && vanished.contains(&event.pubkey) {
+                continue;
+            }
+            if event.kind == crate::nips::nip29::JOIN
+                && same_second_removals.removes(&event.pubkey, event.created_at)
+            {
                 continue;
             }
             if event.kind == 9000 {
