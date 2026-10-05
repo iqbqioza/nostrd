@@ -1352,10 +1352,26 @@ impl LocalStore {
                 if let Ok(raw) = tokio::fs::read(file.path()).await
                     && let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&raw)
                 {
+                    // The size comes from the blob, never from the meta: the
+                    // meta is an untrusted legacy file (hand-edited, restored
+                    // from a backup of a different revision, or written by a
+                    // relay that crashed mid-upload) and its `size` is the one
+                    // field with teeth. GET advertises it as
+                    // `Content-Length` and feeds it to `parse_range`, so a
+                    // wrong value makes the response body disagree with its
+                    // own length and turns a range past the end of the file
+                    // into a 206. `mime` and `uploaded` are carried over
+                    // (they cannot be derived from the blob and are not used
+                    // for framing); a missing blob falls back to the meta so
+                    // a mapping-only store still migrates.
+                    let size = match tokio::fs::metadata(dir.join(&sha)).await {
+                        Ok(stat) => stat.len(),
+                        Err(_) => meta["size"].as_u64().unwrap_or(0),
+                    };
                     buf.push((
                         sha.clone(),
                         crate::server::blossom::sanitize_mime(meta["mime"].as_str().unwrap_or("")),
-                        meta["size"].as_u64().unwrap_or(0),
+                        size,
                         meta["uploaded"].as_i64().unwrap_or(0),
                         pubkey.clone(),
                     ));
@@ -1530,6 +1546,13 @@ impl S3Store {
             // fetched still migrates as a derived entry.
             let mut via_meta: std::collections::HashSet<(String, String)> =
                 std::collections::HashSet::new();
+            // Blob sizes from this listing page, keyed by `(npub, sha)`. A
+            // meta-backed entry takes its size from here, never from the
+            // meta: see the local pass for why. The listing is already
+            // fetched (the blob-only path uses it) and its size is the
+            // object's real length, so this costs no extra request.
+            let mut listed_sizes: std::collections::HashMap<(String, String), u64> =
+                std::collections::HashMap::new();
             let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(16));
             let mut tasks = tokio::task::JoinSet::new();
             for (key, size) in keys {
@@ -1549,13 +1572,16 @@ impl S3Store {
                     }
                     let client = self.client.clone();
                     let semaphore = std::sync::Arc::clone(&semaphore);
+                    let sha = sha.to_ascii_lowercase();
+                    let owner = pubkey.clone();
                     tasks.spawn(async move {
                         let _permit = semaphore.acquire().await;
                         let raw = client.get_object(&key).await;
-                        (key, pubkey, raw)
+                        (sha, owner, raw)
                     });
                     continue;
                 }
+                listed_sizes.insert((pubkey.clone(), file.to_ascii_lowercase()), size);
                 // Blobs without a meta (metadata moved to LMDB): the size
                 // comes from the listing; mime falls back to octet-stream.
                 // Normalized like the local pass and the meta path: GET
@@ -1572,18 +1598,10 @@ impl S3Store {
                     ));
                 }
             }
-            while let Some(Ok((key, pubkey, raw))) = tasks.join_next().await {
-                let Some(sha) = key
-                    .strip_suffix(".meta.json")
-                    .and_then(|k| k.split_once('/'))
-                    .map(|(_, f)| f)
-                else {
-                    continue;
-                };
-                if sha.len() != 64 || hex::decode(sha).is_err() {
+            while let Some(Ok((sha, pubkey, raw))) = tasks.join_next().await {
+                if sha.len() != 64 || hex::decode(&sha).is_err() {
                     continue;
                 }
-                let sha = sha.to_ascii_lowercase();
                 if let Ok(Some(raw)) = raw
                     && let Ok(meta) = serde_json::from_slice::<serde_json::Value>(&raw)
                 {
@@ -1591,10 +1609,18 @@ impl S3Store {
                     // the local pass): a blob whose meta cannot be fetched
                     // still migrates as a derived entry below.
                     via_meta.insert((sha.clone(), pubkey.clone()));
+                    // The blob's real size, not the meta's `size` (see the
+                    // local pass). A blob on another listing page falls back
+                    // to the meta rather than to zero: its length is unknown
+                    // here, and the derived path cannot see it either.
+                    let size = listed_sizes
+                        .get(&(pubkey.clone(), sha.clone()))
+                        .copied()
+                        .unwrap_or_else(|| meta["size"].as_u64().unwrap_or(0));
                     from_meta.push((
                         sha,
                         crate::server::blossom::sanitize_mime(meta["mime"].as_str().unwrap_or("")),
-                        meta["size"].as_u64().unwrap_or(0),
+                        size,
                         meta["uploaded"].as_i64().unwrap_or(0),
                         pubkey,
                     ));
@@ -2310,6 +2336,134 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A legacy `.meta.json` is an untrusted file, and its `size` is the one
+    /// field with teeth: GET advertises it as `Content-Length` and feeds it
+    /// to `parse_range`. A meta that disagrees with the blob must not decide
+    /// the mapping's size, or the response body contradicts its own length
+    /// and a range past the end of the file comes back 206.
+    #[tokio::test]
+    async fn migration_takes_the_size_from_the_blob_not_the_meta() {
+        let (db, db_path) = db("mig-size").await;
+        let dir = std::env::temp_dir().join(format!(
+            "nostrfy-blossom-test-mig-size-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let npub_dir = dir.join(npub_of(&pk(1)));
+        std::fs::create_dir_all(&npub_dir).unwrap();
+        // The blob is the authority: 5 bytes.
+        let sha = "ab".repeat(32);
+        std::fs::write(npub_dir.join(&sha), b"12345").unwrap();
+        // The meta claims 999. Its `mime` and `uploaded` are kept: they
+        // cannot be derived from the blob and do not frame the response.
+        std::fs::write(
+            npub_dir.join(format!("{sha}.meta.json")),
+            br#"{"size":999,"mime":"image/png","uploaded":1787000000}"#,
+        )
+        .unwrap();
+        let s = BlobStore::new("local", &dir, 0, None, db, Stats::new())
+            .await
+            .unwrap();
+        let (_tx, drain) = tokio::sync::watch::channel(false);
+        assert_eq!(
+            s.auto_migrate_legacy(drain).await.unwrap(),
+            MigrationOutcome::Completed(1)
+        );
+
+        let desc = s
+            .find(&sha)
+            .await
+            .unwrap()
+            .expect("the blob must be mapped");
+        assert_eq!(
+            desc.size, 5,
+            "the stored size must be the blob's, not the meta's 999: it is \
+             served as Content-Length and bounds every byte range"
+        );
+        assert_eq!(
+            desc.mime, "image/png",
+            "a field that cannot be derived from the blob must survive"
+        );
+        assert_eq!(
+            desc.uploaded, 1787000000,
+            "the upload time must survive too"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = db_path;
+    }
+
+    /// A mapping-only store (the blob is gone, the meta remains) still
+    /// migrates: falling back to the meta's `size` is the last resort, and
+    /// dropping the row would make the content unreachable.
+    #[tokio::test]
+    async fn migration_keeps_a_meta_only_entry() {
+        let (db, db_path) = db("mig-metaonly").await;
+        let dir = std::env::temp_dir().join(format!(
+            "nostrfy-blossom-test-mig-metaonly-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let npub_dir = dir.join(npub_of(&pk(1)));
+        std::fs::create_dir_all(&npub_dir).unwrap();
+        // Only the meta: no blob next to it.
+        let sha = "bc".repeat(32);
+        std::fs::write(
+            npub_dir.join(format!("{sha}.meta.json")),
+            br#"{"size":7,"mime":"text/plain","uploaded":1787000000}"#,
+        )
+        .unwrap();
+        let s = BlobStore::new("local", &dir, 0, None, db, Stats::new())
+            .await
+            .unwrap();
+        let (_tx, drain) = tokio::sync::watch::channel(false);
+        assert_eq!(
+            s.auto_migrate_legacy(drain).await.unwrap(),
+            MigrationOutcome::Completed(1),
+            "a meta without a blob still migrates"
+        );
+        let desc = s.find(&sha).await.unwrap().expect("the entry must exist");
+        assert_eq!(
+            desc.size, 7,
+            "with no blob to measure, the meta's size is the last resort"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = db_path;
+    }
+
+    /// The blob is the size authority, and it wins over a meta that
+    /// *under*-reports just as it does over one that over-reports: a short
+    /// `Content-Length` would truncate the body mid-object.
+    #[tokio::test]
+    async fn migration_prefers_a_longer_blob_over_a_shorter_meta() {
+        let (db, db_path) = db("mig-size-short").await;
+        let dir = std::env::temp_dir().join(format!(
+            "nostrfy-blossom-test-mig-size-short-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let npub_dir = dir.join(npub_of(&pk(1)));
+        std::fs::create_dir_all(&npub_dir).unwrap();
+        let sha = "cd".repeat(32);
+        std::fs::write(npub_dir.join(&sha), b"0123456789").unwrap();
+        std::fs::write(
+            npub_dir.join(format!("{sha}.meta.json")),
+            br#"{"size":3,"mime":"text/plain","uploaded":1787000000}"#,
+        )
+        .unwrap();
+        let s = BlobStore::new("local", &dir, 0, None, db, Stats::new())
+            .await
+            .unwrap();
+        let (_tx, drain) = tokio::sync::watch::channel(false);
+        s.auto_migrate_legacy(drain).await.unwrap();
+        assert_eq!(
+            s.find(&sha).await.unwrap().unwrap().size,
+            10,
+            "the blob's 10 bytes must win over the meta's 3"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = db_path;
+    }
+
     #[tokio::test]
     async fn auto_migration_merges_multi_owner_blobs() {
         let (db, db_path) = db("mig2").await;
@@ -2870,5 +3024,54 @@ mod scan_debug {
                 .any(|(s, _, _, _, p)| s == &sha && p == &pub_b),
             "the blob-only second owner must migrate too: {entries:?}"
         );
+    }
+
+    /// The S3 half of the size rule: a meta-backed entry takes the size the
+    /// listing reports for the blob, not the meta's `size`. Both land on the
+    /// same page here, so the listing already knows the real length and the
+    /// fix costs no extra request.
+    #[tokio::test]
+    async fn s3_scan_legacy_takes_the_size_from_the_listing_not_the_meta() {
+        let (endpoint, bucket) = crate::server::blossom::s3::mock_server::build_mock().await;
+        let pub_a = "aa".repeat(32);
+        let npub_a = npub_of(&pub_a);
+        let sha = "ab".repeat(32);
+        // The blob is 5 bytes; the meta claims 999 and is otherwise valid.
+        bucket
+            .lock()
+            .unwrap()
+            .insert(format!("{npub_a}/{sha}"), b"hello".to_vec());
+        bucket.lock().unwrap().insert(
+            format!("{npub_a}/{sha}.meta.json"),
+            br#"{"mime":"image/png","size":999,"uploaded":7}"#.to_vec(),
+        );
+        let s = S3Store::new(S3Config {
+            endpoint,
+            region: "us-east-1".into(),
+            bucket: "bucket".into(),
+            access_key: "ak".into(),
+            secret_key: "sk".into(),
+        })
+        .await
+        .unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        s.scan_legacy(tx).await.unwrap();
+        let mut entries = Vec::new();
+        while let Some(chunk) = rx.recv().await {
+            entries.extend(chunk);
+        }
+        let entry = entries
+            .iter()
+            .find(|(s, _, _, _, p)| s == &sha && p == &pub_a)
+            .unwrap_or_else(|| panic!("the meta entry must migrate: {entries:?}"));
+        assert_eq!(
+            entry.2, 5,
+            "the listing's size for the blob must win over the meta's 999"
+        );
+        assert_eq!(
+            entry.1, "image/png",
+            "a field that cannot be derived must survive"
+        );
+        assert_eq!(entry.3, 7, "the upload time must survive too");
     }
 }
