@@ -190,6 +190,8 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 | `inbox_write_policy` | string | `"any"` | Write policy for `/inbox`: `any` or `relay` |
 | `outbox_write_policy` | string | `"any"` | Write policy for `/outbox`: `any` or `relay` |
 | `trusted_proxies` | string array | `[]` | Reverse-proxy addresses/CIDRs whose `X-Forwarded-For` is trusted (e.g. `["127.0.0.1/32", "::1/128"]`). Empty = trust no proxy. Fixed at startup — requires a `restart` |
+| `landing_page_file` | string | `""` | HTML file served to a plain browser GET of the relay URL instead of the built-in decoy page. Empty = decoy |
+| `assets_dir` | string | `""` | Directory served under `/assets/<name>` (images/CSS/JS for the landing page). Empty = no `/assets/` route. Fixed at startup — requires a `restart` |
 
 ### Key details
 
@@ -200,6 +202,10 @@ The changes take effect immediately and are persisted (same lists as `nostrfy re
 **`api_host`** — A hostname (e.g. `api.example.com`) dedicated to the REST API. Requests whose Host header matches it are served only `/api/v1`, `/health` and `/metrics`; every other host gets `404` for those paths, and the API host gets `404` for the relay endpoints. This lets you serve the API and the relay on the same port behind one reverse proxy. Host matching ignores case, `:port` suffixes and IPv6 brackets. Empty = the API is available on every host. Fixed at startup — requires a `restart`.
 
 **`ws_paths`** — Which paths serve the WebSocket endpoint and the NIP-11 document: `root` serves `/` only (the default; the legacy `/ws` and `/ws/` paths are removed); `inbox-outbox` serves only `/inbox` and `/outbox`; `all` serves the root and the inbox/outbox paths. The inbox/outbox paths give the relay distinct endpoints for the inbox/outbox routing model (e.g. `wss://relay.example.com/inbox` and `wss://relay.example.com/outbox`). In `inbox-outbox` mode the root path returns 404 on every host except a configured Blossom host, where it answers the Blossom server-info document. Fixed at startup — requires a `restart`.
+
+**`landing_page_file`** — By default a plain HTTP GET of the relay URL (no `Accept: application/nostr+json`, no WebSocket upgrade) is answered with a built-in decoy page that reveals nothing about the relay. Set this to the path of an HTML file to serve your own page there instead — relay rules, contact details, statistics. The NIP-11 document (requested with `Accept: application/nostr+json`) and WebSocket connections are unaffected. The file is read on demand and cached until its modification time or size changes, so an external job can regenerate it in place without a restart; the setting itself applies on SIGHUP. It must be a regular file of at most 8 MiB (symlinks are not followed); when it is missing or unservable the decoy page is served, never the relay document. Served as `text/html; charset=utf-8` with `X-Content-Type-Options: nosniff`.
+
+**`assets_dir`** — A directory whose files are served under `/assets/<name>`, for images, stylesheets and scripts referenced by the landing page (e.g. an `og:image`). Only flat file names made of ASCII letters, digits, `.`, `_` and `-` that do not start with a dot are served; subdirectories, hidden files, symlinks and files over 8 MiB get `404`. The content type follows the extension (unknown extensions are `application/octet-stream`), always with `X-Content-Type-Options: nosniff`. Files are read per request, so they can be replaced in place. Empty (the default) leaves `/assets/` unrouted. Fixed at startup — requires a `restart`.
 
 **`metrics_enabled`** — When `true`, serves Prometheus-formatted metrics at `/metrics` (no authentication). Fixed at startup — requires a `restart`.
 
@@ -616,7 +622,7 @@ Editing the file and sending `kill -HUP $(cat nostrfy.pid)` reloads it **without
 | --- | --- |
 | Relay identity and policies: `relay.name`, `description`, `pubkey`, `contact`, `icon`, `post_policy`, `public_url`, `reject_ephemeral`, `enabled_git`, `enabled_nip78_auth`, `require_auth`, `send_auth_challenge`, `require_pow`, `new_pubkey_min_age_secs`, `max_events_per_min_per_pubkey` | `relay.private_key` (warned about and ignored), `relay.livekit_url`/`livekit_api_key`/`livekit_api_secret`, `relay.enabled_nips`/`disabled_nips`, `relay.max_groups` |
 | `rpc.management_token`, `rpc.admin_pubkey`, `blossom.restrict_uploads`, `access.restrict_relay` | `rpc.max_admin_body_bytes` |
-| `server.inbox_write_policy`, `server.outbox_write_policy` (existing connections pick them up on the next config refresh), `relay.enabled_command_events` (read per event), `daemon.stats_file` (read on every stats tick), `database.db_buffer_size` (new connections only) | `server.host`, `server.port`, `server.ws_paths`, `server.api_host`, `server.metrics_enabled`, `server.trusted_proxies` (they shape the listener, routes and per-connection accounting built at startup) |
+| `server.inbox_write_policy`, `server.outbox_write_policy` (existing connections pick them up on the next config refresh), `server.landing_page_file` (read per request), `relay.enabled_command_events` (read per event), `daemon.stats_file` (read on every stats tick), `database.db_buffer_size` (new connections only) | `server.host`, `server.port`, `server.ws_paths`, `server.api_host`, `server.metrics_enabled`, `server.trusted_proxies`, `server.assets_dir` (they shape the listener, routes and per-connection accounting built at startup) |
 | Most of `[limits]`: `max_ws_message_bytes`, `max_filters`, `max_subscriptions`, `max_limit`, `max_count`, `max_sub_id_len`, `max_content_bytes`, `max_tags`, `max_tag_value_bytes`, `max_created_at_future_secs`, `max_neg_items`, `max_sub_bytes`, `group_late_publish_secs`, the API bounds (`max_api_concurrent`, `max_api_queue_msgs`, `max_api_limit`, `max_api_offset`, `max_api_fetch`, `max_api_search_bytes`), `max_out_queue_bytes`, `max_req_response_bytes`, `ws_idle_timeout_secs` (existing connections keep their deadline; the new value applies to connections made after the reload) | `limits.live_buffer`, `limits.live_batch_size`, `limits.live_batch_interval_ms`, `limits.socket_recv_buffer_kb`, `limits.max_connections`, `limits.max_connections_per_ip`, `limits.http_read_timeout_secs`, `limits.max_connections_per_sec_per_ip` (they shape the accept loop built at startup), `server.trusted_proxies` (it shapes the per-connection accounting) |
 | — | `database.path`, `database.purge_interval_secs`, `database.map_size`, `database.max_map_size`, `database.max_dbs`, `database.max_readers`, `database.search_index`, `database.meta_index`, `database.reader_threads`, `database.disabled_fsync`, `database.db_request_timeout_secs`, `database.max_db_queue_msgs`, `database.max_db_queue_events`, `database.max_db_queue_bytes`, `database.max_indexed_words` |
 | — | `daemon.max_log_size_bytes`, `daemon.max_log_files`, `daemon.stats_interval_secs`, `daemon.log_file`, `daemon.pid_file` |
@@ -663,6 +669,8 @@ api_host = "api.example.com"
 metrics_enabled = true
 # Proxies on this host (nginx/Caddy); remove for direct exposure.
 trusted_proxies = ["127.0.0.1/32", "::1/128"]
+landing_page_file = ""
+assets_dir = ""
 ws_paths = "root"
 inbox_write_policy = "any"
 outbox_write_policy = "any"

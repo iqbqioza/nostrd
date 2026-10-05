@@ -215,6 +215,21 @@ pub struct ServerConfig {
     /// directly: they could then spoof `X-Forwarded-For` and bypass the
     /// per-IP limits. Read at startup — changing it requires a restart.
     pub trusted_proxies: Vec<String>,
+    /// HTML file served to a plain browser GET of the relay URL instead of
+    /// the built-in decoy page (requests asking for
+    /// `application/nostr+json` still get the NIP-11 document, and
+    /// WebSocket upgrades are unaffected). Empty (the default) keeps the
+    /// decoy. Read on demand and re-read when the file changes, so an
+    /// external generator can rewrite it without a restart; the setting
+    /// itself applies on SIGHUP. Must be a regular file (symlinks are not
+    /// followed) of at most 8 MiB, else the decoy is served.
+    pub landing_page_file: String,
+    /// Directory whose files are served under `/assets/<name>` (images,
+    /// CSS, scripts for the landing page). Only flat file names of ASCII
+    /// letters, digits, `.`, `_` and `-` are served (no subdirectories, no
+    /// hidden files, symlinks not followed, at most 8 MiB each). Empty (the
+    /// default) disables the route. Fixed at startup — requires a restart.
+    pub assets_dir: String,
 }
 
 /// NIP-86 management RPC settings: served on the relay port (there is no
@@ -445,6 +460,8 @@ impl Default for ServerConfig {
             inbox_write_policy: "any".into(),
             outbox_write_policy: "any".into(),
             trusted_proxies: Vec::new(),
+            landing_page_file: String::new(),
+            assets_dir: String::new(),
         }
     }
 }
@@ -2625,6 +2642,8 @@ fn known_config_keys() -> &'static [(&'static str, &'static [&'static str])] {
                 "outbox_write_policy",
                 "trusted_proxies",
                 "metrics_enabled",
+                "landing_page_file",
+                "assets_dir",
                 "management_token",
                 "admin_pubkey",
                 "require_auth",
