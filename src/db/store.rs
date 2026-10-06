@@ -2342,12 +2342,19 @@ impl Store {
 
     /// Whether a NIP-29 purge marker blocks `event`: any `h`-tagged event
     /// with `created_at <= cut` is a re-publication of purged history (see
-    /// [`PURGED_GROUPS`]). The `kind:9007` re-create is the exception: it
+    /// [`PURGED_GROUPS`]), and so is a relay-generated metadata event
+    /// (39000-39005, which carries the group id in `d` instead of `h`).
+    /// Other `d`-tagged events are ordinary addressable traffic and are
+    /// never blocked here. The `kind:9007` re-create is the exception: it
     /// is compared against the purge time alone, so a legitimate re-create
     /// at (or after) the purge passes even when future-dated purged content
     /// pushed the cut past it.
     fn purged_groups_blocks(&self, wtxn: &heed::RwTxn, event: &Event) -> Result<bool> {
-        if !event.tags.iter().any(|tag| tag.len() >= 2 && tag[0] == "h") {
+        // The metadata kinds are checked by their `d` tag below; every
+        // other event needs an `h` tag to name a group at all.
+        let is_meta =
+            (crate::nips::nip29::GROUP_META..=crate::nips::nip29::GROUP_PINS).contains(&event.kind);
+        if !is_meta && !event.tags.iter().any(|tag| tag.len() >= 2 && tag[0] == "h") {
             return Ok(false);
         }
         // No group was ever purged: skip the per-tag hashing entirely (the
@@ -2356,7 +2363,10 @@ impl Store {
             return Ok(false);
         }
         for tag in &event.tags {
-            if tag.len() < 2 || tag[0] != "h" {
+            if tag.len() < 2 {
+                continue;
+            }
+            if tag[0] != "h" && !(is_meta && tag[0] == "d") {
                 continue;
             }
             let Some(raw) = self.purged_groups.get(wtxn, &purged_group_key(&tag[1]))? else {
@@ -2450,13 +2460,14 @@ impl Store {
         // NIP-29: a purged group's history must not re-enter the database
         // after the id is re-created (a re-create installs default-public
         // settings, exposing old private posts). One marker per group id
-        // records the purge time and the cut; `h`-tagged events with
-        // `created_at <= cut` are rejected, including same-second and
-        // future-dated events removed by the purge. Only the `kind:9007`
-        // re-create compares against the purge time instead, so it passes
-        // even when the cut was pushed forward. Only events carrying an
-        // `h` tag are checked, so ordinary traffic pays one tag scan at
-        // most.
+        // records the purge time and the cut; `h`-tagged events — and the
+        // relay-generated metadata events (39000-39005, keyed by their `d`
+        // tag) — with `created_at <= cut` are rejected, including
+        // same-second and future-dated events removed by the purge. Only
+        // the `kind:9007` re-create compares against the purge time
+        // instead, so it passes even when the cut was pushed forward.
+        // Other events without an `h` tag are unchecked, so ordinary
+        // traffic pays one tag scan at most.
         if self.purged_groups_blocks(wtxn, event)? {
             return Ok(PutOutcome::PreviouslyDeleted);
         }

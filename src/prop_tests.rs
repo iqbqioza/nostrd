@@ -243,9 +243,12 @@ impl Model {
     }
 
     fn purged_blocks(&self, event: &Event) -> bool {
+        // Mirrors `Store::purged_groups_blocks`: `h`-tagged history, plus
+        // the relay-generated metadata (39000-39005) by its `d` tag.
+        let is_meta = (nip29::GROUP_META..=nip29::GROUP_PINS).contains(&event.kind);
         event.tags.iter().any(|tag| {
             tag.len() >= 2
-                && tag[0] == "h"
+                && (tag[0] == "h" || (is_meta && tag[0] == "d"))
                 && self
                     .purged_groups
                     .get(&tag[1])
@@ -390,13 +393,18 @@ impl Model {
         removed
     }
 
-    /// NIP-29 `kind:9008`: removes the group's `h`-tagged history and records
+    /// NIP-29 `kind:9008`: removes the group's `h`-tagged history and its
+    /// relay-generated metadata (39000-39005, keyed by `d`), and records
     /// the purge cut (the furthest purge time and the newest removed event).
     fn purge_group(&mut self, group: &str, now: u64) -> usize {
         let doomed: Vec<String> = self
             .stored
             .iter()
-            .filter(|(_, event)| h_tagged(event, group))
+            .filter(|(_, event)| {
+                h_tagged(event, group)
+                    || ((nip29::GROUP_META..=nip29::GROUP_PINS).contains(&event.kind)
+                        && d_tagged(event, group))
+            })
             .map(|(id, _)| id.clone())
             .collect();
         let max_created = doomed
@@ -454,6 +462,13 @@ fn h_tagged(event: &Event, group: &str) -> bool {
         .tags
         .iter()
         .any(|tag| tag.len() >= 2 && tag[0] == "h" && tag[1] == group)
+}
+
+fn d_tagged(event: &Event, group: &str) -> bool {
+    event
+        .tags
+        .iter()
+        .any(|tag| tag.len() >= 2 && tag[0] == "d" && tag[1] == group)
 }
 
 /// The bounded top-`k` result of one filter, including the scan's
