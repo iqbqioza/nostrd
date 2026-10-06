@@ -391,6 +391,17 @@ enum Msg {
         /// later chunk must not hide that the derived state went stale.
         reply: oneshot::Sender<(Option<usize>, bool)>,
     },
+    /// Records a [`PendingDeletion`] in the `delete_pending` table without
+    /// running the walk. The writer queue sheds a deletion under overload
+    /// before the walk can record it itself, and the request would then be
+    /// lost (the NIP-09 event is already stored, so the client's only
+    /// recourse is a re-send that reads back as a duplicate and never
+    /// re-runs the removal). Recording it here makes the startup resume
+    /// finish the deletion instead. `true` when the record committed.
+    RecordPendingDeletion {
+        request: store::PendingDeletion,
+        reply: oneshot::Sender<bool>,
+    },
     /// NIP-29 `kind:9008`: purge every stored event of a deleted group, so a
     /// later re-creation of the id cannot expose the old history.
     GroupPurge {
@@ -2101,6 +2112,19 @@ impl DbClient {
             reply,
         })
         .await
+    }
+
+    /// Records a deletion request in the `delete_pending` table without
+    /// running the removal walk, so the startup resume finishes it.
+    ///
+    /// Used when the writer shed the deletion itself (the queue was full):
+    /// the walk never ran, so it never wrote its own record, and the request
+    /// would otherwise be lost with no way for the client to trigger it
+    /// again. Returns `false` when the record did not commit (the caller
+    /// keeps the request in memory and retries, or reports the failure).
+    pub async fn record_pending_deletion(&self, request: store::PendingDeletion) -> bool {
+        self.request_write(|reply| Msg::RecordPendingDeletion { request, reply })
+            .await
     }
 
     /// Migration-only: records NIP-09 re-publication blocks for deletion

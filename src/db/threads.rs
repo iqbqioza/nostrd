@@ -1205,6 +1205,17 @@ pub(crate) fn spawn(
                                         report.group_state_removed,
                                     ));
                                 }
+                                Msg::RecordPendingDeletion { request, reply } => {
+                                    match store.record_pending_deletion(&request) {
+                                        Ok(()) => {
+                                            let _ = reply.send(true);
+                                        }
+                                        Err(e) => {
+                                            db_error(&thread_errors, &e);
+                                            let _ = reply.send(false);
+                                        }
+                                    }
+                                }
                                 Msg::GroupPurge {
                                     group,
                                     now,
