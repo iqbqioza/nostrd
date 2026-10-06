@@ -854,8 +854,8 @@ impl Store {
             wtxn.commit()?;
             (purge_now, cut, create_id, effective_until)
         };
-        let start = tag_key(b'h', gid.as_bytes(), 0, &[0u8; ID_LEN]);
-        let end = crate::db::store::range_end(
+        let h_start = tag_key(b'h', gid.as_bytes(), 0, &[0u8; ID_LEN]);
+        let h_end = crate::db::store::range_end(
             tag_key(
                 b'h',
                 gid.as_bytes(),
@@ -864,113 +864,208 @@ impl Store {
             ),
             effective_until,
         );
+        // The relay-generated metadata events (39000-39005) carry the group
+        // id in `d`, not `h` (see `nip29::group_id_any`): without this second
+        // range the purge leaves the old member roster and settings behind,
+        // and a re-create exposes them under the new public group.
+        let d_start = tag_key(b'd', gid.as_bytes(), 0, &[0u8; ID_LEN]);
+        let d_end = crate::db::store::range_end(
+            tag_key(
+                b'd',
+                gid.as_bytes(),
+                effective_until.saturating_add(1),
+                &[0u8; ID_LEN],
+            ),
+            effective_until,
+        );
         // Ids beyond the index key limit are stored but never tag-indexed
         // (the write path skips over-long keys instead of aborting the
-        // batch): the tag-index range above cannot see them, so the walk
-        // falls back to a bounded time-range scan with an in-memory `h`
-        // match, mirroring the query engine's fallback for the same ids.
+        // batch): the tag-index ranges above cannot see them, so the walk
+        // falls back to a bounded time-range scan with an in-memory match
+        // (`h`, or `d` on a metadata kind), mirroring the query engine's
+        // fallback for the same ids.
         let overlong = gid.len() > TAG_INDEX_VALUE_MAX;
         let created_start = created_key(0, &[0u8; ID_LEN]);
         let created_end = created_key(effective_until, &[0xffu8; ID_LEN]);
-        let mut last_key: Option<Vec<u8>> = None;
+        // One walk per tag namespace: `h` for user and moderation events,
+        // `d` for the relay-generated metadata (39000-39005, which carry no
+        // `h` tag). The `d` range also matches ordinary addressable events
+        // whose `d` happens to equal the group id, so that phase
+        // additionally requires a metadata kind. An over-long id is indexed
+        // under neither tag: the single time-range scan below covers both
+        // namespaces at once through its in-memory predicate.
+        enum PurgePhase {
+            ByTag {
+                start: Vec<u8>,
+                end: Vec<u8>,
+                meta_only: bool,
+            },
+            ByCreated,
+        }
+        let phases: Vec<PurgePhase> = if overlong {
+            vec![PurgePhase::ByCreated]
+        } else {
+            vec![
+                PurgePhase::ByTag {
+                    start: h_start,
+                    end: h_end,
+                    meta_only: false,
+                },
+                PurgePhase::ByTag {
+                    start: d_start,
+                    end: d_end,
+                    meta_only: true,
+                },
+            ]
+        };
         let mut removed = 0usize;
         let mut max_created = 0u64;
-        loop {
-            if self.cancelled() {
-                // SIGTERM mid-walk: stop at the chunk boundary and leave the
-                // pending record (written above) for the next startup.
-                return Err(anyhow::anyhow!(
-                    "NIP-29 group purge cancelled during shutdown; resuming at next startup"
-                ));
-            }
-            #[cfg(test)]
-            if take_chunk_fault(&self.fail_chunk_after) {
-                return Err(anyhow::anyhow!("test-only removal chunk failure"));
-            }
-            // Test-only: fail after the marker and in-progress record
-            // committed, so the resume path runs with real crash state.
-            #[cfg(test)]
-            if self
-                .fail_next_purge_chunk
-                .swap(false, std::sync::atomic::Ordering::SeqCst)
-            {
-                return Err(anyhow::anyhow!("test-only purge chunk failure"));
-            }
-            // A fresh write transaction per chunk: a group's history is
-            // unbounded, and one transaction across the whole purge pinned
-            // the writer while a MapFull aborted everything.
-            let mut wtxn = self.env.write_txn()?;
-            let entries = if overlong {
-                let lower = match &last_key {
-                    Some(k) => std::ops::Bound::Excluded(k.as_slice()),
-                    None => std::ops::Bound::Included(created_start.as_slice()),
+        for phase in &phases {
+            let mut last_key: Option<Vec<u8>> = None;
+            loop {
+                if self.cancelled() {
+                    // SIGTERM mid-walk: stop at the chunk boundary and leave the
+                    // pending record (written above) for the next startup.
+                    return Err(anyhow::anyhow!(
+                        "NIP-29 group purge cancelled during shutdown; resuming at next startup"
+                    ));
+                }
+                #[cfg(test)]
+                if take_chunk_fault(&self.fail_chunk_after) {
+                    return Err(anyhow::anyhow!("test-only removal chunk failure"));
+                }
+                // Test-only: fail after the marker and in-progress record
+                // committed, so the resume path runs with real crash state.
+                #[cfg(test)]
+                if self
+                    .fail_next_purge_chunk
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    return Err(anyhow::anyhow!("test-only purge chunk failure"));
+                }
+                // A fresh write transaction per chunk: a group's history is
+                // unbounded, and one transaction across the whole purge pinned
+                // the writer while a MapFull aborted everything.
+                let mut wtxn = self.env.write_txn()?;
+                let entries = match phase {
+                    PurgePhase::ByCreated => {
+                        let lower = match &last_key {
+                            Some(k) => std::ops::Bound::Excluded(k.as_slice()),
+                            None => std::ops::Bound::Included(created_start.as_slice()),
+                        };
+                        removal_chunk(
+                            self.by_created,
+                            &wtxn,
+                            (lower, std::ops::Bound::Included(created_end.as_slice())),
+                        )?
+                    }
+                    PurgePhase::ByTag { start, end, .. } => {
+                        let lower = match &last_key {
+                            Some(k) => std::ops::Bound::Excluded(k.as_slice()),
+                            None => std::ops::Bound::Included(start.as_slice()),
+                        };
+                        removal_chunk(
+                            self.by_tag,
+                            &wtxn,
+                            (lower, std::ops::Bound::Excluded(end.as_slice())),
+                        )?
+                    }
                 };
-                removal_chunk(
-                    self.by_created,
-                    &wtxn,
-                    (lower, std::ops::Bound::Included(created_end.as_slice())),
-                )?
-            } else {
-                let lower = match &last_key {
-                    Some(k) => std::ops::Bound::Excluded(k.as_slice()),
-                    None => std::ops::Bound::Included(start.as_slice()),
-                };
-                removal_chunk(
-                    self.by_tag,
-                    &wtxn,
-                    (lower, std::ops::Bound::Excluded(end.as_slice())),
-                )?
-            };
-            if entries.is_empty() {
-                break;
-            }
-            last_key = Some(entries.last().unwrap().0.clone());
-            for (_, id) in entries {
-                let Some(raw) = self.events.get(&wtxn, &id)? else {
-                    continue;
-                };
-                // The removed event's timestamp raises the cut: without it
-                // a same-second or future-dated event would be removed by
-                // this purge and then accepted again on replay.
-                if overlong {
-                    // Only `h`-tagged events of this group may go: the
-                    // time range is unscoped, so match in memory (an event
-                    // that fails to parse cannot be classified and stays).
-                    let Ok(event) = serde_json::from_slice::<Event>(raw) else {
+                if entries.is_empty() {
+                    break;
+                }
+                last_key = Some(entries.last().unwrap().0.clone());
+                for (_, id) in entries {
+                    let Some(raw) = self.events.get(&wtxn, &id)? else {
                         continue;
                     };
-                    if !event
-                        .tags
-                        .iter()
-                        .any(|t| t.len() >= 2 && t[0] == "h" && t[1].as_str() == gid)
-                    {
+                    // The removed event's timestamp raises the cut: without it
+                    // a same-second or future-dated event would be removed by
+                    // this purge and then accepted again on replay.
+                    let matched = match phase {
+                        PurgePhase::ByCreated => {
+                            // The time range is unscoped, so match in memory (an
+                            // event that fails to parse cannot be classified and
+                            // stays): `h`-tagged history, or relay-generated
+                            // metadata naming the group in `d`.
+                            let Ok(event) = serde_json::from_slice::<Event>(raw) else {
+                                continue;
+                            };
+                            let history = event
+                                .tags
+                                .iter()
+                                .any(|t| t.len() >= 2 && t[0] == "h" && t[1].as_str() == gid);
+                            let metadata =
+                                (crate::nips::nip29::GROUP_META..=crate::nips::nip29::GROUP_PINS)
+                                    .contains(&event.kind)
+                                    && event.tags.iter().any(|t| {
+                                        t.len() >= 2 && t[0] == "d" && t[1].as_str() == gid
+                                    });
+                            if !history && !metadata {
+                                continue;
+                            }
+                            max_created = max_created.max(event.created_at);
+                            if event.kind == crate::nips::nip29::CREATE_GROUP && id.len() == ID_LEN
+                            {
+                                create_id = Some(id.as_slice().try_into().expect("checked length"));
+                            }
+                            true
+                        }
+                        PurgePhase::ByTag { meta_only, .. } if *meta_only => {
+                            // The `d` range is shared with ordinary addressable
+                            // events: only relay-generated metadata naming the
+                            // group in `d` may go (an event that fails to parse
+                            // cannot be classified and stays).
+                            let Ok(event) = serde_json::from_slice::<Event>(raw) else {
+                                continue;
+                            };
+                            if !(crate::nips::nip29::GROUP_META..=crate::nips::nip29::GROUP_PINS)
+                                .contains(&event.kind)
+                            {
+                                continue;
+                            }
+                            if !event
+                                .tags
+                                .iter()
+                                .any(|t| t.len() >= 2 && t[0] == "d" && t[1].as_str() == gid)
+                            {
+                                continue;
+                            }
+                            max_created = max_created.max(event.created_at);
+                            true
+                        }
+                        PurgePhase::ByTag { .. } => {
+                            if let Ok(event) = serde_json::from_slice::<Event>(raw) {
+                                max_created = max_created.max(event.created_at);
+                                if event.kind == crate::nips::nip29::CREATE_GROUP
+                                    && id.len() == ID_LEN
+                                {
+                                    create_id =
+                                        Some(id.as_slice().try_into().expect("checked length"));
+                                }
+                            }
+                            true
+                        }
+                    };
+                    if !matched {
                         continue;
                     }
-                    max_created = max_created.max(event.created_at);
-                    if event.kind == crate::nips::nip29::CREATE_GROUP && id.len() == ID_LEN {
-                        create_id = Some(id.as_slice().try_into().expect("checked length"));
-                    }
-                } else if let Ok(event) = serde_json::from_slice::<Event>(raw) {
-                    max_created = max_created.max(event.created_at);
-                    if event.kind == crate::nips::nip29::CREATE_GROUP && id.len() == ID_LEN {
-                        create_id = Some(id.as_slice().try_into().expect("checked length"));
-                    }
+                    self.remove_event(&mut wtxn, &id)?;
+                    removed += 1;
                 }
-                self.remove_event(&mut wtxn, &id)?;
-                removed += 1;
+                // Persist the raised cut (and any create id) with the chunk
+                // that produced it: a crash before completion must not lose
+                // either (the cut would regress and a future-dated removed
+                // event would be accepted again; the create id would let an
+                // exact replay resurrect the group).
+                cut = cut.max(max_created);
+                self.purge_pending.put(
+                    &mut wtxn,
+                    &key,
+                    &encode_pending_purge(gid, purge_now, cut, effective_until, create_id.as_ref()),
+                )?;
+                wtxn.commit()?;
             }
-            // Persist the raised cut (and any create id) with the chunk
-            // that produced it: a crash before completion must not lose
-            // either (the cut would regress and a future-dated removed
-            // event would be accepted again; the create id would let an
-            // exact replay resurrect the group).
-            cut = cut.max(max_created);
-            self.purge_pending.put(
-                &mut wtxn,
-                &key,
-                &encode_pending_purge(gid, purge_now, cut, effective_until, create_id.as_ref()),
-            )?;
-            wtxn.commit()?;
         }
         // Completion commit: re-merge the marker (a legacy 8-byte marker was
         // upgraded by the initial commit above), clear the in-progress

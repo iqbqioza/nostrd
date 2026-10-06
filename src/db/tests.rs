@@ -2038,6 +2038,101 @@ fn group_purge_removes_only_that_groups_events() {
 }
 
 #[test]
+fn group_purge_removes_relay_metadata_and_blocks_its_replay() {
+    // The relay-generated metadata events (39000-39005) carry the group id
+    // in `d`, not `h`: the purge walk must remove them too, or a re-create
+    // (public by default) exposes the old private roster and settings. The
+    // re-publication block must cover their `d` tag as well, while an
+    // ordinary addressable event whose `d` happens to equal the group id is
+    // not group history and must survive both.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let now = unix_now();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let meta = event(
+            39000,
+            "old settings",
+            now - 5,
+            vec![vec!["d".into(), "group-1".into()]],
+        );
+        let members = event(
+            39002,
+            "old roster",
+            now - 4,
+            vec![
+                vec!["d".into(), "group-1".into()],
+                vec!["p".into(), "aa".repeat(32)],
+            ],
+        );
+        let addr = event(
+            30001,
+            "unrelated addressable",
+            now - 3,
+            vec![vec!["d".into(), "group-1".into()]],
+        );
+        let other = event(
+            39000,
+            "other group",
+            now - 2,
+            vec![vec!["d".into(), "group-2".into()]],
+        );
+        for e in [&meta, &members, &addr, &other] {
+            assert_eq!(db.put(e.clone(), now).await, PutOutcome::Stored);
+        }
+        assert_eq!(db.group_purge("group-1".into(), now).await, Some(2));
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"kinds": [39000, 39002], "#d": ["group-1"]}))
+                .unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert!(res.is_empty(), "the purged metadata must be gone");
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"kinds": [30001], "#d": ["group-1"]}))
+                .unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(
+            res.len(),
+            1,
+            "an addressable event that merely shares the d value is not group history"
+        );
+        let f: Filter =
+            serde_json::from_value(serde_json::json!({"kinds": [39000], "#d": ["group-2"]}))
+                .unwrap();
+        let (res, _) = db.query(vec![f], 500, now).await;
+        assert_eq!(res.len(), 1, "other groups are untouched");
+        // A re-broadcast of the purged metadata is refused without a
+        // per-event tombstone; fresh addressable traffic under the same `d`
+        // still stores.
+        assert!(matches!(
+            db.put(meta.clone(), now).await,
+            PutOutcome::PreviouslyDeleted
+        ));
+        let fresh_addr = event(
+            30001,
+            "fresh addressable",
+            now,
+            vec![vec!["d".into(), "group-1".into()]],
+        );
+        assert!(
+            matches!(
+                db.put(fresh_addr, now).await,
+                PutOutcome::Stored | PutOutcome::Replaced
+            ),
+            "fresh addressable traffic under the same d value is not blocked"
+        );
+    });
+    db.shutdown();
+}
+
+#[test]
 fn group_purge_removes_unindexed_long_group_ids() {
     // An `h` value beyond the index key limit is stored but never indexed
     // (queries find it via the time-scan fallback): the purge walk must

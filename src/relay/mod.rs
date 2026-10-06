@@ -3386,24 +3386,49 @@ impl Relay {
     /// Whether a `kind:9008` group purge committed. The purge API reports a
     /// failure as zero removed (indistinguishable from "nothing to purge"),
     /// so the id is confirmed clean only when no stored `h`-tagged event
-    /// remains. A failed or truncated query fails closed: the id stays
-    /// ghosted rather than becoming re-creatable with its history intact.
+    /// remains — and no relay-generated metadata event either (39000-39005
+    /// carry the group id in `d`, not `h`). A failed or truncated query
+    /// fails closed: the id stays ghosted rather than becoming re-creatable
+    /// with its history intact.
     async fn group_purge_confirmed(&self, gid: &str, until: u64) -> bool {
-        let mut filter: crate::filter::Filter =
+        let mut history: crate::filter::Filter =
             serde_json::from_value(serde_json::json!({ "#h": [gid] })).expect("static filter");
+        // The metadata check is scoped to the relay-generated kinds: an
+        // ordinary addressable event whose `d` happens to equal the group
+        // id is not group history and must not keep the id ghosted.
+        let mut metadata: crate::filter::Filter = serde_json::from_value(serde_json::json!({
+            "kinds": [
+                crate::nips::nip29::GROUP_META,
+                crate::nips::nip29::GROUP_ADMINS,
+                crate::nips::nip29::GROUP_MEMBERS,
+                crate::nips::nip29::GROUP_ROLES,
+                crate::nips::nip29::GROUP_PARTICIPANTS,
+                crate::nips::nip29::GROUP_PINS,
+            ],
+            "#d": [gid],
+        }))
+        .expect("static filter");
         // A migration-recorded purge is bounded: events after the cut are
         // the re-created group's and must not fail the confirmation.
         if until != u64::MAX {
-            filter.until = Some(until);
+            history.until = Some(until);
+            metadata.until = Some(until);
         }
-        match self
-            .db
-            .query_full_startup(vec![filter], 1, unix_now(), false)
-            .await
-        {
-            Some((events, more)) => !more && events.is_empty(),
-            None => false,
+        for filter in [history, metadata] {
+            match self
+                .db
+                .query_full_startup(vec![filter], 1, unix_now(), false)
+                .await
+            {
+                Some((events, more)) => {
+                    if more || !events.is_empty() {
+                        return false;
+                    }
+                }
+                None => return false,
+            }
         }
+        true
     }
 
     /// Startup barrier for the database writer's recovery: the server
@@ -6135,6 +6160,116 @@ mod tests {
                 relay.db.put(msg, now + 1).await,
                 crate::db::PutOutcome::PreviouslyDeleted,
                 "the purged history must not re-enter after the re-create"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn deleting_a_group_purges_its_relay_metadata() {
+        // H2: with a relay key configured, creating a group stores the
+        // relay-signed metadata events (39000-39002, keyed by `d`, not
+        // `h`). Deleting the group must purge those too — otherwise the old
+        // roster survives under the re-created (public by default) group —
+        // and the purge confirmation must cover them, or the id is
+        // unghosted while its metadata remains.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay_with_key(false, &"02".repeat(32)).await;
+            let now = crate::util::unix_now();
+            let secp = secp256k1::Secp256k1::new();
+            let keypair = secp256k1::Keypair::from_seckey_slice(&secp, &[7u8; 32]).unwrap();
+            let pubkey = secp256k1::XOnlyPublicKey::from_keypair(&keypair)
+                .0
+                .to_string();
+            let signed = |kind: u64, content: &str, created_at: u64| {
+                let mut e = crate::event::Event {
+                    id: String::new(),
+                    pubkey: pubkey.clone(),
+                    created_at,
+                    kind,
+                    tags: vec![vec!["h".into(), "g2".into()]],
+                    content: content.into(),
+                    sig: String::new(),
+                };
+                e.id = crate::nips::nip01::compute_id(&e);
+                let id = e.id_bytes().unwrap();
+                e.sig = secp.sign_schnorr_no_aux_rand(&id, &keypair).to_string();
+                e
+            };
+            let create = signed(crate::nips::nip29::CREATE_GROUP, "", now - 5);
+            assert!(matches!(
+                relay.accept_event(create, &[], None).await,
+                crate::db::PutOutcome::Stored
+            ));
+            let metadata_filter = || -> crate::filter::Filter {
+                serde_json::from_value(serde_json::json!({
+                    "kinds": [39000, 39001, 39002, 39005],
+                    "#d": ["g2"],
+                }))
+                .expect("static filter")
+            };
+            let (res, _) = relay.db.query(vec![metadata_filter()], 10, now).await;
+            assert!(
+                !res.is_empty(),
+                "creating a group with a relay key stores its metadata events"
+            );
+            let delete = signed(crate::nips::nip29::DELETE_GROUP, "", now);
+            assert!(matches!(
+                relay.accept_event(delete, &[], None).await,
+                crate::db::PutOutcome::Stored
+            ));
+            let (res, _) = relay.db.query(vec![metadata_filter()], 10, now).await;
+            assert!(
+                res.is_empty(),
+                "the deleted group's relay metadata must be purged"
+            );
+            // The confirmation covers the metadata too: the id is
+            // re-creatable only when nothing remains.
+            let recreate = signed(crate::nips::nip29::CREATE_GROUP, "recreate", now + 1);
+            assert!(matches!(
+                relay.accept_event(recreate, &[], None).await,
+                crate::db::PutOutcome::Stored
+            ));
+            assert!(
+                relay.groups.read().await.group("g2").is_some(),
+                "a confirmed purge must leave the id re-creatable"
+            );
+            relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn group_purge_confirmation_covers_relay_metadata() {
+        // The purge confirmation must see the relay-generated metadata
+        // (39000-39005, keyed by `d`): with only the `#h` check, a leftover
+        // 39000 — the state an older purge left behind — keeps the id
+        // re-creatable while its history is still stored.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay = build_relay().await;
+            let now = crate::util::unix_now();
+            let mut leftover = crate::event::Event {
+                id: String::new(),
+                pubkey: "03".repeat(32),
+                created_at: now,
+                kind: crate::nips::nip29::GROUP_META,
+                tags: vec![vec!["d".into(), "g9".into()]],
+                content: String::new(),
+                sig: String::new(),
+            };
+            leftover.id = crate::nips::nip01::compute_id(&leftover);
+            assert_eq!(
+                relay.db.put(leftover, now).await,
+                crate::db::PutOutcome::Stored
+            );
+            assert!(
+                !relay.group_purge_confirmed("g9", u64::MAX).await,
+                "a leftover 39000 must keep the id ghosted"
+            );
+            assert!(
+                relay.group_purge_confirmed("g-empty", u64::MAX).await,
+                "an id with no history must confirm clean"
             );
             relay.db.shutdown();
         });
