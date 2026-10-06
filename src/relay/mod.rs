@@ -114,6 +114,21 @@ pub struct Relay {
     /// held across an await) is enough: both drain sites already hold
     /// `persist_access_lock`.
     access_ops: std::sync::Mutex<Vec<crate::config::AccessOp>>,
+    /// Deletion requests whose side effect could not be applied because the
+    /// writer shed the message (the queue was full), held until a write
+    /// succeeds and they can be recorded in [`DELETE_PENDING`] for the
+    /// startup resume. Without this the request would be lost: the NIP-09
+    /// event itself is already stored, so the client's only recourse is a
+    /// re-send that the database reports as a duplicate (and a duplicate
+    /// never re-runs the removal). Bounded by
+    /// [`Self::PENDING_REMOVALS_LIMIT`]; past the bound the ack degrades to
+    /// the retryable failure instead of growing without limit. A plain
+    /// `Mutex`, never held across an await.
+    pending_removals: std::sync::Mutex<Vec<crate::db::store::PendingDeletion>>,
+    /// How many unapplied deletion requests may be held in memory waiting
+    /// for the `delete_pending` flush. Past the bound the ack degrades to
+    /// the retryable failure rather than growing without limit.
+    pending_removals_limit: std::sync::atomic::AtomicUsize,
     /// Serializes `persist_roles` snapshot capture and write (same hazard
     /// as `persist_access_lock`: a stale role snapshot must not overwrite a
     /// newer one). Shared with the role rebuild worker, which persists the
@@ -1506,6 +1521,9 @@ impl ApiLimiter {
 }
 
 impl Relay {
+    /// Default bound on the held unapplied deletions (see
+    /// [`Self::pending_removals`]).
+    const DEFAULT_PENDING_REMOVALS_LIMIT: usize = 1024;
     pub async fn new(
         config: Arc<RwLock<Config>>,
         db: DbClient,
@@ -1680,6 +1698,10 @@ impl Relay {
             publish_rate_pruned_at: std::sync::atomic::AtomicU64::new(0),
             persist_access_lock: tokio::sync::Mutex::new(()),
             access_ops: std::sync::Mutex::new(seed_ops),
+            pending_removals: std::sync::Mutex::new(Vec::new()),
+            pending_removals_limit: std::sync::atomic::AtomicUsize::new(
+                Self::DEFAULT_PENDING_REMOVALS_LIMIT,
+            ),
             persist_roles_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             snapshot_persist: std::sync::Arc::new(SnapshotPersist::default()),
             persist_blossom_allow_lock: tokio::sync::Mutex::new(()),
@@ -2395,10 +2417,13 @@ impl Relay {
                         outcome
                     }
                     // The event stored but a required removal side effect
-                    // (NIP-09/9005) was dropped: the client must retry
-                    // instead of receiving a `true` ack for a deletion that
-                    // did not happen. `after_put` already counted the
-                    // database error.
+                    // (NIP-09/9005) was dropped and could not even be held
+                    // for the `delete_pending` flush: the client is told to
+                    // retry. This is the only case where the ack is
+                    // actionable — a stored event's id is its content hash,
+                    // so an ordinary re-send reads back as a duplicate that
+                    // never re-runs the removal. `after_put` already counted
+                    // the database error.
                     RemovalAck::NotApplied => {
                         self.stats.bump(&self.stats.events_rejected, 1);
                         PutOutcome::Invalid(
@@ -2909,6 +2934,10 @@ impl Relay {
         nip29_enabled: bool,
     ) -> RemovalAck {
         let mut removal_failed = false;
+        // A removal that could not be applied, held for the pending-record
+        // flush. See `Self::hold_pending_removal` for why the request cannot
+        // simply be re-driven by the client.
+        let mut unapplied: Option<crate::db::store::PendingDeletion> = None;
         if nip9 && event.kind == nip09::DELETION_KIND {
             // NIP-29/NIP-43: a deletion that removes state events
             // (moderation, join/leave, role state) invalidates the derived
@@ -2943,12 +2972,21 @@ impl Relay {
                 Some(removed) => self.stats.bump(&self.stats.events_deleted, removed as u64),
                 None => {
                     // The deletion event stored but its side effect was
-                    // dropped (writer overload): the client must retry
-                    // instead of receiving a `true` ack for a deletion that
-                    // did not happen.
+                    // dropped (writer overload). A walk that failed
+                    // mid-way already recorded itself in `delete_pending`
+                    // and the startup resume will finish it; only the
+                    // fail-fast case (the message never reached the writer)
+                    // needs the request held here.
                     log::error!("NIP-09 deletion side effect was not applied");
                     self.stats.bump(&self.stats.db_errors, 1);
                     removal_failed = true;
+                    unapplied = Some(crate::db::store::PendingDeletion {
+                        targets: nip09::deletion_targets(&event),
+                        addresses: nip09::deletion_addresses(&event),
+                        request_pubkey: Some(event.pubkey.clone()),
+                        request_created: event.created_at,
+                        group: None,
+                    });
                 }
             }
             if state_removed {
@@ -2988,11 +3026,14 @@ impl Relay {
             // list without being stored.
             self.apply_leave_request(&event).await;
         }
-        if nip29_enabled
-            && nip29::is_group_action(&event)
-            && !self.apply_group_event(&event, now).await
-        {
-            removal_failed = true;
+        if nip29_enabled && nip29::is_group_action(&event) {
+            let (applied, group_unapplied) = self.apply_group_event(&event, now).await;
+            if !applied {
+                removal_failed = true;
+            }
+            // A group action is either a `9005` deletion or a state update,
+            // so at most one of the two unapplied requests can be set.
+            unapplied = unapplied.or(group_unapplied);
         }
         // Command events: with `relay.enabled_command_events` a kind:1
         // event authored by the relay's own pubkey carries an operator
@@ -3009,11 +3050,83 @@ impl Relay {
         // pub/sub (there is nothing to replay from); stored events cannot
         // miss this way.
         let delivered = self.broadcast(event).await.is_ok();
-        if removal_failed {
-            RemovalAck::NotApplied
-        } else {
-            RemovalAck::Applied(delivered)
+        if !removal_failed {
+            return RemovalAck::Applied(delivered);
         }
+        // The event is stored and stays stored: the id is what the client
+        // signs, so re-sending the deletion to retry is impossible (the
+        // database reports the second attempt as a duplicate, and a
+        // duplicate never re-runs the removal). Reporting the failure is
+        // therefore not actionable, and the request is now held for the
+        // `delete_pending` flush so the startup resume completes it.
+        match unapplied {
+            Some(request) => {
+                if self.hold_pending_removal(request).await {
+                    RemovalAck::Applied(delivered)
+                } else {
+                    RemovalAck::NotApplied
+                }
+            }
+            None => RemovalAck::NotApplied,
+        }
+    }
+
+    /// Holds a deletion request whose side effect was shed by the writer
+    /// queue and flushes the held list into the `delete_pending` table.
+    ///
+    /// Returns whether the request is durably recoverable (recorded now, or
+    /// still held in memory under the bound). `false` means the bound was
+    /// exceeded, so the caller keeps the retryable failure: an unbounded
+    /// queue would trade a lost deletion for unbounded memory.
+    fn pending_removals_limit(&self) -> usize {
+        self.pending_removals_limit
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    async fn hold_pending_removal(&self, request: crate::db::store::PendingDeletion) -> bool {
+        {
+            let mut held = self
+                .pending_removals
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let limit = self.pending_removals_limit();
+            if held.len() >= limit {
+                log::error!(
+                    "dropping an unapplied deletion: {} requests are already held",
+                    held.len()
+                );
+                return false;
+            }
+            held.push(request);
+        }
+        // Drain and record in the same pass: the writer shed the deletion
+        // moments ago and may still be full, in which case the requests stay
+        // held and the next event retries the flush.
+        let drained: Vec<crate::db::store::PendingDeletion> = {
+            let mut held = self
+                .pending_removals
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *held)
+        };
+        let mut retained = Vec::with_capacity(drained.len());
+        for request in drained {
+            if !self.db.record_pending_deletion(request.clone()).await {
+                retained.push(request);
+            }
+        }
+        let mut held = self
+            .pending_removals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // Anything another task queued while this flush awaited comes first,
+        // so the bound still bounds the total held.
+        let limit = self.pending_removals_limit();
+        retained.append(&mut held);
+        let over_bound = retained.len() > limit;
+        retained.truncate(limit);
+        *held = retained;
+        !over_bound
     }
 
     /// Persists the live NIP-29 group state immediately. The hot mutation
@@ -3565,9 +3678,16 @@ impl Relay {
     /// applied: the caller must report the retryable outcome instead of
     /// `OK true`. Every other path returns `true` (a failed `9008` purge
     /// keeps the id fail-closed as a ghost, which is a safe, non-removal
-    /// outcome).
-    async fn apply_group_event(&self, event: &Event, now: u64) -> bool {
+    /// outcome). The second element carries the unapplied request so the
+    /// caller can hold it for the `delete_pending` flush (see
+    /// [`Self::after_put`]).
+    async fn apply_group_event(
+        &self,
+        event: &Event,
+        now: u64,
+    ) -> (bool, Option<crate::db::store::PendingDeletion>) {
         let mut removal_failed = false;
+        let mut unapplied = None;
         // A `kind:9008` purge may fail (or the process may crash before it
         // commits). The delete tombstone alone would let a later create
         // clear it and expose the un-purged history, so the id is ghosted
@@ -3614,10 +3734,19 @@ impl Relay {
                         // The 9005 stored but its side effect was dropped
                         // (writer overload): report the retryable failure
                         // instead of a silent success (same OK semantics as
-                        // the NIP-09 deletion path).
+                        // the NIP-09 deletion path). The request is held for
+                        // the `delete_pending` flush so the client does not
+                        // have to (and cannot usefully) re-send it.
                         log::error!("NIP-29 9005 deletion side effect was not applied");
                         self.stats.bump(&self.stats.db_errors, 1);
                         removal_failed = true;
+                        unapplied = Some(crate::db::store::PendingDeletion {
+                            targets: nip29::delete_targets(event),
+                            addresses: Vec::new(),
+                            request_pubkey: None,
+                            request_created: u64::MAX,
+                            group: Some(gid.to_string()),
+                        });
                     }
                 }
                 if state_removed {
@@ -3718,7 +3847,7 @@ impl Relay {
                 );
             }
         }
-        !removal_failed
+        (!removal_failed, unapplied)
     }
 }
 
@@ -3831,9 +3960,10 @@ impl PendingBatch {
                             relay.stats.bump(&relay.stats.events_accepted, 1);
                         }
                         RemovalAck::NotApplied => {
-                            // The event stored but a required removal was
-                            // not: report the retryable failure (see the
-                            // single-event path).
+                            // The event stored, the removal was dropped and
+                            // could not be held for the `delete_pending`
+                            // flush either: report the retryable failure (see
+                            // the single-event path).
                             relay.stats.bump(&relay.stats.events_rejected, 1);
                             ack_override = Some(PutOutcome::Invalid(
                                 "error: database overloaded: removal was not applied; retry".into(),
@@ -5755,10 +5885,13 @@ mod tests {
 
     #[test]
     fn nip09_deletion_failure_is_reported_as_retryable() {
-        // A NIP-09 deletion whose removal walk fails mid-way must report a
-        // retryable failure (the client retries; the durable pending record
-        // lets the startup resume finish it) and still mark the derived
-        // state stale for the events the partial walk removed.
+        // A NIP-09 deletion whose removal walk fails mid-way is
+        // acknowledged with `OK true`: the event itself is stored and stays
+        // stored, so telling the client to retry is not actionable (a
+        // re-send reads back as a duplicate, which never re-runs the
+        // removal). The durable pending record is what makes the ack
+        // truthful — the startup resume finishes the deletion. The partial
+        // walk still marks the derived state stale.
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             use crate::db::PutOutcome;
@@ -5775,10 +5908,7 @@ mod tests {
                 pubkey: author_pk.clone(),
                 created_at: now.saturating_sub(10),
                 kind: 9002,
-                tags: vec![
-                    vec!["h".into(), "g1".into()],
-                    vec!["private".into()],
-                ],
+                tags: vec![vec!["h".into(), "g1".into()], vec!["private".into()]],
                 content: String::new(),
                 sig: String::new(),
             };
@@ -5800,10 +5930,11 @@ mod tests {
             let raw = deletion.id_bytes().unwrap();
             deletion.sig = secp.sign_schnorr_no_aux_rand(&raw, &author).to_string();
 
-            let outcome = relay.accept_event(deletion, &[], None).await;
+            let outcome = relay.accept_event(deletion.clone(), &[], None).await;
             assert!(
-                matches!(&outcome, PutOutcome::Invalid(r) if r.contains("removal") && r.contains("retry")),
-                "a failed deletion side effect must report a retryable failure: {outcome:?}"
+                matches!(outcome, PutOutcome::Stored),
+                "a stored deletion whose removal was held for the resume is a \
+                 success, not a retryable failure: {outcome:?}"
             );
             let pending = relay
                 .db
@@ -5815,8 +5946,125 @@ mod tests {
                 1,
                 "the durable pending record must exist for the startup resume"
             );
+            // The client's only recourse for the old "retry" message was a
+            // re-send of the same bytes, and that is a duplicate which never
+            // re-runs the removal: the ack is only truthful because the
+            // record above survives the restart.
+            let resend = relay.accept_event(deletion, &[], None).await;
+            assert!(
+                matches!(resend, PutOutcome::Duplicate(_)),
+                "a re-send must stay a duplicate (so it can never be what \
+                 recovers the deletion): {resend:?}"
+            );
             relay.db.shutdown();
         });
+    }
+
+    #[tokio::test]
+    async fn a_shed_deletion_is_held_for_the_startup_resume() {
+        use crate::db::PutOutcome;
+        // The writer shed the deletion before the walk could record it
+        // (the queue was full), so nothing durable referenced the request.
+        // The event is already stored, and a re-send is a duplicate that
+        // never re-runs the removal: the relay must hold the request itself
+        // and record it, or the deletion is lost for good.
+        let relay = build_relay().await;
+        relay
+            .pending_removals_limit
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        let now = crate::util::unix_now();
+        let secp = secp256k1::Secp256k1::new();
+        let author = secp256k1::Keypair::from_seckey_slice(&secp, &[9u8; 32]).unwrap();
+        let author_pk = secp256k1::XOnlyPublicKey::from_keypair(&author)
+            .0
+            .to_string();
+        let mut target = crate::event::Event {
+            id: String::new(),
+            pubkey: author_pk.clone(),
+            created_at: now.saturating_sub(10),
+            kind: 1,
+            tags: vec![],
+            content: "to be deleted".into(),
+            sig: String::new(),
+        };
+        target.id = crate::nips::nip01::compute_id(&target);
+        let raw = target.id_bytes().unwrap();
+        target.sig = secp.sign_schnorr_no_aux_rand(&raw, &author).to_string();
+        assert_eq!(relay.db.put(target.clone(), now).await, PutOutcome::Stored);
+
+        let mut deletion = crate::event::Event {
+            id: String::new(),
+            pubkey: author_pk,
+            created_at: now,
+            kind: crate::nips::nip09::DELETION_KIND,
+            tags: vec![vec!["e".into(), target.id.clone()]],
+            content: String::new(),
+            sig: String::new(),
+        };
+        deletion.id = crate::nips::nip01::compute_id(&deletion);
+        let raw = deletion.id_bytes().unwrap();
+        deletion.sig = secp.sign_schnorr_no_aux_rand(&raw, &author).to_string();
+
+        // Hold it by hand: this is the state the writer-shed path leaves
+        // behind, and it must be flushed into the durable table.
+        let request = crate::db::store::PendingDeletion {
+            targets: vec![target.id.clone()],
+            addresses: Vec::new(),
+            request_pubkey: Some(deletion.pubkey.clone()),
+            request_created: deletion.created_at,
+            group: None,
+        };
+        assert!(
+            relay.hold_pending_removal(request).await,
+            "a request inside the bound must be reported as held"
+        );
+        let pending = relay
+            .db
+            .pending_deletions()
+            .await
+            .expect("the pending deletions must be readable");
+        assert_eq!(
+            pending.len(),
+            1,
+            "the held request must reach the durable pending table"
+        );
+        assert_eq!(pending[0].targets, vec![target.id.clone()]);
+        assert!(
+            relay
+                .pending_removals
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "a flushed request must not stay in memory"
+        );
+
+        // Past the bound the ack degrades to the retryable failure rather
+        // than growing the held list without limit.
+        {
+            let mut held = relay
+                .pending_removals
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            held.push(crate::db::store::PendingDeletion {
+                targets: vec!["ff".repeat(32)],
+                addresses: Vec::new(),
+                request_pubkey: Some(deletion.pubkey.clone()),
+                request_created: deletion.created_at,
+                group: None,
+            });
+        }
+        let overflow = crate::db::store::PendingDeletion {
+            targets: vec!["ee".repeat(32)],
+            addresses: Vec::new(),
+            request_pubkey: Some(deletion.pubkey),
+            request_created: now,
+            group: None,
+        };
+        assert!(
+            !relay.hold_pending_removal(overflow).await,
+            "past the bound the request must not be reported as held"
+        );
+        relay.db.shutdown();
     }
 
     #[test]

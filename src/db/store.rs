@@ -1653,6 +1653,23 @@ impl Store {
         Ok(())
     }
 
+    /// Records a deletion request that the writer never got to run, so the
+    /// startup resume completes it (see
+    /// [`crate::db::DbClient::record_pending_deletion`]). Uses the same key
+    /// and encoding as the walk's own record, so a request that later runs
+    /// normally overwrites this entry with an identical value and clears it
+    /// on completion — recording twice is idempotent.
+    pub(crate) fn record_pending_deletion(&self, request: &PendingDeletion) -> Result<()> {
+        let encoded = encode_pending_deletion(
+            &request.targets,
+            &request.addresses,
+            request.request_pubkey.as_deref(),
+            request.request_created,
+            request.group.as_deref(),
+        );
+        self.put_pending_deletion(&pending_deletion_key(&encoded), &encoded)
+    }
+
     /// Every started-but-unfinished NIP-09 deletion, decoded for the
     /// startup resume and the metrics. A malformed record is skipped with a
     /// warning (like the vanish records): one corrupt entry must not abort
