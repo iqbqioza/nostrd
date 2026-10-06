@@ -67,7 +67,7 @@ pub fn relay_info(
             "subscription": [],
             "publication": []
         },
-        "stats": stats.as_json(),
+        "stats": stats.as_public_json(),
     });
     if let Some(self_pubkey) = self_pubkey {
         info["self"] = json!(self_pubkey);
@@ -164,8 +164,11 @@ impl Relay {
             }
         };
         // The stats change on every request (connections, counters): always
-        // serve a fresh section, cached document or not.
-        info["stats"] = self.stats.as_json();
+        // serve a fresh section, cached document or not. A NIP-11 client is
+        // by definition a Nostr client, so the document is exactly what a
+        // plain probe fetches — it must not carry the storage/health
+        // oracle `/relay/stats` withholds (see PRIVATE_STATS_KEYS).
+        info["stats"] = self.stats.as_public_json();
         info
     }
 }
@@ -191,6 +194,62 @@ mod tests {
         // NIP-11's examples are relative seconds (300, 3), not absolute
         // timestamps.
         assert_eq!(upper, Config::default().limits.max_created_at_future_secs);
+    }
+
+    #[test]
+    fn the_stats_section_is_the_public_subset() {
+        // A NIP-11 client sends `Accept: application/nostr+json`, which is
+        // exactly the probe that distinguishes a Nostr client from a
+        // scanner — the document must not carry the oracle
+        // `/relay/stats` withholds via PRIVATE_STATS_KEYS.
+        let stats = Stats::new();
+        stats
+            .db_free_bytes
+            .store(999, std::sync::atomic::Ordering::Relaxed);
+        stats
+            .db_disk_full
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        stats
+            .db_errors
+            .store(3, std::sync::atomic::Ordering::Relaxed);
+        stats
+            .accept_errors
+            .store(2, std::sync::atomic::Ordering::Relaxed);
+        stats
+            .rebuild_failures
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        stats
+            .conn_refused_blocked
+            .store(1, std::sync::atomic::Ordering::Relaxed);
+        let info = relay_info(&Config::default(), &AccessControl::default(), &stats, None);
+        let section = info
+            .get("stats")
+            .expect("the relay info document carries a stats section");
+        for absent in [
+            "db_free_bytes",
+            "db_disk_full",
+            "db_errors",
+            "accept_errors",
+            "rebuild_failures",
+            "log_errors",
+            "connection_refusals",
+        ] {
+            assert!(
+                section.get(absent).is_none(),
+                "{absent} must not leak through the NIP-11 stats section"
+            );
+        }
+        for present in ["db_size_bytes", "uptime_secs", "written_at"] {
+            assert!(
+                section.get(present).is_some(),
+                "{present} must remain in the public stats"
+            );
+        }
+        assert_eq!(
+            section.get("db_size_bytes").and_then(Value::as_u64),
+            Some(0),
+            "the public subset preserves the ordinary counters"
+        );
     }
 
     #[test]
