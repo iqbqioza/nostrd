@@ -26,9 +26,15 @@ pub const PROTECTED_TAG: &str = "-";
 /// to its author is an annoyance; one that publishes it to the world is the
 /// failure NIP-70 exists to prevent.
 pub fn is_protected(event: &Event) -> bool {
-    event
-        .tags
-        .iter()
+    tags_protected(&event.tags)
+}
+
+/// Tag-list variant of [`is_protected`] for paths that only carry the tags
+/// (the negentropy light record has no content or signature to build an
+/// [`Event`] from). Same rule: any tag *named* `-` marks the event,
+/// regardless of extra values.
+pub fn tags_protected(tags: &[Vec<String>]) -> bool {
+    tags.iter()
         .any(|t| t.first().is_some_and(|name| name == PROTECTED_TAG))
 }
 

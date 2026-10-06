@@ -466,9 +466,7 @@ impl ScanCollector for ItemCollector {
         } else if self.items.len() + 1 == limit {
             self.boundary = Some(event.created_at());
         }
-        let protected = event.tags().iter().any(|t| {
-            t.len() == 1 && t.first().map(String::as_str) == Some(crate::nips::nip70::PROTECTED_TAG)
-        });
+        let protected = crate::nips::nip70::tags_protected(event.tags());
         let (gid, meta) = match crate::nips::nip29::group_id_any_light(event) {
             Some(gid) => {
                 let meta = (crate::nips::nip29::GROUP_META..=crate::nips::nip29::GROUP_PINS)
@@ -1870,7 +1868,10 @@ mod tests {
     }
 
     #[test]
-    fn push_light_matches_strict_protected_semantics() {
+    fn push_light_matches_loose_protected_semantics() {
+        // The light path must agree with `is_protected` (any tag named `-`
+        // marks the event): a multi-value dash tag withheld from anonymous
+        // REQ must also be withheld from anonymous NEG sync.
         use super::{ItemCollector, NegLight, ScanCollector};
         let mut c = ItemCollector::new(8);
         let strict = NegLight {
@@ -1889,8 +1890,8 @@ mod tests {
         };
         assert!(c.push_light(&loose, [0x02u8; 32], 8));
         assert!(
-            !c.items[0].protected,
-            "[\"-\", \"extra\"] is public like the full path"
+            c.items[0].protected,
+            "[\"-\", \"extra\"] is protected like the full path"
         );
     }
 
