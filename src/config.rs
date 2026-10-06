@@ -1311,6 +1311,21 @@ impl Config {
                 "NIP-42 is disabled: gift wraps (kind 1059) are served to anyone; enable NIP-42 to restrict them to their recipients"
             );
         }
+        // Same footgun, one surface over. NIP-43 stamps its relay-generated
+        // membership state with a NIP-70 `-` tag (13534 membership list,
+        // 33534 role definitions) and requires that tag on leave requests
+        // (28936). The `-` tag is only accepted from — and served to —
+        // authenticated clients, and the only authentication here is
+        // NIP-42. With NIP-42 disabled every client is anonymous, so
+        // 13534/33534 are withheld from everyone and leave requests are
+        // rejected at intake: the entire NIP-43 membership surface silently
+        // stops working. A startup error would over-reach (an open relay
+        // without AUTH is legal); the operator needs the consequence named.
+        if self.nip_enabled(43) && !self.nip_enabled(42) {
+            log::warn!(
+                "NIP-42 is disabled: NIP-43 membership metadata (kinds 13534/33534) is withheld from every client and leave requests (28936) are rejected; enable NIP-42 to make these work"
+            );
+        }
         // Limits must be usable (zero would disable core functionality or
         // make the queue fail fast on the first request, or — for content
         // and tag caps — reject every EVENT and make the relay look dead).
@@ -4410,6 +4425,26 @@ max_log_files = 2
         assert!(
             cfg.validate().is_err(),
             "enabled_nip78_auth requires NIP-42 to be enabled"
+        );
+    }
+
+    #[test]
+    fn nip43_with_nip42_disabled_is_legal_but_shadowed() {
+        // M15: `validate` stays `Ok` — an open relay without NIP-42 is
+        // legitimate, so this can only be a `log::warn`, not a startup
+        // error. But the combination still pulls the NIP-70 `-` gate into
+        // a corner: the NIP-43 membership snapshot (13534/33534) and leave
+        // requests (28936) carry the tag, so with NIP-42 off no client can
+        // ever satisfy the auth the gate demands. The warning names that
+        // consequence; this pins that nothing escalates to a hard error.
+        let mut cfg = Config::default();
+        cfg.relay.enabled_nip78_auth = false;
+        cfg.relay.disabled_nips = vec![42];
+        assert!(cfg.nip_enabled(43), "NIP-43 is on by default");
+        assert!(!cfg.nip_enabled(42));
+        assert!(
+            cfg.validate().is_ok(),
+            "an NIP-43 + NIP-42-disabled relay is legal and must start"
         );
     }
 
