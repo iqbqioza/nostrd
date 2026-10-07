@@ -286,6 +286,14 @@ pub struct GroupStore {
     /// not pay an O(groups) scan per create. Stale entries (a link that was
     /// later removed) only cost one scan.
     declared_children: HashSet<String>,
+    /// Fail-closed while the store is being replaced after a removed
+    /// group-state event invalidated its derivation: membership and
+    /// visibility decisions made from pre-removal state would keep applying
+    /// the removed grant (NIP-43's role store already gates this way). Set
+    /// by [`Self::mark_stale`] (called from the relay's stale paths), and
+    /// cleared by an ordinary `GroupsMap::default` rebuild either on a clean
+    /// post-scan swap with a current view or from a fresh persistent state.
+    pub(crate) stale: bool,
 }
 
 /// The persistable NIP-29 group state: everything [`GroupStore`] holds
@@ -515,11 +523,24 @@ impl GroupStore {
         self.validate_write_inner(event, relay_pubkey)
     }
 
+    pub fn mark_stale(&mut self) {
+        self.stale = true;
+    }
+
     fn validate_write_inner(
         &self,
         event: &Event,
         relay_pubkey: Option<&str>,
     ) -> anyhow::Result<()> {
+        // The store is derived from an authority no longer certain (a
+        // removed group-state event and the rebuild has not recomputed the
+        // surviving tree): NIP-43 rejects role actions on the cleared store
+        // for exactly the same reason. A stale `is_member` would keep
+        // authorizing a member whose grant was removed, and a stale
+        // settings blob would service requests with unverified privacy.
+        if self.stale {
+            bail!("restricted: group state is rebuilding");
+        }
         // NIP-29: the event's `h` tag carries *the* group id. Multiple `h`
         // tags are ambiguous and dangerous: the checks below use the first
         // one while the stored tag index and subscriptions match any of
@@ -1369,6 +1390,13 @@ impl GroupStore {
     /// AUTH-revealable: their content stays gone for everyone. Drives the
     /// NIP-67 `"auth"` EOSE hint.
     pub fn privacy_gated(&self, event: &Event) -> bool {
+        // A stale store cannot decide whether a group's content demands an
+        // authenticated member, so those events are simply not served
+        // (fail-closed): claiming they need auth would advertise that
+        // authenticating might help when it cannot.
+        if self.stale {
+            return false;
+        }
         let Some(gid) = group_id_any(event) else {
             return false;
         };
@@ -1469,6 +1497,15 @@ impl GroupStore {
     }
 
     pub fn visible_gid(&self, gid: &str, is_meta: bool, authed: Option<&str>) -> bool {
+        // While the store is known stale (a group-state event was removed
+        // and the rebuild has not re-derived the answer), every group
+        // decision fails closed: serving an event because its (possibly
+        // removed) privacy setting allowed it, or granting membership to a
+        // deleted user, hands current state they no longer hold. Mirrors
+        // the NIP-43 role store's empty-swap during its own rebuild.
+        if self.stale {
+            return false;
+        }
         // Content of a deleted group is never served: the group is gone,
         // and its (possibly private) history must not become readable by
         // everyone.
