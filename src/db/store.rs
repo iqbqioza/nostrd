@@ -472,7 +472,11 @@ pub(crate) fn apply_put_batch(
 }
 
 /// A batch of events to store in one transaction, with its reply.
-pub(crate) type PutBatchMsg = (Vec<(Arc<Event>, u64)>, oneshot::Sender<Vec<PutOutcome>>);
+pub(crate) type PutBatchMsg = (
+    Vec<(Arc<Event>, u64)>,
+    Vec<Option<([u8; 32], u64)>>,
+    oneshot::Sender<Vec<PutOutcome>>,
+);
 
 /// The writer thread's pending write state: the open transaction, the
 /// queued single puts with their reply channels and the queued put
@@ -528,12 +532,18 @@ pub(crate) fn flush_everything(
     let mut all: Vec<(Arc<Event>, u64)> = std::mem::take(&mut batch.puts);
     let mut first_seen = std::mem::take(&mut batch.first_seen);
     let mut splits: Vec<usize> = vec![all.len()];
-    for (events, _) in batch.pending_batches.iter_mut() {
+    for (events, batch_first_seen, _) in batch.pending_batches.iter_mut() {
+        // `batch.first_seen` is aligned with `puts`; each queued batch adds
+        // its own aligned reservations for its events.
+        let aligned = if batch_first_seen.len() == events.len() {
+            std::mem::take(batch_first_seen)
+        } else {
+            vec![None; events.len()]
+        };
+        first_seen.extend(aligned);
         all.append(events);
         splits.push(all.len());
     }
-    // The batch events carry no first-seen reservation: pad the aligned
-    // vector to the merged length.
     first_seen.resize(all.len(), None);
     let outcomes = apply_put_batch(
         store,
@@ -549,7 +559,7 @@ pub(crate) fn flush_everything(
     {
         let _ = s.send(out);
     }
-    for (i, (_, reply)) in batch.pending_batches.drain(..).enumerate() {
+    for (i, (_, _, reply)) in batch.pending_batches.drain(..).enumerate() {
         let range = splits[i]..splits[i + 1];
         let _ = reply.send(outcomes[range].to_vec());
     }

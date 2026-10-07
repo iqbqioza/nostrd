@@ -2682,7 +2682,6 @@ impl Relay {
             results: Vec::new(),
             put_slots: Vec::new(),
             puts: Vec::new(),
-            new_pubkeys: Vec::new(),
             vanishes: Vec::new(),
             now: 0,
             nip9: false,
@@ -2905,8 +2904,29 @@ impl Relay {
         let receiver = if puts.is_empty() {
             None
         } else {
-            self.db
-                .put_batch_deferred(puts.iter().map(|e| (Arc::clone(e), now)).collect())
+            // First-seen reservations ride the batch put transaction (one
+            // commit/fsync for event+clock), replacing the previously
+            // separate `touch_first_seen_batch` write that could vanish on
+            // a writer failure and then disable the account-age gate.
+            let first_seen: Vec<Option<([u8; 32], u64)>> = if new_pubkeys.len() == puts.len() {
+                puts.iter()
+                    .zip(new_pubkeys.iter())
+                    .map(|(event, &is_new)| {
+                        if is_new {
+                            event.pubkey_bytes().map(|pk| (pk, now))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            } else {
+                // No age gate active: nothing to reserve.
+                vec![None; puts.len()]
+            };
+            self.db.put_batch_deferred(
+                puts.iter().map(|e| (Arc::clone(e), now)).collect(),
+                first_seen,
+            )
         };
         drop(cfg);
 
@@ -2916,7 +2936,6 @@ impl Relay {
             results,
             put_slots,
             puts,
-            new_pubkeys,
             vanishes,
             now,
             nip9: nip9_enabled,
@@ -3877,7 +3896,6 @@ pub(crate) struct PendingBatch {
     results: Vec<(String, PutOutcome)>,
     put_slots: Vec<usize>,
     puts: Vec<Arc<Event>>,
-    new_pubkeys: Vec<bool>,
     vanishes: Vec<(usize, String, Event)>,
     now: u64,
     nip9: bool,
@@ -3898,7 +3916,6 @@ impl PendingBatch {
         let mut results = self.results;
         let puts = self.puts;
         let put_slots = self.put_slots;
-        let new_pubkeys = self.new_pubkeys;
         let vanishes = self.vanishes;
         let now = self.now;
         let nip9 = self.nip9;
@@ -3946,32 +3963,13 @@ impl PendingBatch {
             outcomes = vec![PutOutcome::Invalid("error: database overloaded".into()); puts.len()];
         }
 
-        // Record the first-seen timestamp only for accounts whose first
-        // event actually stored: a failed first event must not pre-warm
-        // the account-age clock.
-        let is_new_vec = if new_pubkeys.is_empty() {
-            vec![false; puts.len()]
-        } else {
-            new_pubkeys
-        };
-        let mut persist_first_seen: Vec<[u8; 32]> = Vec::new();
-        for (((event, outcome), slot), is_new) in puts
-            .into_iter()
-            .zip(outcomes)
-            .zip(put_slots)
-            .zip(is_new_vec)
-        {
+        // Reply to each put with its side effects (removal, delivery).
+        for ((event, outcome), slot) in puts.into_iter().zip(outcomes).zip(put_slots) {
             let id = event.id.clone();
-            let first_seen_pubkey = if is_new { event.pubkey_bytes() } else { None };
             let mut ack_override = None;
             match outcome {
                 PutOutcome::Stored | PutOutcome::Replaced | PutOutcome::Ephemeral => {
                     let ack = relay.after_put(event, now, nip9, nip43, nip29).await;
-                    // The first-seen timestamp belongs to the stored event
-                    // regardless of a removal side effect.
-                    if let Some(pk) = first_seen_pubkey {
-                        persist_first_seen.push(pk);
-                    }
                     match ack {
                         RemovalAck::Applied(delivered) => {
                             if !delivered {
@@ -4001,14 +3999,6 @@ impl PendingBatch {
                 }
             }
             results[slot] = (id, ack_override.unwrap_or(outcome));
-        }
-        if !persist_first_seen.is_empty() {
-            relay
-                .db
-                .touch_first_seen_batch(
-                    persist_first_seen.into_iter().map(|pk| (pk, now)).collect(),
-                )
-                .await;
         }
 
         for (slot, id, event) in vanishes {
