@@ -1239,11 +1239,29 @@ impl GroupStore {
                     // does not turn n creates into O(n²); the smallest
                     // declaring parent wins deterministically when several
                     // groups declared the same placeholder id.
+                    //
+                    // The adopting parent consented on its own side by
+                    // declaring the placeholder, but the child's creator
+                    // never agreed to the link: NIP-29 requires both sides
+                    // to administer the group they attach (the 9002
+                    // bidirectional rule in `validate_edit_metadata`), so
+                    // the creating author must also be an admin of the
+                    // prospective parent (the relay master key is an
+                    // implicit admin of every group). Without the check, a
+                    // parent admin pre-claims any not-yet-existing id as a
+                    // placeholder child and whoever creates that id later
+                    // is silently grafted into the pre-claimer's tree
+                    // (their 39000 gains a `parent` tag they never chose).
+                    // A creator who is not an admin of any declaring
+                    // parent still gets their group, as a root.
                     if self.declared_children.contains(gid) {
+                        let relay_signed = !relay_pubkey.is_empty()
+                            && event.pubkey.eq_ignore_ascii_case(relay_pubkey);
                         adopted_parent = self
                             .groups
                             .iter()
                             .filter(|(_, g)| g.children.iter().any(|c| c == gid))
+                            .filter(|(_, g)| relay_signed || g.is_admin(&event.pubkey))
                             .map(|(id, _)| id.clone())
                             .min();
                         if let Some(parent) = &adopted_parent {
