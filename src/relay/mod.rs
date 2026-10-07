@@ -1258,6 +1258,14 @@ async fn groups_rebuild_worker(
                     for buffered in buffered {
                         fresh.apply(&buffered.event, "", buffered.now, false, true);
                     }
+                    // Only the swap can release the fail-closed flag: when a
+                    // removal landed mid-scan, the fresh DB view is bounded by
+                    // the same snapshot that created the request. If the dirty
+                    // flag was set after the scan saw the database, keep the
+                    // flag true: it carries the "not current" contract to the
+                    // next loop iteration (when the scheduler drains the flag
+                    // once more) or to the second full copy of history.
+                    fresh.stale = state.dirty.load(Ordering::SeqCst);
                     *store = fresh;
                 }
                 buffer.scanning = false;
@@ -3344,6 +3352,10 @@ impl Relay {
     pub(crate) async fn mark_group_state_stale(&self) {
         self.groups_rebuild.dirty.store(true, Ordering::SeqCst);
         self.groups_rebuild.pending.store(true, Ordering::SeqCst);
+        // The live store may still hold the grants/settings the removal just
+        // targeted: every membership/visibility/write decision fails closed
+        // until the rebuild replaces the store with a verified one.
+        self.groups.write().await.mark_stale();
         self.persist_groups().await;
         schedule_groups_rebuild(
             self.db.clone(),
@@ -4785,6 +4797,135 @@ mod tests {
             roles.is_member_of(&b),
             "the surviving role's grant must be restored"
         );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn nip09_deletion_of_a_membership_grant_is_fail_closed_until_rebuild() {
+        // M1: a group-state removal must mirror the role path
+        // (`nip09_deletion_of_a_role_definition_revokes_and_rebuilds_survivors`):
+        // the live store cannot be trusted to still authorize the removed
+        // member/grant/settings, and every visibility, membership and write
+        // gate must respond fail-closed until the rebuild re-derives the
+        // surviving state. After the rebuild the outcome must be identical
+        // to the accurate DB state (the grant is gone for good).
+        let relay = build_relay().await;
+        relay.config.write().await.relay.enabled_nips = vec![9, 29];
+
+        let now = crate::util::unix_now();
+        let secp = secp256k1::Secp256k1::new();
+        let seed = |n: u8| secp256k1::Keypair::from_seckey_slice(&secp, &[n; 32]).unwrap();
+        let sign = |kp: &secp256k1::Keypair, kind: u64, created_at: u64, tags: Vec<Vec<String>>| {
+            let mut e = crate::event::Event {
+                id: String::new(),
+                pubkey: secp256k1::XOnlyPublicKey::from_keypair(kp).0.to_string(),
+                created_at,
+                kind,
+                tags,
+                content: String::new(),
+                sig: String::new(),
+            };
+            e.id = crate::nips::nip01::compute_id(&e);
+            let id = e.id_bytes().unwrap();
+            e.sig = secp.sign_schnorr_no_aux_rand(&id, kp).to_string();
+            e
+        };
+        let g1 = |tags: Vec<Vec<String>>| {
+            let mut tags = tags;
+            tags.insert(0, vec!["h".into(), "g1".into()]);
+            tags
+        };
+        let admin = seed(7);
+        let member = seed(8);
+        let member_pk = secp256k1::XOnlyPublicKey::from_keypair(&member)
+            .0
+            .to_string();
+
+        let create = sign(&admin, 9007, now - 200, g1(vec![]));
+        let set_restricted = sign(&admin, 9002, now - 190, g1(vec![vec!["restricted".into()]]));
+        let put_user = sign(
+            &admin,
+            9000,
+            now - 180,
+            g1(vec![vec!["p".into(), member_pk.clone()]]),
+        );
+        let post = sign(&member, 1, now - 170, g1(vec![]));
+        let results = relay
+            .accept_events_batch(vec![create, set_restricted, put_user.clone(), post], &[])
+            .await;
+        assert!(
+            results
+                .iter()
+                .all(|(_, o)| matches!(o, crate::db::PutOutcome::Stored)),
+            "setup: {results:?}"
+        );
+        // The member's post is visible before the deletion...
+        {
+            let groups = relay.groups.read().await;
+            assert!(
+                groups.visible_gid("g1", false, Some(&member_pk)),
+                "the restricted post must be visible to its own member pre-removal"
+            );
+        }
+
+        // Delete the `9000` grant by NIP-09 (only its author may).
+        let deletion = sign(
+            &admin,
+            5,
+            now - 160,
+            vec![vec!["e".into(), put_user.id.clone()]],
+        );
+        assert!(matches!(
+            relay.accept_event(deletion, &[], None).await,
+            crate::db::PutOutcome::Stored
+        ));
+
+        // Immediately: the fail-closed gate rejects a further restricted
+        // post regardless of stale-held membership, and the stored post is
+        // withheld from reads until the rebuild confirms the remaining
+        // state. The live store carries no derived truth it cannot
+        // re-derive yet, so none of these paths serve it.
+        let probe = sign(&member, 1, now - 150, g1(vec![]));
+        let reason = match relay.accept_event(probe, &[], None).await {
+            crate::db::PutOutcome::Invalid(r) => r,
+            other => panic!("a stale restricted post must be rejected: {other:?}"),
+        };
+        assert!(
+            reason.contains("restricted: group state is rebuilding"),
+            "fail-closed reason, got {reason:?}"
+        );
+        {
+            let groups = relay.groups.read().await;
+            assert!(
+                !groups.visible_gid("g1", false, Some(&member_pk)),
+                "the stale store must not let stale settings publish"
+            );
+        }
+
+        // After the coalesced rebuild, the accurate verdict replaces the
+        // fail-closed one without extra admin action.
+        assert!(
+            wait_for_rebuild_worker(&relay).await,
+            "the group rebuild must finish"
+        );
+        let probe2 = sign(&member, 1, now - 140, g1(vec![]));
+        let reason2 = match relay.accept_event(probe2, &[], None).await {
+            crate::db::PutOutcome::Invalid(r) => r,
+            other => panic!("the accurate gate must reject: {other:?}"),
+        };
+        assert!(
+            reason2.contains("restricted: only group members can post"),
+            "the rebuilt store must reject as the missing-grant would: {reason2:?}"
+        );
+        // ...and ordinary visibility comes back for groups it can verify
+        // (the group still exists; its gate reopens with a verified store).
+        {
+            let groups = relay.groups.read().await;
+            assert!(
+                groups.visible_gid("g1", false, Some(&member_pk)),
+                "the rebuilt store services the group with verified state"
+            );
+        }
         relay.db.shutdown();
     }
 
