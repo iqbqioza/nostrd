@@ -875,6 +875,129 @@ fn create_adopts_a_group_that_declared_it_as_a_child() {
 }
 
 #[test]
+fn a_placeholder_child_is_adopted_only_with_the_creator_consent() {
+    // The CREATE-time placeholder resolution must not graft a group into a
+    // tree its creator never agreed to: the declaring parent consented on
+    // its own side, but NIP-29 attaches a group only when the other side
+    // administers it too (the 9002 bidirectional rule). An id pre-claimed
+    // as a placeholder child therefore adopts only a create whose author
+    // is an admin of a declaring parent — or the relay's own key, which is
+    // an implicit admin of every group.
+    let mut store = GroupStore::with_cap(10);
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        1,
+        false,
+        false,
+    );
+    store.apply(
+        &event(
+            9002,
+            ADMIN,
+            Some("g1"),
+            vec![vec!["child".into(), "victim".into()]],
+        ),
+        "relay",
+        1,
+        false,
+        false,
+    );
+    // A stranger's create of the pre-claimed id is not adopted: the group
+    // is created as a root (its creator never consented to the link).
+    store.apply(
+        &event(CREATE_GROUP, OTHER, Some("victim"), vec![]),
+        "relay",
+        2,
+        false,
+        false,
+    );
+    assert_eq!(
+        store.group("victim").unwrap().parent,
+        None,
+        "a stranger's create must not be adopted by a placeholder parent"
+    );
+    // The declaring parent's next metadata edit must not claim the new
+    // group as a child either.
+    let out = store.apply(
+        &event(9002, ADMIN, Some("g1"), vec![]),
+        "relay",
+        3,
+        false,
+        false,
+    );
+    assert!(
+        !out.iter().any(|e| e.kind == GROUP_META
+            && e.tags
+                .iter()
+                .any(|t| t == &vec!["child".to_string(), "victim".to_string()])),
+        "the non-consented group must not appear as a child of g1"
+    );
+}
+
+#[test]
+fn a_placeholder_child_is_adopted_when_the_creator_is_a_parent_admin() {
+    // The consent rule keeps the legitimate flow intact: the parent admin
+    // who declared the placeholder also creates the child (the common
+    // case), and the relay master key may create it on their behalf.
+    let mut store = GroupStore::with_cap(10);
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g1"), vec![]),
+        "relay",
+        1,
+        false,
+        false,
+    );
+    store.apply(
+        &event(
+            9002,
+            ADMIN,
+            Some("g1"),
+            vec![vec!["child".into(), "g2".into()]],
+        ),
+        "relay",
+        1,
+        false,
+        false,
+    );
+    // The declaring parent's own admin creates the child: adopted.
+    store.apply(
+        &event(CREATE_GROUP, ADMIN, Some("g2"), vec![]),
+        "relay",
+        2,
+        false,
+        false,
+    );
+    assert_eq!(store.group("g2").unwrap().parent.as_deref(), Some("g1"));
+    // A fresh id the stranger creates is still not adopted, but an
+    // ADMIN-created id under the same declared parent is (deterministic
+    // smallest declaring parent wins).
+    store.apply(
+        &event(
+            9002,
+            ADMIN,
+            Some("g1"),
+            vec![
+                vec!["child".into(), "g2".into()],
+                vec!["child".into(), "g3".into()],
+            ],
+        ),
+        "relay",
+        3,
+        false,
+        false,
+    );
+    store.apply(
+        &event(CREATE_GROUP, OTHER, Some("g3"), vec![]),
+        "relay",
+        4,
+        false,
+        false,
+    );
+    assert_eq!(store.group("g3").unwrap().parent, None);
+}
+
+#[test]
 fn deleted_group_content_is_hidden() {
     let mut store = seeded();
     let edit = event(9002, ADMIN, Some("g1"), vec![vec!["private".into()]]);
