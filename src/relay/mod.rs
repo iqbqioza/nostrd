@@ -145,6 +145,12 @@ pub struct Relay {
     /// without it a command that captured an older snapshot can queue its
     /// write after a newer one and drop the newer entry on the next restart.
     persist_blossom_allow_lock: tokio::sync::Mutex<()>,
+    /// Serializes the NIP-86 `[relay]` field rewrite (name/description/icon):
+    /// `persist_relay_field` is a read-modify-write of the whole config file,
+    /// so two RPCs running in parallel both read the same text and the later
+    /// write silently reverts the earlier change. The lock covers the whole
+    /// read/rewrite/write, so the second caller reads the first's result.
+    persist_relay_field_lock: tokio::sync::Mutex<()>,
     /// NIP-86 blockip/unblockip: every list change notifies each
     /// connection's watcher, so established read-only subscribers (which
     /// never send a frame) are disconnected too — a version counter could
@@ -1713,6 +1719,7 @@ impl Relay {
             persist_roles_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             snapshot_persist: std::sync::Arc::new(SnapshotPersist::default()),
             persist_blossom_allow_lock: tokio::sync::Mutex::new(()),
+            persist_relay_field_lock: tokio::sync::Mutex::new(()),
             ip_blocks_tx: tokio::sync::watch::channel(0).0,
             config_version: AtomicU64::new(0),
             drain_tx: tokio::sync::watch::channel(false).0,
@@ -2180,6 +2187,12 @@ impl Relay {
     /// lines. A failure only warns: the change stays applied in memory
     /// until the next config reload.
     pub async fn persist_relay_field(&self, field: &str, value: &str) -> bool {
+        // Read-modify-write of one file: without the lock, two NIP-86 RPCs
+        // changing different fields in parallel both read the pre-change
+        // text, and the second write drops the first change from disk with
+        // no error (the in-memory config keeps both, so only a restart
+        // reveals the loss).
+        let _guard = self.persist_relay_field_lock.lock().await;
         let Some(path) = self.config_path.read().await.clone() else {
             log::warn!(
                 "cannot persist relay.{field}: the config file path is unknown \
@@ -5668,6 +5681,66 @@ mod tests {
             !relay.persist_relay_field("description", "x").await,
             "an unwritable path must report failure"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+        relay.db.shutdown();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_relay_field_persists_do_not_drop_each_other() {
+        // Two NIP-86 RPCs changing different `[relay]` fields run in
+        // parallel; the read-modify-write must be serialized so the later
+        // write does not revert the earlier change on disk (both changes
+        // are applied in memory, so only the file tells them apart).
+        let relay = build_relay().await;
+        let dir = std::env::temp_dir().join("nostrfy-persist-field-race-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("nostrfy.toml");
+        *relay.config_path.write().await = Some(path.clone());
+        // Several rounds: each writer is a separate task, so without the
+        // lock they interleave their read/rewrite and the last writer
+        // publishes a config that dropped the others' fields.
+        for round in 0..20 {
+            let mut text = String::from("[relay]\nname = \"old\"\n");
+            for field in ["description", "icon", "contact_email", "website", "tos_url"] {
+                text.push_str(&format!("{field} = \"old\"\n"));
+            }
+            std::fs::write(&path, &text).unwrap();
+            let mut tasks = tokio::task::JoinSet::new();
+            for field in [
+                "name",
+                "description",
+                "icon",
+                "contact_email",
+                "website",
+                "tos_url",
+            ] {
+                let relay = std::sync::Arc::clone(&relay);
+                let field = field.to_string();
+                let value = format!("new-{field}-{round}");
+                tasks.spawn(async move {
+                    assert!(
+                        relay.persist_relay_field(&field, &value).await,
+                        "the persist must succeed"
+                    );
+                });
+            }
+            while tasks.join_next().await.is_some() {}
+            let text = std::fs::read_to_string(&path).unwrap();
+            for field in [
+                "name",
+                "description",
+                "icon",
+                "contact_email",
+                "website",
+                "tos_url",
+            ] {
+                assert!(
+                    text.contains(&format!("new-{field}-{round}")),
+                    "round {round}: the {field} write was lost: {text}"
+                );
+            }
+        }
         let _ = std::fs::remove_dir_all(&dir);
         relay.db.shutdown();
     }
