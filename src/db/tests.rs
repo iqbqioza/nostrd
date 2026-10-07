@@ -3280,6 +3280,41 @@ fn read_only_first_seen_does_not_record() {
         assert!(!created);
         assert_eq!(ts, 1234);
     });
+    db.shutdown();
+}
+
+#[test]
+fn a_deferred_batch_put_records_its_first_seen_reservation() {
+    // For a batched publish path the account-age reservation must ride the
+    // put transaction (atomic with the commit): a separate first-seen write
+    // could be dropped silently by a writer failure and silently disable
+    // the age gate while the event already stores.
+    let db = DbClient::open(
+        &config(),
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let now = unix_now();
+        let pk = "40".repeat(32);
+        let pk_bytes: [u8; 32] = hex::decode(&pk).unwrap().try_into().unwrap();
+        let ev = authored_event(1, &pk, "first", now, vec![]);
+        let rx = db
+            .put_batch_deferred(vec![(Arc::new(ev), now)], vec![Some((pk_bytes, now))])
+            .expect("the queued put must be accepted");
+        let outcomes = rx.await.expect("a queued put must not reply dropped");
+        assert!(matches!(outcomes[0], PutOutcome::Stored));
+        let (created, ts) = db.first_seen_batch(vec![pk_bytes]).await[0];
+        assert!(!created, "the reservation must be recorded with the put");
+        assert_eq!(ts, now);
+    });
+    db.shutdown();
 }
 
 #[test]
@@ -5444,7 +5479,8 @@ fn db_queue_byte_cap_fails_fast() {
         let now = unix_now();
         let big = event(1, &"x".repeat(4_000), now, vec![]);
         assert!(
-            db.put_batch_deferred(vec![(Arc::new(big), now)]).is_none(),
+            db.put_batch_deferred(vec![(Arc::new(big), now)], Vec::new())
+                .is_none(),
             "an over-budget write must fail fast"
         );
         assert_eq!(

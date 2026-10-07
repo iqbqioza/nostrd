@@ -321,6 +321,11 @@ enum Msg {
     /// Accepts many events in a single write transaction (one commit).
     PutBatch {
         events: Vec<(Arc<Event>, u64)>,
+        /// Per-event first-seen reservation, aligned with `events`
+        /// (`None` per event = no reservation): recorded inside the same
+        /// write transaction as the put it belongs to, so a split commit
+        /// cannot record the event without its clock (or vice versa).
+        first_seen: Vec<Option<([u8; 32], u64)>>,
         reply: oneshot::Sender<Vec<PutOutcome>>,
     },
     /// First-seen trust bookkeeping: records the arrival time of each
@@ -1678,8 +1683,12 @@ impl DbClient {
             .into_iter()
             .map(|(event, now)| (Arc::new(event), now))
             .collect();
-        self.request_write(|reply| Msg::PutBatch { events, reply })
-            .await
+        self.request_write(|reply| Msg::PutBatch {
+            events,
+            first_seen: Vec::new(),
+            reply,
+        })
+        .await
     }
 
     /// Like [`Self::put_batch`], reporting a lost writer (or a dropped
@@ -1692,8 +1701,12 @@ impl DbClient {
         &self,
         events: Vec<(Arc<Event>, u64)>,
     ) -> Option<Vec<PutOutcome>> {
-        self.request_write_checked(|reply| Msg::PutBatch { events, reply })
-            .await
+        self.request_write_checked(|reply| Msg::PutBatch {
+            events,
+            first_seen: Vec::new(),
+            reply,
+        })
+        .await
     }
 
     /// Queues a batch for the writer and returns the reply receiver
@@ -1705,8 +1718,16 @@ impl DbClient {
     pub fn put_batch_deferred(
         &self,
         events: Vec<(Arc<Event>, u64)>,
+        first_seen: Vec<Option<([u8; 32], u64)>>,
     ) -> Option<tokio::sync::oneshot::Receiver<Vec<PutOutcome>>> {
-        self.send_request(|reply| Msg::PutBatch { events, reply }, &self.tx)
+        self.send_request(
+            |reply| Msg::PutBatch {
+                events,
+                first_seen,
+                reply,
+            },
+            &self.tx,
+        )
     }
 
     /// NIP-77: returns only `(created_at, id)` records of the matching

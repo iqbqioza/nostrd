@@ -955,8 +955,12 @@ pub(crate) fn spawn(
                                 panic!("test-only writer handler fault");
                             }
                         }
-                        Msg::PutBatch { events, reply } => {
-                            batch.pending_batches.push((events, reply));
+                        Msg::PutBatch {
+                            events,
+                            first_seen,
+                            reply,
+                        } => {
+                            batch.pending_batches.push((events, first_seen, reply));
                         }
                         Msg::Shutdown => {
                             flush_everything(&store, &thread_errors, &mut batch);
@@ -1703,7 +1707,7 @@ pub(crate) fn spawn(
                     for s in batch.senders.drain(..) {
                         let _ = s.send(PutOutcome::Invalid("database error".into()));
                     }
-                    for (events, reply) in batch.pending_batches.drain(..) {
+                    for (events, _, reply) in batch.pending_batches.drain(..) {
                         let _ = reply.send(vec![
                             PutOutcome::Invalid("database error".into());
                             events.len()
