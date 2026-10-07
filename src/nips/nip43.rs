@@ -178,10 +178,12 @@ impl RoleStore {
         if self.roles.remove(id).is_some() {
             // Drop lingering assignments to the deleted role so the
             // membership event never lists a non-existent role.
+            let kept = members_without_roles(&self.assignments);
             for roles in self.assignments.values_mut() {
                 roles.retain(|r| r != id);
             }
-            self.assignments.retain(|_, roles| !roles.is_empty());
+            self.assignments
+                .retain(|pubkey, roles| kept.contains(pubkey) || !roles.is_empty());
             true
         } else {
             false
@@ -430,10 +432,12 @@ impl RoleStore {
                             .any(|t| t.first().map(String::as_str) == Some(DELETED_TAG))
                         {
                             self.roles.remove(id);
+                            let kept = members_without_roles(&self.assignments);
                             for roles in self.assignments.values_mut() {
                                 roles.retain(|r| r != id);
                             }
-                            self.assignments.retain(|_, roles| !roles.is_empty());
+                            self.assignments
+                                .retain(|pubkey, roles| kept.contains(pubkey) || !roles.is_empty());
                             continue;
                         }
                         self.roles.insert(
@@ -481,12 +485,33 @@ impl RoleStore {
         // the whole scan because event timestamps are client-controlled: a
         // membership list may legitimately precede its role definition.
         let roles = &self.roles;
+        let kept = members_without_roles(&self.assignments);
         for assigned in self.assignments.values_mut() {
             assigned.retain(|role| roles.contains_key(role));
         }
-        self.assignments.retain(|_, assigned| !assigned.is_empty());
+        self.assignments
+            .retain(|pubkey, assigned| kept.contains(pubkey) || !assigned.is_empty());
         true
     }
+}
+
+/// The pubkeys whose membership currently assigns no roles. Used by the
+/// role cleanups to tell "a grant this cleanup emptied" from "a member
+/// with no roles": deleting a role drops it from a grant, and an entry
+/// left empty becomes stale ONLY when it had roles to lose. A
+/// claim-admitted member (`admit`, no roles yet) was already empty, so it
+/// is a real membership — keep it. The previous
+/// `retain(|_, roles| !roles.is_empty())` ignored that difference and
+/// evicted every claim-admitted participant on every role deletion and on
+/// every rebuild.
+fn members_without_roles(
+    assignments: &std::collections::HashMap<String, Vec<String>>,
+) -> std::collections::HashSet<String> {
+    assignments
+        .iter()
+        .filter(|(_, roles)| roles.is_empty())
+        .map(|(pubkey, _)| pubkey.clone())
+        .collect()
 }
 
 fn tag_value<'a>(event: &'a Event, name: &str) -> Option<&'a str> {
@@ -852,6 +877,98 @@ mod tests {
                 !store.roles.contains_key("king"),
                 "a deleted role must not resurrect on restart"
             );
+        });
+    }
+
+    #[test]
+    fn rebuild_keeps_claim_admitted_members() {
+        // A claim-admitted joiner is admitted with an entry holding NO
+        // roles (`admit`), and `is_member_of` treats it as membership with no
+        // roles (its rejoin gets "duplicate:"). The rebuild's cleanups then
+        // evicted every such entry: the deleted-role tombstone branch runs
+        // `assignments.retain(|_, assigned| !assigned.is_empty())`, and so
+        // does the end-of-rebuild filter — both assume an empty entry is
+        // stale, but this one is deliberate. Every rebuild (any role event,
+        // a vanish, a restart that rescans) and every `delete` (deleterole)
+        // dropped all claim-admitted participants.
+        use crate::nips::nip01;
+        use std::sync::Arc;
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir()
+            .join("nostrfy-nip43-claim-rebuild-test")
+            .join(format!("{:x}-{id}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        let cfg = crate::config::DatabaseConfig {
+            path,
+            map_size: 16 * 1024 * 1024,
+            max_map_size: 32 * 1024 * 1024,
+            ..Default::default()
+        };
+        let db = crate::db::DbClient::open(
+            &cfg,
+            true,
+            Arc::new(Default::default()),
+            0,
+            128,
+            4096,
+            262144,
+        )
+        .unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let relay_pk = "aa".repeat(32);
+            let claimy = "ab".repeat(32);
+            let roledy = "cc".repeat(32);
+            let mut role = Event {
+                id: String::new(),
+                pubkey: relay_pk.clone(),
+                created_at: 100,
+                kind: ROLE_DEFINITION,
+                tags: vec![
+                    vec!["-".into()],
+                    vec!["d".into(), "kept".into()],
+                    vec!["label".into(), "Kept".into()],
+                ],
+                content: String::new(),
+                sig: String::new(),
+            };
+            // The claim-admitted member carries no role; the other does.
+            let mut members = Event {
+                id: String::new(),
+                pubkey: relay_pk.clone(),
+                created_at: 200,
+                kind: MEMBERSHIP_LIST,
+                tags: vec![
+                    vec!["-".into()],
+                    vec!["member".into(), claimy.clone()],
+                    vec!["member".into(), roledy.clone(), "kept".into()],
+                ],
+                content: String::new(),
+                sig: String::new(),
+            };
+            for ev in [&mut role, &mut members] {
+                ev.id = nip01::compute_id(ev);
+            }
+            let now = unix_now();
+            for ev in [&role, &members] {
+                assert_eq!(db.put(ev.clone(), now).await, crate::db::PutOutcome::Stored);
+            }
+            let mut store = RoleStore::default();
+            assert!(
+                store.rebuild(&db, &relay_pk).await,
+                "the rebuild must complete"
+            );
+            assert!(store.roles.contains_key("kept"));
+            assert!(
+                store.is_member_of(&roledy),
+                "a role grant survives the rebuild"
+            );
+            assert!(
+                store.is_member_of(&claimy),
+                "a claim-admitted member with no roles must survive the rebuild"
+            );
+            drop(db);
         });
     }
 
