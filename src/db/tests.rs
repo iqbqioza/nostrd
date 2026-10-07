@@ -6680,7 +6680,7 @@ fn pending_deletion_is_reported_and_resumed_at_startup() {
     let targets = vec![post.id.clone(), moderation.id.clone()];
     rt.block_on(async {
         let (removed, state_removed) = db
-            .apply_deletion_checked(targets.clone(), vec![], Some(pk.clone()), now)
+            .apply_deletion_checked(targets.clone(), vec![], Some(pk.clone()), now, false)
             .await;
         assert!(
             removed.is_none(),
@@ -6743,6 +6743,282 @@ fn pending_deletion_is_reported_and_resumed_at_startup() {
 }
 
 #[test]
+fn a_pre_flag_pending_deletion_is_resumed_and_cleared() {
+    // 後方互換: `purge_wraps` バイト追加前に書かれた DELETE_PENDING
+    // レコードも、再起動時にリプレイされ、その実キー（旧形式のハッシュ）で
+    // 削除されなければならない。エンコードを再計算してキーを導くと旧キーの
+    // エントリが残り、以後毎回「resumed」となってしまう。
+    use crate::db::store::{Store, encode_pending_deletion, pending_deletion_key};
+    let cfg = config();
+    let now = 1_700_000_000u64;
+    let pk = "ab".repeat(32);
+    let post = {
+        let mut e = event(1, "post", now - 20, vec![]);
+        e.pubkey = pk.clone();
+        e.id = nip01::compute_id(&e);
+        e
+    };
+    {
+        let store = Store::open(
+            &cfg,
+            Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            128,
+        )
+        .unwrap();
+        let mut wtxn = store.env.write_txn().unwrap();
+        assert_eq!(
+            store.put_event_in(&mut wtxn, &post, now).unwrap(),
+            PutOutcome::Stored
+        );
+        // 旧形式のレコードを直接書き込む（末尾の purge_wraps バイトを持たない）。
+        let mut encoded = encode_pending_deletion(
+            std::slice::from_ref(&post.id),
+            &[],
+            Some(&pk),
+            now,
+            None,
+            true,
+        );
+        encoded.pop();
+        let key = pending_deletion_key(&encoded);
+        store.delete_pending.put(&mut wtxn, &key, &encoded).unwrap();
+        wtxn.commit().unwrap();
+    }
+    let db = DbClient::open(
+        &cfg,
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        assert_eq!(
+            db.put(event(1, "barrier", now, vec![]), now).await,
+            PutOutcome::Stored
+        );
+        assert!(
+            db.pending_deletions()
+                .await
+                .expect("a healthy pending read must answer")
+                .is_empty(),
+            "the resumed old-format record must be cleared"
+        );
+        assert_eq!(db.table_counts().await.expect("counts").delete_pending, 0);
+        let f: Filter = serde_json::from_value(serde_json::json!({"authors": [pk]})).unwrap();
+        assert!(db.query(vec![f], 10, now).await.0.is_empty());
+    });
+    db.shutdown();
+}
+
+#[test]
+fn a_failed_gift_wrap_purge_is_held_for_the_deletion_resume() {
+    // NIP-59: the wrap purge must not be a log-only side effect. When it
+    // fails (here: the recipient index is not built, so the walk cannot
+    // find the wraps), the deletion itself fails and the pending record
+    // stays — the replay must re-attempt the purge, not just the walk.
+    use crate::db::store::Store;
+    let cfg = config();
+    let now = 1_700_000_000u64;
+    let pk = "ef".repeat(32);
+    let post = {
+        let mut e = event(1, "post", now - 20, vec![]);
+        e.pubkey = pk.clone();
+        e.id = nip01::compute_id(&e);
+        e
+    };
+    let wrap = authored_event(
+        1059,
+        &"ab".repeat(32),
+        "wrap",
+        now - 10,
+        vec![vec!["p".into(), pk.clone()]],
+    );
+    let store = Store::open(
+        &cfg,
+        Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        128,
+    )
+    .unwrap();
+    {
+        let mut wtxn = store.env.write_txn().unwrap();
+        for e in [&post, &wrap] {
+            assert_eq!(
+                store.put_event_in(&mut wtxn, e, now).unwrap(),
+                PutOutcome::Stored
+            );
+        }
+        wtxn.commit().unwrap();
+    }
+    // Marker missing (Store::open never runs the backfill): the purge fails
+    // loudly, and so does the whole deletion.
+    assert!(store.gift_wrap_index_needs_rebuild().unwrap());
+    let report = store.apply_deletion_group(
+        std::slice::from_ref(&post.id),
+        &[],
+        Some(&pk),
+        now,
+        None,
+        true,
+    );
+    assert!(
+        report.error.is_some(),
+        "a failed wrap purge must fail the deletion, not log and pass"
+    );
+    {
+        let rtxn = store.env.read_txn().unwrap();
+        assert!(
+            store
+                .events
+                .get(&rtxn, &wrap.id_bytes().unwrap())
+                .unwrap()
+                .is_some(),
+            "the failed purge must leave the wrap in place"
+        );
+        assert_eq!(
+            store.delete_pending.len(&rtxn).unwrap(),
+            1,
+            "the failed deletion keeps its pending record"
+        );
+    }
+    // The startup recovery rebuilds the index; the resume then completes
+    // both the walk and the purge and clears the record.
+    assert_eq!(store.rebuild_gift_wrap_index().unwrap(), 1);
+    let report = store.apply_deletion_group(
+        std::slice::from_ref(&post.id),
+        &[],
+        Some(&pk),
+        now,
+        None,
+        true,
+    );
+    assert!(report.error.is_none(), "the resume must succeed");
+    {
+        let rtxn = store.env.read_txn().unwrap();
+        assert!(
+            store
+                .events
+                .get(&rtxn, &wrap.id_bytes().unwrap())
+                .unwrap()
+                .is_none(),
+            "the resume must also revoke the requester's gift wraps"
+        );
+        assert_eq!(
+            store.delete_pending.len(&rtxn).unwrap(),
+            0,
+            "the completed deletion clears its pending record"
+        );
+    }
+}
+
+#[test]
+fn an_interrupted_deletion_also_resumes_the_gift_wrap_purge() {
+    // NIP-59 via the checked writer path: when the walk is interrupted
+    // after a committed chunk, neither the targeted events nor the
+    // recipient's wraps are fully handled — and the startup resume must
+    // finish both (the wrap purge shares the request's pending record).
+    use crate::db::store::Store;
+    let cfg = config();
+    let now = 1_700_000_000u64;
+    let pk = "ef".repeat(32);
+    let authored = |kind: u64, content: &str, created: u64, tags: Vec<Vec<String>>| {
+        let mut e = event(kind, content, created, tags);
+        e.pubkey = pk.clone();
+        e.id = nip01::compute_id(&e);
+        e
+    };
+    let post = authored(1, "post", now - 20, vec![]);
+    let wrap = authored_event(
+        1059,
+        &"ab".repeat(32),
+        "wrap",
+        now - 10,
+        vec![vec!["p".into(), pk.clone()]],
+    );
+    let expiry = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let store = Store::open(&cfg, Arc::clone(&expiry), 128).unwrap();
+    {
+        let mut wtxn = store.env.write_txn().unwrap();
+        for e in [&post, &wrap] {
+            assert_eq!(
+                store.put_event_in(&mut wtxn, e, now).unwrap(),
+                PutOutcome::Stored
+            );
+        }
+        wtxn.commit().unwrap();
+    }
+    // Fail after the first removal chunk committed: the wrap purge (which
+    // runs inside the same walk) never ran.
+    store
+        .fail_next_delete_chunk
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let db = DbClient::open_with_store(
+        &cfg,
+        store,
+        expiry,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+    )
+    .unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let (removed, _) = db
+            .apply_deletion_checked(vec![post.id.clone()], vec![], Some(pk.clone()), now, true)
+            .await;
+        assert!(
+            removed.is_none(),
+            "an interrupted deletion must not report a clean count"
+        );
+        let wraps =
+            || -> Filter { serde_json::from_value(serde_json::json!({"kinds": [1059]})).unwrap() };
+        assert_eq!(
+            db.query(vec![wraps()], 10, now).await.0.len(),
+            1,
+            "the wrap purge is held with the interrupted walk"
+        );
+    });
+    db.shutdown();
+    // A restart resumes the pending deletion before serving any message:
+    // the replay removes no more posts (already gone) but must revoke the
+    // requester's wraps and clear the record.
+    let db = DbClient::open(
+        &cfg,
+        true,
+        Arc::new(Default::default()),
+        0,
+        128,
+        4096,
+        262144,
+    )
+    .unwrap();
+    rt.block_on(async {
+        assert_eq!(
+            db.put(event(1, "barrier", now, vec![]), now).await,
+            PutOutcome::Stored
+        );
+        assert!(
+            db.pending_deletions()
+                .await
+                .expect("a healthy pending read must answer")
+                .is_empty(),
+            "the resumed deletion must clear its record"
+        );
+        let wraps =
+            || -> Filter { serde_json::from_value(serde_json::json!({"kinds": [1059]})).unwrap() };
+        assert!(
+            db.query(vec![wraps()], 10, now).await.0.is_empty(),
+            "the resumed deletion must also revoke the requester's wraps"
+        );
+    });
+    db.shutdown();
+}
+
+#[test]
 fn interrupted_deletion_resume_removes_remaining_state() {
     // A genuinely partial walk: one target was removed and the record
     // persisted, but the process died before the rest. The startup resume
@@ -6779,7 +7055,7 @@ fn interrupted_deletion_resume_removes_remaining_state() {
         store
             .remove_event(&mut wtxn, &post.id_bytes().unwrap())
             .unwrap();
-        let encoded = encode_pending_deletion(&targets, &[], Some(&pk), now, None);
+        let encoded = encode_pending_deletion(&targets, &[], Some(&pk), now, None, true);
         let key = pending_deletion_key(&encoded);
         store.delete_pending.put(&mut wtxn, &key, &encoded).unwrap();
         wtxn.commit().unwrap();
@@ -6852,7 +7128,7 @@ fn shutdown_cancellation_aborts_removals_and_leaves_pending() {
 
         db.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
         let (removed, state) = db
-            .apply_deletion_checked(vec![post.id.clone()], vec![], Some(pk.clone()), now)
+            .apply_deletion_checked(vec![post.id.clone()], vec![], Some(pk.clone()), now, false)
             .await;
         assert!(removed.is_none(), "a cancelled deletion is a failure");
         assert!(!state);
@@ -6897,7 +7173,7 @@ fn shutdown_cancellation_aborts_removals_and_leaves_pending() {
         // Clearing the flag lets the retries complete and clear the records.
         db.cancel.store(false, std::sync::atomic::Ordering::SeqCst);
         let (removed, _) = db
-            .apply_deletion_checked(vec![post.id.clone()], vec![], Some(pk.clone()), now)
+            .apply_deletion_checked(vec![post.id.clone()], vec![], Some(pk.clone()), now, false)
             .await;
         assert_eq!(removed, Some(1));
         assert!(
@@ -8114,7 +8390,7 @@ fn disk_full_removals_fail_closed_before_any_side_effect() {
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
         let (removed, state) = db
-            .apply_deletion_checked(vec![post.id.clone()], vec![], Some(pk.clone()), now)
+            .apply_deletion_checked(vec![post.id.clone()], vec![], Some(pk.clone()), now, false)
             .await;
         assert_eq!(removed, None, "a full-disk deletion must report failure");
         assert!(!state);
@@ -8170,7 +8446,7 @@ fn disk_full_removals_fail_closed_before_any_side_effect() {
             .disk_full
             .store(false, std::sync::atomic::Ordering::SeqCst);
         assert_eq!(
-            db.apply_deletion_checked(vec![post.id.clone()], vec![], Some(pk.clone()), now)
+            db.apply_deletion_checked(vec![post.id.clone()], vec![], Some(pk.clone()), now, false)
                 .await
                 .0,
             Some(1)
@@ -8224,6 +8500,7 @@ fn nip09_first_chunk_failure_stays_pending_until_startup_resume() {
                 vec![],
                 Some(pk.clone()),
                 now,
+                false,
             )
             .await;
         assert!(
@@ -8304,7 +8581,7 @@ fn nip09_middle_chunk_failure_resumes_at_startup() {
             .chunk_after
             .store(2, std::sync::atomic::Ordering::SeqCst);
         let (removed, state) = db
-            .apply_deletion_checked(targets.clone(), vec![], Some(pk.clone()), now)
+            .apply_deletion_checked(targets.clone(), vec![], Some(pk.clone()), now, false)
             .await;
         assert!(
             removed.is_none(),
@@ -8409,7 +8686,13 @@ fn delegated_address_tombstone_survives_a_mid_walk_crash() {
             .chunk_after
             .store(2, std::sync::atomic::Ordering::SeqCst);
         let (removed, _) = db
-            .apply_deletion_checked(vec![], vec![addr.clone()], Some(delegator.clone()), now)
+            .apply_deletion_checked(
+                vec![],
+                vec![addr.clone()],
+                Some(delegator.clone()),
+                now,
+                false,
+            )
             .await;
         assert!(removed.is_none(), "the mid-walk crash must report failure");
         // The version is gone.
@@ -8436,7 +8719,7 @@ fn delegated_address_tombstone_survives_a_mid_walk_crash() {
         // Replaying the request (the startup resume path) completes cleanly
         // and keeps the guard.
         let (removed, _) = db
-            .apply_deletion_checked(vec![], vec![addr], Some(delegator), now)
+            .apply_deletion_checked(vec![], vec![addr], Some(delegator), now, false)
             .await;
         assert_eq!(removed, Some(0));
         assert!(

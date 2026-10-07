@@ -267,6 +267,7 @@ impl Store {
         request_pubkey: Option<&str>,
         request_created: u64,
         group: Option<&str>,
+        purge_wraps: bool,
     ) -> RemovalReport {
         let mut removed = 0usize;
         let mut group_state_removed = false;
@@ -277,6 +278,7 @@ impl Store {
                 request_pubkey,
                 request_created,
                 group,
+                purge_wraps,
                 &mut removed,
                 &mut group_state_removed,
             )
@@ -301,6 +303,7 @@ impl Store {
         request_pubkey: Option<&str>,
         request_created: u64,
         group: Option<&str>,
+        purge_wraps: bool,
         removed: &mut usize,
         group_state_removed: &mut bool,
     ) -> Result<()> {
@@ -317,8 +320,14 @@ impl Store {
         // Record the request before the first removal chunk. A request with
         // nothing to walk (no tags) cannot be interrupted, so it writes no
         // record that would need clearing.
-        let pending_encoded =
-            encode_pending_deletion(targets, addresses, request_pubkey, request_created, group);
+        let pending_encoded = encode_pending_deletion(
+            targets,
+            addresses,
+            request_pubkey,
+            request_created,
+            group,
+            purge_wraps,
+        );
         let pending_key = pending_deletion_key(&pending_encoded);
         let has_work = !targets.is_empty() || !addresses.is_empty();
         if has_work {
@@ -610,6 +619,28 @@ impl Store {
             if !author_owns && delegated_any {
                 self.merge_address_tombstone(&akey, request_created)?;
             }
+        }
+
+        // NIP-59: the deletion walk also revokes the gift wraps addressed
+        // to the requester. This runs inside the same resumable unit as the
+        // walk, so a failure here propagates like a walk failure and the
+        // deletion's pending record (recorded above) is NOT cleared — the
+        // startup resume re-attempts the whole walk, purge included. This
+        // is why the purge lives here and not only at the event handler.
+        // `request_pubkey` is the deleter's own hex key, and a 9005 group
+        // delete passes `None`, so moderated deletes never touch another
+        // user's wraps (matching the handler's previous behaviour).
+        //
+        // `purge_wraps` is true only for the live NIP-09 path. The
+        // migration passes false and owns the bounded purge separately
+        // (it must not remove wraps imported after the request's own
+        // timestamp); a 9005 group delete has `request_pubkey == None`.
+        if purge_wraps
+            && let Some(pk) = request_pubkey
+            && let Ok(bytes) = hex::decode(pk)
+            && bytes.len() == ID_LEN
+        {
+            self.remove_gift_wraps_for(&bytes, u64::MAX, removed)?;
         }
 
         // The whole walk committed cleanly: the request no longer needs a
@@ -1192,7 +1223,7 @@ impl Store {
         &self,
         errors: &Arc<std::sync::atomic::AtomicU64>,
     ) -> (usize, bool) {
-        let pending = match self.pending_deletions() {
+        let pending = match self.pending_deletions_and_keys() {
             Ok(pending) => pending,
             Err(e) => {
                 db_error(errors, &e);
@@ -1201,23 +1232,18 @@ impl Store {
         };
         let mut completed = 0usize;
         let mut group_state_removed = false;
-        for request in pending {
+        for (record_key, request) in pending {
             if self.cancelled() {
                 break;
             }
             // A record with neither a requester nor a group scope can never
             // authorize a removal (the walk refuses it): drop it so it does
             // not block every startup forever. Legitimate records always
-            // carry one of the two.
+            // carry one of the two. Clear it by its literal key: for a
+            // record written by an older binary, re-deriving the key from
+            // the current encoding would not match.
             if request.request_pubkey.is_none() && request.group.is_none() {
-                let encoded = encode_pending_deletion(
-                    &request.targets,
-                    &request.addresses,
-                    None,
-                    request.request_created,
-                    None,
-                );
-                if let Err(e) = self.clear_pending_deletion(&pending_deletion_key(&encoded)) {
+                if let Err(e) = self.clear_pending_deletion(&record_key) {
                     db_error(errors, &e);
                 }
                 continue;
@@ -1228,11 +1254,20 @@ impl Store {
                 request.request_pubkey.as_deref(),
                 request.request_created,
                 request.group.as_deref(),
+                request.purge_wraps,
             );
             group_state_removed |= report.group_state_removed;
             match report.error {
                 Some(e) => db_error(errors, &e),
-                None => completed += 1,
+                None => {
+                    completed += 1;
+                    // The walk cleared its own record under the key of the
+                    // current encoding; for a pre-flag record that key
+                    // differs from the stored one, so clear it literally.
+                    if let Err(e) = self.clear_pending_deletion(&record_key) {
+                        db_error(errors, &e);
+                    }
+                }
             }
         }
         (completed, group_state_removed)

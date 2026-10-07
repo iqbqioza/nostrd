@@ -1180,6 +1180,7 @@ pub(crate) fn spawn(
                                     request_pubkey,
                                     request_created,
                                     group,
+                                    purge_wraps,
                                     reply,
                                 } => {
                                     // A failed walk replies `None` so the
@@ -1196,6 +1197,7 @@ pub(crate) fn spawn(
                                         request_pubkey.as_deref(),
                                         request_created,
                                         group.as_deref(),
+                                        purge_wraps,
                                     );
                                     if let Some(e) = &report.error {
                                         db_error(&thread_errors, e);
