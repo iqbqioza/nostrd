@@ -173,6 +173,12 @@ A non-zero `bad signature` count means the export contains events strfry
 accepted without verification (e.g. imported with `--no-verify`); they will
 be skipped. If you trust them, pass `--no-verify` to import them anyway.
 
+A non-zero `bad delegation` count means the export contains NIP-26 events
+whose delegation token does not verify. The relay indexes a delegated event
+under the delegator's pubkey too, so storing a forged token would publish it
+in someone else's author feed — such events are always skipped (even with
+`--no-verify`, which only relaxes the *event* signature check).
+
 The dry run classifies ephemeral and already-expired events (they are never
 stored) but does not simulate the NIP-09/NIP-29 deletion side effects, which
 need the database: expect the real run's side-effect counts to be non-zero.
@@ -316,6 +322,7 @@ rm -rf /var/lib/nostrfy            # or restore the pre-migration backup
 | `database writer unavailable; the migration did not complete` | The writer thread stopped or the queue is overloaded: check disk/map size, re-run (safe) |
 | `group purge for <id> did not complete` | The purge was interrupted: re-run the migration |
 | High `bad signature` count | The strfry DB contains unverified events: inspect them; import with `--no-verify` only if you trust the source |
+| High `bad delegation` count | The export's NIP-26 delegation tokens do not verify (strfry does not check them): the affected events are skipped and never published under the delegator's feed; there is no override, because the token is the delegator's own authorization |
 | High `expired`/`ephemeral` counts | Expected: nostrfy never stores ephemeral events, and expired events are dropped |
 | First start is slow | The group/role state is being rebuilt from the imported events; it is a one-time cost, logged in the log file |
 | `database writer unavailable` while the disk or LMDB map is full | Raise `database.map_size` (and `max_map_size`), free disk space, then re-run (safe) |
