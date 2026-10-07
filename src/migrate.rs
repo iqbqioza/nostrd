@@ -45,7 +45,7 @@ use secp256k1::Secp256k1;
 use crate::db::{DbClient, PutOutcome};
 use crate::event::Event;
 use crate::filter::Filter;
-use crate::nips::{nip01, nip09, nip29, nip62};
+use crate::nips::{nip01, nip09, nip26, nip29, nip62};
 use crate::util::unix_now;
 
 /// Upper bound on one input batch's total event bytes: `Options::batch`
@@ -98,6 +98,12 @@ pub struct Stats {
     pub oversized: u64,
     /// Events whose id/signature verification failed.
     pub bad_signature: u64,
+    /// Events whose NIP-26 delegation tag failed verification (forged or
+    /// malformed token): the read/index paths honor a delegation tag
+    /// unconditionally (`authors: [<delegator>]` also matches), so storing
+    /// one without verifying would let the export impersonate a
+    /// delegator's author feed.
+    pub bad_delegation: u64,
     /// Parsed and verified events (dry-run only: the real run reports the
     /// storage outcome instead).
     pub valid: u64,
@@ -146,6 +152,7 @@ impl Stats {
         self.malformed
             + self.oversized
             + self.bad_signature
+            + self.bad_delegation
             + self.expired
             + self.ephemeral
             + self.previously_deleted
@@ -187,11 +194,12 @@ impl std::fmt::Display for Stats {
         writeln!(
             f,
             "skipped {} event(s): {} malformed, {} oversized, {} bad signature, \
-             {} expired, {} ephemeral, {} previously deleted, {} rejected",
+             {} bad delegation, {} expired, {} ephemeral, {} previously deleted, {} rejected",
             self.skipped(),
             self.malformed,
             self.oversized,
             self.bad_signature,
+            self.bad_delegation,
             self.expired,
             self.ephemeral,
             self.previously_deleted,
@@ -316,6 +324,18 @@ pub async fn run(
         );
         if opts.verify && nip01::verify(&event, &secp).is_err() {
             stats.bad_signature += 1;
+            continue;
+        }
+        // NIP-26: the live write path verifies the delegation token
+        // unconditionally (the read/index paths honor the tag whether NIP-26
+        // is advertised or not), so the import must not be the weaker path:
+        // a forged tag in the export would index the event under an
+        // arbitrary delegator's pubkey. Unconditional even under
+        // `--no-verify`: that switch trusts the *event* signatures, while
+        // the token is the delegator's own authorization. Events without a
+        // delegation tag pass.
+        if !nip26::verify(&event, &secp) {
+            stats.bad_delegation += 1;
             continue;
         }
         batch_bytes = batch_bytes.saturating_add(trimmed.len());
@@ -1420,6 +1440,73 @@ mod tests {
         assert_eq!(stats.ephemeral, 1);
         assert_eq!(stats.stored, 1);
         assert_eq!(visible(&db, serde_json::json!({})).len(), 1);
+        db.shutdown();
+    }
+
+    #[test]
+    fn a_forged_delegation_in_the_export_is_skipped() {
+        // The read/index paths honor a NIP-26 delegation tag unconditionally:
+        // the event is indexed under the delegator too, so `authors:
+        // [<delegator>]` matches it. The live write path verifies the token
+        // before storing (see `validate_base`); importing an export that
+        // skips the check would let a forged tag impersonate a delegator's
+        // author feed. A correctly signed token imports unchanged.
+        use sha2::{Digest, Sha256};
+
+        let db = test_db("delegation");
+        let now = unix_now();
+        let delegatee = keypair(1).x_only_public_key().0.to_string();
+        let delegator = keypair(2).x_only_public_key().0.to_string();
+        let conditions = "kind=1";
+        let sign_token = |delegator_key: &Keypair| {
+            let mut hasher = Sha256::new();
+            hasher.update(format!("nostr:delegation:{delegatee}:{conditions}").as_bytes());
+            let message: [u8; 32] = hasher.finalize().into();
+            Secp256k1::new()
+                .sign_schnorr_no_aux_rand(&message, delegator_key)
+                .to_string()
+        };
+        // Forged: the token is signed by a third key, so it does not
+        // authorize this delegator.
+        let forged = signed(
+            1,
+            1,
+            now - 10,
+            vec![vec![
+                "delegation".into(),
+                delegator.clone(),
+                conditions.into(),
+                sign_token(&keypair(3)),
+            ]],
+            "forged",
+        );
+        // Authentic: the delegator itself signed the token.
+        let authentic = signed(
+            1,
+            1,
+            now - 10,
+            vec![vec![
+                "delegation".into(),
+                delegator,
+                conditions.into(),
+                sign_token(&keypair(2)),
+            ]],
+            "authentic",
+        );
+        let stats = run_str(
+            &db,
+            &jsonl(&[forged.clone(), authentic.clone()]),
+            &options(),
+        );
+        assert_eq!(stats.bad_delegation, 1, "{stats:?}");
+        assert_eq!(stats.stored, 1);
+        let stored = visible(&db, serde_json::json!({"kinds": [1]}));
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].id, authentic.id);
+        assert!(
+            visible(&db, serde_json::json!({"ids": [forged.id]})).is_empty(),
+            "the forged delegation must not reach the database"
+        );
         db.shutdown();
     }
 
