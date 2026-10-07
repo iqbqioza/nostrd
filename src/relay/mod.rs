@@ -2966,6 +2966,7 @@ impl Relay {
                     nip09::deletion_addresses(&event),
                     Some(event.pubkey.clone()),
                     event.created_at,
+                    true,
                 )
                 .await;
             match removed {
@@ -2986,6 +2987,7 @@ impl Relay {
                         request_pubkey: Some(event.pubkey.clone()),
                         request_created: event.created_at,
                         group: None,
+                        purge_wraps: true,
                     });
                 }
             }
@@ -3005,21 +3007,13 @@ impl Relay {
                     self.mark_roles_stale().await;
                 }
             }
-            // NIP-59: gift wraps are signed by random keys, so their
-            // recipient cannot delete them via NIP-09; the relay
-            // deletes wraps addressed to the deleter instead. A failure
-            // only logs: the purge has no pending record, so a client
-            // retry is a duplicate and cannot resume it (the next restart's
-            // expiry/name maintenance does not re-run it either).
-            if let Some(pubkey) = event.pubkey_bytes() {
-                match self.db.delete_gift_wraps_to_checked(pubkey, u64::MAX).await {
-                    Some(purged) => self.stats.bump(&self.stats.events_deleted, purged as u64),
-                    None => {
-                        log::error!("NIP-59 gift-wrap purge was not applied");
-                        self.stats.bump(&self.stats.db_errors, 1);
-                    }
-                }
-            }
+            // NIP-59: the gift-wrap purge now lives inside the resumable
+            // deletion walk (`apply_deletion_walk`), so a failure there
+            // surfaces through `apply_deletion_checked`'s `None` and is
+            // held for the startup resume (no separate log-only step).
+            // (Gift wraps are signed by random keys, so their recipient
+            // cannot delete them via NIP-09; the relay deletes wraps
+            // addressed to the deleter instead.)
         }
         if nip43 && event.kind == nip43::LEAVE {
             // NIP-43: leave requests (ephemeral kinds) update the member
@@ -3771,6 +3765,7 @@ impl Relay {
                             request_pubkey: None,
                             request_created: u64::MAX,
                             group: Some(gid.to_string()),
+                            purge_wraps: false,
                         });
                     }
                 }
@@ -5232,6 +5227,7 @@ mod tests {
             Some(author.as_str()),
             u64::MAX,
             None,
+            true,
         );
         {
             let mut wtxn = store.env.write_txn().unwrap();
@@ -6038,6 +6034,7 @@ mod tests {
             request_pubkey: Some(deletion.pubkey.clone()),
             request_created: deletion.created_at,
             group: None,
+            purge_wraps: true,
         };
         assert!(
             relay.hold_pending_removal(request).await,
@@ -6076,6 +6073,7 @@ mod tests {
                 request_pubkey: Some(deletion.pubkey.clone()),
                 request_created: deletion.created_at,
                 group: None,
+                purge_wraps: true,
             });
         }
         let overflow = crate::db::store::PendingDeletion {
@@ -6084,6 +6082,7 @@ mod tests {
             request_pubkey: Some(deletion.pubkey),
             request_created: now,
             group: None,
+            purge_wraps: true,
         };
         assert!(
             !relay.hold_pending_removal(overflow).await,

@@ -384,6 +384,9 @@ enum Msg {
         request_created: u64,
         /// NIP-29 9005 moderation: restrict deletion to events of this group.
         group: Option<String>,
+        /// NIP-59: also purge the requester's gift wraps (live NIP-09
+        /// only; migration/moderation own their bounded purge).
+        purge_wraps: bool,
         /// `(removed, group_state_removed)`: the count is `None` when the
         /// removal walk failed (the checked callers must not treat a
         /// skipped deletion as success), while the flag is still set when
@@ -1922,7 +1925,7 @@ impl DbClient {
         request_pubkey: Option<String>,
         request_created: u64,
     ) -> usize {
-        self.apply_deletion_checked(targets, addresses, request_pubkey, request_created)
+        self.apply_deletion_checked(targets, addresses, request_pubkey, request_created, false)
             .await
             .0
             .unwrap_or(0)
@@ -1940,6 +1943,7 @@ impl DbClient {
         addresses: Vec<nip09::Address>,
         request_pubkey: Option<String>,
         request_created: u64,
+        purge_wraps: bool,
     ) -> (Option<usize>, bool) {
         self.request_write(|reply| Msg::Delete {
             targets,
@@ -1947,6 +1951,7 @@ impl DbClient {
             request_pubkey,
             request_created,
             group: None,
+            purge_wraps,
             reply,
         })
         .await
@@ -1978,6 +1983,7 @@ impl DbClient {
             request_pubkey: None,
             request_created: u64::MAX,
             group: Some(group),
+            purge_wraps: false,
             reply,
         })
         .await

@@ -717,6 +717,7 @@ async fn apply_group_side_effects(db: &DbClient, opts: &Options, stats: &mut Sta
                             Vec::new(),
                             Some(event.pubkey.clone()),
                             event.created_at,
+                            false,
                         )
                         .await;
                     if removed.is_none() {
@@ -812,6 +813,7 @@ async fn drop_fake_group_metadata(
                     Vec::new(),
                     Some(event.pubkey.clone()),
                     event.created_at,
+                    false,
                 )
                 .await;
             if removed.is_none() {
@@ -882,6 +884,7 @@ async fn drop_refused_moderation(
                 Vec::new(),
                 Some(event.pubkey.clone()),
                 event.created_at,
+                false,
             )
             .await;
         if removed.is_none() {
@@ -1052,6 +1055,7 @@ async fn apply_nip09(db: &DbClient, event: &Event, stats: &mut Stats) -> Result<
             addresses,
             Some(event.pubkey.clone()),
             event.created_at,
+            false,
         )
         .await;
     if removed.is_none() {

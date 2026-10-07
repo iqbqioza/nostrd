@@ -33,6 +33,10 @@ pub(crate) struct PendingDeletion {
     pub request_created: u64,
     /// NIP-29 `kind:9005` group scope.
     pub group: Option<String>,
+    /// Whether the walk also purges the requester's NIP-59 gift wraps:
+    /// true for the live NIP-09 path, false for the migration and
+    /// moderation paths, which own their (bounded) purge separately.
+    pub purge_wraps: bool,
 }
 
 /// Row counts of the bookkeeping tables, exposed as gauges so operators
@@ -1666,8 +1670,37 @@ impl Store {
             request.request_pubkey.as_deref(),
             request.request_created,
             request.group.as_deref(),
+            request.purge_wraps,
         );
         self.put_pending_deletion(&pending_deletion_key(&encoded), &encoded)
+    }
+
+    /// Like [`Self::pending_deletions`], but yields each record together
+    /// with the key it is actually stored under. The startup resume must
+    /// clear records by that literal key: the key is a digest of the
+    /// record's own bytes, and a record written by an older binary (no
+    /// `purge_wraps` byte) hashes differently from the bytes the current
+    /// encoder produces for the same request, so re-deriving the key would
+    /// leave the old entry behind.
+    pub(crate) fn pending_deletions_and_keys(&self) -> Result<Vec<([u8; 32], PendingDeletion)>> {
+        let rtxn = self.env.read_txn()?;
+        let mut out = Vec::new();
+        for item in self.delete_pending.iter(&rtxn)? {
+            let (key, raw) = item?;
+            match decode_pending_deletion(raw) {
+                Some(request) => {
+                    let key: [u8; 32] = key
+                        .try_into()
+                        .map_err(|_| anyhow::anyhow!("pending deletion key is not 32 bytes"))?;
+                    out.push((key, request));
+                }
+                None => log::warn!(
+                    "skipping corrupt pending deletion record ({} bytes)",
+                    raw.len()
+                ),
+            }
+        }
+        Ok(out)
     }
 
     /// Every started-but-unfinished NIP-09 deletion, decoded for the
@@ -2065,6 +2098,7 @@ pub(crate) fn encode_pending_deletion(
     request_pubkey: Option<&str>,
     request_created: u64,
     group: Option<&str>,
+    purge_wraps: bool,
 ) -> Vec<u8> {
     fn put_str(out: &mut Vec<u8>, value: &str) {
         out.extend_from_slice(&(value.len() as u32).to_be_bytes());
@@ -2093,6 +2127,10 @@ pub(crate) fn encode_pending_deletion(
         put_str(&mut out, &address.pubkey);
         put_str(&mut out, &address.d);
     }
+    // Trailing flag, appended: records written before the flag existed
+    // decode as `false` (their walk never purged wraps), and the live
+    // path's resume re-derives the key from the same bytes.
+    out.push(u8::from(purge_wraps));
     out
 }
 
@@ -2151,12 +2189,19 @@ pub(crate) fn decode_pending_deletion(raw: &[u8]) -> Option<PendingDeletion> {
         let d = reader.string()?;
         addresses.push(crate::nips::nip09::Address { kind, pubkey, d });
     }
+    // Missing trailing byte means the record predates the flag: those
+    // walks never purged wraps, so replay with `false`.
+    let purge_wraps = match reader.u8() {
+        Some(byte) => byte != 0,
+        None => false,
+    };
     Some(PendingDeletion {
         targets,
         addresses,
         request_pubkey,
         request_created,
         group,
+        purge_wraps,
     })
 }
 

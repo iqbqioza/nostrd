@@ -893,6 +893,7 @@ impl Harness {
                         addresses,
                         Some(requester),
                         request_created,
+                        false,
                     ));
                     assert_eq!(
                         got_removed.0,
