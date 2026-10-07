@@ -4942,10 +4942,10 @@ mod tests {
     }
 
     #[test]
-    fn neg_syncs_loose_protected_tag_as_public() {
-        // `["-", "extra"]` is public like the REQ path: only the exact
-        // `["-"]` tag is protected. An anonymous NEG-OPEN must include it
-        // in the sync set instead of withholding it.
+    fn neg_withholds_loose_protected_tag_from_anonymous() {
+        // `["-", "extra"]` is protected like the REQ path: any tag named
+        // `-` marks the event. An anonymous NEG-OPEN must withhold it from
+        // the sync set instead of syncing it.
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
             let mut conn = build_conn().await;
@@ -4963,8 +4963,8 @@ mod tests {
             let state = conn.neg.get("loose").expect("sync must stay open");
             let want = ev.id_bytes().expect("test event id");
             assert!(
-                state.items.iter().any(|(_, id)| *id == want),
-                "a [\"-\", \"extra\"] event must be synced to anonymous peers"
+                !state.items.iter().any(|(_, id)| *id == want),
+                "a [\"-\", \"extra\"] event must be withheld from anonymous peers"
             );
             conn.relay.db.shutdown();
         });
