@@ -624,11 +624,21 @@ impl Conn {
         }
         if let Ok(text) = serde_json::to_string(&value) {
             let size = text.len();
-            // An unset byte cap (`0` = unlimited) disables the normal
-            // ceiling, but completion-critical frames still need one:
-            // NEG-MSG id lists can be large, and without a bound a slow
-            // reader could accumulate them up to the count cap.
-            if self.out_queue_bytes == 0
+            // Control frames are exempt from the *configured* per-connection
+            // cap (a dropped EOSE would hang a completing subscription), but
+            // they are not exempt from an absolute bound. The exemption used
+            // to hold whenever a cap was configured, which left the frame
+            // count as the only limit: an OK frame echoes the client-supplied
+            // `id` verbatim, a malformed event can carry one as large as
+            // `max_ws_message_bytes`, and `OUT_QUEUE_LIMIT * 2` such frames
+            // pin gigabytes per connection. The other control sources are
+            // already small or self-limiting (a subscription id is bounded by
+            // `max_sub_id_len`, COUNT by `max_count`, and NEG separately by
+            // its own backpressure guard), so this ceiling only binds the
+            // echo. It applies whether or not a cap is configured, and like
+            // `send_tagged` it never drops the first frame of an empty
+            // queue, so a lone over-ceiling frame is still delivered.
+            if !self.outgoing.is_empty()
                 && self.out_bytes.saturating_add(size) > self.control_ceiling()
             {
                 self.dropped += 1;
@@ -7359,6 +7369,66 @@ mod tests {
                 "a dropped completion-critical frame must mark the connection \
                  for close so the peer can resynchronize"
             );
+            conn.relay.db.shutdown();
+        });
+    }
+
+    #[test]
+    fn a_configured_out_queue_cap_still_bounds_control_frames() {
+        // The control-frame byte ceiling must not depend on whether the
+        // operator configured `max_out_queue_bytes`. An OK frame echoes the
+        // client-supplied `id` verbatim, and a malformed event can carry a
+        // ~1 MiB one, so with the ceiling skipped the only remaining bound
+        // was the frame count: `OUT_QUEUE_LIMIT * 2` x `max_ws_message_bytes`
+        // (~8 GiB per connection) for a peer that never reads.
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let mut conn = build_conn().await;
+            // The documented default, and a small REQ budget so the ceiling
+            // is test-sized.
+            conn.out_queue_bytes = 256 * 1024;
+            conn.req_response_bytes = 100;
+            assert_eq!(conn.control_ceiling(), 200);
+            let frame = |id: usize| serde_json::json!(["OK", "a".repeat(id), false, "x"]);
+            let dropped_before = conn
+                .relay
+                .stats
+                .buffers_dropped
+                .load(std::sync::atomic::Ordering::Relaxed);
+            // The first frame of an empty queue is never dropped (like
+            // `send_tagged`): a single oversized frame still goes out.
+            conn.send_control(frame(100));
+            let after_first = conn.out_bytes;
+            assert!(after_first > 0 && after_first <= 200, "{after_first}");
+            assert_eq!(conn.outgoing.len(), 1);
+            // A frame that crosses the ceiling is dropped and counted, and
+            // the queue does not grow.
+            conn.send_control(frame(200));
+            assert_eq!(
+                conn.outgoing.len(),
+                1,
+                "the over-ceiling frame must not queue"
+            );
+            assert_eq!(
+                conn.out_bytes, after_first,
+                "a dropped frame must not be counted"
+            );
+            assert_eq!(
+                conn.relay
+                    .stats
+                    .buffers_dropped
+                    .load(std::sync::atomic::Ordering::Relaxed),
+                dropped_before + 1,
+                "the ceiling drop must be counted"
+            );
+            assert!(
+                conn.control_overflowed,
+                "a dropped completion-critical frame must mark the connection for close"
+            );
+            // A frame that keeps the queue under the ceiling still fits.
+            conn.send_control(frame(10));
+            assert_eq!(conn.outgoing.len(), 2);
+            assert!(conn.out_bytes > after_first);
             conn.relay.db.shutdown();
         });
     }
