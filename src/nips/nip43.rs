@@ -97,9 +97,10 @@ impl RoleStore {
     pub fn is_member_of(&self, pubkey: &str) -> bool {
         // Membership is presence on the member list: a claim-admitted
         // joiner carries no roles yet still appears in `kind:13534` and
-        // must get the `duplicate:` verdict on rejoin (every other entry
-        // is kept role-non-empty by the assign/unassign/delete cleanup,
-        // so this matches the old check on all existing states).
+        // must get the `duplicate:` verdict on rejoin. Only `remove_pubkey`
+        // (a leave request) deletes an entry, and `unassign`/`delete` drop
+        // one only when the cleanup itself emptied its role list, so a
+        // role-empty entry is exactly the claim-admitted case.
         self.assignments.contains_key(pubkey)
     }
 
@@ -212,7 +213,14 @@ impl RoleStore {
             let before = roles.len();
             roles.retain(|r| r != role);
             changed = roles.len() != before;
-            if roles.is_empty() {
+            // Only `remove_pubkey` (a leave request) deletes an entry; a
+            // member whose grant this cleanup emptied goes, but a member
+            // that was already role-empty — a claim-admitted joiner — must
+            // keep the entry: it had no grant to lose, and dropping it would
+            // silently revoke a membership `changed` reports as untouched,
+            // so the caller skips both the persist and the republish and
+            // every store disagrees until a later mutation papers over it.
+            if roles.is_empty() && changed {
                 self.assignments.remove(pubkey);
             }
         }
@@ -541,6 +549,56 @@ mod tests {
         assert!(check_role_color("1.5").is_err());
         assert!(check_role_color("red").is_err());
         assert!(check_role_color("37px").is_err());
+    }
+
+    #[test]
+    fn unassign_keeps_a_claim_admitted_member() {
+        // A claim-admitted member is a role-empty entry (admit() creates it
+        // with no roles), and `unassign` used to drop that entry even when it
+        // removed nothing: `roles.is_empty()` was already true, so the member
+        // silently lost the membership it got from its claim while `changed`
+        // stayed false — the caller then skipped the persist AND the
+        // republish, leaving the live store, the persisted snapshot and the
+        // published `kind:13534` in disagreement. `delete` was fixed for this
+        // with `members_without_roles`; `unassign` was missed.
+        let mut store = RoleStore::default();
+        store.create("r1", "r1", "", "", None);
+        let claim_holder = "cc".repeat(32);
+        let roled = "dd".repeat(32);
+        store.admit(&claim_holder);
+        assert!(store.assign(&roled, "r1"));
+        assert!(store.is_member_of(&claim_holder));
+        assert_eq!(store.assignments[&claim_holder].len(), 0);
+
+        // Revoking a role the claim-holder never had: nothing changed, and
+        // the membership must survive.
+        assert!(
+            !store.unassign(&claim_holder, "r1"),
+            "revoking an absent grant reports no change"
+        );
+        assert!(
+            store.is_member_of(&claim_holder),
+            "a claim-admitted member must keep the membership it was admitted with"
+        );
+        assert_eq!(
+            store.assignments[&claim_holder].len(),
+            0,
+            "the entry must not gain a role"
+        );
+        // The published membership (role-empty entries included) is intact.
+        let members: Vec<&String> = store.assignments.keys().collect();
+        assert!(
+            members.iter().any(|m| m.as_str() == claim_holder),
+            "the claim-holder must still be listed in kind:13534: {members:?}"
+        );
+
+        // The roled member is still cleaned up when its last role goes.
+        assert!(store.unassign(&roled, "r1"));
+        assert!(
+            !store.is_member_of(&roled),
+            "a member whose grant this cleanup emptied must still be dropped"
+        );
+        assert!(store.is_member_of(&claim_holder));
     }
 
     #[test]

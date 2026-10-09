@@ -4891,6 +4891,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unassigning_an_absent_role_keeps_a_claim_admitted_member() {
+        // End-to-end for the NIP-86 `unassignrole` path: revoking a role a
+        // claim-joined member never held must not drop the membership. The
+        // store-level fix keeps `unassign` reporting no change, so the
+        // caller still skips the persist and the republish — and now the
+        // live store, the snapshot and the published `kind:13534` all agree.
+        let relay = build_role_relay(Some(&"01".repeat(32))).await;
+        relay.config.write().await.relay.enabled_nips = vec![43];
+        let a = "aa".repeat(32);
+        let b = "bb".repeat(32);
+        assert!(relay.create_role("r1", "R1", "", "", None).await);
+        assert!(
+            relay.admit_member(&a, true).await,
+            "the claim-holder is admitted (role-less member)"
+        );
+        assert_eq!(relay.assign_role(&b, "r1").await, RoleChange::Applied);
+        assert!(relay.roles.read().await.is_member_of(&a));
+
+        // The NIP-86 surface: revoke a role from the claim-holder. Their
+        // membership must survive, because nothing was actually revoked.
+        assert_eq!(
+            relay.unassign_role(&a, "r1").await,
+            RoleChange::Noop,
+            "revoking an absent grant is a no-op success"
+        );
+        let roles = relay.roles.read().await;
+        assert!(
+            roles.is_member_of(&a),
+            "the claim-admitted member must keep the membership"
+        );
+        assert!(roles.assignments[&a].is_empty(), "no role may be invented");
+        drop(roles);
+        // The roled member's grant is still revoked end to end.
+        assert_eq!(relay.unassign_role(&b, "r1").await, RoleChange::Applied);
+        assert!(!relay.roles.read().await.is_member_of(&b));
+        assert!(relay.roles.read().await.is_member_of(&a));
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
     async fn nip09_deletion_of_a_role_definition_revokes_and_rebuilds_survivors() {
         // NIP-09: deleting a relay-signed role-state event must revoke the
         // grants derived from it immediately (the marking path clears the
