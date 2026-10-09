@@ -1224,15 +1224,28 @@ async fn groups_rebuild_worker(
                 buffer.retry = false;
                 buffer.overflow = false;
                 drop(buffer);
+                // Re-arm the retry — the flag was drained at the top of
+                // this iteration, so without this the loop would exit with
+                // `dirty == false` and the trailing re-schedule would also
+                // find nothing to do. Nothing would then ever start another
+                // scan, and the live store would stay fail-closed (every
+                // group read hidden, every group write rejected) for the
+                // remaining lifetime of the process. The role worker
+                // re-arms its flag in the same branch; this worker does it
+                // the same way, so the next removal retries and a restart
+                // rebuilds from the surviving events.
+                state.dirty.store(true, Ordering::SeqCst);
                 state
                     .failed_rebuilds
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 log::error!(
-                    "group state rebuild after a vanish failed; dropping the persisted \
-                     snapshot so the next restart rebuilds from the surviving events"
+                    "group state rebuild failed; keeping the live group store fail-closed \\
+                     until another removal retries it (the snapshot stays dropped so a \\
+                     restart rebuilds from the surviving events)"
                 );
                 state.pending.store(true, Ordering::SeqCst);
-                continue;
+                state.running.store(false, Ordering::SeqCst);
+                return;
             }
             // Finalize under the buffer lock: the take and the swap are one
             // atomic step against the accept paths (which hold the same
@@ -8354,6 +8367,15 @@ mod tests {
             relay.rebuild_failures(),
             1,
             "the failed group scan must be counted exactly once"
+        );
+        assert!(
+            relay
+                .groups_rebuild
+                .dirty
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "a failed rebuild must keep the retry armed: the dirty flag was drained at the \
+             top of the iteration, so without re-arming it nothing ever reschedules the scan \\
+             and the fail-closed live store never recovers"
         );
     }
 
