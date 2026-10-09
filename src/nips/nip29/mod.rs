@@ -294,6 +294,14 @@ pub struct GroupStore {
     /// cleared by an ordinary `GroupsMap::default` rebuild either on a clean
     /// post-scan swap with a current view or from a fresh persistent state.
     pub(crate) stale: bool,
+    /// The specific group ids whose derived state a removal invalidated and
+    /// whose rebuild has not confirmed yet. Empty is normal operation; the
+    /// global `stale` flag is the fallback for a removal whose groups could
+    /// not be resolved (a failed lookup, a vanish, the startup resume), and
+    /// gates every group. Keeping the two lets an unprivileged caller fail
+    /// closed only the groups it actually touched instead of every group on
+    /// the relay.
+    pub(crate) stale_groups: HashSet<String>,
 }
 
 /// The persistable NIP-29 group state: everything [`GroupStore`] holds
@@ -527,20 +535,23 @@ impl GroupStore {
         self.stale = true;
     }
 
+    /// Fails closed for the named groups only (see [`Self::stale_groups`]).
+    pub fn mark_groups_stale(&mut self, gids: impl IntoIterator<Item = String>) {
+        self.stale_groups.extend(gids);
+    }
+
+    /// Whether `gid`'s derived state is unverified: the global flag covers
+    /// removals whose scope could not be resolved, the set the ones that
+    /// could.
+    pub fn group_is_stale(&self, gid: &str) -> bool {
+        self.stale || self.stale_groups.contains(gid)
+    }
+
     fn validate_write_inner(
         &self,
         event: &Event,
         relay_pubkey: Option<&str>,
     ) -> anyhow::Result<()> {
-        // The store is derived from an authority no longer certain (a
-        // removed group-state event and the rebuild has not recomputed the
-        // surviving tree): NIP-43 rejects role actions on the cleared store
-        // for exactly the same reason. A stale `is_member` would keep
-        // authorizing a member whose grant was removed, and a stale
-        // settings blob would service requests with unverified privacy.
-        if self.stale {
-            bail!("restricted: group state is rebuilding");
-        }
         // NIP-29: the event's `h` tag carries *the* group id. Multiple `h`
         // tags are ambiguous and dangerous: the checks below use the first
         // one while the stored tag index and subscriptions match any of
@@ -566,6 +577,17 @@ impl GroupStore {
             }
             return Ok(());
         };
+        // The store is derived from an authority no longer certain (a
+        // removed group-state event and the rebuild has not recomputed the
+        // surviving tree): NIP-43 rejects role actions on the cleared store
+        // for exactly the same reason. A stale `is_member` would keep
+        // authorizing a member whose grant was removed, and a stale
+        // settings blob would service requests with unverified privacy.
+        // The gate is per group: a caller who removed state in *this* group
+        // cannot deny writes to every other group on the relay.
+        if self.group_is_stale(gid) {
+            bail!("restricted: group state is rebuilding");
+        }
         // A ghosted id must never be resurrected by a create: its create
         // event is gone while survivors may still be stored, so a fresh
         // default-public group would expose their (possibly private)
@@ -1412,12 +1434,16 @@ impl GroupStore {
         // authenticated member, so those events are simply not served
         // (fail-closed): claiming they need auth would advertise that
         // authenticating might help when it cannot.
-        if self.stale {
-            return false;
-        }
         let Some(gid) = group_id_any(event) else {
             return false;
         };
+        // A stale group cannot decide whether its content demands an
+        // authenticated member, so those events are simply not served
+        // (fail-closed): claiming they need auth would advertise that
+        // authenticating might help when it cannot.
+        if self.group_is_stale(gid) {
+            return false;
+        }
         if self.deleted.contains(gid) || self.ghost.contains(gid) {
             return false;
         }
@@ -1521,7 +1547,7 @@ impl GroupStore {
         // removed) privacy setting allowed it, or granting membership to a
         // deleted user, hands current state they no longer hold. Mirrors
         // the NIP-43 role store's empty-swap during its own rebuild.
-        if self.stale {
+        if self.group_is_stale(gid) {
             return false;
         }
         // Content of a deleted group is never served: the group is gone,

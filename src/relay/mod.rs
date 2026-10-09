@@ -265,6 +265,14 @@ impl StampClock {
 /// dirty flag.
 const GROUPS_REBUILD_MIN_INTERVAL_SECS: u64 = 2;
 
+/// Upper bound on the group ids a single NIP-09 deletion resolves before the
+/// store falls back to failing closed for *every* group. The scope exists so
+/// an unprivileged caller who removes group state in its own group cannot deny
+/// service to every other group, so the resolution cost has to be bounded too:
+/// reaching the cap already means the caller stored and named this many group
+/// state events, and the resulting rebuild is one shared, coalesced scan.
+const GROUP_STALE_SCOPE_CAP: usize = 1_024;
+
 /// Bound on the group events buffered while a rebuild scan runs. The scan
 /// does not hold `groups.write()`, so events arriving meanwhile are applied
 /// to the live store and buffered for replay on the fresh one; a burst
@@ -293,6 +301,17 @@ struct BufferedGroupEvent {
 /// buffered and replayed onto the fresh store under the final write lock.
 #[derive(Default)]
 struct RebuildBuffer {
+    /// Group ids marked stale since the in-flight scan took its snapshot.
+    /// A swap moves them onto the fresh store instead of clearing them: the
+    /// scan may have read the database before the removal that marked them,
+    /// so those groups stay fail-closed for the next scan. Ids already in
+    /// the set when the scan started are covered by it, so the swap drops
+    /// them.
+    stale_scope: std::collections::HashSet<String>,
+    /// A removal whose groups could not be resolved was marked since the
+    /// scan took its snapshot: the fresh store keeps the global
+    /// fail-closed flag instead of clearing it.
+    stale_all: bool,
     /// A scan is in flight: group mutations are captured here.
     scanning: bool,
     /// Captured events, bounded by [`GROUPS_REBUILD_BUFFER_MAX`]. The local
@@ -396,7 +415,9 @@ struct GroupsRebuild {
     /// write after a newer one and overwrite it, and a snapshot from before
     /// a vanish could land after the post-vanish clear.
     persist_lock: tokio::sync::Mutex<()>,
-    /// Mutations accepted while the scan runs (see [`RebuildBuffer`]).
+    /// Mutations accepted while the scan runs and the group ids whose
+    /// staleness the in-flight scan has not yet confirmed (see
+    /// [`RebuildBuffer`]).
     buffer: tokio::sync::Mutex<RebuildBuffer>,
     /// Derived-state mutations committed but not yet applied in memory
     /// (see [`DerivedMutationEpoch`]).
@@ -599,10 +620,29 @@ enum BufferedRoleMutation {
 /// moderation/join/leave event rebuilds the group store, a NIP-43 role-state
 /// event rebuilds the role store. Kept separate so a NIP-29-only removal
 /// does not revoke the live NIP-43 grants (and schedule a full role scan).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct StateTouch {
     groups: bool,
     roles: bool,
+    /// The group ids the deletion's targets actually belong to, so the
+    /// group store can fail closed for only those groups instead of every
+    /// group on the relay. Empty with `groups == true` means the scope
+    /// could not be resolved (see `groups_all`).
+    group_ids: Vec<String>,
+    /// The group removals could not be scoped to ids (the lookup failed or
+    /// was truncated): every group must fail closed rather than risk
+    /// serving a group whose grant was just removed.
+    groups_all: bool,
+}
+
+/// How much of the group store a removal invalidated. `Groups` is the
+/// common case and keeps the fail-closed blast radius to the groups the
+/// removal actually touched; `All` is the fallback when they cannot be
+/// resolved (a vanished author spans unknown groups, the startup resume
+/// replays recorded requests, a lookup failed).
+enum GroupStaleScope<'a> {
+    All,
+    Groups(&'a [String]),
 }
 
 /// Role mutations accepted while a rebuild scan is in flight (see
@@ -1156,9 +1196,15 @@ async fn groups_rebuild_worker(
             // an event accepted in between is buffered and its in-memory
             // effect is reflected in the captured sets, and the worker will
             // still replay it onto the fresh store.
+            // The scope snapshot taken here is what lets the swap clear the
+            // gates: an id that was already marked when the scan starts is
+            // covered by the scan (its database write happened before the
+            // mark), while one marked afterwards may not be.
             {
                 let mut buffer = state.buffer.lock().await;
                 buffer.scanning = true;
+                buffer.stale_scope.clear();
+                buffer.stale_all = false;
                 buffer.events.clear();
                 buffer.overflow = false;
                 buffer.retry = false;
@@ -1273,18 +1319,25 @@ async fn groups_rebuild_worker(
                          overflow happened during the scan; rebuilding again"
                     );
                 } else {
+                    // Only the swap can release a fail-closed gate. The scan
+                    // covers every group it read, so anything marked before
+                    // it started (the set the buffering window cleared) is
+                    // released; anything marked during it is carried onto the
+                    // fresh store, because the scan may have read the
+                    // database before that removal committed. The set is read
+                    // through the buffer guard this block already holds —
+                    // re-locking the async mutex here would deadlock the
+                    // single writer against itself.
+                    fresh.mark_groups_stale(buffer.stale_scope.drain());
+                    fresh.stale = buffer.stale_all;
+                    // `groups.write()` is taken after the buffer lock (the
+                    // established order in this worker), so a concurrent
+                    // mark on the same path cannot interleave between the
+                    // scope read and the swap.
                     let mut store = groups.write().await;
                     for buffered in buffered {
                         fresh.apply(&buffered.event, "", buffered.now, false, true);
                     }
-                    // Only the swap can release the fail-closed flag: when a
-                    // removal landed mid-scan, the fresh DB view is bounded by
-                    // the same snapshot that created the request. If the dirty
-                    // flag was set after the scan saw the database, keep the
-                    // flag true: it carries the "not current" contract to the
-                    // next loop iteration (when the scheduler drains the flag
-                    // once more) or to the second full copy of history.
-                    fresh.stale = state.dirty.load(Ordering::SeqCst);
                     *store = fresh;
                 }
                 buffer.scanning = false;
@@ -3052,9 +3105,21 @@ impl Relay {
                 // role scan). When the relevance pre-check could not
                 // classify the targets, both stores are marked (fail
                 // closed).
+                //
+                // The group mark is scoped to the groups the deletion
+                // actually addressed. An unauthenticated publisher can
+                // remove group state in a group it administers (create,
+                // put-user, delete the put-user); failing closed for every
+                // group on the relay would turn that into a NIP-29 outage
+                // an attacker can sustain by repeating it, for a grant it
+                // could have revoked in its own group anyway.
                 let unknown = !touch.groups && !touch.roles;
                 if touch.groups || unknown {
-                    self.mark_group_state_stale().await;
+                    if touch.groups_all {
+                        self.mark_group_state_stale().await;
+                    } else {
+                        self.mark_group_state_stale_for(&touch.group_ids).await;
+                    }
                 }
                 if touch.roles || unknown {
                     self.mark_roles_stale().await;
@@ -3309,12 +3374,15 @@ impl Relay {
     /// deletion removes them. A failed lookup fails closed: both stores are
     /// rebuilt even if the targets turn out unrelated.
     async fn deletion_touches_group_state(&self, event: &Event) -> StateTouch {
-        fn classify(kind: u64) -> StateTouch {
-            StateTouch {
-                groups: (nip29::MOD_MIN..=nip29::MOD_MAX).contains(&kind)
+        /// Whether `kind` feeds the group or the role derived state. An
+        /// `a`-tag address carries its kind directly, so it can classify the
+        /// family but never the group the event belongs to.
+        fn classify(kind: u64) -> (bool, bool) {
+            (
+                (nip29::MOD_MIN..=nip29::MOD_MAX).contains(&kind)
                     || kind == nip29::JOIN
                     || kind == nip29::LEAVE,
-                roles: matches!(
+                matches!(
                     kind,
                     nip43::ROLE_DEFINITION
                         | nip43::MEMBERSHIP_LIST
@@ -3323,13 +3391,20 @@ impl Relay {
                         | nip43::JOIN
                         | nip43::LEAVE
                 ),
-            }
+            )
         }
         let mut touch = StateTouch::default();
         for address in nip09::deletion_addresses(event) {
-            let classified = classify(address.kind);
-            touch.groups |= classified.groups;
-            touch.roles |= classified.roles;
+            let (groups, roles) = classify(address.kind);
+            touch.groups |= groups;
+            touch.roles |= roles;
+            // An address names a kind, not an event, so the group it would
+            // affect cannot be resolved: keep the fail-closed-for-everything
+            // fallback. In practice the group action kinds an address can
+            // name (9000-9022) are not replaceable, so no stored event ever
+            // matches them and the walk removes nothing; the flag is carried
+            // so a future replaceable group kind cannot silently narrow.
+            touch.groups_all |= groups;
         }
         let targets = nip09::deletion_targets(event);
         if targets.is_empty() {
@@ -3351,31 +3426,62 @@ impl Relay {
             nip43::JOIN,
             nip43::LEAVE,
         ];
+        // The group side resolves *every* matched group-state event, not
+        // just one: the caller marks exactly those group ids stale instead
+        // of failing closed for every group on the relay. The role side
+        // only needs its existence bit, so it keeps a single-row page.
         for (kinds, is_group) in [(group_kinds, true), (role_kinds, false)] {
             let filter = crate::filter::Filter {
                 ids: Some(targets.clone()),
                 kinds: Some(kinds),
                 ..Default::default()
             };
-            match self
-                .db
-                .query_full_startup(vec![filter], 1, unix_now(), false)
-                .await
-            {
-                Some((events, _)) => {
-                    if !events.is_empty() {
-                        if is_group {
+            let page = if is_group {
+                self.db
+                    .query_full_startup(vec![filter], GROUP_STALE_SCOPE_CAP, unix_now(), false)
+                    .await
+            } else {
+                self.db
+                    .query_full_startup(vec![filter], 1, unix_now(), false)
+                    .await
+            };
+            match page {
+                Some((events, more)) => {
+                    if is_group {
+                        if !events.is_empty() {
                             touch.groups = true;
-                        } else {
-                            touch.roles = true;
                         }
+                        // Cap the resolved scope so one deletion request
+                        // cannot turn the rebuild scoping into an unbounded
+                        // allocation: past the cap the request fails closed
+                        // for every group rather than silently under-scoping
+                        // (the attacker pays for its own stored events to
+                        // reach the cap, and the extra rebuild is bounded
+                        // by the standard interval).
+                        if more || events.len() >= GROUP_STALE_SCOPE_CAP {
+                            touch.groups = true;
+                            touch.groups_all = true;
+                        }
+                        for gid in events
+                            .iter()
+                            .filter_map(|event| nip29::group_id_any(event).map(str::to_string))
+                        {
+                            if !touch.group_ids.contains(&gid) {
+                                touch.group_ids.push(gid);
+                            }
+                        }
+                    } else if !events.is_empty() {
+                        touch.roles = true;
                     }
                 }
-                // The database did not answer: assume the deletion matters.
+                // The database did not answer: assume the deletion matters,
+                // and without resolvable ids every group fails closed.
                 None => {
                     return StateTouch {
                         groups: true,
                         roles: true,
+                        groups_all: true,
+                        ..Default::default()
                     };
                 }
             }
@@ -3395,12 +3501,50 @@ impl Relay {
     /// [`Self::mark_roles_stale`] separately, so a NIP-29-only removal does
     /// not revoke the live role grants and schedule a full role scan.
     pub(crate) async fn mark_group_state_stale(&self) {
+        self.mark_group_state_stale_scope(GroupStaleScope::All)
+            .await;
+    }
+
+    /// Fails closed for only the group ids the removal actually touched.
+    /// An unauthenticated caller that removes group state in a group it
+    /// administers must not deny every group on the relay, so the NIP-09
+    /// and 9005 paths resolve the addressed groups and pass them here; the
+    /// unresolved paths (vanish, the startup resume, a failed lookup) keep
+    /// the global scope.
+    pub(crate) async fn mark_group_state_stale_for(&self, group_ids: &[String]) {
+        self.mark_group_state_stale_scope(GroupStaleScope::Groups(group_ids))
+            .await;
+    }
+
+    async fn mark_group_state_stale_scope(&self, scope: GroupStaleScope<'_>) {
         self.groups_rebuild.dirty.store(true, Ordering::SeqCst);
         self.groups_rebuild.pending.store(true, Ordering::SeqCst);
+        // The buffer lock is taken and dropped before `groups.write()` (the
+        // worker's order is buffer → groups, and taking both here in the
+        // same order would still be safe). Either way, the mark either
+        // lands in the set before the worker's take (the scan covers it, so
+        // the swap clears it) or after it (the swap carries it onto the
+        // fresh store), so the group stays fail-closed until a scan that
+        // started after the removal completes.
+        {
+            let mut buffer = self.groups_rebuild.buffer.lock().await;
+            match scope {
+                GroupStaleScope::All => buffer.stale_all = true,
+                GroupStaleScope::Groups(ids) => {
+                    buffer.stale_scope.extend(ids.iter().cloned());
+                }
+            }
+        }
         // The live store may still hold the grants/settings the removal just
         // targeted: every membership/visibility/write decision fails closed
-        // until the rebuild replaces the store with a verified one.
-        self.groups.write().await.mark_stale();
+        // for those groups until the rebuild replaces the store with a
+        // verified one.
+        match scope {
+            GroupStaleScope::All => self.groups.write().await.mark_stale(),
+            GroupStaleScope::Groups(ids) => {
+                self.groups.write().await.mark_groups_stale(ids.to_vec());
+            }
+        }
         self.persist_groups().await;
         schedule_groups_rebuild(
             self.db.clone(),
@@ -3566,7 +3710,8 @@ impl Relay {
                 // for an id the rebuild does not reconstruct, so a
                 // legitimate re-creation is revealed.
                 self.unghost_confirmed(gid).await;
-                self.mark_group_state_stale().await;
+                // Scoped: the purge is by definition for this one group.
+                self.mark_group_state_stale_for(&[gid.to_string()]).await;
             }
         } else {
             log::error!(
@@ -3832,9 +3977,26 @@ impl Relay {
                     // grant must revoke the membership): mark the touched
                     // store(s) stale and let the coalesced workers rebuild.
                     // An unclassifiable pre-check marks both (fail closed).
+                    //
+                    // Scoped to the moderated group (the `h` tag) and to the
+                    // groups the targets resolved to: a 9005 can only delete
+                    // events of its own group, so failing closed for every
+                    // group on the relay would let one admin deny service to
+                    // all of them.
                     let unknown = !touch.groups && !touch.roles;
                     if touch.groups || unknown {
-                        self.mark_group_state_stale().await;
+                        let mut ids = vec![gid.to_string()];
+                        for gid in &touch.group_ids {
+                            if !ids.contains(gid) {
+                                ids.push(gid.clone());
+                            }
+                        }
+                        if touch.groups_all {
+                            ids.clear();
+                            self.mark_group_state_stale().await;
+                        } else {
+                            self.mark_group_state_stale_for(&ids).await;
+                        }
                     }
                     if touch.roles || unknown {
                         self.mark_roles_stale().await;
@@ -4813,6 +4975,149 @@ mod tests {
             roles.is_member_of(&b),
             "the surviving role's grant must be restored"
         );
+        relay.db.shutdown();
+    }
+
+    #[tokio::test]
+    async fn a_group_state_deletion_fails_closed_only_for_its_own_group() {
+        // Availability: an NIP-09 deletion that removes group state must not
+        // fail closed for every group on the relay. The trigger costs the
+        // caller nothing (create a group, put-user, delete the put-user) and
+        // is unauthenticated, so a store-wide gate would let any publisher
+        // sustain a NIP-29 outage by repeating it — while gaining nothing,
+        // because the grant it revokes is its own.
+        let relay = build_relay().await;
+        relay.config.write().await.relay.enabled_nips = vec![9, 29];
+
+        let now = crate::util::unix_now();
+        let secp = secp256k1::Secp256k1::new();
+        let seed = |n: u8| secp256k1::Keypair::from_seckey_slice(&secp, &[n; 32]).unwrap();
+        let sign = |kp: &secp256k1::Keypair, kind: u64, created_at: u64, tags: Vec<Vec<String>>| {
+            let mut e = crate::event::Event {
+                id: String::new(),
+                pubkey: secp256k1::XOnlyPublicKey::from_keypair(kp).0.to_string(),
+                created_at,
+                kind,
+                tags,
+                content: String::new(),
+                sig: String::new(),
+            };
+            e.id = crate::nips::nip01::compute_id(&e);
+            let id = e.id_bytes().unwrap();
+            e.sig = secp.sign_schnorr_no_aux_rand(&id, kp).to_string();
+            e
+        };
+        let g1 = |tags: Vec<Vec<String>>| {
+            let mut tags = tags;
+            tags.insert(0, vec!["h".into(), "g1".into()]);
+            tags
+        };
+        let g2 = |tags: Vec<Vec<String>>| {
+            let mut tags = tags;
+            tags.insert(0, vec!["h".into(), "g2".into()]);
+            tags
+        };
+        // Two groups, both administered by the same key: the one whose state
+        // is deleted, and an unrelated bystander.
+        let a = seed(7);
+        let member = seed(8);
+        let member_pk = secp256k1::XOnlyPublicKey::from_keypair(&member)
+            .0
+            .to_string();
+        let results = relay
+            .accept_events_batch(
+                vec![
+                    sign(&a, 9007, now - 300, g1(vec![])),
+                    sign(&a, 9002, now - 290, g1(vec![vec!["restricted".into()]])),
+                    sign(&a, 9007, now - 280, g2(vec![])),
+                    sign(&a, 9002, now - 270, g2(vec![vec!["restricted".into()]])),
+                ],
+                &[],
+            )
+            .await;
+        assert!(
+            results
+                .iter()
+                .all(|(_, o)| matches!(o, crate::db::PutOutcome::Stored)),
+            "setup: {results:?}"
+        );
+        let put_user = sign(
+            &a,
+            9000,
+            now - 200,
+            g1(vec![vec!["p".into(), member_pk.clone()]]),
+        );
+        // The bystander group keeps its own grant for the same member, so a
+        // post there is either accepted or refused for an accurate reason
+        // (not "rebuilding").
+        let bystander_grant = sign(
+            &a,
+            9000,
+            now - 190,
+            g2(vec![vec!["p".into(), member_pk.clone()]]),
+        );
+        assert!(matches!(
+            relay.accept_event(put_user.clone(), &[], None).await,
+            crate::db::PutOutcome::Stored
+        ));
+        assert!(matches!(
+            relay.accept_event(bystander_grant, &[], None).await,
+            crate::db::PutOutcome::Stored
+        ));
+        // Delete that grant by NIP-09 (only its author may).
+        let deletion = sign(&a, 5, now - 100, vec![vec!["e".into(), put_user.id]]);
+        assert!(matches!(
+            relay.accept_event(deletion, &[], None).await,
+            crate::db::PutOutcome::Stored
+        ));
+        // The removed group fails closed...
+        let reason = match relay
+            .accept_event(sign(&member, 1, now - 90, g1(vec![])), &[], None)
+            .await
+        {
+            crate::db::PutOutcome::Invalid(r) => r,
+            other => panic!("the removed group must be fail-closed: {other:?}"),
+        };
+        assert!(
+            reason.contains("restricted: group state is rebuilding"),
+            "got {reason:?}"
+        );
+        {
+            let groups = relay.groups.read().await;
+            assert!(
+                !groups.visible_gid("g1", false, Some(&member_pk)),
+                "the removed group must be withheld"
+            );
+            assert!(
+                groups.visible_gid("g2", false, Some(&member_pk)),
+                "an unrelated group must keep serving while one group rebuilds"
+            );
+        }
+        // ...and the unrelated group still accepts writes for the very same
+        // member, because the gate is scoped to the group that lost its
+        // grant.
+        let bystander = sign(&member, 1, now - 80, g2(vec![]));
+        match relay.accept_event(bystander, &[], None).await {
+            crate::db::PutOutcome::Stored => {}
+            other => panic!("an unrelated group must not be caught in the blast radius: {other:?}"),
+        }
+        // The coalesced rebuild releases both gates with their verified
+        // state: g1 no longer grants the removed member, g2 never gated.
+        assert!(
+            wait_for_rebuild_worker(&relay).await,
+            "the group rebuild must finish"
+        );
+        {
+            let groups = relay.groups.read().await;
+            assert!(
+                !groups.group_is_stale("g1"),
+                "the rebuilt removed group must not stay gated"
+            );
+            assert!(
+                !groups.group_is_stale("g2"),
+                "the bystander group must not stay gated"
+            );
+        }
         relay.db.shutdown();
     }
 
