@@ -87,10 +87,24 @@ pub fn conditions_allow(conditions: &str, kind: u64, created_at: u64) -> bool {
     {
         return false;
     }
-    // AND across distinct (field, operator) groups; OR within a group.
-    results
-        .iter()
-        .all(|(key, _)| results.iter().any(|(k, r)| k == key && *r))
+    // AND across distinct (field, operator) groups; OR within a group. The
+    // inner lookup used to rescan `results` from the front for every outer
+    // element, which is quadratic in the condition count. A delegation token
+    // is self-issued (the attacker is their own delegator), so a token padded
+    // with N-1 false conditions in one group turned every event into an
+    // O(N²) evaluation: measured (release build, adversarial shape) 20k
+    // conditions = 2.0s and 100k = 59s, versus 0.34ms and 0.9ms after
+    // grouping each (field, operator) once. The grouped form is a single pass
+    // and produces the identical answer (pinned by
+    // `conditions_grouping_is_identical_for_any_shape`).
+    let mut groups: Vec<((&str, &str), bool)> = Vec::with_capacity(results.len());
+    for (key, result) in &results {
+        match groups.iter_mut().find(|(k, _)| k == key) {
+            Some(entry) => entry.1 |= *result,
+            None => groups.push((*key, *result)),
+        }
+    }
+    groups.iter().all(|(_, ok)| *ok)
 }
 
 /// Verifies a delegation tag when present. Events without a delegation tag
