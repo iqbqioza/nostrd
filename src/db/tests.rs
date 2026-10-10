@@ -5136,6 +5136,74 @@ fn event_meta_rebuilds_from_stored_events() {
 }
 
 #[test]
+fn meta_rebuild_converges_when_a_row_cannot_be_indexed() {
+    // A row the index cannot describe (corrupt JSON, or a legacy pubkey that
+    // is not 32-byte hex) used to be skipped without a placeholder, so
+    // `event_meta.len()` could never reach `events.len()`: the rebuild
+    // "succeeded" on every startup, re-scanned and re-wrote the whole
+    // database, and stayed permanently marked as needing a rebuild.
+    let expiry = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let store = crate::db::store::Store::open(&config(), expiry, 128).unwrap();
+    let now = unix_now();
+    let mut good = event(1, "good", now, vec![]);
+    let good_id = good.id_bytes().unwrap();
+    let corrupt = event(1, "corrupt", now + 1, vec![]);
+    let corrupt_id = corrupt.id_bytes().unwrap();
+    let mut bad_pk = event(1, "legacy", now + 2, vec![]);
+    let bad_pk_id = bad_pk.id_bytes().unwrap();
+    bad_pk.pubkey = "zz".into();
+    {
+        let mut wtxn = store.env.write_txn().unwrap();
+        let written: [(&[u8; 32], &[u8]); 3] = [
+            (&good_id, &serde_json::to_vec(&good).unwrap()),
+            (&corrupt_id, b"{not json"),
+            (&bad_pk_id, &serde_json::to_vec(&bad_pk).unwrap()),
+        ];
+        for (id, raw) in written {
+            store.events.put(&mut wtxn, id, raw).unwrap();
+            let created = match *id {
+                x if x == good_id => now,
+                x if x == corrupt_id => now + 1,
+                _ => now + 2,
+            };
+            store
+                .by_created
+                .put(&mut wtxn, &crate::db::store::created_key(created, id), b"")
+                .unwrap();
+        }
+        wtxn.commit().unwrap();
+    }
+    good.id = hex::encode(good_id);
+    assert!(store.meta_needs_rebuild().unwrap());
+    let count = store.rebuild_event_meta().unwrap();
+    assert_eq!(count, 3, "every stored row is accounted for");
+    assert!(
+        !store.meta_needs_rebuild().unwrap(),
+        "the rebuild must converge: a failed check keeps the index rebuilt on every startup"
+    );
+    // The indexable row keeps its real header...
+    let meta = store.event_meta.unwrap();
+    let rtxn = store.env.read_txn().unwrap();
+    let (kind, created, _, _) =
+        crate::db::store::decode_meta(meta.get(&rtxn, &good_id).unwrap().unwrap()).unwrap();
+    assert_eq!((kind, created), (1, now));
+    // ...and the unindexable rows get the empty placeholder, which the scan
+    // already treats as "fall back to the full parse" (it never matches a
+    // real header).
+    for id in [corrupt_id, bad_pk_id] {
+        let raw = meta.get(&rtxn, &id).unwrap().expect("a placeholder row");
+        assert!(raw.is_empty(), "the placeholder must be empty: {raw:?}");
+        assert!(
+            crate::db::store::decode_meta(raw).is_none(),
+            "the scan must fall back to the full parse for it"
+        );
+    }
+    drop(rtxn);
+    // A restart converges immediately: no second scan.
+    assert!(!store.meta_needs_rebuild().unwrap());
+}
+
+#[test]
 fn rebuild_event_meta_refuses_full_disk() {
     // Like its sibling rebuilds, the metadata backfill must fail with a
     // clean error below the free-space margin instead of committing into
