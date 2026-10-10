@@ -2685,23 +2685,41 @@ impl Store {
                 let mut out: Vec<(Vec<u8>, Vec<u8>)> = Vec::with_capacity(10_000);
                 for item in self.events.range(&rtxn, &range)? {
                     let (id, raw) = item?;
+                    // Every stored row gets an entry, including the ones the
+                    // index cannot describe: `meta_needs_rebuild` compares
+                    // `event_meta.len()` with `events.len()`, so a skipped row
+                    // would keep that comparison permanently true and the
+                    // rebuild would re-scan the whole database on every
+                    // startup. The placeholder is an empty value, which
+                    // `decode_meta` rejects (`raw.len() < META_LEN`): the scan
+                    // then falls back to the full JSON parse for that row
+                    // exactly as it already does for a missing header, so
+                    // correctness is unchanged — only the count converges.
+                    let unindexable = || (id.to_vec(), Vec::new());
                     let Ok(event) = serde_json::from_slice::<Event>(raw) else {
+                        out.push(unindexable());
+                        if out.len() >= 10_000 {
+                            break;
+                        }
                         continue;
                     };
-                    // A non-32-byte hex pubkey (legacy corruption) must be
-                    // skipped: `encode_meta` slices `[..32]` below and would
-                    // panic the startup rebuild otherwise.
-                    let Ok(pubkey) = hex::decode(&event.pubkey) else {
-                        continue;
-                    };
-                    if pubkey.len() != ID_LEN {
-                        continue;
+                    // A non-32-byte hex pubkey (legacy corruption) cannot be
+                    // encoded: `encode_meta` slices `[..32]` and would panic
+                    // the startup rebuild. Placeholder it instead of
+                    // skipping it.
+                    match hex::decode(&event.pubkey)
+                        .ok()
+                        .filter(|p| p.len() == ID_LEN)
+                    {
+                        Some(pubkey) => {
+                            let expiry = crate::nips::nip40::expiry(&event).unwrap_or(0);
+                            out.push((
+                                id.to_vec(),
+                                encode_meta(event.kind, event.created_at, &pubkey, expiry),
+                            ));
+                        }
+                        None => out.push(unindexable()),
                     }
-                    let expiry = crate::nips::nip40::expiry(&event).unwrap_or(0);
-                    out.push((
-                        id.to_vec(),
-                        encode_meta(event.kind, event.created_at, &pubkey, expiry),
-                    ));
                     if out.len() >= 10_000 {
                         break;
                     }
